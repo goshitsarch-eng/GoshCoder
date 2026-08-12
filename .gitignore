@@ -1,0 +1,15 @@
+# Reference clone of the upstream pi repo (not our code)
+reference/
+
+# Build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Local scratch
+.tmp/
