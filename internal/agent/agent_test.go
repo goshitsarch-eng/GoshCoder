@@ -538,7 +538,7 @@ func TestAgentToolValidationFailure(t *testing.T) {
 	if len(ends) != 1 || !ends[0].IsError {
 		t.Fatalf("tool end = %#v", ends)
 	}
-	if text := ends[0].Result.Content[0].(llm.TextContent); !strings.Contains(text.Text, "Validation failed") {
+	if text := ends[0].Result.Content[0].(llm.TextContent); !strings.Contains(text.Text, "validation failed") {
 		t.Fatalf("result text = %q", text.Text)
 	}
 }

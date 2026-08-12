@@ -44,7 +44,7 @@ func TestValidateToolArgumentsMissingRequired(t *testing.T) {
 		t.Fatal("expected a validation error")
 	}
 	// The message keeps pi's shape: tool name, bullet list, received args.
-	if !strings.Contains(err.Error(), `Validation failed for tool "my_tool"`) {
+	if !strings.Contains(err.Error(), `validation failed for tool "my_tool"`) {
 		t.Fatalf("err = %v", err)
 	}
 	if !strings.Contains(err.Error(), "name: required property missing") {

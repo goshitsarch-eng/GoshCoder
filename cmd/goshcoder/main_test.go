@@ -390,3 +390,13 @@ func TestAuthStreamFnToleratesNilAuth(t *testing.T) {
 		t.Fatalf("stopReason = %q", final.StopReason)
 	}
 }
+
+func TestLimitedCommandOutputCapsMemory(t *testing.T) {
+	output := &limitedCommandOutput{limit: 4}
+	if n, err := output.Write([]byte("abcdef")); err != nil || n != 6 {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if output.builder.String() != "abcd" || !output.truncated {
+		t.Fatalf("output = %#v", output)
+	}
+}

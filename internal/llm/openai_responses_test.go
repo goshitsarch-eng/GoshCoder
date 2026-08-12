@@ -652,7 +652,7 @@ func TestResponsesNoAPIKeyErrors(t *testing.T) {
 	if final.Type != EventError {
 		t.Fatalf("final event = %#v", final)
 	}
-	if !strings.Contains(final.Error.ErrorMessage, "No API key") {
+	if !strings.Contains(final.Error.ErrorMessage, "no API key") {
 		t.Fatalf("errorMessage = %q", final.Error.ErrorMessage)
 	}
 }

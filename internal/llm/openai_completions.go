@@ -528,10 +528,10 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 		finishBlock(block)
 	}
 	if ctx.Err() != nil {
-		return errors.New("Request was aborted")
+		return errors.New("request was aborted")
 	}
 	if output.StopReason == StopAborted {
-		return errors.New("Request was aborted")
+		return errors.New("request was aborted")
 	}
 	if !hasFinishReason && !compat.SupportsFinishReason {
 		output.StopReason = StopStop
@@ -544,7 +544,7 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 	}
 	if output.StopReason == StopError {
 		if output.ErrorMessage == "" {
-			return errors.New("Provider returned an error stop reason")
+			return errors.New("provider returned an error stop reason")
 		}
 		return errors.New(output.ErrorMessage)
 	}
@@ -699,7 +699,7 @@ func getClientAPIKey(provider string, apiKey string, headers ProviderHeaders) (s
 	if hasHeader(headers, "authorization") || hasHeader(headers, "cf-aig-authorization") {
 		return "unused", nil
 	}
-	return "", fmt.Errorf("No API key for provider: %s", provider)
+	return "", fmt.Errorf("no API key for provider: %s", provider)
 }
 
 func hasHeader(headers ProviderHeaders, name string) bool {

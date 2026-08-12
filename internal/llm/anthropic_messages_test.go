@@ -257,7 +257,7 @@ func TestAnthropicStreamEndedBeforeMessageStop(t *testing.T) {
 
 	events := drainEvents(es)
 	last := events[len(events)-1]
-	if last.Type != EventError || !strings.Contains(last.Error.ErrorMessage, "Anthropic stream ended before message_stop") {
+	if last.Type != EventError || !strings.Contains(last.Error.ErrorMessage, "anthropic stream ended before message_stop") {
 		t.Fatalf("last = %#v (%v)", last, last.Error)
 	}
 }

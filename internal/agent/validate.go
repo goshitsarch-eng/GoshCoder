@@ -23,7 +23,7 @@ func validateToolArguments(tool Tool, toolName string, args map[string]any) (map
 	var schema jsonSchema
 	if len(tool.Parameters) > 0 {
 		if err := json.Unmarshal(tool.Parameters, &schema); err != nil {
-			return nil, fmt.Errorf("Validation failed for tool %q: invalid parameters schema: %v", toolName, err)
+			return nil, fmt.Errorf("validation failed for tool %q: invalid parameters schema: %v", toolName, err)
 		}
 	}
 	if schema == nil {
@@ -47,7 +47,7 @@ func validateToolArguments(tool Tool, toolName string, args map[string]any) (map
 
 	received, _ := json.MarshalIndent(args, "", "  ")
 	sort.Strings(errs)
-	return nil, fmt.Errorf("Validation failed for tool %q:\n%s\n\nReceived arguments:\n%s",
+	return nil, fmt.Errorf("validation failed for tool %q:\n%s\n\nReceived arguments:\n%s",
 		toolName, "  - "+strings.Join(errs, "\n  - "), received)
 }
 

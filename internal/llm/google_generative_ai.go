@@ -152,7 +152,7 @@ func (p *googleStreamer) streamOnce() error {
 
 	// Google has no header-only auth fallback: the key is required.
 	if opts.APIKey == "" {
-		return fmt.Errorf("No API key for provider: %s", p.model.Provider)
+		return fmt.Errorf("no API key for provider: %s", p.model.Provider)
 	}
 	if ctx.Err() != nil {
 		return AbortError{}
@@ -198,14 +198,14 @@ func (p *googleStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return fmt.Errorf("Google stream ended without a finish reason")
+		return fmt.Errorf("google stream ended without a finish reason")
 	}
 	if p.output.StopReason == StopAborted || p.output.StopReason == StopError {
 		// Google reports failures as a finishReason rather than an error body.
 		if p.output.RawStopReason != "" {
-			return fmt.Errorf("Provider stopped with: %s", p.output.RawStopReason)
+			return fmt.Errorf("provider stopped with: %s", p.output.RawStopReason)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})

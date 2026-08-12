@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net"
 	"net/http"
 	"net/url"
@@ -212,9 +213,19 @@ func callbackHost(env map[string]string) string {
 // startCallbackServer listens on host:port and serves path, accepting a
 // callback whose state matches expectedState.
 func startCallbackServer(host string, port int, path, expectedState string) (*callbackServer, error) {
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("oauth callback host must be loopback, got %q", host)
+		}
+	}
 	listener, err := net.Listen("tcp", net.JoinHostPort(host, fmt.Sprint(port)))
 	if err != nil {
 		return nil, fmt.Errorf("cannot listen on %s:%d for the OAuth callback: %w", host, port, err)
+	}
+	if address, ok := listener.Addr().(*net.TCPAddr); !ok || !address.IP.IsLoopback() {
+		listener.Close()
+		return nil, errors.New("oauth callback server did not bind to a loopback address")
 	}
 
 	cs := &callbackServer{
@@ -250,7 +261,11 @@ func startCallbackServer(host string, port int, path, expectedState string) (*ca
 		}
 	})
 
-	cs.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	cs.server = &http.Server{
+		Handler: mux, ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second,
+		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10,
+	}
 	go func() { _ = cs.server.Serve(listener) }()
 	return cs, nil
 }
@@ -264,9 +279,11 @@ func (cs *callbackServer) close() {
 // writeCallbackPage renders a minimal page for the browser.
 func writeCallbackPage(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
 	w.WriteHeader(status)
-	fmt.Fprintf(w, "<!doctype html><meta charset=utf-8><title>GoshCoder</title>"+
-		"<body style=\"font:16px system-ui;padding:3rem\"><p>%s</p>", message)
+	_, _ = fmt.Fprintf(w, "<!doctype html><meta charset=utf-8><title>GoshCoder</title>"+
+		"<body style=\"font:16px system-ui;padding:3rem\"><p>%s</p>", html.EscapeString(message))
 }
 
 // browserOpener is replaceable so login tests never launch a real browser.
@@ -430,7 +447,7 @@ func (a anthropicOAuth) Login(ctx context.Context, interaction LoginInteraction,
 		"code_verifier": pkce.Verifier,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Anthropic token exchange request failed: %w", err)
+		return nil, fmt.Errorf("anthropic token exchange request failed: %w", err)
 	}
 
 	var parsed tokenResponse
@@ -440,7 +457,7 @@ func (a anthropicOAuth) Login(ctx context.Context, interaction LoginInteraction,
 	}
 	cred, err := credentialFrom(&parsed, anthropicRefreshSkew)
 	if err != nil {
-		return nil, fmt.Errorf("Anthropic token exchange: %w", err)
+		return nil, fmt.Errorf("anthropic token exchange: %w", err)
 	}
 	return cred, nil
 }
@@ -474,10 +491,10 @@ func (k kimiCodingOAuth) Login(ctx context.Context, interaction LoginInteraction
 		if ctx.Err() != nil {
 			return nil, ErrLoginCancelled
 		}
-		return nil, fmt.Errorf("Kimi Code device authorization request failed: %w", err)
+		return nil, fmt.Errorf("kimi Code device authorization request failed: %w", err)
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("Kimi Code device authorization failed (status %d): %s",
+		return nil, fmt.Errorf("kimi Code device authorization failed (status %d): %s",
 			status, strings.TrimSpace(truncate(string(body), 300)))
 	}
 
@@ -545,10 +562,10 @@ func (k kimiCodingOAuth) pollDeviceToken(ctx context.Context, host string, devic
 			if ctx.Err() != nil {
 				return nil, ErrLoginCancelled
 			}
-			return nil, fmt.Errorf("Kimi Code device token request failed: %w", err)
+			return nil, fmt.Errorf("kimi Code device token request failed: %w", err)
 		}
 		if status >= 500 {
-			return nil, fmt.Errorf("Kimi Code device token request failed (status %d): %s",
+			return nil, fmt.Errorf("kimi Code device token request failed (status %d): %s",
 				status, strings.TrimSpace(truncate(string(body), 300)))
 		}
 
@@ -557,7 +574,7 @@ func (k kimiCodingOAuth) pollDeviceToken(ctx context.Context, host string, devic
 		if status >= 200 && status < 300 {
 			cred, err := credentialFrom(&parsed, 0)
 			if err != nil {
-				return nil, fmt.Errorf("Kimi Code token poll: %w", err)
+				return nil, fmt.Errorf("kimi Code token poll: %w", err)
 			}
 			return cred, nil
 		}
@@ -574,11 +591,11 @@ func (k kimiCodingOAuth) pollDeviceToken(ctx context.Context, host string, devic
 				interval += 5 * time.Second
 			}
 		case "expired_token":
-			return nil, errors.New("Kimi Code device authorization expired; restart login")
+			return nil, errors.New("kimi Code device authorization expired; restart login")
 		case "access_denied":
-			return nil, errors.New("Kimi Code login was denied")
+			return nil, errors.New("kimi Code login was denied")
 		default:
-			return nil, fmt.Errorf("Kimi Code device token request failed (status %d): %s",
+			return nil, fmt.Errorf("kimi Code device token request failed (status %d): %s",
 				status, strings.TrimSpace(truncate(string(body), 300)))
 		}
 		if err := wait(interval); err != nil {

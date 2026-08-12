@@ -60,6 +60,10 @@ func TestPlanningWriteGate(t *testing.T) {
 	if allowed != nil {
 		t.Fatalf("markdown write blocked: %#v", allowed)
 	}
+	shell := manager.BeforeToolCall(t.Context(), agent.BeforeToolCallContext{ToolCall: llm.ToolCall{Name: "bash"}, Args: map[string]any{"command": "rm -rf ."}})
+	if shell == nil || !shell.Block {
+		t.Fatalf("shell was not blocked: %#v", shell)
+	}
 	blocked := manager.BeforeToolCall(t.Context(), agent.BeforeToolCallContext{ToolCall: llm.ToolCall{Name: "edit"}, Args: map[string]any{"path": "main.go"}})
 	if blocked == nil || !blocked.Block {
 		t.Fatalf("code edit was not blocked: %#v", blocked)

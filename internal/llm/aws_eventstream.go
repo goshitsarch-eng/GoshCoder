@@ -51,7 +51,7 @@ type eventStreamReader struct {
 }
 
 func newEventStreamReader(r io.Reader) *eventStreamReader {
-	return &eventStreamReader{r: r}
+	return &eventStreamReader{r: io.LimitReader(r, maxProviderStreamBytes)}
 }
 
 // Next decodes the next message, returning io.EOF at the end of the stream.

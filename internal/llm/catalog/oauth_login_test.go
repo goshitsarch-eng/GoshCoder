@@ -108,6 +108,32 @@ func TestParseAuthorizationInput(t *testing.T) {
 	}
 }
 
+func TestCallbackServerRejectsNonLoopbackHost(t *testing.T) {
+	if _, err := startCallbackServer("0.0.0.0", 0, "/callback", "state"); err == nil {
+		t.Fatal("non-loopback callback host was accepted")
+	}
+}
+
+func TestCallbackPageEscapesProviderError(t *testing.T) {
+	server, err := startCallbackServer("127.0.0.1", 0, "/callback", "expected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.close()
+	response, err := http.Get("http://" + server.addr + "/callback?error=" + url.QueryEscape("<script>alert(1)</script>"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "<script>") || !strings.Contains(string(body), "&lt;script&gt;") {
+		t.Fatalf("unsafe callback page: %s", body)
+	}
+}
+
 func TestCallbackServerRejectsStateMismatch(t *testing.T) {
 	server, err := startCallbackServer("127.0.0.1", 0, "/callback", "expected")
 	if err != nil {

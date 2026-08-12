@@ -502,6 +502,27 @@ func TestCodexRefreshUnauthorizedIsTerminal(t *testing.T) {
 // Credential extras
 // ---------------------------------------------------------------------------
 
+func TestCredentialStoreRecoversStaleLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	lockPath := path + ".lock"
+	if err := os.WriteFile(lockPath, []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * lockFileTimeout)
+	if err := os.Chtimes(lockPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	store := NewFileCredentialStore(path)
+	if _, err := store.Modify("test", func(*Credential) (*Credential, error) {
+		return &Credential{Type: "api_key", Key: "secret"}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("lock remains: %v", err)
+	}
+}
+
 func TestCredentialExtraRoundTripsThroughAuthJSON(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	store := NewFileCredentialStore(path)

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"goshcoder/internal/agent"
@@ -251,7 +252,7 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 
 	case "/plannotator":
 		if s.plan == nil {
-			return false, errors.New("Plannotator is unavailable in this session")
+			return false, errors.New("plannotator is unavailable in this session")
 		}
 		phase, err := s.plan.Toggle()
 		if err != nil {
@@ -384,10 +385,13 @@ func (s *session) sessionInfo() claudetui.SessionInfo {
 			info.ContextUsed = assistant.Usage.TotalTokens
 		}
 	}
-	status := exec.Command("git", "status", "--short", "--branch", "--untracked-files=normal")
+	statusContext, cancelStatus := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelStatus()
+	status := exec.CommandContext(statusContext, "git", "status", "--short", "--branch", "--untracked-files=normal")
+	status.WaitDelay = time.Second
 	status.Dir = s.workspaceRoot()
-	if output, err := status.Output(); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if output, _, err := runCommandLimited(status, 1<<20); err == nil {
+		lines := strings.Split(strings.TrimSpace(output), "\n")
 		for index, line := range lines {
 			if index == 0 && strings.HasPrefix(line, "## ") {
 				branch := strings.TrimPrefix(line, "## ")
@@ -406,6 +410,39 @@ func (s *session) sessionInfo() claudetui.SessionInfo {
 	return info
 }
 
+type limitedCommandOutput struct {
+	mu        sync.Mutex
+	builder   strings.Builder
+	limit     int
+	truncated bool
+}
+
+func (output *limitedCommandOutput) Write(data []byte) (int, error) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	originalLength := len(data)
+	remaining := output.limit - output.builder.Len()
+	if remaining <= 0 {
+		output.truncated = output.truncated || originalLength > 0
+		return originalLength, nil
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+		output.truncated = true
+	}
+	_, _ = output.builder.Write(data)
+	return originalLength, nil
+}
+
+func runCommandLimited(command *exec.Cmd, limit int) (string, bool, error) {
+	output := &limitedCommandOutput{limit: limit}
+	command.Stdout, command.Stderr = output, output
+	err := command.Run()
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	return output.builder.String(), output.truncated, err
+}
+
 func (s *session) workspaceRoot() string {
 	if s.workspace != nil {
 		return s.workspace.Root
@@ -419,7 +456,9 @@ func (s *session) workspaceRoot() string {
 
 func (s *session) browserReview(title, content string) (plannotator.Decision, error) {
 	reviewer := plannotator.BrowserReviewer{Notify: func(message string) { fmt.Fprintln(os.Stderr, message) }}
-	return reviewer.Review(context.Background(), title, content)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+	return reviewer.Review(ctx, title, content)
 }
 
 func (s *session) deliverReviewFeedback(subject string, decision plannotator.Decision) error {
@@ -441,28 +480,38 @@ func (s *session) deliverReviewFeedback(subject string, decision plannotator.Dec
 func (s *session) reviewCode(argument string) error {
 	target := strings.TrimSpace(argument)
 	var cmd *exec.Cmd
+	commandContext, cancelCommand := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelCommand()
 	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
-		cmd = exec.Command("gh", "pr", "diff", target)
+		cmd = exec.CommandContext(commandContext, "gh", "pr", "diff", target)
 	} else {
-		cmd = exec.Command("git", "diff", "--no-ext-diff", "--")
+		cmd = exec.CommandContext(commandContext, "git", "diff", "--no-ext-diff", "--")
 	}
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = s.workspaceRoot()
-	content, err := cmd.CombinedOutput()
+	content, truncated, err := runCommandLimited(cmd, 4<<20)
 	if err != nil {
-		return fmt.Errorf("load review diff: %w: %s", err, strings.TrimSpace(string(content)))
+		return fmt.Errorf("load review diff: %w: %s", err, strings.TrimSpace(content))
+	}
+	if truncated {
+		return errors.New("review diff exceeds the 4 MiB limit")
 	}
 	if len(content) == 0 && target == "" {
-		cmd = exec.Command("git", "diff", "--cached", "--no-ext-diff", "--")
+		cmd = exec.CommandContext(commandContext, "git", "diff", "--cached", "--no-ext-diff", "--")
+		cmd.WaitDelay = 2 * time.Second
 		cmd.Dir = s.workspaceRoot()
-		content, err = cmd.CombinedOutput()
+		content, truncated, err = runCommandLimited(cmd, 4<<20)
 		if err != nil {
 			return fmt.Errorf("git diff --cached: %w", err)
+		}
+		if truncated {
+			return errors.New("review diff exceeds the 4 MiB limit")
 		}
 	}
 	if len(content) == 0 {
 		return errors.New("there are no changes to review")
 	}
-	decision, err := s.browserReview("Review code changes", "```diff\n"+string(content)+"\n```")
+	decision, err := s.browserReview("Review code changes", "```diff\n"+content+"\n```")
 	if err != nil {
 		return err
 	}
@@ -518,15 +567,15 @@ func (s *session) annotateFile(path string) error {
 			if ext != ".md" && ext != ".mdx" && ext != ".txt" && ext != ".html" && ext != ".htm" {
 				return nil
 			}
-			data, readErr := os.ReadFile(filePath)
+			relative, _ := filepath.Rel(candidate, filePath)
+			heading := fmt.Sprintf("\n\n## %s\n\n", filepath.ToSlash(relative))
+			remaining := (2 << 20) - combined.Len() - len(heading)
+			data, readErr := readFileLimited(filePath, remaining)
 			if readErr != nil {
 				return readErr
 			}
-			if combined.Len()+len(data) > 2<<20 {
-				return errors.New("folder content is too large to annotate (maximum 2MB)")
-			}
-			relative, _ := filepath.Rel(candidate, filePath)
-			fmt.Fprintf(&combined, "\n\n## %s\n\n%s", filepath.ToSlash(relative), data)
+			combined.WriteString(heading)
+			combined.Write(data)
 			return nil
 		})
 		if err != nil {
@@ -537,19 +586,35 @@ func (s *session) annotateFile(path string) error {
 			return errors.New("folder has no annotatable text files")
 		}
 	} else {
-		content, err = os.ReadFile(candidate)
+		content, err = readFileLimited(candidate, 2<<20)
 		if err != nil {
 			return err
 		}
-	}
-	if len(content) > 2<<20 {
-		return errors.New("file is too large to annotate (maximum 2MB)")
 	}
 	decision, err := s.browserReview("Annotate "+filepath.Base(candidate), string(content))
 	if err != nil {
 		return err
 	}
 	return s.deliverReviewFeedback(candidate, decision)
+}
+
+func readFileLimited(path string, limit int) ([]byte, error) {
+	if limit < 0 {
+		return nil, errors.New("content exceeds the annotation limit")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > limit {
+		return nil, errors.New("content exceeds the 2 MiB annotation limit")
+	}
+	return content, nil
 }
 
 func (s *session) annotateLastMessage() error {

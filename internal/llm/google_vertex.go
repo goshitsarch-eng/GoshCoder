@@ -212,13 +212,13 @@ func (p *vertexStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return fmt.Errorf("Google Vertex stream ended without a finish reason")
+		return fmt.Errorf("google Vertex stream ended without a finish reason")
 	}
 	if p.output.StopReason == StopAborted || p.output.StopReason == StopError {
 		if p.output.RawStopReason != "" {
-			return fmt.Errorf("Provider stopped with: %s", p.output.RawStopReason)
+			return fmt.Errorf("provider stopped with: %s", p.output.RawStopReason)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})
@@ -260,7 +260,7 @@ func resolveVertexProject(options *GoogleVertexOptions) (string, error) {
 	if project := getProviderEnvValue("GCLOUD_PROJECT", options.Env); project != "" {
 		return project, nil
 	}
-	return "", fmt.Errorf("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.")
+	return "", fmt.Errorf("vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options")
 }
 
 // resolveVertexLocation resolves the Vertex region.
@@ -271,7 +271,7 @@ func resolveVertexLocation(options *GoogleVertexOptions) (string, error) {
 	if location := getProviderEnvValue("GOOGLE_CLOUD_LOCATION", options.Env); location != "" {
 		return location, nil
 	}
-	return "", fmt.Errorf("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options.")
+	return "", fmt.Errorf("vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options")
 }
 
 // resolveVertexCustomBaseURL returns model.BaseURL when it is a usable

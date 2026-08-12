@@ -5,7 +5,7 @@ No third-party dependencies: everything is Go's standard library.
 
 ## Install
 
-Requires Go 1.26+.
+Requires Go 1.26.5 or newer. The patch-level minimum avoids known standard-library security vulnerabilities in earlier Go 1.26 releases.
 
 ```sh
 go build -o bin/goshcoder ./cmd/goshcoder
@@ -118,8 +118,15 @@ Documented at the top of each ported file. The notable ones:
 ## Development
 
 ```sh
-go build ./... && go vet ./... && go test ./...
+go build ./... && go vet -all ./... && go test ./...
+staticcheck ./...   # optional external audit tool
+govulncheck ./...   # optional external vulnerability scanner
 ```
+
+Release validation also runs the race detector. Filesystem tools use Go's
+`os.Root` confinement, planning mode disables shell execution, local callback
+servers bind only to loopback, and network, disk, and subprocess inputs have
+explicit resource limits.
 
 The pi reference clone lives in `reference/pi` (gitignored) and is what the
 ports are written against.

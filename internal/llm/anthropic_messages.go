@@ -231,7 +231,7 @@ func anthropicAssertRequestAuth(provider, apiKey string, headers ProviderHeaders
 	if hasHeader(headers, "authorization") || hasHeader(headers, "x-api-key") || hasHeader(headers, "cf-aig-authorization") {
 		return "", false, nil
 	}
-	return "", false, fmt.Errorf("No API key for provider: %s", provider)
+	return "", false, fmt.Errorf("no API key for provider: %s", provider)
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +521,7 @@ func resolveAnthropicStrictSampling(tool Tool, supportsStrict bool) (bool, error
 		return true, nil
 	}
 	if config.Strict == "require" {
-		return false, fmt.Errorf("Tool %q requires JSON-schema constrained sampling, but strict tools are unsupported.", tool.Name)
+		return false, fmt.Errorf("Tool %q requires JSON-schema constrained sampling, but strict tools are unsupported", tool.Name)
 	}
 	return false, nil
 }
@@ -659,7 +659,7 @@ func anthropicConvertToolResult(msg ToolResultMessage, isOAuth bool, deferredNam
 		references = append(references, map[string]any{"type": "tool_reference", "tool_name": refName})
 	}
 	converted := anthropicConvertContentBlocks(msg.Content)
-	var content any = converted
+	var content = any(converted)
 	if len(references) > 0 {
 		content = references
 	}
@@ -830,7 +830,7 @@ func mapAnthropicStopReason(reason, refusalExplanation string) (StopReason, stri
 	case "sensitive": // Content flagged by safety filters
 		return StopError, "Provider stopped with: sensitive", nil
 	default:
-		return "", "", fmt.Errorf("Unhandled stop reason: %s", reason)
+		return "", "", fmt.Errorf("unhandled stop reason: %s", reason)
 	}
 }
 
@@ -1082,11 +1082,11 @@ func parseAnthropicStreamEvent(eventName, data string) (*anthropicStreamEvent, e
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
 		repaired, rerr := ParseJSONWithRepair(data)
 		if rerr != nil {
-			return nil, fmt.Errorf("Could not parse Anthropic SSE event %s: %s; data=%s", eventName, err, data)
+			return nil, fmt.Errorf("could not parse Anthropic SSE event %s: %s; data=%s", eventName, err, data)
 		}
 		raw, _ := json.Marshal(repaired)
 		if err := json.Unmarshal(raw, &event); err != nil {
-			return nil, fmt.Errorf("Could not parse Anthropic SSE event %s: %s; data=%s", eventName, err, data)
+			return nil, fmt.Errorf("could not parse Anthropic SSE event %s: %s; data=%s", eventName, err, data)
 		}
 	}
 	return &event, nil
@@ -1309,19 +1309,19 @@ func (p *anthropicMessagesStreamer) consumeStream(ctx context.Context, body io.R
 	}
 
 	if sawMessageStart && !sawMessageStop {
-		return errors.New("Anthropic stream ended before message_stop")
+		return errors.New("anthropic stream ended before message_stop")
 	}
 	if ctx.Err() != nil {
-		return errors.New("Request was aborted")
+		return errors.New("request was aborted")
 	}
 	if output.StopReason == StopPending {
-		return errors.New("Anthropic stream ended without a stop reason")
+		return errors.New("anthropic stream ended without a stop reason")
 	}
 	if output.StopReason == StopAborted || output.StopReason == StopError {
 		if output.ErrorMessage != "" {
 			return errors.New(output.ErrorMessage)
 		}
-		return errors.New("An unknown error occurred")
+		return errors.New("an unknown error occurred")
 	}
 
 	syncContent()

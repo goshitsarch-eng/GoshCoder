@@ -420,6 +420,28 @@ func TestListAndArchive(t *testing.T) {
 	if len(archived) != 1 || archived[0].Name != "a-loop" {
 		t.Fatalf("archived = %#v", archived)
 	}
+	if task, err := store.ReadTask(archived[0]); err != nil || task != "task" {
+		t.Fatalf("archived task = %q, %v", task, err)
+	}
+	if _, err := os.Stat(filepath.Join(store.Root, Dir, "a-loop.md")); !os.IsNotExist(err) {
+		t.Fatalf("active task still exists: %v", err)
+	}
+}
+
+func TestTaskFileCannotEscapeThroughSymlink(t *testing.T) {
+	store := newTestStore(t)
+	outside := t.TempDir()
+	link := filepath.Join(store.Root, "linked")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	state := &State{TaskFile: "linked/task.md"}
+	if err := store.WriteTask(state, "secret"); err == nil {
+		t.Fatal("task write escaped workspace")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "task.md")); !os.IsNotExist(err) {
+		t.Fatalf("outside task exists: %v", err)
+	}
 }
 
 func TestDelete(t *testing.T) {

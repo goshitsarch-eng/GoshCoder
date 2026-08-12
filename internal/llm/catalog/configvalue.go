@@ -7,6 +7,8 @@ package catalog
 // values and provider env values all go through this resolution.
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +22,27 @@ import (
 
 // commandTimeout bounds shell command resolution (TS timeout: 10000).
 const commandTimeout = 10 * time.Second
+const commandOutputLimit = 1 << 20
+
+type commandOutput struct {
+	builder   strings.Builder
+	truncated bool
+}
+
+func (output *commandOutput) Write(data []byte) (int, error) {
+	originalLength := len(data)
+	remaining := commandOutputLimit - output.builder.Len()
+	if remaining <= 0 {
+		output.truncated = output.truncated || originalLength > 0
+		return originalLength, nil
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+		output.truncated = true
+	}
+	_, _ = output.builder.Write(data)
+	return originalLength, nil
+}
 
 var (
 	envVarNameRE       = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -392,28 +415,26 @@ func executeWithDefaultShell(command string) (string, bool) {
 // runShell executes shell with args, optionally feeding stdin, and returns
 // stdout. spawned is false when the executable could not be started.
 func runShell(shell string, args []string, stdin string) (out string, runErr error, spawned bool) {
-	cmd := exec.Command(shell, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, shell, args...)
+	cmd.WaitDelay = 2 * time.Second
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
-	var stdout strings.Builder
+	var stdout commandOutput
 	cmd.Stdout = &stdout
-	cmd.Stderr = nil
-
 	if err := cmd.Start(); err != nil {
 		return "", err, false
 	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		return stdout.String(), err, true
-	case <-time.After(commandTimeout):
-		_ = cmd.Process.Kill()
-		<-done
+	err := cmd.Wait()
+	if ctx.Err() != nil {
 		return "", fmt.Errorf("command timed out after %s", commandTimeout), true
 	}
+	if stdout.truncated {
+		return "", errors.New("command output exceeds 1 MiB"), true
+	}
+	return stdout.builder.String(), err, true
 }
 
 // shellConfig is the resolved command shell (TS ShellConfig).

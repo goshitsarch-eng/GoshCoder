@@ -9,8 +9,8 @@ import (
 	"fmt"
 )
 
-// Known APIs. Pi keeps this open-ended (Api = KnownApi | string); Go mirrors
-// that with a plain string type.
+// API identifies a provider wire protocol. Pi keeps this open-ended
+// (Api = KnownApi | string); Go mirrors that with a plain string type.
 type API = string
 
 const (
@@ -508,7 +508,7 @@ func UnmarshalMessages(data json.RawMessage) ([]Message, error) {
 	return msgs, nil
 }
 
-// Model cost rates in $/million tokens.
+// ModelCostRates contains prices in dollars per million tokens.
 type ModelCostRates struct {
 	Input      float64 `json:"input"`
 	Output     float64 `json:"output"`

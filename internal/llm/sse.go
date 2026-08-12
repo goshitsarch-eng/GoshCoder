@@ -25,8 +25,9 @@ type SSEEvent struct {
 //   - a blank line dispatches the accumulated event (skipped if no data)
 //   - line endings may be \n or \r\n
 const (
-	maxSSELineBytes  = 16 << 20
-	maxSSEEventBytes = 32 << 20
+	maxProviderStreamBytes = 256 << 20
+	maxSSELineBytes        = 16 << 20
+	maxSSEEventBytes       = 32 << 20
 )
 
 var (
@@ -39,7 +40,7 @@ type SSEReader struct {
 }
 
 func NewSSEReader(r io.Reader) *SSEReader {
-	return &SSEReader{r: bufio.NewReader(r)}
+	return &SSEReader{r: bufio.NewReader(io.LimitReader(r, maxProviderStreamBytes))}
 }
 
 // Next returns the next dispatched event. It returns io.EOF when the stream

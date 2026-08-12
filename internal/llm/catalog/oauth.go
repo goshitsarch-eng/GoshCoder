@@ -277,7 +277,7 @@ func (a anthropicOAuth) Refresh(ctx context.Context, current *Credential, _ map[
 		"refresh_token": current.Refresh,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Anthropic token refresh request failed: %w", err)
+		return nil, fmt.Errorf("anthropic token refresh request failed: %w", err)
 	}
 
 	var parsed tokenResponse
@@ -287,7 +287,7 @@ func (a anthropicOAuth) Refresh(ctx context.Context, current *Credential, _ map[
 	}
 	cred, err := credentialFrom(&parsed, anthropicRefreshSkew)
 	if err != nil {
-		return nil, fmt.Errorf("Anthropic token refresh: %w", err)
+		return nil, fmt.Errorf("anthropic token refresh: %w", err)
 	}
 	return cred, nil
 }
@@ -344,7 +344,7 @@ func (k kimiCodingOAuth) Refresh(ctx context.Context, current *Credential, env m
 
 		status, body, err := postForm(ctx, endpoint, form)
 		if err != nil {
-			lastErr = fmt.Errorf("Kimi Code token refresh request failed: %w", err)
+			lastErr = fmt.Errorf("kimi Code token refresh request failed: %w", err)
 			continue
 		}
 
@@ -353,7 +353,7 @@ func (k kimiCodingOAuth) Refresh(ctx context.Context, current *Credential, env m
 		if status >= 200 && status < 300 {
 			cred, err := credentialFrom(&parsed, 0)
 			if err != nil {
-				return nil, fmt.Errorf("Kimi Code token refresh: %w", err)
+				return nil, fmt.Errorf("kimi Code token refresh: %w", err)
 			}
 			return cred, nil
 		}
@@ -368,7 +368,7 @@ func (k kimiCodingOAuth) Refresh(ctx context.Context, current *Credential, env m
 		return nil, tokenError(k.Name(), "refresh", status, body, &parsed)
 	}
 	if lastErr == nil {
-		lastErr = errors.New("Kimi Code token refresh failed")
+		lastErr = errors.New("kimi Code token refresh failed")
 	}
 	return nil, lastErr
 }

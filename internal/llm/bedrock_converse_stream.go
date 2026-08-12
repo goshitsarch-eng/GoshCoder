@@ -451,7 +451,7 @@ var bedrockImageFormats = map[string]string{
 func bedrockImageBlock(mimeType, data string) (map[string]any, error) {
 	format, ok := bedrockImageFormats[mimeType]
 	if !ok {
-		return nil, fmt.Errorf("Unknown image type: %s", mimeType)
+		return nil, fmt.Errorf("unknown image type: %s", mimeType)
 	}
 	if _, err := base64.StdEncoding.DecodeString(data); err != nil {
 		return nil, fmt.Errorf("invalid base64 image data: %w", err)
@@ -850,13 +850,13 @@ func (p *bedrockStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return fmt.Errorf("Bedrock stream ended without a stop reason")
+		return fmt.Errorf("bedrock stream ended without a stop reason")
 	}
 	if p.output.StopReason == StopAborted || p.output.StopReason == StopError {
 		if p.output.ErrorMessage != "" {
 			return fmt.Errorf("%s", p.output.ErrorMessage)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})
@@ -963,7 +963,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 		switch message.EventType() {
 		case "messageStart":
 			if event.Role != "assistant" {
-				return fmt.Errorf("Unexpected assistant message start but got %s message start instead", event.Role)
+				return fmt.Errorf("unexpected assistant message start but got %s message start instead", event.Role)
 			}
 			p.push(AssistantMessageEvent{Type: EventStart})
 

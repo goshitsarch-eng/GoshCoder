@@ -103,7 +103,10 @@ func newSession(cfg sessionConfig) (*session, error) {
 				return nil, err
 			}
 		}
-		if manager.State().Phase != plannotator.PhaseIdle {
+		switch manager.State().Phase {
+		case plannotator.PhasePlanning:
+			agentTools = mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{manager.Tool()})
+		case plannotator.PhaseExecuting:
 			agentTools = mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{manager.Tool()})
 		}
 		if !cfg.Quiet && manager.State().Phase != plannotator.PhaseIdle {
@@ -265,11 +268,24 @@ func (s *session) syncPlanRuntime() {
 		return
 	}
 	s.agent.SetSystemPrompt(s.plan.Prompt(s.baseSystemPrompt))
-	if s.plan.State().Phase == plannotator.PhaseIdle {
+	switch s.plan.State().Phase {
+	case plannotator.PhaseIdle:
 		s.agent.SetTools(s.normalTools)
-		return
+	case plannotator.PhasePlanning:
+		s.agent.SetTools(mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}))
+	case plannotator.PhaseExecuting:
+		s.agent.SetTools(mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}))
 	}
-	s.agent.SetTools(mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}))
+}
+
+func withoutTool(group []agent.Tool, name string) []agent.Tool {
+	filtered := make([]agent.Tool, 0, len(group))
+	for _, tool := range group {
+		if tool.Name != name {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
 }
 
 func mergeTools(groups ...[]agent.Tool) []agent.Tool {

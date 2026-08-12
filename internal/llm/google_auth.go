@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -143,9 +144,17 @@ func fileExistsAt(path string) bool {
 }
 
 func loadGoogleCredentialFile(path string) (*googleCredentialFile, error) {
-	content, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading Google credentials %s: %w", path, err)
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, (2<<20)+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading Google credentials %s: %w", path, err)
+	}
+	if len(content) > 2<<20 {
+		return nil, fmt.Errorf("google credentials %s exceed 2 MiB", path)
 	}
 	var creds googleCredentialFile
 	if err := json.Unmarshal(content, &creds); err != nil {
@@ -231,7 +240,7 @@ func postGoogleTokenRequest(ctx context.Context, tokenURI string, form url.Value
 
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("Google token exchange failed: %w", err)
+		return nil, fmt.Errorf("google token exchange failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -252,7 +261,7 @@ func postGoogleTokenRequest(ctx context.Context, tokenURI string, form url.Value
 		if detail == "" {
 			detail = fmt.Sprintf("status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("Google token exchange failed: %s", detail)
+		return nil, fmt.Errorf("google token exchange failed: %s", detail)
 	}
 
 	expiresIn := payload.ExpiresIn

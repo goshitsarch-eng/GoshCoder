@@ -156,7 +156,13 @@ func (m *Manager) BeforeToolCall(_ context.Context, call agent.BeforeToolCallCon
 	m.mu.Lock()
 	planning := m.state.Phase == PhasePlanning
 	m.mu.Unlock()
-	if !planning || (call.ToolCall.Name != "write" && call.ToolCall.Name != "edit") {
+	if !planning {
+		return nil
+	}
+	if call.ToolCall.Name == "bash" {
+		return &agent.BeforeToolCallResult{Block: true, Reason: "Plannotator: shell commands are disabled during planning because they can modify the workspace."}
+	}
+	if call.ToolCall.Name != "write" && call.ToolCall.Name != "edit" {
 		return nil
 	}
 	path, _ := call.Args["path"].(string)
@@ -412,12 +418,23 @@ func (m *Manager) load() error {
 	if m.stateFile == "" {
 		return nil
 	}
-	encoded, err := os.ReadFile(m.stateFile)
+	file, err := os.Open(m.stateFile)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	defer file.Close()
+	encoded, err := io.ReadAll(io.LimitReader(file, 1<<20))
+	if err != nil {
+		return err
+	}
+	if len(encoded) == 1<<20 {
+		var extra [1]byte
+		if count, _ := file.Read(extra[:]); count > 0 {
+			return errors.New("plannotator state exceeds 1 MiB")
+		}
 	}
 	return json.Unmarshal(encoded, &m.state)
 }

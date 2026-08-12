@@ -97,7 +97,7 @@ func TestAzureInvalidBaseURLErrors(t *testing.T) {
 	if final.Type != EventError || final.Reason != StopError {
 		t.Fatalf("final = %#v", final)
 	}
-	if !strings.Contains(final.Error.ErrorMessage, "Invalid Azure OpenAI base URL") {
+	if !strings.Contains(final.Error.ErrorMessage, "invalid Azure OpenAI base URL") {
 		t.Fatalf("errorMessage = %q", final.Error.ErrorMessage)
 	}
 }
@@ -396,7 +396,7 @@ func TestAzureNoAPIKeyErrors(t *testing.T) {
 	if final.Type != EventError {
 		t.Fatalf("final = %#v", final)
 	}
-	if !strings.Contains(final.Error.ErrorMessage, "No API key") {
+	if !strings.Contains(final.Error.ErrorMessage, "no API key") {
 		t.Fatalf("errorMessage = %q", final.Error.ErrorMessage)
 	}
 }

@@ -17,7 +17,7 @@ import (
 // the request context is canceled.
 type AbortError struct{}
 
-func (AbortError) Error() string { return "Request aborted" }
+func (AbortError) Error() string { return "request aborted" }
 
 // IsAbort reports whether err is an AbortError or a context cancellation.
 func IsAbort(err error) bool {
@@ -263,8 +263,8 @@ func IsRetryableAssistantError(message *AssistantMessage) bool {
 	return retryableProviderErrorPattern.MatchString(message.ErrorMessage)
 }
 
-// RetryPolicy: bounded attempts with exponential backoff
-// (baseDelayMs * 2^(attempt-1)). Mirrors utils/retry.ts.
+// RetryPolicy configures bounded attempts with exponential backoff
+// (baseDelayMs * 2^(attempt-1)). It mirrors utils/retry.ts.
 type RetryPolicy struct {
 	Enabled     bool
 	MaxRetries  int

@@ -16,8 +16,12 @@ package ralph
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,6 +44,8 @@ const CompleteMarker = "<promise>COMPLETE</promise>"
 
 // DefaultMaxIterations bounds a loop that does not specify its own limit.
 const DefaultMaxIterations = 50
+
+const maxRalphFileBytes = 2 * 1024 * 1024
 
 // Status is the loop lifecycle state.
 type Status = string
@@ -128,6 +134,12 @@ type Store struct {
 
 // NewStore returns a store rooted at the given workspace directory.
 func NewStore(root, sessionID string) *Store {
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	return &Store{Root: root, SessionID: sessionID}
 }
 
@@ -142,6 +154,106 @@ func (s *Store) path(name, ext string, archived bool) string {
 	return filepath.Join(s.dir(archived), SanitizeName(name)+ext)
 }
 
+func (s *Store) rootName(path string) (string, error) {
+	name, err := filepath.Rel(s.Root, path)
+	if err != nil || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %s is outside the workspace", path)
+	}
+	return name, nil
+}
+
+func (s *Store) readFile(path string) ([]byte, error) {
+	name, err := s.rootName(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(s.Root)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, maxRalphFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > maxRalphFileBytes {
+		return nil, fmt.Errorf("ralph file exceeds %d bytes", maxRalphFileBytes)
+	}
+	return content, nil
+}
+
+func (s *Store) removeFile(path string) error {
+	name, err := s.rootName(path)
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.Root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	err = root.Remove(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (s *Store) writeFile(path string, content []byte, mode os.FileMode) error {
+	name, err := s.rootName(path)
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.Root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return err
+	}
+	var temporary string
+	for range 10 {
+		bytes := make([]byte, 12)
+		if _, err := rand.Read(bytes); err != nil {
+			return err
+		}
+		temporary = filepath.Join(filepath.Dir(name), ".ralph-"+hex.EncodeToString(bytes)+".tmp")
+		file, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(content); err != nil {
+			file.Close()
+			root.Remove(temporary)
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			file.Close()
+			root.Remove(temporary)
+			return err
+		}
+		if err := file.Close(); err != nil {
+			root.Remove(temporary)
+			return err
+		}
+		if err := root.Rename(temporary, name); err != nil {
+			root.Remove(temporary)
+			return err
+		}
+		return nil
+	}
+	return errors.New("could not allocate temporary Ralph file")
+}
+
 // TaskFile returns the workspace-relative task file path for a loop.
 func (s *Store) TaskFile(name string) string {
 	return filepath.ToSlash(filepath.Join(Dir, SanitizeName(name)+".md"))
@@ -149,7 +261,7 @@ func (s *Store) TaskFile(name string) string {
 
 // Load reads a loop's state. ok is false when the loop does not exist.
 func (s *Store) Load(name string, archived bool) (*State, bool) {
-	content, err := os.ReadFile(s.path(name, ".state.json", archived))
+	content, err := s.readFile(s.path(name, ".state.json", archived))
 	if err != nil {
 		return nil, false
 	}
@@ -165,20 +277,31 @@ func (s *Store) Load(name string, archived bool) (*State, bool) {
 func (s *Store) Save(state *State, archived bool) error {
 	state.Active = state.Status == StatusActive
 	path := s.path(state.Name, ".state.json", archived)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	encoded, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(encoded, '\n'), 0o644)
+	return s.writeFile(path, append(encoded, '\n'), 0o644)
 }
 
 // List returns every loop, sorted by name.
 func (s *Store) List(archived bool) []*State {
-	entries, err := os.ReadDir(s.dir(archived))
+	name, err := s.rootName(s.dir(archived))
 	if err != nil {
+		return nil
+	}
+	root, err := os.OpenRoot(s.Root)
+	if err != nil {
+		return nil
+	}
+	defer root.Close()
+	directory, err := root.Open(name)
+	if err != nil {
+		return nil
+	}
+	entries, readErr := directory.ReadDir(-1)
+	_ = directory.Close()
+	if readErr != nil {
 		return nil
 	}
 	var states []*State
@@ -197,7 +320,7 @@ func (s *Store) List(archived bool) []*State {
 
 // ReadTask reads a loop's task file.
 func (s *Store) ReadTask(state *State) (string, error) {
-	content, err := os.ReadFile(filepath.Join(s.Root, filepath.FromSlash(state.TaskFile)))
+	content, err := s.readFile(filepath.Join(s.Root, filepath.FromSlash(state.TaskFile)))
 	if err != nil {
 		return "", err
 	}
@@ -207,10 +330,7 @@ func (s *Store) ReadTask(state *State) (string, error) {
 // WriteTask writes a loop's task file, creating .ralph as needed.
 func (s *Store) WriteTask(state *State, content string) error {
 	path := filepath.Join(s.Root, filepath.FromSlash(state.TaskFile))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return s.writeFile(path, []byte(content), 0o644)
 }
 
 // ownedByThisSession reports whether this session drives the loop. A loop with
@@ -365,13 +485,22 @@ func (s *Store) Archive(name string) error {
 	if !ok {
 		return fmt.Errorf("no loop named %q", name)
 	}
-	if err := os.MkdirAll(s.dir(true), 0o755); err != nil {
+	task, err := s.ReadTask(state)
+	if err != nil {
+		return fmt.Errorf("read loop task for archive: %w", err)
+	}
+	archived := *state
+	archived.TaskFile = filepath.ToSlash(filepath.Join(Dir, "archive", SanitizeName(state.Name)+".md"))
+	if err := s.WriteTask(&archived, task); err != nil {
 		return err
 	}
-	if err := s.Save(state, true); err != nil {
+	if err := s.Save(&archived, true); err != nil {
 		return err
 	}
-	if err := os.Remove(s.path(name, ".state.json", false)); err != nil && !os.IsNotExist(err) {
+	if err := s.removeFile(s.path(name, ".state.json", false)); err != nil {
+		return err
+	}
+	if err := s.removeFile(filepath.Join(s.Root, filepath.FromSlash(state.TaskFile))); err != nil {
 		return err
 	}
 	if state.Name == s.currentName() {
@@ -395,7 +524,7 @@ func (s *Store) Delete(name string) error {
 		s.path(name, ".state.json", false),
 		filepath.Join(s.Root, Dir, SanitizeName(name)+".md"),
 	} {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := s.removeFile(path); err != nil {
 			return err
 		}
 	}

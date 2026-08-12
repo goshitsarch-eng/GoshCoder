@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -194,6 +195,8 @@ func NewFileCredentialStore(path string) *CredentialStore {
 // SetGetenv overrides the environment lookup used for config-value
 // resolution (tests).
 func (s *CredentialStore) SetGetenv(getenv func(string) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.getenv = getenv
 }
 
@@ -201,13 +204,21 @@ func (s *CredentialStore) loadLocked() error {
 	if s.path == "" {
 		return nil
 	}
-	content, err := os.ReadFile(s.path)
+	file, err := os.Open(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.data = map[string]*Credential{}
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("catalog: failed to read auth.json: %w", err)
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, (10<<20)+1))
+	if err != nil {
+		return fmt.Errorf("catalog: failed to read auth.json: %w", err)
+	}
+	if len(content) > 10<<20 {
+		return errors.New("catalog: auth.json exceeds 10 MiB")
 	}
 	data := map[string]*Credential{}
 	if len(content) > 0 {
@@ -270,15 +281,31 @@ func (s *CredentialStore) lock() (func(), error) {
 	}
 	lockPath := s.path + ".lock"
 	deadline := time.Now().Add(lockFileTimeout)
+	recoveredStaleLock := false
 	for {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			fmt.Fprintf(f, "%d\n", os.Getpid())
-			f.Close()
-			return func() { os.Remove(lockPath) }, nil
+			if _, writeErr := fmt.Fprintf(f, "%d\n", os.Getpid()); writeErr != nil {
+				f.Close()
+				os.Remove(lockPath)
+				return nil, fmt.Errorf("catalog: failed to initialize auth.json lock: %w", writeErr)
+			}
+			if closeErr := f.Close(); closeErr != nil {
+				os.Remove(lockPath)
+				return nil, fmt.Errorf("catalog: failed to initialize auth.json lock: %w", closeErr)
+			}
+			return func() { _ = os.Remove(lockPath) }, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("catalog: failed to acquire auth.json lock: %w", err)
+		}
+		info, statErr := os.Stat(lockPath)
+		if !recoveredStaleLock && statErr == nil && time.Since(info.ModTime()) > lockFileTimeout {
+			if removeErr := os.Remove(lockPath); removeErr == nil {
+				recoveredStaleLock = true
+				deadline = time.Now().Add(lockFileTimeout)
+				continue
+			}
 		}
 		if time.Now().After(deadline) {
 			return nil, errors.New("catalog: timed out acquiring auth.json lock")

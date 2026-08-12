@@ -925,7 +925,7 @@ func TestStreamNoAPIKeyErrorEvent(t *testing.T) {
 	es := Stream(model, conv, &OpenAICompletionsOptions{})
 	events := drainEvents(es)
 	last := events[len(events)-1]
-	if last.Type != EventError || !strings.Contains(last.Error.ErrorMessage, "No API key for provider") {
+	if last.Type != EventError || !strings.Contains(last.Error.ErrorMessage, "no API key for provider") {
 		t.Fatalf("last = %#v (%v)", last, last.Error)
 	}
 }

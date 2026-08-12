@@ -233,7 +233,7 @@ func TestGoogleSafetyFinishReasonErrors(t *testing.T) {
 	if final.Type != EventError || final.Reason != StopError {
 		t.Fatalf("final = %#v", final)
 	}
-	if !strings.Contains(final.Error.ErrorMessage, "Provider stopped with: SAFETY") {
+	if !strings.Contains(final.Error.ErrorMessage, "provider stopped with: SAFETY") {
 		t.Fatalf("errorMessage = %q", final.Error.ErrorMessage)
 	}
 }
@@ -862,7 +862,7 @@ func TestGoogleNoAPIKeyErrors(t *testing.T) {
 	if final.Type != EventError {
 		t.Fatalf("final = %#v", final)
 	}
-	if !strings.Contains(final.Error.ErrorMessage, "No API key") {
+	if !strings.Contains(final.Error.ErrorMessage, "no API key") {
 		t.Fatalf("errorMessage = %q", final.Error.ErrorMessage)
 	}
 }

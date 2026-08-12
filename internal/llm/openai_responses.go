@@ -270,7 +270,7 @@ func (p *responsesStreamer) streamOnce() error {
 		if p.output.ErrorMessage != "" {
 			return fmt.Errorf("%s", p.output.ErrorMessage)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})

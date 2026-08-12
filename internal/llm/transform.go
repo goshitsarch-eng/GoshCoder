@@ -66,8 +66,8 @@ func downgradeUnsupportedImages(messages []Message, model *Model) []Message {
 // synthetic tool results for orphaned tool calls. Port of transformMessages
 // in api/transform-messages.ts.
 //
-// normalizeToolCallId is only consulted for cross-model tool calls.
-func TransformMessages(messages []Message, model *Model, normalizeToolCallId func(id string, model *Model, source *AssistantMessage) string) []Message {
+// normalizeToolCallID is only consulted for cross-model tool calls.
+func TransformMessages(messages []Message, model *Model, normalizeToolCallID func(id string, model *Model, source *AssistantMessage) string) []Message {
 	toolCallIDMap := map[string]string{}
 	// Normalize nil content from untyped callers so downstream code can rely
 	// on the type contract (transform-messages.ts).
@@ -159,8 +159,8 @@ func TransformMessages(messages []Message, model *Model, normalizeToolCallId fun
 				if !isSameModel && tc.ThoughtSignature != "" {
 					tc.ThoughtSignature = ""
 				}
-				if !isSameModel && normalizeToolCallId != nil {
-					if normalizedID := normalizeToolCallId(tc.ID, model, assistant); normalizedID != tc.ID {
+				if !isSameModel && normalizeToolCallID != nil {
+					if normalizedID := normalizeToolCallID(tc.ID, model, assistant); normalizedID != tc.ID {
 						toolCallIDMap[tc.ID] = normalizedID
 						tc.ID = normalizedID
 					}

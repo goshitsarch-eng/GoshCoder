@@ -171,6 +171,35 @@ Both are dependency-free adaptations. They do not load npm or require pi's
 full-screen TypeScript TUI. Plannotator intentionally serves a compact native
 review page instead of embedding its roughly 39 MB generated SPA assets.
 
+## 2026 Go quality and security audit
+
+Audited the full Go tree against Effective Go and the Google Go Style Guide.
+The tree is clean under `go vet -all`, Staticcheck, `govulncheck`, normal tests,
+repeated tests, and the race detector. Important hardening completed:
+
+- workspace and Ralph filesystem operations use `os.Root`, closing symlink and
+  rename race escapes; workspace handles are closed with sessions;
+- reads, edits, command output, plans, state, credentials, diffs, annotations,
+  SSE records, and provider streams have explicit memory bounds;
+- auth and extension state writes use secured temporary files and atomic
+  renames; stale auth locks recover safely;
+- OAuth and Plannotator web servers are loopback-only, size/time limited, use
+  CSRF/state validation, no-store/CSP headers, and escaped HTML;
+- planning mode removes and independently blocks shell execution;
+- retry parsing handles malformed, negative, non-finite, wrapped-cancellation,
+  and past-date cases correctly;
+- subprocesses have contexts and `WaitDelay`; sidebar git inspection uses one
+  bounded, two-second command instead of two unbounded subprocesses;
+- Ralph archives now move both state and task content atomically enough to
+  recover safely from an interrupted operation;
+- Go error style, exported comments, initialisms, dead code, and simplification
+  findings from Staticcheck were corrected.
+
+Go 1.26.5 is the minimum because earlier 1.26 patch releases contain reachable
+standard-library vulnerabilities. Keep it patched and rerun `govulncheck` for
+release builds. The repository still has no third-party Go dependencies and no
+`go.sum`.
+
 ## Conventions to keep
 
 - Every ported file opens with a comment naming its pi source path, and

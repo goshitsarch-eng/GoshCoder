@@ -155,13 +155,14 @@ func (w *cappedOutput) String() string {
 
 // All returns the built-in tool set for a workspace.
 func (w *Workspace) All() []agent.Tool {
-	return []agent.Tool{
-		w.ReadTool(),
-		w.WriteTool(),
-		w.EditTool(),
-		w.ListTool(),
-		w.BashTool(),
-	}
+	return append(w.Planning(), w.BashTool())
+}
+
+// Planning returns the filesystem tools that are safe for plan mode. Bash is
+// intentionally excluded because shell commands can bypass markdown-only
+// write restrictions.
+func (w *Workspace) Planning() []agent.Tool {
+	return []agent.Tool{w.ReadTool(), w.WriteTool(), w.EditTool(), w.ListTool()}
 }
 
 // ReadTool reads a UTF-8 text file.
@@ -370,6 +371,7 @@ func (w *Workspace) BashTool() agent.Tool {
 			}
 
 			cmd := exec.CommandContext(runCtx, shell, append(args, command)...)
+			cmd.WaitDelay = 2 * time.Second
 			cmd.Dir = w.Root
 			output := cappedOutput{limit: maxOutputBytes}
 			cmd.Stdout = &output

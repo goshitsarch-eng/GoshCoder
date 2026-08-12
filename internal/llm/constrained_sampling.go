@@ -59,7 +59,7 @@ type GrammarToolInputJSONBuffer struct {
 func GetGrammarToolInput(toolName string, arguments map[string]any, inputProperty string) (string, error) {
 	input, ok := arguments[inputProperty].(string)
 	if !ok {
-		return "", fmt.Errorf("Grammar tool call %q requires argument %q to be a string.", toolName, inputProperty)
+		return "", fmt.Errorf("grammar tool call %q requires argument %q to be a string", toolName, inputProperty)
 	}
 	return input, nil
 }
@@ -162,7 +162,7 @@ func ResolveJSONSchemaStrictSampling(tool Tool, supportsStrictMode bool) (strict
 		return true, true, nil
 	}
 	if config.Strict == "require" {
-		return false, false, fmt.Errorf("Tool %q requires JSON-schema constrained sampling, but strict tools are unsupported.", tool.Name)
+		return false, false, fmt.Errorf("Tool %q requires JSON-schema constrained sampling, but strict tools are unsupported", tool.Name)
 	}
 	return false, false, nil
 }
@@ -184,13 +184,13 @@ func ResolveGrammarConstrainedSampling(tool Tool, supportsOpenAIGrammarTools boo
 	regex := strings.TrimSpace(config.Variants["openai_regex"])
 	if lark == "" && regex == "" {
 		return GrammarConstrainedSampling{}, false, fmt.Errorf(
-			"Tool %q cannot use grammar constrained sampling: no supported grammar variant was provided.", tool.Name)
+			"Tool %q cannot use grammar constrained sampling: no supported grammar variant was provided", tool.Name)
 	}
 
 	inputProperty, err := inferGrammarInputProperty(tool)
 	if err != nil {
 		return GrammarConstrainedSampling{}, false, fmt.Errorf(
-			"Tool %q cannot use grammar constrained sampling: %v.", tool.Name, err)
+			"Tool %q cannot use grammar constrained sampling: %v", tool.Name, err)
 	}
 
 	format, definition := "regex", config.Variants["openai_regex"]

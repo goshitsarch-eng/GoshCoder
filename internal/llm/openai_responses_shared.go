@@ -952,7 +952,7 @@ func (p *responsesStreamProcessor) ProcessEvent(event *responsesStreamEvent) err
 	case "response.failed":
 		p.sawTerminalResponseEvent = true
 		if event.Response == nil {
-			return fmt.Errorf("Unknown error (no error details in response)")
+			return fmt.Errorf("unknown error (no error details in response)")
 		}
 		p.output.RawStopReason = event.Response.Status
 		if err := event.Response.Error; err != nil {
@@ -968,7 +968,7 @@ func (p *responsesStreamProcessor) ProcessEvent(event *responsesStreamEvent) err
 		if details := event.Response.IncompleteDetails; details != nil && details.Reason != "" {
 			return fmt.Errorf("incomplete: %s", details.Reason)
 		}
-		return fmt.Errorf("Unknown error (no error details in response)")
+		return fmt.Errorf("unknown error (no error details in response)")
 	}
 	return nil
 }

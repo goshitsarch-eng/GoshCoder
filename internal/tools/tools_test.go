@@ -306,6 +306,14 @@ func TestBashToolRequiresCommand(t *testing.T) {
 func TestAllToolsHaveSchemas(t *testing.T) {
 	workspace := newTestWorkspace(t)
 	all := workspace.All()
+	if len(workspace.Planning()) != 4 {
+		t.Fatalf("planning tool count = %d, want 4", len(workspace.Planning()))
+	}
+	for _, tool := range workspace.Planning() {
+		if tool.Name == "bash" {
+			t.Fatal("planning tools include bash")
+		}
+	}
 	if len(all) != 5 {
 		t.Fatalf("tool count = %d, want 5", len(all))
 	}

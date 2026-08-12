@@ -467,7 +467,7 @@ func (p *mistralStreamer) streamOnce() error {
 
 	// Mistral has no header-only auth fallback: the key is required.
 	if opts.APIKey == "" {
-		return fmt.Errorf("No API key for provider: %s", p.model.Provider)
+		return fmt.Errorf("no API key for provider: %s", p.model.Provider)
 	}
 
 	params, err := buildMistralParams(p.model, p.conv, opts)
@@ -501,13 +501,13 @@ func (p *mistralStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return fmt.Errorf("Mistral stream ended without a finish reason")
+		return fmt.Errorf("mistral stream ended without a finish reason")
 	}
 	if p.output.StopReason == StopAborted || p.output.StopReason == StopError {
 		if p.output.ErrorMessage != "" {
 			return fmt.Errorf("%s", p.output.ErrorMessage)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})

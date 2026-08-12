@@ -131,7 +131,7 @@ func normalizeAzureBaseURL(baseURL string) (string, error) {
 	parsed, err := url.Parse(trimmed)
 	// url.Parse accepts bare paths; require an absolute URL like JS `new URL`.
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("Invalid Azure OpenAI base URL: %s", baseURL)
+		return "", fmt.Errorf("invalid Azure OpenAI base URL: %s", baseURL)
 	}
 
 	isAzureHost := false
@@ -195,7 +195,7 @@ func resolveAzureConfig(model *Model, options *AzureOpenAIResponsesOptions) (bas
 		resolved = model.BaseURL
 	}
 	if resolved == "" {
-		return "", "", fmt.Errorf("Azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or pass azureBaseUrl, azureResourceName, or model.baseUrl.")
+		return "", "", fmt.Errorf("azure OpenAI base URL is required. Set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or pass azureBaseUrl, azureResourceName, or model.baseUrl")
 	}
 
 	normalized, err := normalizeAzureBaseURL(resolved)
@@ -300,7 +300,7 @@ func (p *azureResponsesStreamer) streamOnce() error {
 
 	// Azure has no header-only auth fallback: the key is required.
 	if opts.APIKey == "" {
-		return fmt.Errorf("No API key for provider: %s", p.model.Provider)
+		return fmt.Errorf("no API key for provider: %s", p.model.Provider)
 	}
 	baseURL, apiVersion, err := resolveAzureConfig(p.model, opts)
 	if err != nil {
@@ -360,13 +360,13 @@ func (p *azureResponsesStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return fmt.Errorf("Azure OpenAI Responses stream ended without a stop reason")
+		return fmt.Errorf("azure OpenAI Responses stream ended without a stop reason")
 	}
 	if p.output.StopReason == StopAborted || p.output.StopReason == StopError {
 		if p.output.ErrorMessage != "" {
 			return fmt.Errorf("%s", p.output.ErrorMessage)
 		}
-		return fmt.Errorf("An unknown error occurred")
+		return fmt.Errorf("an unknown error occurred")
 	}
 
 	p.es.Push(AssistantMessageEvent{Type: EventDone, Reason: p.output.StopReason, Message: p.snapshot()})
@@ -451,7 +451,7 @@ func doAzureResponsesRequest(ctx context.Context, baseURL, apiVersion, apiKey st
 
 	endpoint, err := url.Parse(strings.TrimSuffix(baseURL, "/") + "/responses")
 	if err != nil {
-		return nil, fmt.Errorf("Invalid Azure OpenAI base URL: %s", baseURL)
+		return nil, fmt.Errorf("invalid Azure OpenAI base URL: %s", baseURL)
 	}
 	query := endpoint.Query()
 	query.Set("api-version", apiVersion)

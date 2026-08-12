@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -53,6 +54,9 @@ func (b BrowserReviewer) Review(ctx context.Context, title, markdown string) (De
 		return Decision{}, err
 	}
 	defer listener.Close()
+	if address, ok := listener.Addr().(*net.TCPAddr); !ok || !address.IP.IsLoopback() {
+		return Decision{}, errors.New("review server did not bind to a loopback address")
+	}
 
 	tokenBytes := make([]byte, 24)
 	if _, err := rand.Read(tokenBytes); err != nil {

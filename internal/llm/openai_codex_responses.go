@@ -175,7 +175,7 @@ func (p *codexResponsesStreamer) streamOnce() error {
 		return AbortError{}
 	}
 	if p.output.StopReason == StopPending {
-		return errors.New("Codex stream ended without a stop reason")
+		return errors.New("codex stream ended without a stop reason")
 	}
 	if p.output.StopReason == StopError || p.output.StopReason == StopAborted {
 		if p.output.ErrorMessage != "" {
@@ -420,7 +420,7 @@ func consumeCodexResponsesSSE(ctx context.Context, body io.Reader, processor *re
 		}
 	}
 	if !processor.sawTerminalResponseEvent {
-		return errors.New("Codex stream ended before a terminal response event")
+		return errors.New("codex stream ended before a terminal response event")
 	}
 	return nil
 }
