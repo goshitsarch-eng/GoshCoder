@@ -62,6 +62,9 @@ func chatCommand(args []string) error {
 	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	cfg := bindSessionFlags(flags)
+	// Coding tools are available out of the box in interactive mode, matching
+	// pi. Users can explicitly choose -tools=false for read-only chat.
+	cfg.EnableTools = true
 	flags.BoolVar(&cfg.Fullscreen, "fullscreen", true, "use the fullscreen interactive TUI")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -75,7 +78,9 @@ func chatCommand(args []string) error {
 		if modelErr != nil && tui.Supported(os.Stdin, os.Stderr) {
 			modelRef, modelErr = onboardChatModel()
 		}
-		if modelErr != nil { return modelErr }
+		if modelErr != nil {
+			return modelErr
+		}
 		cfg.ModelRef = modelRef
 	}
 
@@ -171,15 +176,22 @@ func onboardChatModel() (string, error) {
 	fmt.Fprintln(os.Stderr, "  3. Kimi Coding")
 	fmt.Fprint(os.Stderr, "Choice [1]: ")
 	choice, err := readTerminalLine(os.Stdin)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	provider := "openai-codex"
 	switch strings.TrimSpace(choice) {
 	case "", "1":
-	case "2": provider = "anthropic"
-	case "3": provider = "kimi-coding"
-	default: return "", fmt.Errorf("unknown login choice %q", strings.TrimSpace(choice))
+	case "2":
+		provider = "anthropic"
+	case "3":
+		provider = "kimi-coding"
+	default:
+		return "", fmt.Errorf("unknown login choice %q", strings.TrimSpace(choice))
 	}
-	if err := authCommand([]string{"login", provider}); err != nil { return "", err }
+	if err := authCommand([]string{"login", provider}); err != nil {
+		return "", err
+	}
 	return defaultChatModel()
 }
 
@@ -189,10 +201,16 @@ func readTerminalLine(input *os.File) (string, error) {
 	for {
 		count, err := input.Read(one[:])
 		if count == 1 {
-			if one[0] == '\n' { return line.String(), nil }
-			if one[0] != '\r' { line.WriteByte(one[0]) }
+			if one[0] == '\n' {
+				return line.String(), nil
+			}
+			if one[0] != '\r' {
+				line.WriteByte(one[0])
+			}
 		}
-		if err != nil { return "", err }
+		if err != nil {
+			return "", err
+		}
 	}
 }
 

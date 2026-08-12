@@ -45,7 +45,7 @@ goshcoder auth login kimi-coding
 | `-m`, `-model` | Model as `provider/model`, or a bare id when unambiguous |
 | `-s`, `-system` | System prompt |
 | `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| `-tools` | Enable the built-in file and shell tools |
+| `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
 | `-ralph` | Enable long-running ralph loops |
 | `-plan` | Start in native Plannotator planning/review mode |
 | `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |

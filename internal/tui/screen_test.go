@@ -31,6 +31,15 @@ func TestRenderFrameHidesSidebarWhenNarrow(t *testing.T) {
 	}
 }
 
+func TestRenderFrameRemovesUntrustedTerminalEscapes(t *testing.T) {
+	frame := Frame{Title: "bad\x1b]52;c;payload\a", Messages: []Message{{Role: "assistant", Text: "hello\x1b[2Jworld"}}}
+	lines, _, _ := renderFrame(frame, 80, 16)
+	output := strings.Join(lines, "\n")
+	if strings.Contains(output, "\x1b]52") || strings.Contains(output, "\x1b[2Jworld") {
+		t.Fatalf("untrusted escape survived: %q", output)
+	}
+}
+
 func TestRuneWidthHandlesCJKAndCombiningMarks(t *testing.T) {
 	if got := runeSliceWidth([]rune("A你e\u0301")); got != 4 {
 		t.Fatalf("width = %d", got)

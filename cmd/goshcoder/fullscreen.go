@@ -44,7 +44,7 @@ func runFullscreenChat(session *session) error {
 	defer terminal.Close()
 
 	var activityMu sync.Mutex
-	activity := "Ready · Enter submit · /help commands · Ctrl-D exit"
+	activity := "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
 	dirty := make(chan struct{}, 1)
 	requestRender := func() {
 		select {
@@ -66,7 +66,7 @@ func runFullscreenChat(session *session) error {
 				activity = event.ToolName + " complete"
 			}
 		case agent.EventAgentEnd:
-			activity = "Ready · Enter submit · /help commands · Ctrl-D exit"
+			activity = "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
 		}
 		activityMu.Unlock()
 		requestRender()
@@ -83,6 +83,12 @@ func runFullscreenChat(session *session) error {
 
 	editor := fullscreenEditor{historyIndex: -1}
 	var notices []tui.Message
+	for _, tool := range session.agent.State().Tools {
+		if tool.Name == "bash" {
+			notices = append(notices, tui.Message{Role: "Notice", Text: "Coding tools are enabled for " + session.workspaceRoot() + ". Shell commands run with your user privileges; use -tools=false for read-only chat."})
+			break
+		}
+	}
 	info := session.sessionInfo()
 	turnDone := make(chan error, 1)
 	commandDone := make(chan fullscreenResult, 1)
@@ -143,6 +149,12 @@ func runFullscreenChat(session *session) error {
 				}
 			case "abort":
 				session.agent.Abort()
+			case "thinking":
+				cycleFullscreenThinking(session)
+				info = session.sessionInfo()
+				activityMu.Lock()
+				activity = "Thinking set to " + session.agent.State().ThinkingLevel
+				activityMu.Unlock()
 			case "submit":
 				prompt := strings.TrimSpace(string(editor.input))
 				if prompt == "" {
@@ -191,7 +203,7 @@ func runFullscreenChat(session *session) error {
 			}
 			info = session.sessionInfo()
 			activityMu.Lock()
-			activity = "Ready · Enter submit · /help commands · Ctrl-D exit"
+			activity = "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
 			activityMu.Unlock()
 			requestRender()
 		case <-interrupts:
@@ -227,6 +239,8 @@ func handleFullscreenInput(editor *fullscreenEditor, data []byte, streaming bool
 	}
 	for len(data) > 0 {
 		switch {
+		case strings.HasPrefix(string(data), "\x1b[Z"):
+			return "thinking"
 		case strings.HasPrefix(string(data), "\x1b[5~"):
 			editor.scroll += 10
 			data = data[4:]
@@ -322,6 +336,18 @@ func handleFullscreenInput(editor *fullscreenEditor, data []byte, streaming bool
 		}
 	}
 	return ""
+}
+
+func cycleFullscreenThinking(session *session) {
+	levels := []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+	current := session.agent.State().ThinkingLevel
+	for index, level := range levels {
+		if level == current {
+			session.agent.SetThinkingLevel(levels[(index+1)%len(levels)])
+			return
+		}
+	}
+	session.agent.SetThinkingLevel("off")
 }
 
 func editorHistory(editor *fullscreenEditor, direction int) {

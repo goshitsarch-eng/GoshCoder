@@ -7,6 +7,7 @@
 package config
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +60,12 @@ func DefaultModelPath() string { return filepath.Join(AgentDir(), "default-model
 // ReadDefaultModel returns the remembered model reference, or an empty string
 // when no model has been selected yet.
 func ReadDefaultModel() string {
-	content, err := os.ReadFile(DefaultModelPath())
+	file, err := os.Open(DefaultModelPath())
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, 4097))
 	if err != nil || len(content) > 4096 {
 		return ""
 	}

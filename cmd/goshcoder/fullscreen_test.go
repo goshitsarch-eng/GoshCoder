@@ -27,6 +27,12 @@ func TestFullscreenEditorHandlesSplitUTF8(t *testing.T) {
 	}
 }
 
+func TestFullscreenEditorShiftTabAction(t *testing.T) {
+	if action := handleFullscreenInput(&fullscreenEditor{}, []byte("\x1b[Z"), false); action != "thinking" {
+		t.Fatalf("action = %q", action)
+	}
+}
+
 func TestFullscreenEditorHistory(t *testing.T) {
 	editor := fullscreenEditor{history: []string{"first", "second"}, historyIndex: -1, input: []rune("draft")}
 	editor.cursor = len(editor.input)

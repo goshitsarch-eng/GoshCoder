@@ -192,6 +192,7 @@ func renderMessages(messages []Message, width int) []string {
 }
 
 func wrap(text string, width int) []string {
+	text = safeTerminalText(text)
 	if text == "" {
 		return []string{""}
 	}
@@ -217,7 +218,7 @@ func wrap(text string, width int) []string {
 }
 
 func truncate(text string, width int) string {
-	return string(truncateRunes([]rune(stripANSI(text)), width))
+	return string(truncateRunes([]rune(safeTerminalText(stripANSI(text))), width))
 }
 func pad(text string, width int) string {
 	plainWidth := runeSliceWidth([]rune(stripANSI(text)))
@@ -250,6 +251,16 @@ func runeWidth(r rune) int {
 	}
 	return 1
 }
+func safeTerminalText(text string) string {
+	var output strings.Builder
+	for _, r := range text {
+		if r == '\n' || r == '\t' || !unicode.IsControl(r) {
+			output.WriteRune(r)
+		}
+	}
+	return output.String()
+}
+
 func stripANSI(text string) string {
 	var out strings.Builder
 	for index := 0; index < len(text); {

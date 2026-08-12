@@ -22,7 +22,7 @@ import (
 )
 
 // Version is the CLI version.
-const Version = "0.1.0-dev"
+const Version = "0.2.0-dev"
 
 const usage = `GoshCoder - a Go coding agent
 
@@ -49,7 +49,7 @@ Chat/run flags:
   -m, -model <ref>    Model as "provider/model" or a bare model id (chat remembers the last model)
   -s, -system <text>  System prompt
   -thinking <level>   off|minimal|low|medium|high|xhigh|max (default off)
-  -tools              Enable the built-in file and shell tools
+  -tools              Enable file and shell tools (chat default true; disable with -tools=false)
   -ralph              Enable long-running ralph loops (ralph_start/ralph_done)
   -plan               Start with native Plannotator plan review enabled
   -claude-tui         Use the native pi-claude-code-tui look in line mode (default true)
