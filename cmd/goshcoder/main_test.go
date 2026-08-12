@@ -219,6 +219,28 @@ func TestBindSessionFlagsLongForms(t *testing.T) {
 	}
 }
 
+func TestChatDefaultsEnableToolsAndRalphWithOptOut(t *testing.T) {
+	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
+	cfg := bindSessionFlags(flags)
+	applyChatDefaults(flags, cfg)
+	if err := flags.Parse([]string{"-tools=false", "-ralph=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EnableTools || cfg.EnableRalph {
+		t.Fatalf("explicit chat opt-out ignored: %#v", cfg)
+	}
+
+	flags = flag.NewFlagSet("chat", flag.ContinueOnError)
+	cfg = bindSessionFlags(flags)
+	applyChatDefaults(flags, cfg)
+	if err := flags.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.EnableTools || !cfg.EnableRalph {
+		t.Fatalf("chat defaults = %#v", cfg)
+	}
+}
+
 func TestBindSessionFlagsDefaults(t *testing.T) {
 	flags := flag.NewFlagSet("test", flag.ContinueOnError)
 	cfg := bindSessionFlags(flags)

@@ -552,8 +552,13 @@ func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 }
 
 func fullscreenCommandRunsAsync(prompt string) bool {
-	command := strings.Fields(prompt)[0]
-	return command == "/compact" || command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last"
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 {
+		return false
+	}
+	command := fields[0]
+	return command == "/compact" || command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
+		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
 }
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
@@ -705,6 +710,26 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		}
 		return suggestions
 	}
+	if strings.HasPrefix(lower, "/ralph ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/ralph "))
+		if strings.ContainsAny(query, " \t\n") {
+			return nil
+		}
+		commands := []fullscreenSuggestion{
+			{label: "start", description: "Start a new iterative development loop", value: "/ralph start ", execute: false},
+			{label: "status", description: "Show the active loop", value: "/ralph status", execute: true},
+			{label: "list", description: "List saved loops", value: "/ralph list", execute: true},
+			{label: "resume", description: "Resume a paused loop", value: "/ralph resume ", execute: false},
+			{label: "stop", description: "Stop an active loop", value: "/ralph stop ", execute: false},
+		}
+		var suggestions []fullscreenSuggestion
+		for _, command := range commands {
+			if strings.HasPrefix(command.label, query) {
+				suggestions = append(suggestions, command)
+			}
+		}
+		return suggestions
+	}
 	if strings.HasPrefix(lower, "/thinking ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/thinking "))
 		if strings.ContainsAny(query, " \t\n") {
@@ -740,7 +765,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/model", "/thinking", "/plannotator-annotate", "/steer", "/followup":
+		case "/model", "/thinking", "/ralph", "/plannotator-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -860,6 +885,9 @@ func fullscreenSuggestionTitle(input string) string {
 	}
 	if strings.HasPrefix(lower, "/thinking ") {
 		return "THINKING LEVEL  ·  model-supported options"
+	}
+	if strings.HasPrefix(lower, "/ralph ") {
+		return "RALPH LOOP  ·  iterative development controls"
 	}
 	return "COMMANDS  ·  ↑/↓ navigate  ·  Tab complete  ·  Enter select"
 }

@@ -47,7 +47,7 @@ goshcoder auth login kimi-coding
 | `-s`, `-system` | System prompt |
 | `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
-| `-ralph` | Enable long-running ralph loops |
+| `-ralph` | Enable long-running Ralph loops (default in chat; use `-ralph=false` to disable) |
 | `-plan` | Start in native Plannotator planning/review mode |
 | `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
 | `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
@@ -91,6 +91,8 @@ pi extensions are TypeScript modules loaded at runtime. GoshCoder has no plugin
 host, so selected extension features are native built-ins:
 
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
+  Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
+  the model to start a loop. `/ralph` opens loop controls in the command palette.
 - `@plannotator/pi-extension`: `/plannotator`, browser plan approval/denial with
   line annotations, overall notes, direct Markdown edits, resubmission change
   views, responsive navigation, light/dark themes, planning write gates,

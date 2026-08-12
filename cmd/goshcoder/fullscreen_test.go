@@ -10,6 +10,7 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
 )
 
@@ -181,6 +182,34 @@ func TestFullscreenTranscriptKeepsToolActivityCompact(t *testing.T) {
 	visible = fullscreenMessages(messages)
 	if len(visible) != 3 || visible[2].Role != "tool" || !visible[2].IsError {
 		t.Fatalf("tool error missing from transcript: %#v", visible)
+	}
+}
+
+func TestBubbleTeaCommandPaletteShowsRalphControls(t *testing.T) {
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+	session.loops = ralph.NewStore(t.TempDir(), "test-session")
+
+	root := fullscreenSuggestions(session, "/")
+	found := false
+	for _, item := range root {
+		if item.label == "/ralph" {
+			found = true
+			if item.execute || item.value != "/ralph " {
+				t.Fatalf("Ralph root suggestion = %#v", item)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("Ralph missing from root suggestions: %#v", root)
+	}
+
+	controls := fullscreenSuggestions(session, "/ralph ")
+	if len(controls) != 5 || controls[0].label != "start" || controls[0].value != "/ralph start " {
+		t.Fatalf("Ralph controls = %#v", controls)
+	}
+	if !fullscreenCommandRunsAsync("/ralph start audit improve test coverage") {
+		t.Fatal("Ralph start must not block the Bubble Tea update loop")
 	}
 }
 

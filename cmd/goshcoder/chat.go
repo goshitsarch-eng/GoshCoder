@@ -28,6 +28,7 @@ import (
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/ralph"
 	"goshcoder/internal/tui"
 )
 
@@ -47,7 +48,7 @@ const chatHelp = `Slash commands:
   /compact [focus]      Summarize older context and keep recent turns
   /reload               Reload context files, prompts, and skills
   /resources            Show loaded local resources
-  /ralph <subcommand>   Manage ralph loops (list, status, resume, stop)
+  /ralph <subcommand>   Ralph loops (start, list, status, resume, stop)
   /plannotator          Toggle native Plannotator planning mode
   /plannotator-review [PR URL]  Review git changes or a GitHub PR
   /plannotator-annotate <target> Annotate a file, folder, or URL
@@ -60,13 +61,21 @@ Anything else is sent to the model. Ctrl-C aborts a running turn; Ctrl-C while
 idle exits.
 `
 
+func applyChatDefaults(flags *flag.FlagSet, cfg *sessionConfig) {
+	// Coding tools and native Ralph loops are available out of the box in
+	// interactive mode, matching always-loaded pi extensions. Explicit false
+	// flags still provide an opt-out.
+	cfg.EnableTools = true
+	cfg.EnableRalph = true
+	flags.Lookup("tools").DefValue = "true"
+	flags.Lookup("ralph").DefValue = "true"
+}
+
 func chatCommand(args []string) error {
 	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	cfg := bindSessionFlags(flags)
-	// Coding tools are available out of the box in interactive mode, matching
-	// pi. Users can explicitly choose -tools=false for read-only chat.
-	cfg.EnableTools = true
+	applyChatDefaults(flags, cfg)
 	flags.BoolVar(&cfg.Fullscreen, "fullscreen", true, "use the fullscreen interactive TUI")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -482,6 +491,23 @@ func (s *session) handleRalphSlashCommand(rest string) error {
 	argument = strings.TrimSpace(argument)
 
 	switch subcommand {
+	case "start":
+		name, task, _ := strings.Cut(argument, " ")
+		name, task = strings.TrimSpace(name), strings.TrimSpace(task)
+		if name == "" || task == "" {
+			return errors.New("usage: /ralph start <name> <task>")
+		}
+		if !strings.HasPrefix(task, "#") {
+			task = "# Task\n\n" + task
+		}
+		state, err := s.loops.Start(name, task, ralph.Options{})
+		if err != nil {
+			return err
+		}
+		s.agent.SetSystemPrompt(s.runtimeSystemPrompt())
+		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("started Ralph loop %s (max %d iterations)", state.Name, state.MaxIterations)))
+		return s.runTurn(ralph.BuildPrompt(state, task, false))
+
 	case "", "status":
 		state, ok := s.loops.Current()
 		if !ok {
@@ -531,7 +557,7 @@ func (s *session) handleRalphSlashCommand(rest string) error {
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("stopped %s at iteration %d", state.Name, state.Iteration)))
 
 	default:
-		return fmt.Errorf("unknown ralph subcommand %q (status, list, resume, stop)", subcommand)
+		return fmt.Errorf("unknown ralph subcommand %q (start, status, list, resume, stop)", subcommand)
 	}
 	return nil
 }
