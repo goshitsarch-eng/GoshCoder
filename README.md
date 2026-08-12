@@ -108,7 +108,9 @@ The visual extensions are implemented by GoshCoder's lightweight, Crush-inspired
 Bubble Tea TUI rather than pi's TypeScript runtime. Type `/` to open the command
 palette; arrows select an item, Tab completes it, and Enter accepts it. `/model`
 opens a searchable picker containing models from authenticated providers, while
-`/thinking` contains only levels supported by the active model.
+`/thinking` contains only levels supported by the active model. Transient 429/5xx
+provider failures are retried automatically; live tool progress stays in the
+sidebar instead of filling the transcript with file-operation details.
 
 ## Deviations from pi
 

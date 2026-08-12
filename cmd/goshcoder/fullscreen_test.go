@@ -130,6 +130,39 @@ func TestBubbleTeaCommandPaletteAcceptsThinkingChoice(t *testing.T) {
 	}
 }
 
+func TestFullscreenActivityUpdatesDuringTools(t *testing.T) {
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	tuiModel := &fullscreenModel{session: fullscreenTestSession(model, llm.ThinkingOff), activity: "Ready"}
+	tuiModel.applyAgentEvent(agent.Event{Type: agent.EventToolExecutionStart, ToolName: "edit"})
+	if tuiModel.activity != "Running edit" || !strings.Contains(tuiModel.recentTool, "running") {
+		t.Fatalf("start activity = %q, %q", tuiModel.activity, tuiModel.recentTool)
+	}
+	tuiModel.applyAgentEvent(agent.Event{Type: agent.EventToolExecutionEnd, ToolName: "edit"})
+	if tuiModel.activity != "edit complete" || !strings.Contains(tuiModel.recentTool, "complete") {
+		t.Fatalf("end activity = %q, %q", tuiModel.activity, tuiModel.recentTool)
+	}
+}
+
+func TestFullscreenTranscriptKeepsToolActivityCompact(t *testing.T) {
+	messages := []agent.Message{
+		llm.AssistantMessage{Content: []llm.ContentBlock{
+			llm.TextContent{Type: "text", Text: "Working on it."},
+			llm.ToolCall{Type: "toolCall", ID: "call-1", Name: "edit", Arguments: map[string]any{"path": "secret/file.go"}},
+		}},
+		llm.ToolResultMessage{Role: "toolResult", ToolName: "edit", Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: "secret/file.go changed"}}},
+	}
+	visible := fullscreenMessages(messages)
+	if len(visible) != 1 || visible[0].Role != "assistant" || strings.Contains(visible[0].Text, "secret/file.go") {
+		t.Fatalf("visible transcript = %#v", visible)
+	}
+
+	messages = append(messages, llm.ToolResultMessage{Role: "toolResult", ToolName: "edit", IsError: true, Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: "permission denied"}}})
+	visible = fullscreenMessages(messages)
+	if len(visible) != 2 || visible[1].Role != "Error" {
+		t.Fatalf("tool error missing from transcript: %#v", visible)
+	}
+}
+
 func TestBubbleTeaCommandPaletteRunsPlannotator(t *testing.T) {
 	workspace, err := tools.NewWorkspace(t.TempDir())
 	if err != nil {

@@ -21,6 +21,7 @@ type loopConfig struct {
 	onPayload           func(map[string]any, *llm.Model) map[string]any
 	onResponse          func(llm.ProviderResponse, *llm.Model)
 	thinkingBudgets     *llm.ThinkingBudgets
+	maxRetries          int
 	maxRetryDelayMs     *int64
 	toolExecution       ToolExecutionMode
 	beforeToolCall      BeforeToolCallFunc
@@ -262,6 +263,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *Context, config *loo
 	opts.SessionID = config.sessionID
 	opts.OnPayload = config.onPayload
 	opts.OnResponse = config.onResponse
+	opts.MaxRetries = config.maxRetries
 	opts.MaxRetryDelayMs = config.maxRetryDelayMs
 
 	fn := streamFn

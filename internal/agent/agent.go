@@ -44,6 +44,9 @@ type AgentOptions struct {
 	SessionID string
 	// ThinkingBudgets are per-level thinking token budgets.
 	ThinkingBudgets *llm.ThinkingBudgets
+	// MaxRetries is the number of retries for transient provider failures such
+	// as 429 and 5xx responses. Zero preserves the provider default of no retry.
+	MaxRetries int
 	// MaxRetryDelayMs caps provider-requested retry delays. Nil uses the
 	// provider default.
 	MaxRetryDelayMs *int64
@@ -182,6 +185,7 @@ type Agent struct {
 	prepareNextTurn     PrepareNextTurnFunc
 	sessionID           string
 	thinkingBudgets     *llm.ThinkingBudgets
+	maxRetries          int
 	maxRetryDelayMs     *int64
 	toolExecution       ToolExecutionMode
 }
@@ -201,6 +205,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		prepareNextTurn:     opts.PrepareNextTurn,
 		sessionID:           opts.SessionID,
 		thinkingBudgets:     opts.ThinkingBudgets,
+		maxRetries:          opts.MaxRetries,
 		maxRetryDelayMs:     opts.MaxRetryDelayMs,
 		toolExecution:       opts.ToolExecution,
 	}
@@ -534,6 +539,7 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) loopConfig {
 		onPayload:           a.onPayload,
 		onResponse:          a.onResponse,
 		thinkingBudgets:     a.thinkingBudgets,
+		maxRetries:          a.maxRetries,
 		maxRetryDelayMs:     a.maxRetryDelayMs,
 		toolExecution:       a.toolExecution,
 		beforeToolCall:      a.beforeToolCall,

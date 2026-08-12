@@ -41,6 +41,7 @@ type fullscreenModelChoice struct {
 type fullscreenAgentEvent struct{ event agent.Event }
 type fullscreenTurnFinished struct{ err error }
 type fullscreenCommandFinished struct{ result fullscreenResult }
+type fullscreenInfoRefreshed struct{ info claudetui.SessionInfo }
 type fullscreenTick time.Time
 
 type fullscreenModel struct {
@@ -54,20 +55,23 @@ type fullscreenModel struct {
 	height      int
 	busyCommand bool
 	spin        int
-	events      <-chan fullscreenAgentEvent
+	updates     <-chan fullscreenAgentEvent
+	lifecycle   <-chan fullscreenAgentEvent
 	models      []fullscreenModelChoice
+	recentTool  string
 }
 
-func newFullscreenModel(session *session, events <-chan fullscreenAgentEvent) *fullscreenModel {
+func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAgentEvent) *fullscreenModel {
 	model := &fullscreenModel{
-		session:  session,
-		editor:   fullscreenEditor{historyIndex: -1},
-		info:     session.sessionInfo(),
-		activity: "Ready",
-		width:    80,
-		height:   24,
-		events:   events,
-		models:   availableFullscreenModels(session),
+		session:   session,
+		editor:    fullscreenEditor{historyIndex: -1},
+		info:      session.sessionInfo(),
+		activity:  "Ready",
+		width:     80,
+		height:    24,
+		updates:   updates,
+		lifecycle: lifecycle,
+		models:    availableFullscreenModels(session),
 	}
 	for _, tool := range session.agent.State().Tools {
 		if tool.Name == "bash" {
@@ -82,19 +86,25 @@ func newFullscreenModel(session *session, events <-chan fullscreenAgentEvent) *f
 }
 
 func runFullscreenChat(session *session) error {
-	events := make(chan fullscreenAgentEvent, 256)
+	// Streaming deltas are coalesced, while lifecycle/tool events use a
+	// separate queue so a delta flood can never hide activity changes.
+	updates := make(chan fullscreenAgentEvent, 1)
+	lifecycle := make(chan fullscreenAgentEvent, 64)
 	unsubscribe := session.agent.Subscribe(func(_ context.Context, event agent.Event) {
-		select {
-		case events <- fullscreenAgentEvent{event: event}:
-		default:
-			// Streaming deltas can be coalesced because View reads the current
-			// agent state. Never block the agent on terminal repainting.
+		message := fullscreenAgentEvent{event: event}
+		if event.Type == agent.EventMessageUpdate {
+			select {
+			case updates <- message:
+			default:
+			}
+			return
 		}
+		lifecycle <- message
 	})
 	defer unsubscribe()
 
 	program := tea.NewProgram(
-		newFullscreenModel(session, events),
+		newFullscreenModel(session, updates, lifecycle),
 		tea.WithAltScreen(),
 		tea.WithInput(os.Stdin),
 		tea.WithOutput(os.Stderr),
@@ -105,15 +115,26 @@ func runFullscreenChat(session *session) error {
 }
 
 func (model *fullscreenModel) Init() tea.Cmd {
-	return tea.Batch(tea.HideCursor, waitForFullscreenEvent(model.events), fullscreenTickCommand())
+	return tea.Batch(tea.HideCursor, waitForFullscreenEvent(model.updates, model.lifecycle), fullscreenTickCommand())
 }
 
-func waitForFullscreenEvent(events <-chan fullscreenAgentEvent) tea.Cmd {
-	return func() tea.Msg { return <-events }
+func waitForFullscreenEvent(updates, lifecycle <-chan fullscreenAgentEvent) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case event := <-lifecycle:
+			return event
+		case event := <-updates:
+			return event
+		}
+	}
 }
 
 func fullscreenTickCommand() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(now time.Time) tea.Msg { return fullscreenTick(now) })
+}
+
+func refreshFullscreenInfo(session *session) tea.Cmd {
+	return func() tea.Msg { return fullscreenInfoRefreshed{info: session.sessionInfo()} }
 }
 
 func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -123,7 +144,12 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fullscreenAgentEvent:
 		model.applyAgentEvent(value.event)
-		return model, waitForFullscreenEvent(model.events)
+		model.refreshRealtimeInfo()
+		wait := waitForFullscreenEvent(model.updates, model.lifecycle)
+		if value.event.Type == agent.EventToolExecutionEnd || value.event.Type == agent.EventAgentEnd {
+			return model, tea.Batch(wait, refreshFullscreenInfo(model.session))
+		}
+		return model, wait
 
 	case fullscreenTurnFinished:
 		if value.err != nil {
@@ -137,6 +163,9 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if model.applyCommandResult(value.result) {
 			return model, tea.Quit
 		}
+
+	case fullscreenInfoRefreshed:
+		model.info = value.info
 
 	case fullscreenTick:
 		model.spin = (model.spin + 1) % 8
@@ -165,17 +194,26 @@ func (model *fullscreenModel) applyAgentEvent(event agent.Event) {
 		}
 	case agent.EventToolExecutionStart:
 		model.activity = "Running " + event.ToolName
+		model.recentTool = "● " + event.ToolName + " running"
 	case agent.EventToolExecutionEnd:
 		if event.IsError {
 			model.activity = event.ToolName + " failed"
+			model.recentTool = "× " + event.ToolName + " failed"
 		} else {
 			model.activity = event.ToolName + " complete"
+			model.recentTool = "✓ " + event.ToolName + " complete"
 		}
 	case agent.EventAgentEnd:
 		model.activity = "Ready"
 		model.activityAt = time.Time{}
-		model.info = model.session.sessionInfo()
 	}
+}
+
+func (model *fullscreenModel) refreshRealtimeInfo() {
+	fresh := model.session.sessionInfoRealtime()
+	fresh.Branch = model.info.Branch
+	fresh.ChangedFiles = model.info.ChangedFiles
+	model.info = fresh
 }
 
 func (model *fullscreenModel) View() string {
@@ -210,7 +248,7 @@ func (model *fullscreenModel) View() string {
 	frame := tui.Frame{
 		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
 		Messages:           messages,
-		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot()),
+		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,
 		Status:             status,
@@ -243,6 +281,11 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 
 	case "ctrl+d":
 		if len(model.editor.input) == 0 {
+			if streaming {
+				model.session.agent.Abort()
+				model.activity = "Aborting"
+				return nil
+			}
 			return tea.Quit
 		}
 		model.deleteAtCursor()

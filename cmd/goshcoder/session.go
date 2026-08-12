@@ -163,6 +163,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 			// leaving the stream function bound to the session's first provider.
 			return authStreamFn(s.auth)(model, ctx, opts)
 		},
+		// Brief provider outages should recover in-place instead of forcing the
+		// user to restart the app and reconstruct the task with "continue".
+		MaxRetries: 2,
 		GetAPIKey: func(string) string {
 			if s.auth == nil {
 				return ""

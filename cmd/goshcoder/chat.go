@@ -497,6 +497,14 @@ func terminalWidth() int {
 }
 
 func (s *session) sessionInfo() claudetui.SessionInfo {
+	info := s.sessionInfoRealtime()
+	s.enrichSessionGit(&info)
+	return info
+}
+
+// sessionInfoRealtime avoids subprocesses and is safe to refresh for every
+// agent event. Git state is layered in asynchronously by the fullscreen UI.
+func (s *session) sessionInfoRealtime() claudetui.SessionInfo {
 	state := s.agent.State()
 	info := claudetui.SessionInfo{
 		Model:        s.model.Provider + "/" + s.model.ID,
@@ -525,6 +533,10 @@ func (s *session) sessionInfo() claudetui.SessionInfo {
 			info.ContextUsed = assistant.Usage.TotalTokens
 		}
 	}
+	return info
+}
+
+func (s *session) enrichSessionGit(info *claudetui.SessionInfo) {
 	statusContext, cancelStatus := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancelStatus()
 	status := exec.CommandContext(statusContext, "git", "status", "--short", "--branch", "--untracked-files=normal")
@@ -547,7 +559,6 @@ func (s *session) sessionInfo() claudetui.SessionInfo {
 			}
 		}
 	}
-	return info
 }
 
 type limitedCommandOutput struct {

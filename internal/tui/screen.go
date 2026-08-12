@@ -10,17 +10,17 @@ import (
 	charmterm "github.com/charmbracelet/x/term"
 )
 
-const background = "\x1b[48;2;30;27;33m"
-const accent = "\x1b[38;2;255;92;214m"
-const violet = "\x1b[38;2;126;92;255m"
-const cyan = "\x1b[38;2;55;230;161m"
-const blue = "\x1b[38;2;128;170;255m"
-const amber = "\x1b[38;2;245;190;92m"
-const red = "\x1b[38;2;255;105;120m"
-const textColor = "\x1b[38;2;230;225;233m"
-const muted = "\x1b[38;2;116;109;124m"
-const faint = "\x1b[38;2;76;70;83m"
-const selected = "\x1b[48;2;62;49;70m\x1b[38;2;255;240;252m"
+const background = "\x1b[48;2;13;24;31m"
+const accent = "\x1b[38;2;255;172;92m"
+const violet = "\x1b[38;2;73;166;191m"
+const cyan = "\x1b[38;2;83;210;172m"
+const blue = "\x1b[38;2;112;174;221m"
+const amber = "\x1b[38;2;242;201;108m"
+const red = "\x1b[38;2;246;116;116m"
+const textColor = "\x1b[38;2;220;230;232m"
+const muted = "\x1b[38;2;119;143;150m"
+const faint = "\x1b[38;2;62;87;96m"
+const selected = "\x1b[48;2;27;67;76m\x1b[38;2;239;248;246m"
 const bold = "\x1b[1m"
 const dim = "\x1b[2m"
 const clearStyle = "\x1b[0m"
@@ -211,7 +211,7 @@ func renderSidebar(sidebar []string, width, height int) []string {
 	lines := []string{
 		violet + "  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱" + reset,
 		accent + bold + "  █▀▀ █▀█ █▀▀ █ █" + reset,
-		violet + bold + "  █▄█ █▄█ ▄▄█ █▀█" + reset,
+		cyan + bold + "  █▄█ █▄█ ▄▄█ █▀█" + reset,
 		muted + "             C O D E R" + reset,
 		violet + "  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱" + reset,
 		"",

@@ -1542,6 +1542,7 @@ func TestAgentForwardsSessionAndThinking(t *testing.T) {
 		StreamFn:        streamFn,
 		SessionID:       "sess-1",
 		ThinkingBudgets: budgets,
+		MaxRetries:      2,
 		InitialState:    &InitialState{Model: testModel(), ThinkingLevel: llm.ThinkingHigh},
 	})
 
@@ -1556,6 +1557,9 @@ func TestAgentForwardsSessionAndThinking(t *testing.T) {
 	}
 	if seen.ThinkingBudgets != budgets {
 		t.Fatalf("thinkingBudgets = %#v", seen.ThinkingBudgets)
+	}
+	if seen.MaxRetries != 2 {
+		t.Fatalf("maxRetries = %d", seen.MaxRetries)
 	}
 }
 

@@ -126,10 +126,12 @@ func fullscreenMessages(messages []agent.Message) []tui.Message {
 				result = append(result, assistantTUIMessages(*value)...)
 			}
 		case llm.ToolResultMessage:
-			result = append(result, tui.Message{Role: "tool", Text: value.ToolName + ": " + blockSummary(value.Content)})
+			if value.IsError {
+				result = append(result, tui.Message{Role: "Error", Text: value.ToolName + ": " + blockSummary(value.Content)})
+			}
 		case *llm.ToolResultMessage:
-			if value != nil {
-				result = append(result, tui.Message{Role: "tool", Text: value.ToolName + ": " + blockSummary(value.Content)})
+			if value != nil && value.IsError {
+				result = append(result, tui.Message{Role: "Error", Text: value.ToolName + ": " + blockSummary(value.Content)})
 			}
 		}
 	}
@@ -145,15 +147,12 @@ func userText(message llm.UserMessage) string {
 
 func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	var thinking, text strings.Builder
-	var tools []string
 	for _, block := range message.Content {
 		switch value := block.(type) {
 		case llm.ThinkingContent:
 			thinking.WriteString(value.Thinking)
 		case llm.TextContent:
 			text.WriteString(value.Text)
-		case llm.ToolCall:
-			tools = append(tools, value.Name+" "+summarizeArgs(value.Arguments))
 		}
 	}
 	var result []tui.Message
@@ -163,16 +162,13 @@ func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	if text.Len() > 0 {
 		result = append(result, tui.Message{Role: "assistant", Text: text.String()})
 	}
-	if len(tools) > 0 {
-		result = append(result, tui.Message{Role: "tool", Text: "Calling " + strings.Join(tools, ", ")})
-	}
 	if message.ErrorMessage != "" {
 		result = append(result, tui.Message{Role: "Error", Text: message.ErrorMessage})
 	}
 	return result
 }
 
-func fullscreenSidebar(info claudetui.SessionInfo, cwd string) []string {
+func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string) []string {
 	contextText := compactNumber(info.ContextUsed)
 	if info.ContextLimit > 0 {
 		contextText += fmt.Sprintf("/%s  %d%%", compactNumber(info.ContextLimit), min(100, info.ContextUsed*100/info.ContextLimit))
@@ -185,12 +181,20 @@ func fullscreenSidebar(info claudetui.SessionInfo, cwd string) []string {
 	if mode == "" {
 		mode = "normal"
 	}
+	activityLine := "● " + activity
+	if activity == "Ready" {
+		activityLine = "○ Ready"
+	}
+	pendingLine := fmt.Sprintf("%d messages  ·  %d active tools", info.Messages, pendingTools)
+	if recentTool == "" {
+		recentTool = fmt.Sprintf("%d tools available", info.Tools)
+	}
 	return []string{
 		"New Session", cwd, "",
 		"MODEL", "◇ " + info.Model, info.Thinking + " thinking  ·  " + mode,
 		contextText + fmt.Sprintf("  ·  $%.4f", info.Cost), "",
-		"ACTIVITY", fmt.Sprintf("● %d messages", info.Messages),
-		fmt.Sprintf("%d tools  ·  %d files changed", info.Tools, info.ChangedFiles), "",
+		"ACTIVITY", activityLine, pendingLine, recentTool, "",
+		"WORKSPACE", fmt.Sprintf("%d changed files", info.ChangedFiles), "",
 		"GIT", branch,
 	}
 }
