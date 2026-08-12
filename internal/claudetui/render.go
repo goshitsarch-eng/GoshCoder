@@ -121,7 +121,7 @@ func HeaderWithInfo(width int, appVersion, model, thinking, cwd string, color bo
 		center("Let's build something great", leftWidth),
 		center(model+" · "+thinking+" effort", leftWidth), center(FormatCWD(cwd), leftWidth), "",
 	}
-	tips := []string{"", "Getting started", "Ask GoshCoder to build it", "────────────────", "Commands", "/help", "/model", "/plannotator"}
+	tips := []string{"", "Getting started", "Ask GoshCoder to build it", "────────────────", "Commands", "/help", "/model", "/planner"}
 	if info != nil {
 		tips = infoLines(*info)
 	}

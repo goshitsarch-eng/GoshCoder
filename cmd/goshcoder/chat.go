@@ -49,10 +49,10 @@ const chatHelp = `Slash commands:
   /reload               Reload context files, prompts, and skills
   /resources            Show loaded local resources
   /ralph <subcommand>   Ralph loops (start, list, status, resume, stop)
-  /plannotator          Toggle native Plannotator planning mode
-  /plannotator-review [PR URL]  Review git changes or a GitHub PR
-  /plannotator-annotate <target> Annotate a file, folder, or URL
-  /plannotator-last     Annotate the last assistant response
+  /planner              Toggle native planning mode
+  /planner-review [PR URL]  Review git changes or a GitHub PR
+  /planner-annotate <target> Annotate a file, folder, or URL
+  /planner-last         Annotate the last assistant response
   /use-claude-code-tui  Enable the native startup/editor look
   /use-default-tui      Restore the plain line-oriented look
   /exit                 Leave chat
@@ -80,8 +80,8 @@ func chatCommand(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	// Native extension commands are available in chat even when plan mode was
-	// not requested at startup.
+	// Planner commands are available in chat even when plan mode was not
+	// requested at startup.
 	cfg.LoadPlannotator = true
 	cfg.Fullscreen = cfg.Fullscreen && tui.Supported(os.Stdin, os.Stderr)
 	if cfg.ModelRef == "" {
@@ -284,10 +284,16 @@ func userMessage(text string) llm.UserMessage {
 func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	command, rest, _ := strings.Cut(input, " ")
 	rest = strings.TrimSpace(rest)
-	// Accept the common shorthand/misspelling without hiding the canonical
-	// Plannotator command from completion and help.
-	if command == "/plannator" {
-		command = "/plannotator"
+	// Preserve the old upstream command names as hidden compatibility aliases.
+	switch command {
+	case "/plannator", "/plannotator":
+		command = "/planner"
+	case "/plannotator-review":
+		command = "/planner-review"
+	case "/plannotator-annotate":
+		command = "/planner-annotate"
+	case "/plannotator-last":
+		command = "/planner-last"
 	}
 
 	switch command {
@@ -445,27 +451,27 @@ Ctrl-D      quit when the editor is empty`)
 	case "/ralph":
 		return false, s.handleRalphSlashCommand(rest)
 
-	case "/plannotator":
+	case "/planner":
 		if s.plan == nil {
-			return false, errors.New("plannotator is unavailable in this session")
+			return false, errors.New("planner is unavailable in this session")
 		}
 		phase, err := s.plan.Toggle()
 		if err != nil {
 			return false, err
 		}
 		s.syncPlanRuntime()
-		fmt.Fprintln(os.Stderr, dim("Plannotator: "+string(phase)))
+		fmt.Fprintln(os.Stderr, dim("Planner: "+string(phase)))
 
-	case "/plannotator-review":
+	case "/planner-review":
 		return false, s.reviewCode(rest)
 
-	case "/plannotator-annotate":
+	case "/planner-annotate":
 		if rest == "" {
-			return false, errors.New("usage: /plannotator-annotate <file>")
+			return false, errors.New("usage: /planner-annotate <file>")
 		}
 		return false, s.annotateFile(rest)
 
-	case "/plannotator-last":
+	case "/planner-last":
 		return false, s.annotateLastMessage()
 
 	case "/use-claude-code-tui":
@@ -738,7 +744,7 @@ func (s *session) deliverReviewFeedback(subject string, decision plannotator.Dec
 	if decision.Approved {
 		status = "approved with notes"
 	}
-	return s.runTurn(fmt.Sprintf("Plannotator review of %s was %s. Address this feedback:\n\n%s", subject, status, feedback))
+	return s.runTurn(fmt.Sprintf("Planner review of %s was %s. Address this feedback:\n\n%s", subject, status, feedback))
 }
 
 func (s *session) reviewCode(argument string) error {

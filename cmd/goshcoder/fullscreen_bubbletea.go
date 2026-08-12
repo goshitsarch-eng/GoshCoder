@@ -557,7 +557,8 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 		return false
 	}
 	command := fields[0]
-	return command == "/compact" || command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
+	return command == "/compact" || command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
+		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
 		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
 }
 
@@ -765,7 +766,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/model", "/thinking", "/ralph", "/plannotator-annotate", "/steer", "/followup":
+		case "/model", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -796,7 +797,7 @@ func fullscreenCommandAvailable(session *session, command string) bool {
 	if command == "/ralph" {
 		return session.loops != nil
 	}
-	if strings.HasPrefix(command, "/plannotator") {
+	if strings.HasPrefix(command, "/planner") {
 		return session.plan != nil
 	}
 	return true

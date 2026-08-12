@@ -48,7 +48,7 @@ goshcoder auth login kimi-coding
 | `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
 | `-ralph` | Enable long-running Ralph loops (default in chat; use `-ralph=false` to disable) |
-| `-plan` | Start in native Plannotator planning/review mode |
+| `-planner` | Start in native Planner review mode (`-plan` remains an alias) |
 | `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
 | `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
 | `-C` | Workspace directory for tools |
@@ -66,7 +66,7 @@ be pointed at either tool.
 | `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
 | `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `internal/ralph` | Long-running iterative development loops |
-| `internal/plannotator` | Plan mode, browser approval/annotations, and checklist progress |
+| `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
 | `internal/tui` | Bubble Tea view renderer, responsive transcript, palette, composer, and sidebar |
 | `internal/config` | On-disk paths |
@@ -93,13 +93,13 @@ host, so selected extension features are native built-ins:
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. `/ralph` opens loop controls in the command palette.
-- `@plannotator/pi-extension`: `/plannotator`, browser plan approval/denial with
-  line annotations, overall notes, direct Markdown edits, resubmission change
-  views, responsive navigation, light/dark themes, planning write gates,
-  persisted phase state, checklist progress, `/plannotator-review`,
-  `/plannotator-annotate`, and `/plannotator-last`. Use `-plan` to begin in
-  planning mode. PR URL review uses the optional GitHub CLI (`gh`); local git
-  review needs only `git`.
+- **Planner** (native adaptation of `@plannotator/pi-extension`): `/planner`,
+  browser plan approval/denial with line annotations, overall notes, direct
+  Markdown edits, resubmission change views, responsive navigation, light/dark
+  themes, planning write gates, persisted phase state, checklist progress,
+  `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
+  begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
+  local git review needs only `git`.
 - `pi-claude-code-tui`: startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
   tools, changed files, branch, and active mode. The panel refreshes

@@ -184,7 +184,7 @@ func TestBindSessionFlags(t *testing.T) {
 		"-thinking", "high",
 		"-tools",
 		"-ralph",
-		"-plan",
+		"-planner",
 		"-claude-tui",
 		"-C", "/tmp/work",
 		"trailing", "prompt",

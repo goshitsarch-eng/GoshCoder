@@ -21,7 +21,7 @@ func TestHeaderFitsWidth(t *testing.T) {
 
 func TestWideHeaderHasTipsAndNarrowDoesNot(t *testing.T) {
 	wide := strings.Join(Header(100, "1", "p/m", "off", "/x", false), "\n")
-	if !strings.Contains(wide, "Getting started") || !strings.Contains(wide, "/plannotator") {
+	if !strings.Contains(wide, "Getting started") || !strings.Contains(wide, "/planner") {
 		t.Fatalf("wide header = %q", wide)
 	}
 	narrow := strings.Join(Header(40, "1", "p/m", "off", "/x", false), "\n")

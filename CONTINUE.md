@@ -154,13 +154,13 @@ models (100%)**.
 
 The two user-requested packages are now native:
 
-- `internal/plannotator`: planning/executing/idle state machine, markdown-only
-  planning write gate, `plannotator_submit_plan`, and a polished loopback review
+- **Planner** (`internal/plannotator`): planning/executing/idle state machine,
+  markdown-only planning write gate, `planner_submit_plan`, and a polished loopback review
   app with approve/deny, line annotations, notes, direct Markdown edits,
   resubmission changes, themes, responsive navigation, persisted per-workspace
   state, `[DONE:n]` checklist tracking, and chat commands for plan, git-diff,
   file, and last-message review. `-plan` starts planning immediately; chat
-  always loads `/plannotator` so it can be toggled later.
+  always loads `/planner` so it can be toggled later.
 - `internal/claudetui`: model/context/cost/git/mode information used by both
   the startup card and the responsive fullscreen sidebar.
 - `internal/tui`: Bubble Tea/Lip Gloss alternate-screen interface with a fixed
@@ -176,7 +176,7 @@ The two user-requested packages are now native:
   automatic structured context compaction while retaining recent turns.
 
 These are native adaptations and do not load npm or pi's TypeScript TUI.
-Plannotator intentionally serves a compact native review page instead of
+Planner intentionally serves a native review page instead of
 embedding its roughly 39 MB generated SPA assets.
 
 ## 2026 Go quality and security audit
@@ -191,7 +191,7 @@ repeated tests, and the race detector. Important hardening completed:
   SSE records, and provider streams have explicit memory bounds;
 - auth and extension state writes use secured temporary files and atomic
   renames; stale auth locks recover safely;
-- OAuth and Plannotator web servers are loopback-only, size/time limited, use
+- OAuth and Planner web servers are loopback-only, size/time limited, use
   CSRF/state validation, no-store/CSP headers, and escaped HTML;
 - planning mode removes and independently blocks shell execution;
 - retry parsing handles malformed, negative, non-finite, wrapped-cancellation,
@@ -234,7 +234,7 @@ Gloss; dependency checksums are committed in `go.sum`.
 - Selected pi extensions are native built-ins: `internal/ralph`
   (`@tmustier/pi-ralph-wiggum`), `internal/plannotator`
   (`@plannotator/pi-extension`), and `internal/claudetui`
-  (`pi-claude-code-tui`). Plannotator uses a dependency-free stdlib browser
+  (`pi-claude-code-tui`). Planner uses a dependency-free stdlib browser
   reviewer; the visual UI is native Go rather than pi's npm/TUI runtime.
 - Persisted JSONL session trees, resume/branch pickers, TypeScript packages and
   plugins, LSP/MCP management, and export/share remain outside current parity.

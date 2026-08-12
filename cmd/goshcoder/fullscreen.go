@@ -45,8 +45,8 @@ var fullscreenSlashCommands = []slashCommand{
 	{"/new", "Start a fresh conversation"}, {"/compact", "Summarize older context"},
 	{"/reload", "Reload local resources"},
 	{"/resources", "Show loaded context, prompts, and skills"},
-	{"/plannotator", "Toggle planning mode"}, {"/plannotator-review", "Review code changes"},
-	{"/plannotator-annotate", "Annotate a target"}, {"/plannotator-last", "Annotate last response"},
+	{"/planner", "Toggle planning mode"}, {"/planner-review", "Review code changes"},
+	{"/planner-annotate", "Annotate a target"}, {"/planner-last", "Annotate last response"},
 	{"/ralph", "Manage Ralph loops"}, {"/system", "Show or replace system prompt"},
 	{"/exit", "Exit GoshCoder"}, {"/quit", "Exit GoshCoder"},
 }
@@ -230,7 +230,7 @@ func toolTUIMessage(call llm.ToolCall, result *llm.ToolResultMessage) tui.Messag
 		if command := arg("command"); command != "" {
 			title += " " + firstLine(command)
 		}
-	case "plannotator_submit_plan":
+	case "planner_submit_plan":
 		if path := arg("filePath"); path != "" {
 			title = "submit plan " + path
 		}
@@ -251,7 +251,7 @@ func toolTUIMessage(call llm.ToolCall, result *llm.ToolResultMessage) tui.Messag
 		return message
 	}
 	switch call.Name {
-	case "bash", "grep", "find", "ls", "list", "plannotator_submit_plan":
+	case "bash", "grep", "find", "ls", "list", "planner_submit_plan":
 		lines := strings.Split(strings.TrimSpace(message.Detail), "\n")
 		message.Text = strings.Join(lines[:min(3, len(lines))], "\n")
 	}

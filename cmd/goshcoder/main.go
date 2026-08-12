@@ -51,7 +51,7 @@ Chat/run flags:
   -thinking <level>   off|minimal|low|medium|high|xhigh|max (default off)
   -tools              Enable file and shell tools (chat default true; disable with -tools=false)
   -ralph              Enable long-running ralph loops (ralph_start/ralph_done)
-  -plan               Start with native Plannotator plan review enabled
+  -planner            Start with native Planner review enabled
   -claude-tui         Use the native pi-claude-code-tui look in line mode (default true)
   -fullscreen         Use the native fullscreen TUI in chat (default true on terminals)
   -C <dir>            Workspace directory for tools (default: current directory)
@@ -151,7 +151,8 @@ func bindSessionFlags(flags *flag.FlagSet) *sessionConfig {
 	flags.StringVar(&cfg.Thinking, "thinking", "off", "thinking level")
 	flags.BoolVar(&cfg.EnableTools, "tools", false, "enable built-in tools")
 	flags.BoolVar(&cfg.EnableRalph, "ralph", false, "enable long-running ralph loops")
-	flags.BoolVar(&cfg.EnablePlannotator, "plan", false, "start in Plannotator planning mode")
+	flags.BoolVar(&cfg.EnablePlannotator, "planner", false, "start in Planner mode")
+	flags.BoolVar(&cfg.EnablePlannotator, "plan", false, "alias for -planner")
 	flags.BoolVar(&cfg.ClaudeTUI, "claude-tui", true, "use the pi-claude-code-tui look")
 	flags.StringVar(&cfg.Workdir, "C", ".", "workspace directory")
 	return cfg

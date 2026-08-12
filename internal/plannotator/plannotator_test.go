@@ -217,7 +217,7 @@ func TestBrowserReviewerDecision(t *testing.T) {
 	if len(match) != 2 {
 		t.Fatalf("review page has no token: %s", body)
 	}
-	for _, feature := range []string{"Contents", "Annotations", "Feedback", "Edit", "Copy plan", "Overall implementation notes"} {
+	for _, feature := range []string{"Planner", "Contents", "Annotations", "Feedback", "Edit", "Copy plan", "Overall implementation notes"} {
 		if !strings.Contains(pageText, feature) {
 			t.Fatalf("review page missing %q: %s", feature, pageText)
 		}

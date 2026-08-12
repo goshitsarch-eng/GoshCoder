@@ -21,7 +21,7 @@ import (
 	"goshcoder/internal/llm"
 )
 
-const SubmitToolName = "plannotator_submit_plan"
+const SubmitToolName = "planner_submit_plan"
 const maxPlanBytes = 2 * 1024 * 1024
 
 type Phase string
@@ -78,7 +78,7 @@ func New(root, stateFile string, reviewer Reviewer) (*Manager, error) {
 	switch m.state.Phase {
 	case PhaseIdle, PhasePlanning, PhaseExecuting:
 	default:
-		return nil, fmt.Errorf("invalid persisted Plannotator phase %q", m.state.Phase)
+		return nil, fmt.Errorf("invalid persisted Planner phase %q", m.state.Phase)
 	}
 	if m.state.Phase == PhaseExecuting && m.state.PlanPath != "" {
 		if content, err := m.readPlan(m.state.PlanPath); err == nil {
@@ -151,7 +151,7 @@ func (m *Manager) promptSuffixLocked() string {
 		if len(remaining) == 0 {
 			return ""
 		}
-		return fmt.Sprintf("\n\n[PLANNOTATOR - EXECUTING PLAN]\nFull tool access is enabled. Execute the approved plan from %s.\n\nRemaining steps:\n%s\n\nExecute each step in order. After completing a step, include [DONE:n] in your response where n is the step number.", m.state.PlanPath, strings.Join(remaining, "\n"))
+		return fmt.Sprintf("\n\n[PLANNER - EXECUTING PLAN]\nFull tool access is enabled. Execute the approved plan from %s.\n\nRemaining steps:\n%s\n\nExecute each step in order. After completing a step, include [DONE:n] in your response where n is the step number.", m.state.PlanPath, strings.Join(remaining, "\n"))
 	default:
 		return ""
 	}
@@ -165,14 +165,14 @@ func (m *Manager) BeforeToolCall(_ context.Context, call agent.BeforeToolCallCon
 		return nil
 	}
 	if call.ToolCall.Name == "bash" {
-		return &agent.BeforeToolCallResult{Block: true, Reason: "Plannotator: shell commands are disabled during planning because they can modify the workspace."}
+		return &agent.BeforeToolCallResult{Block: true, Reason: "Planner: shell commands are disabled during planning because they can modify the workspace."}
 	}
 	if call.ToolCall.Name != "write" && call.ToolCall.Name != "edit" {
 		return nil
 	}
 	path, _ := call.Args["path"].(string)
 	if !m.IsPlanPathAllowed(path) {
-		return &agent.BeforeToolCallResult{Block: true, Reason: fmt.Sprintf("Plannotator: during planning, writes and edits are limited to markdown files inside the workspace. Blocked: %s", path)}
+		return &agent.BeforeToolCallResult{Block: true, Reason: fmt.Sprintf("Planner: during planning, writes and edits are limited to markdown files inside the workspace. Blocked: %s", path)}
 	}
 	return nil
 }
@@ -189,7 +189,7 @@ func (m *Manager) PrepareNextTurn(base string) agent.PrepareNextTurnFunc {
 func (m *Manager) Tool() agent.Tool {
 	return agent.Tool{
 		Name: SubmitToolName, Label: "Submit Plan",
-		Description:   "Submit a markdown plan for human review. Use only in Plannotator planning mode after writing the plan inside the workspace. If denied, revise the same file and resubmit.",
+		Description:   "Submit a markdown plan for human review. Use only in Planner mode after writing the plan inside the workspace. If denied, revise the same file and resubmit.",
 		Parameters:    json.RawMessage(`{"type":"object","properties":{"filePath":{"type":"string","description":"Markdown plan path relative to the workspace"}},"required":["filePath"]}`),
 		ExecutionMode: agent.ToolExecutionSequential,
 		Execute: func(ctx context.Context, _ string, params map[string]any, _ func(agent.ToolResult)) (agent.ToolResult, error) {
@@ -203,7 +203,7 @@ func (m *Manager) Submit(ctx context.Context, inputPath string) (agent.ToolResul
 	m.mu.Lock()
 	if m.state.Phase != PhasePlanning {
 		m.mu.Unlock()
-		return textResult("Error: Not in Plannotator planning mode."), nil
+		return textResult("Error: Not in Planner mode."), nil
 	}
 	m.mu.Unlock()
 
@@ -343,7 +343,7 @@ func (m *Manager) StatusLine() string {
 	state := m.State()
 	switch state.Phase {
 	case PhasePlanning:
-		return "Plannotator: planning"
+		return "Planner: planning"
 	case PhaseExecuting:
 		completed := 0
 		for _, item := range state.Items {
@@ -351,9 +351,9 @@ func (m *Manager) StatusLine() string {
 				completed++
 			}
 		}
-		return fmt.Sprintf("Plannotator: executing %d/%d", completed, len(state.Items))
+		return fmt.Sprintf("Planner: executing %d/%d", completed, len(state.Items))
 	default:
-		return "Plannotator: idle"
+		return "Planner: idle"
 	}
 }
 
@@ -460,7 +460,7 @@ func textResult(text string) agent.ToolResult {
 
 const planningPrompt = `
 
-[PLANNOTATOR - PLANNING PHASE]
+[PLANNER - PLANNING PHASE]
 You are in plan mode. Do not modify the codebase, commit, install dependencies, or run destructive commands. You may only write or edit markdown plan files (.md or .mdx) inside the workspace.
 
-Explore the codebase with read-only tools. Build a concise plan containing Context, Approach, Files to modify, Reuse, implementation checklist items using "- [ ]", and Verification. Ask the user only about ambiguities that cannot be answered from the code. When ready, call plannotator_submit_plan with the plan file path. If review denies it, make targeted edits to the same file and resubmit.`
+Explore the codebase with read-only tools. Build a concise plan containing Context, Approach, Files to modify, Reuse, implementation checklist items using "- [ ]", and Verification. Ask the user only about ambiguities that cannot be answered from the code. When ready, call planner_submit_plan with the plan file path. If review denies it, make targeted edits to the same file and resubmit.`

@@ -213,7 +213,7 @@ func TestBubbleTeaCommandPaletteShowsRalphControls(t *testing.T) {
 	}
 }
 
-func TestBubbleTeaCommandPaletteRunsPlannotator(t *testing.T) {
+func TestBubbleTeaCommandPaletteRunsPlanner(t *testing.T) {
 	workspace, err := tools.NewWorkspace(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -232,11 +232,11 @@ func TestBubbleTeaCommandPaletteRunsPlannotator(t *testing.T) {
 
 	tuiModel := &fullscreenModel{session: session, editor: fullscreenEditor{input: []rune("/pla"), cursor: 4}}
 	items := tuiModel.suggestions()
-	if len(items) == 0 || items[0].label != "/plannotator" {
+	if len(items) == 0 || items[0].label != "/planner" {
 		t.Fatalf("suggestions = %#v", items)
 	}
 	if command := tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnter}); command != nil {
-		t.Fatal("Plannotator toggle should complete immediately")
+		t.Fatal("Planner toggle should complete immediately")
 	}
 	if phase := manager.State().Phase; phase != plannotator.PhasePlanning {
 		t.Fatalf("phase = %q", phase)

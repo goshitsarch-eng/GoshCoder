@@ -25,7 +25,7 @@ func TestPlanPrepareNextTurnDoesNotDuplicateModePrompt(t *testing.T) {
 	if update == nil || update.Context == nil {
 		t.Fatal("plan hook returned no context")
 	}
-	if count := strings.Count(update.Context.SystemPrompt, "[PLANNOTATOR - PLANNING PHASE]"); count != 1 {
+	if count := strings.Count(update.Context.SystemPrompt, "[PLANNER - PLANNING PHASE]"); count != 1 {
 		t.Fatalf("planning prompt count = %d\n%s", count, update.Context.SystemPrompt)
 	}
 }
