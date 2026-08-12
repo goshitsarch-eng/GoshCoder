@@ -1,12 +1,14 @@
 package plannotator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,6 +21,22 @@ import (
 type reviewerStub struct {
 	decision Decision
 	err      error
+}
+
+type versionedReviewerStub struct {
+	decisions []Decision
+	previous  []string
+}
+
+func (r *versionedReviewerStub) Review(context.Context, string, string) (Decision, error) {
+	return Decision{}, errors.New("expected versioned review")
+}
+
+func (r *versionedReviewerStub) ReviewVersion(_ context.Context, _, _ string, previous string) (Decision, error) {
+	r.previous = append(r.previous, previous)
+	decision := r.decisions[0]
+	r.decisions = r.decisions[1:]
+	return decision, nil
 }
 
 func (r reviewerStub) Review(context.Context, string, string) (Decision, error) {
@@ -194,9 +212,15 @@ func TestBrowserReviewerDecision(t *testing.T) {
 	}
 	body, _ := io.ReadAll(page.Body)
 	page.Body.Close()
-	match := regexp.MustCompile(`name="token" value="([^"]+)"`).FindStringSubmatch(string(body))
+	pageText := string(body)
+	match := regexp.MustCompile(`name="token" value="([^"]+)"`).FindStringSubmatch(pageText)
 	if len(match) != 2 {
 		t.Fatalf("review page has no token: %s", body)
+	}
+	for _, feature := range []string{"Contents", "Annotations", "Feedback", "Edit", "Copy plan", "Overall implementation notes"} {
+		if !strings.Contains(pageText, feature) {
+			t.Fatalf("review page missing %q: %s", feature, pageText)
+		}
 	}
 	form := url.Values{"action": {"deny"}, "feedback": {"Needs tests"}, "token": {match[1]}}
 	response, err := http.PostForm(target+"api/decision", form)
@@ -210,6 +234,96 @@ func TestBrowserReviewerDecision(t *testing.T) {
 	decision := <-result
 	if decision.Approved || decision.Feedback != "Needs tests" {
 		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestReviewPageJavaScriptParses(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is unavailable")
+	}
+	markdown := "# Plan `quoted`\n- [ ] don't break \\ paths\n<script>escaped</script>"
+	lines, headings := prepareReviewDocument(markdown)
+	var page bytes.Buffer
+	if err := reviewPage.Execute(&page, reviewPageData{
+		Title: "Review", Markdown: markdown, Previous: "# Earlier", Lines: lines,
+		Headings: headings, Token: "token", HasPrevious: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`(?s)<script>(.*)</script>`).FindSubmatch(page.Bytes())
+	if len(match) != 2 {
+		t.Fatal("rendered page has no script")
+	}
+	path := filepath.Join(t.TempDir(), "review.js")
+	if err := os.WriteFile(path, match[1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
+		t.Fatalf("review JavaScript does not parse: %v\n%s", err, output)
+	}
+}
+
+func TestBrowserReviewerVersionShowsChangesAndEscapesContent(t *testing.T) {
+	opened := make(chan string, 1)
+	reviewer := BrowserReviewer{OpenBrowser: func(target string) error { opened <- target; return nil }}
+	result := make(chan error, 1)
+	go func() {
+		_, err := reviewer.ReviewVersion(t.Context(), "Review <script>", "# New\n- [ ] <script>alert(1)</script>", "# Old")
+		result <- err
+	}()
+	target := <-opened
+	response, err := http.Get(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	text := string(body)
+	if !strings.Contains(text, "± Changes") || strings.Contains(text, "<script>alert(1)</script>") {
+		t.Fatalf("versioned/escaped page = %s", text)
+	}
+	match := regexp.MustCompile(`name="token" value="([^"]+)"`).FindStringSubmatch(text)
+	if len(match) != 2 {
+		t.Fatal("missing token")
+	}
+	form := url.Values{"action": {"approve"}, "token": {match[1]}}
+	posted, err := http.PostForm(target+"api/decision", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted.Body.Close()
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitPassesDeniedPlanToNextVersion(t *testing.T) {
+	root := t.TempDir()
+	plan := "# Plan\n- [ ] First\n"
+	if err := os.WriteFile(filepath.Join(root, "plan.md"), []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reviewer := &versionedReviewerStub{decisions: []Decision{{Feedback: "revise"}, {Approved: true}}}
+	manager, err := New(root, filepath.Join(t.TempDir(), "state.json"), reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Enter(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Submit(t.Context(), "plan.md"); err != nil {
+		t.Fatal(err)
+	}
+	updated := "# Plan\n- [ ] First\n- [ ] Second\n"
+	if err := os.WriteFile(filepath.Join(root, "plan.md"), []byte(updated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Submit(t.Context(), "plan.md"); err != nil {
+		t.Fatal(err)
+	}
+	if len(reviewer.previous) != 2 || reviewer.previous[0] != "" || reviewer.previous[1] != plan {
+		t.Fatalf("previous versions = %#v", reviewer.previous)
 	}
 }
 

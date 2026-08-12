@@ -10,8 +10,8 @@ cd /c/Users/vaugh/OneDrive/Desktop/GoshCoder
 go build ./... && go vet ./... && gofmt -l ./internal ./cmd && go test ./...
 ```
 
-Expected: all clean across 8 packages. Zero third-party dependencies (no
-`go.sum`) — keep it that way.
+Expected: all packages build, vet, and test clean. The fullscreen UI uses
+Bubble Tea/Lip Gloss dependencies recorded in `go.sum`.
 
 The pi reference clone is at `reference/pi` (gitignored). Every port is written
 against it; read the TS before porting anything.
@@ -155,18 +155,25 @@ models (100%)**.
 The two user-requested packages are now native:
 
 - `internal/plannotator`: planning/executing/idle state machine, markdown-only
-  planning write gate, `plannotator_submit_plan`, loopback browser review with
-  approve/deny/notes and clickable line annotations, persisted per-workspace
+  planning write gate, `plannotator_submit_plan`, and a polished loopback review
+  app with approve/deny, line annotations, notes, direct Markdown edits,
+  resubmission changes, themes, responsive navigation, persisted per-workspace
   state, `[DONE:n]` checklist tracking, and chat commands for plan, git-diff,
   file, and last-message review. `-plan` starts planning immediately; chat
   always loads `/plannotator` so it can be toggled later.
 - `internal/claudetui`: model/context/cost/git/mode information used by both
   the startup card and the responsive fullscreen sidebar.
 - `internal/tui`: Bubble Tea/Lip Gloss alternate-screen interface with a fixed
-  transcript viewport, responsive sidebar, styled message cards and composer,
-  Unicode width handling, history, scrolling, live agent updates, and a nested
-  command palette. `/model` searches models from authenticated providers and
-  `/thinking` derives its choices from the active model's supported level map.
+  transcript viewport, OpenCode-style responsive sidebar, compact/expandable
+  tool cards, a multiline editor, Unicode width handling, history, scrolling,
+  live agent updates, and a nested command palette. `/model` searches models
+  from authenticated providers and `/thinking` derives its choices from the
+  active model's supported level map.
+- `internal/resources`: Pi-compatible context files, system prompt overrides,
+  prompt templates, and Agent Skills. The CLI supports `/reload`, `/resources`,
+  and resource slash expansion.
+- `cmd/goshcoder/compaction.go`: manual `/compact [focus]` and near-limit
+  automatic structured context compaction while retaining recent turns.
 
 These are native adaptations and do not load npm or pi's TypeScript TUI.
 Plannotator intentionally serves a compact native review page instead of
@@ -227,5 +234,7 @@ Gloss; dependency checksums are committed in `go.sum`.
 - Selected pi extensions are native built-ins: `internal/ralph`
   (`@tmustier/pi-ralph-wiggum`), `internal/plannotator`
   (`@plannotator/pi-extension`), and `internal/claudetui`
-  (`pi-claude-code-tui`). Plannotator uses a compact stdlib browser reviewer;
-  the visual UI is native Go rather than pi's npm/TUI runtime.
+  (`pi-claude-code-tui`). Plannotator uses a dependency-free stdlib browser
+  reviewer; the visual UI is native Go rather than pi's npm/TUI runtime.
+- Persisted JSONL session trees, resume/branch pickers, TypeScript packages and
+  plugins, LSP/MCP management, and export/share remain outside current parity.

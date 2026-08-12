@@ -181,11 +181,15 @@ func (q agentQueue) HasQueuedMessages() bool {
 // This is the Go equivalent of the extension's agent_end and
 // before_agent_start hooks, folded into the one hook the agent loop offers
 // between turns.
-func ralphPrepareNextTurn(loops *ralph.Store, baseSystemPrompt string) agent.PrepareNextTurnFunc {
+func ralphPrepareNextTurn(loops *ralph.Store, baseSystemPrompt func() string) agent.PrepareNextTurnFunc {
 	if loops == nil {
 		return nil
 	}
 	return func(ctx context.Context, c agent.PrepareNextTurnContext) *agent.TurnUpdate {
+		base := ""
+		if baseSystemPrompt != nil {
+			base = baseSystemPrompt()
+		}
 		state, ok := loops.Current()
 		if !ok || state.Status != ralph.StatusActive {
 			return nil
@@ -200,13 +204,13 @@ func ralphPrepareNextTurn(loops *ralph.Store, baseSystemPrompt string) agent.Pre
 				"ralph: loop %q completed at iteration %d", state.Name, state.Iteration)))
 			// Drop the loop instructions now that the loop is done.
 			updated := c.Context
-			updated.SystemPrompt = baseSystemPrompt
+			updated.SystemPrompt = base
 			return &agent.TurnUpdate{Context: &updated}
 		}
 
 		fmt.Fprintf(os.Stderr, "%s\n", dim(loops.StatusLine()))
 		updated := c.Context
-		updated.SystemPrompt = baseSystemPrompt + ralph.SystemPromptSuffix(state)
+		updated.SystemPrompt = base + ralph.SystemPromptSuffix(state)
 		return &agent.TurnUpdate{Context: &updated}
 	}
 }

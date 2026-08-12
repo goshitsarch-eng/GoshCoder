@@ -19,6 +19,7 @@ import (
 	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
+	coderresources "goshcoder/internal/resources"
 	"goshcoder/internal/tools"
 )
 
@@ -48,10 +49,12 @@ type session struct {
 	workspace *tools.Workspace
 	plan      *plannotator.Manager
 	// baseSystemPrompt is the prompt without extension suffixes.
-	baseSystemPrompt string
-	normalTools      []agent.Tool
-	claudeTUI        bool
-	fullscreen       bool
+	baseSystemPrompt     string
+	explicitSystemPrompt string
+	resources            *coderresources.Set
+	normalTools          []agent.Tool
+	claudeTUI            bool
+	fullscreen           bool
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
@@ -69,7 +72,18 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
 	}
 
-	s := &session{model: model, auth: auth, baseSystemPrompt: cfg.SystemPrompt, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen}
+	resourceRoot, err := filepath.Abs(cfg.Workdir)
+	if err != nil {
+		return nil, err
+	}
+	loadedResources, err := coderresources.Discover(resourceRoot, config.AgentDir())
+	if err != nil {
+		return nil, fmt.Errorf("discover local resources: %w", err)
+	}
+	s := &session{
+		model: model, auth: auth, explicitSystemPrompt: cfg.SystemPrompt,
+		resources: loadedResources, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen,
+	}
 
 	var agentTools []agent.Tool
 	if cfg.EnableTools || cfg.LoadPlannotator || cfg.EnablePlannotator {
@@ -89,6 +103,20 @@ func newSession(cfg sessionConfig) (*session, error) {
 	}
 
 	s.normalTools = append([]agent.Tool(nil), agentTools...)
+	promptTools := s.normalTools
+	if len(promptTools) == 0 && (cfg.LoadPlannotator || cfg.EnablePlannotator) {
+		promptTools = s.workspace.Planning()
+	}
+	toolNames := make([]string, 0, len(promptTools))
+	for _, tool := range promptTools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	s.baseSystemPrompt = s.resources.BuildSystemPrompt(cfg.SystemPrompt, resourceRoot, toolNames)
+	if !cfg.Quiet {
+		for _, warning := range s.resources.Warnings {
+			fmt.Fprintln(os.Stderr, dim("resource warning: "+warning))
+		}
+	}
 	if cfg.LoadPlannotator || cfg.EnablePlannotator {
 		root := s.workspace.Root
 		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
@@ -136,16 +164,10 @@ func newSession(cfg sessionConfig) (*session, error) {
 		agentTools = append(agentTools, s.loops.Tools(agentQueue{&s.agent})...)
 	}
 
-	systemPrompt := cfg.SystemPrompt
-	if s.plan != nil {
-		systemPrompt = s.plan.Prompt(systemPrompt)
-	}
+	systemPrompt := s.runtimeSystemPrompt()
 	if s.loops != nil {
-		if state, ok := s.loops.Current(); ok {
-			systemPrompt = cfg.SystemPrompt + ralph.SystemPromptSuffix(state)
-			if !cfg.Quiet {
-				fmt.Fprintf(os.Stderr, "%s\n", dim(s.loops.StatusLine()))
-			}
+		if _, ok := s.loops.Current(); ok && !cfg.Quiet {
+			fmt.Fprintf(os.Stderr, "%s\n", dim(s.loops.StatusLine()))
 		}
 	}
 
@@ -163,6 +185,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 			// leaving the stream function bound to the session's first provider.
 			return authStreamFn(s.auth)(model, ctx, opts)
 		},
+		ConvertToLLM: convertSessionMessages,
 		// Brief provider outages should recover in-place instead of forcing the
 		// user to restart the app and reconstruct the task with "continue".
 		MaxRetries: 2,
@@ -180,7 +203,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		},
 		// Compose native extension hooks in load order.
 		PrepareNextTurn: composePrepareNextTurn(
-			ralphPrepareNextTurn(s.loops, cfg.SystemPrompt),
+			ralphPrepareNextTurn(s.loops, func() string { return s.baseSystemPrompt }),
 			s.planPrepareNextTurn(),
 		),
 	})
@@ -188,6 +211,32 @@ func newSession(cfg sessionConfig) (*session, error) {
 		s.agent.Subscribe(renderEvent)
 	}
 	return s, nil
+}
+
+func (s *session) expandResourceInput(input string) (string, bool, error) {
+	if s == nil || s.resources == nil {
+		return "", false, nil
+	}
+	return s.resources.Expand(input)
+}
+
+func (s *session) reloadResources() error {
+	loaded, err := coderresources.Discover(s.workspaceRoot(), config.AgentDir())
+	if err != nil {
+		return err
+	}
+	promptTools := s.normalTools
+	if len(promptTools) == 0 && s.plan != nil && s.workspace != nil {
+		promptTools = s.workspace.Planning()
+	}
+	toolNames := make([]string, 0, len(promptTools))
+	for _, tool := range promptTools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	s.resources = loaded
+	s.baseSystemPrompt = loaded.BuildSystemPrompt(s.explicitSystemPrompt, s.workspaceRoot(), toolNames)
+	s.syncPlanRuntime()
+	return nil
 }
 
 func (s *session) close() error {
@@ -238,6 +287,9 @@ func (s *session) handleInterrupts(onIdleInterrupt func()) (stop func()) {
 // runTurn prompts the agent and reports a run failure as an error.
 func (s *session) runTurn(prompt string) error {
 	s.syncPlanRuntime()
+	if err := s.maybeAutoCompact(); err != nil {
+		return fmt.Errorf("automatic context compaction: %w", err)
+	}
 	if err := s.agent.Prompt(prompt); err != nil {
 		return err
 	}
@@ -258,7 +310,7 @@ func (s *session) planPrepareNextTurn() agent.PrepareNextTurnFunc {
 	return func(_ context.Context, turn agent.PrepareNextTurnContext) *agent.TurnUpdate {
 		s.plan.TrackAssistant(turn.Message)
 		updated := turn.Context
-		updated.SystemPrompt = s.plan.Prompt(updated.SystemPrompt)
+		updated.SystemPrompt = s.runtimeSystemPrompt()
 		return &agent.TurnUpdate{Context: &updated}
 	}
 }
@@ -283,11 +335,27 @@ func composePrepareNextTurn(hooks ...agent.PrepareNextTurnFunc) agent.PrepareNex
 	}
 }
 
+func (s *session) runtimeSystemPrompt() string {
+	prompt := s.baseSystemPrompt
+	if s.loops != nil {
+		if state, ok := s.loops.Current(); ok && state.Status == ralph.StatusActive {
+			prompt += ralph.SystemPromptSuffix(state)
+		}
+	}
+	if s.plan != nil {
+		prompt = s.plan.Prompt(prompt)
+	}
+	return prompt
+}
+
 func (s *session) syncPlanRuntime() {
-	if s.plan == nil || s.agent == nil {
+	if s.agent == nil {
 		return
 	}
-	s.agent.SetSystemPrompt(s.plan.Prompt(s.baseSystemPrompt))
+	s.agent.SetSystemPrompt(s.runtimeSystemPrompt())
+	if s.plan == nil {
+		return
+	}
 	switch s.plan.State().Phase {
 	case plannotator.PhaseIdle:
 		s.agent.SetTools(s.normalTools)

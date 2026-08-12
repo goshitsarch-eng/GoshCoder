@@ -18,6 +18,7 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/plannotator"
 	"goshcoder/internal/tui"
 )
 
@@ -45,20 +46,22 @@ type fullscreenInfoRefreshed struct{ info claudetui.SessionInfo }
 type fullscreenTick time.Time
 
 type fullscreenModel struct {
-	session     *session
-	editor      fullscreenEditor
-	notices     []tui.Message
-	info        claudetui.SessionInfo
-	activity    string
-	activityAt  time.Time
-	width       int
-	height      int
-	busyCommand bool
-	spin        int
-	updates     <-chan fullscreenAgentEvent
-	lifecycle   <-chan fullscreenAgentEvent
-	models      []fullscreenModelChoice
-	recentTool  string
+	session       *session
+	editor        fullscreenEditor
+	notices       []tui.Message
+	info          claudetui.SessionInfo
+	activity      string
+	activityAt    time.Time
+	width         int
+	height        int
+	busyCommand   bool
+	spin          int
+	updates       <-chan fullscreenAgentEvent
+	lifecycle     <-chan fullscreenAgentEvent
+	models        []fullscreenModelChoice
+	recentTool    string
+	toolsExpanded bool
+	hideThinking  bool
 }
 
 func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAgentEvent) *fullscreenModel {
@@ -213,6 +216,7 @@ func (model *fullscreenModel) refreshRealtimeInfo() {
 	fresh := model.session.sessionInfoRealtime()
 	fresh.Branch = model.info.Branch
 	fresh.ChangedFiles = model.info.ChangedFiles
+	fresh.Changes = append([]claudetui.ChangedFile(nil), model.info.Changes...)
 	model.info = fresh
 }
 
@@ -245,10 +249,14 @@ func (model *fullscreenModel) View() string {
 		}
 	}
 
+	var planItems []plannotator.ChecklistItem
+	if model.session.plan != nil {
+		planItems = model.session.plan.State().Items
+	}
 	frame := tui.Frame{
 		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
 		Messages:           messages,
-		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool),
+		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool, planItems),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,
 		Status:             status,
@@ -260,6 +268,8 @@ func (model *fullscreenModel) View() string {
 		Thinking:           state.ThinkingLevel,
 		Mode:               model.info.Mode,
 		VirtualCursor:      true,
+		ToolsExpanded:      model.toolsExpanded,
+		HideThinking:       model.hideThinking,
 	}
 	return tui.View(frame, model.width, model.height)
 }
@@ -303,32 +313,67 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 		model.info = model.session.sessionInfo()
 		model.activity = "Thinking set to " + model.session.agent.State().ThinkingLevel
 
+	case "ctrl+l":
+		model.setInput("/model ")
+
+	case "ctrl+p":
+		model.cycleModel(1)
+
+	case "ctrl+shift+p", "shift+ctrl+p":
+		model.cycleModel(-1)
+
+	case "ctrl+o":
+		model.toolsExpanded = !model.toolsExpanded
+		if model.toolsExpanded {
+			model.activity = "Tool output expanded"
+		} else {
+			model.activity = "Tool output collapsed"
+		}
+
+	case "ctrl+t":
+		model.hideThinking = !model.hideThinking
+		if model.hideThinking {
+			model.activity = "Thinking collapsed"
+		} else {
+			model.activity = "Thinking expanded"
+		}
+
+	case "alt+enter":
+		return model.submitFollowUp(streaming)
+
 	case "up":
 		if items := model.suggestions(); len(items) > 0 {
 			model.editor.suggestion = max(0, model.editor.suggestion-1)
-		} else {
+		} else if !moveEditorCursorVertical(&model.editor, -1) {
 			editorHistory(&model.editor, -1)
 		}
 
 	case "down":
 		if items := model.suggestions(); len(items) > 0 {
 			model.editor.suggestion = min(len(items)-1, model.editor.suggestion+1)
-		} else {
+		} else if !moveEditorCursorVertical(&model.editor, 1) {
 			editorHistory(&model.editor, 1)
 		}
 
-	case "left":
+	case "left", "ctrl+b":
 		model.editor.cursor = max(0, model.editor.cursor-1)
-	case "right":
+	case "right", "ctrl+f":
 		model.editor.cursor = min(len(model.editor.input), model.editor.cursor+1)
+	case "alt+left", "ctrl+left", "alt+b":
+		model.moveWord(-1)
+	case "alt+right", "ctrl+right", "alt+f":
+		model.moveWord(1)
 	case "home", "ctrl+a":
-		model.editor.cursor = 0
+		model.editor.cursor = editorLineStart(model.editor.input, model.editor.cursor)
 	case "end", "ctrl+e":
-		model.editor.cursor = len(model.editor.input)
+		model.editor.cursor = editorLineEnd(model.editor.input, model.editor.cursor)
 	case "pgup":
 		model.editor.scroll += 10
 	case "pgdown":
 		model.editor.scroll = max(0, model.editor.scroll-10)
+
+	case "shift+enter", "ctrl+j":
+		model.insertRunes([]rune{'\n'})
 
 	case "backspace":
 		if model.editor.cursor > 0 {
@@ -368,18 +413,61 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 		// Bubble Tea emits a dedicated KeySpace event for a single space,
 		// while pasted text (including spaces) arrives as KeyRunes.
 		if key.Type == tea.KeyRunes || key.Type == tea.KeySpace {
+			var input []rune
 			for _, r := range key.Runes {
-				if unicode.IsControl(r) {
-					continue
+				if !unicode.IsControl(r) {
+					input = append(input, r)
 				}
-				model.editor.input = append(model.editor.input, 0)
-				copy(model.editor.input[model.editor.cursor+1:], model.editor.input[model.editor.cursor:])
-				model.editor.input[model.editor.cursor] = r
-				model.editor.cursor++
 			}
-			model.editor.suggestion = 0
+			model.insertRunes(input)
 		}
 	}
+	return nil
+}
+
+func (model *fullscreenModel) cycleModel(direction int) {
+	if len(model.models) < 2 {
+		model.activity = "Only one model is available"
+		return
+	}
+	current := 0
+	for index, choice := range model.models {
+		if choice.current {
+			current = index
+			break
+		}
+	}
+	next := (current + direction + len(model.models)) % len(model.models)
+	if err := model.session.setModel(model.models[next].ref); err != nil {
+		model.notices = appendNotice(model.notices, "Error", err.Error())
+		return
+	}
+	for index := range model.models {
+		model.models[index].current = index == next
+	}
+	model.info = model.session.sessionInfo()
+	model.activity = "Model set to " + model.models[next].ref
+}
+
+func (model *fullscreenModel) submitFollowUp(streaming bool) tea.Cmd {
+	if !streaming {
+		return model.submitInput(false)
+	}
+	prompt := strings.TrimSpace(string(model.editor.input))
+	if prompt == "" {
+		return nil
+	}
+	model.editor.history = append(model.editor.history, prompt)
+	model.editor.historyIndex, model.editor.draft = -1, ""
+	model.clearInput()
+	if expanded, ok, err := model.session.expandResourceInput(prompt); err != nil {
+		model.notices = appendNotice(model.notices, "Error", err.Error())
+		return nil
+	} else if ok {
+		prompt = expanded
+	}
+	model.session.agent.FollowUp(userMessage(prompt))
+	model.activity = "Follow-up message queued"
 	return nil
 }
 
@@ -396,12 +484,25 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 	model.editor.historyIndex, model.editor.draft = -1, ""
 	model.clearInput()
 
+	if expanded, ok, expandErr := model.session.expandResourceInput(prompt); ok {
+		if expandErr != nil {
+			model.notices = appendNotice(model.notices, "Error", expandErr.Error())
+			model.activity = "Ready"
+			return nil
+		}
+		prompt = expanded
+	} else if expandErr != nil {
+		model.notices = appendNotice(model.notices, "Error", expandErr.Error())
+		model.activity = "Ready"
+		return nil
+	}
+
 	if strings.HasPrefix(prompt, "/") {
 		if prompt == "/exit" || prompt == "/quit" {
 			return tea.Quit
 		}
 		model.activity = "Running " + strings.Fields(prompt)[0]
-		if fullscreenCommandNeedsBrowser(prompt) {
+		if fullscreenCommandRunsAsync(prompt) {
 			model.busyCommand = true
 			model.activityAt = time.Now()
 			return func() tea.Msg {
@@ -450,9 +551,9 @@ func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 	return result.exit
 }
 
-func fullscreenCommandNeedsBrowser(prompt string) bool {
+func fullscreenCommandRunsAsync(prompt string) bool {
 	command := strings.Fields(prompt)[0]
-	return command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last"
+	return command == "/compact" || command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last"
 }
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
@@ -483,6 +584,77 @@ func (model *fullscreenModel) clearInput() {
 	model.editor.cursor = 0
 	model.editor.scroll = 0
 	model.editor.suggestion = 0
+}
+
+func (model *fullscreenModel) insertRunes(input []rune) {
+	if len(input) == 0 {
+		return
+	}
+	at := model.editor.cursor
+	model.editor.input = append(model.editor.input, make([]rune, len(input))...)
+	copy(model.editor.input[at+len(input):], model.editor.input[at:len(model.editor.input)-len(input)])
+	copy(model.editor.input[at:at+len(input)], input)
+	model.editor.cursor += len(input)
+	model.editor.suggestion = 0
+}
+
+func (model *fullscreenModel) moveWord(direction int) {
+	if direction < 0 {
+		for model.editor.cursor > 0 && unicode.IsSpace(model.editor.input[model.editor.cursor-1]) {
+			model.editor.cursor--
+		}
+		for model.editor.cursor > 0 && !unicode.IsSpace(model.editor.input[model.editor.cursor-1]) {
+			model.editor.cursor--
+		}
+		return
+	}
+	for model.editor.cursor < len(model.editor.input) && !unicode.IsSpace(model.editor.input[model.editor.cursor]) {
+		model.editor.cursor++
+	}
+	for model.editor.cursor < len(model.editor.input) && unicode.IsSpace(model.editor.input[model.editor.cursor]) {
+		model.editor.cursor++
+	}
+}
+
+func editorLineStart(input []rune, cursor int) int {
+	cursor = min(max(cursor, 0), len(input))
+	for cursor > 0 && input[cursor-1] != '\n' {
+		cursor--
+	}
+	return cursor
+}
+
+func editorLineEnd(input []rune, cursor int) int {
+	cursor = min(max(cursor, 0), len(input))
+	for cursor < len(input) && input[cursor] != '\n' {
+		cursor++
+	}
+	return cursor
+}
+
+func moveEditorCursorVertical(editor *fullscreenEditor, direction int) bool {
+	if !strings.ContainsRune(string(editor.input), '\n') {
+		return false
+	}
+	start := editorLineStart(editor.input, editor.cursor)
+	column := editor.cursor - start
+	if direction < 0 {
+		if start == 0 {
+			return false
+		}
+		previousEnd := start - 1
+		previousStart := editorLineStart(editor.input, previousEnd)
+		editor.cursor = min(previousStart+column, previousEnd)
+		return true
+	}
+	end := editorLineEnd(editor.input, editor.cursor)
+	if end >= len(editor.input) {
+		return false
+	}
+	nextStart := end + 1
+	nextEnd := editorLineEnd(editor.input, nextStart)
+	editor.cursor = min(nextStart+column, nextEnd)
+	return true
 }
 
 func (model *fullscreenModel) deleteAtCursor() {
@@ -573,6 +745,24 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			item.execute = false
 		}
 		suggestions = append(suggestions, item)
+	}
+	if session.resources != nil {
+		for _, template := range session.resources.Templates {
+			name := "/" + template.Name
+			if strings.HasPrefix(strings.ToLower(name), query) {
+				description := template.Description
+				if template.ArgumentHint != "" {
+					description = template.ArgumentHint + "  ·  " + description
+				}
+				suggestions = append(suggestions, fullscreenSuggestion{label: name, description: description, value: name, execute: true})
+			}
+		}
+		for _, skill := range session.resources.Skills {
+			name := "/skill:" + skill.Name
+			if strings.HasPrefix(strings.ToLower(name), query) {
+				suggestions = append(suggestions, fullscreenSuggestion{label: name, description: skill.Description, value: name, execute: true})
+			}
+		}
 	}
 	return suggestions
 }

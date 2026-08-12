@@ -9,6 +9,7 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/plannotator"
 	"goshcoder/internal/tui"
 )
 
@@ -41,7 +42,9 @@ var fullscreenSlashCommands = []slashCommand{
 	{"/messages", "Show transcript summary"},
 	{"/steer", "Guide the active response"}, {"/followup", "Queue the next message"},
 	{"/queue", "Show queued messages"}, {"/clear", "Clear the transcript"},
-	{"/new", "Start a fresh conversation"},
+	{"/new", "Start a fresh conversation"}, {"/compact", "Summarize older context"},
+	{"/reload", "Reload local resources"},
+	{"/resources", "Show loaded context, prompts, and skills"},
 	{"/plannotator", "Toggle planning mode"}, {"/plannotator-review", "Review code changes"},
 	{"/plannotator-annotate", "Annotate a target"}, {"/plannotator-last", "Annotate last response"},
 	{"/ralph", "Manage Ralph loops"}, {"/system", "Show or replace system prompt"},
@@ -110,8 +113,45 @@ func runFullscreenCommand(session *session, input string) fullscreenResult {
 }
 
 func fullscreenMessages(messages []agent.Message) []tui.Message {
+	toolResults := make(map[string]llm.ToolResultMessage)
+	unnamedResults := make(map[string][]llm.ToolResultMessage)
+	callCounts := make(map[string]int)
+	for _, message := range messages {
+		switch value := message.(type) {
+		case llm.AssistantMessage:
+			for _, block := range value.Content {
+				if call, ok := block.(llm.ToolCall); ok {
+					callCounts[call.Name]++
+				}
+			}
+		case *llm.AssistantMessage:
+			if value != nil {
+				for _, block := range value.Content {
+					if call, ok := block.(llm.ToolCall); ok {
+						callCounts[call.Name]++
+					}
+				}
+			}
+		case llm.ToolResultMessage:
+			if value.ToolCallID == "" {
+				unnamedResults[value.ToolName] = append(unnamedResults[value.ToolName], value)
+			} else {
+				toolResults[value.ToolCallID] = value
+			}
+		case *llm.ToolResultMessage:
+			if value != nil {
+				if value.ToolCallID == "" {
+					unnamedResults[value.ToolName] = append(unnamedResults[value.ToolName], *value)
+				} else {
+					toolResults[value.ToolCallID] = *value
+				}
+			}
+		}
+	}
+
 	result := make([]tui.Message, 0, len(messages))
 	for _, message := range messages {
+		var assistant *llm.AssistantMessage
 		switch value := message.(type) {
 		case llm.UserMessage:
 			result = append(result, tui.Message{Role: "user", Text: userText(value)})
@@ -120,22 +160,102 @@ func fullscreenMessages(messages []agent.Message) []tui.Message {
 				result = append(result, tui.Message{Role: "user", Text: userText(*value)})
 			}
 		case llm.AssistantMessage:
-			result = append(result, assistantTUIMessages(value)...)
+			assistant = &value
 		case *llm.AssistantMessage:
-			if value != nil {
-				result = append(result, assistantTUIMessages(*value)...)
-			}
+			assistant = value
 		case llm.ToolResultMessage:
-			if value.IsError {
-				result = append(result, tui.Message{Role: "Error", Text: value.ToolName + ": " + blockSummary(value.Content)})
+			if value.ToolCallID == "" && callCounts[value.ToolName] == 0 {
+				result = append(result, toolTUIMessage(llm.ToolCall{Name: value.ToolName}, &value))
 			}
 		case *llm.ToolResultMessage:
-			if value != nil && value.IsError {
-				result = append(result, tui.Message{Role: "Error", Text: value.ToolName + ": " + blockSummary(value.Content)})
+			if value != nil && value.ToolCallID == "" && callCounts[value.ToolName] == 0 {
+				result = append(result, toolTUIMessage(llm.ToolCall{Name: value.ToolName}, value))
+			}
+		}
+		if assistant == nil {
+			continue
+		}
+		result = append(result, assistantTUIMessages(*assistant)...)
+		for _, block := range assistant.Content {
+			if call, ok := block.(llm.ToolCall); ok {
+				toolResult, found := toolResults[call.ID]
+				if !found && len(unnamedResults[call.Name]) > 0 {
+					toolResult = unnamedResults[call.Name][0]
+					unnamedResults[call.Name] = unnamedResults[call.Name][1:]
+					found = true
+				}
+				if found {
+					result = append(result, toolTUIMessage(call, &toolResult))
+				} else {
+					result = append(result, toolTUIMessage(call, nil))
+				}
+			}
+		}
+	}
+	for name, pending := range unnamedResults {
+		for _, toolResult := range pending {
+			if toolResult.IsError {
+				result = append(result, toolTUIMessage(llm.ToolCall{Name: name}, &toolResult))
 			}
 		}
 	}
 	return result
+}
+
+func toolTUIMessage(call llm.ToolCall, result *llm.ToolResultMessage) tui.Message {
+	title := call.Name
+	arg := func(name string) string {
+		if call.Arguments == nil {
+			return ""
+		}
+		value, ok := call.Arguments[name]
+		if !ok || value == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+	switch call.Name {
+	case "read", "write", "edit", "ls", "list":
+		if path := arg("path"); path != "" {
+			title += " " + path
+		}
+	case "grep":
+		title += " /" + arg("pattern") + "/"
+		if path := arg("path"); path != "" {
+			title += " in " + path
+		}
+	case "find":
+		title += " " + arg("pattern")
+	case "bash":
+		if command := arg("command"); command != "" {
+			title += " " + firstLine(command)
+		}
+	case "plannotator_submit_plan":
+		if path := arg("filePath"); path != "" {
+			title = "submit plan " + path
+		}
+	default:
+		if summary := summarizeArgs(call.Arguments); summary != "" {
+			title += " " + summary
+		}
+	}
+	message := tui.Message{Role: "tool", Title: title}
+	if result == nil {
+		message.Text = "running…"
+		return message
+	}
+	message.IsError = result.IsError
+	message.Detail = blockSummary(result.Content)
+	if result.IsError {
+		message.Text = firstLine(message.Detail)
+		return message
+	}
+	switch call.Name {
+	case "bash", "grep", "find", "ls", "list", "plannotator_submit_plan":
+		lines := strings.Split(strings.TrimSpace(message.Detail), "\n")
+		message.Text = strings.Join(lines[:min(3, len(lines))], "\n")
+	}
+	return message
 }
 
 func userText(message llm.UserMessage) string {
@@ -168,35 +288,72 @@ func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	return result
 }
 
-func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string) []string {
-	contextText := compactNumber(info.ContextUsed)
-	if info.ContextLimit > 0 {
-		contextText += fmt.Sprintf("/%s  %d%%", compactNumber(info.ContextLimit), min(100, info.ContextUsed*100/info.ContextLimit))
-	}
-	branch := info.Branch
-	if branch == "" {
-		branch = "not a git repo"
+func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem) []string {
+	name := info.Name
+	if name == "" {
+		name = "New Session"
 	}
 	mode := info.Mode
 	if mode == "" {
 		mode = "normal"
 	}
-	activityLine := "● " + activity
-	if activity == "Ready" {
-		activityLine = "○ Ready"
+	percent := 0
+	if info.ContextLimit > 0 {
+		percent = min(100, info.ContextUsed*100/info.ContextLimit)
 	}
-	pendingLine := fmt.Sprintf("%d messages  ·  %d active tools", info.Messages, pendingTools)
-	if recentTool == "" {
-		recentTool = fmt.Sprintf("%d tools available", info.Tools)
+	contextText := fmt.Sprintf("%s tokens", compactNumber(info.ContextUsed))
+	if info.ContextLimit > 0 {
+		contextText = fmt.Sprintf("%s / %s tokens", compactNumber(info.ContextUsed), compactNumber(info.ContextLimit))
 	}
-	return []string{
-		"New Session", cwd, "",
-		"MODEL", "◇ " + info.Model, info.Thinking + " thinking  ·  " + mode,
-		contextText + fmt.Sprintf("  ·  $%.4f", info.Cost), "",
-		"ACTIVITY", activityLine, pendingLine, recentTool, "",
-		"WORKSPACE", fmt.Sprintf("%d changed files", info.ChangedFiles), "",
-		"GIT", branch,
+	lines := []string{
+		"title\t" + name,
+		"accent\t" + info.Model,
+		"meta\t" + info.Thinking + " thinking · " + mode,
+		"",
+		"section\tContext",
+		fmt.Sprintf("bar\t%d", percent),
+		"meta\t" + contextText,
+		fmt.Sprintf("meta\t%d%% used · $%.4f spent", percent, info.Cost),
 	}
+	if activity != "Ready" || pendingTools > 0 {
+		lines = append(lines, "", "section\tActivity", "active\t"+activity)
+		if pendingTools > 0 {
+			lines = append(lines, fmt.Sprintf("meta\t%d tool%s running", pendingTools, map[bool]string{true: "", false: "s"}[pendingTools == 1]))
+		}
+		if recentTool != "" {
+			lines = append(lines, "meta\t"+recentTool)
+		}
+	}
+	if len(items) > 0 {
+		lines = append(lines, "", "section\tTodo")
+		for _, item := range items {
+			state := "open"
+			if item.Completed {
+				state = "done"
+			}
+			lines = append(lines, "todo\t"+state+"\t"+item.Text)
+		}
+	}
+	if len(info.Changes) > 0 {
+		lines = append(lines, "", "section\tModified Files")
+		for index, change := range info.Changes {
+			if index >= 10 {
+				lines = append(lines, fmt.Sprintf("meta\t… %d more files", len(info.Changes)-index))
+				break
+			}
+			lines = append(lines, "file\t"+change.Status+"\t"+change.Path)
+		}
+	}
+	branch := info.Branch
+	if branch == "" {
+		branch = "not a git repo"
+	}
+	lines = append(lines,
+		"", "section\tWorkspace", "meta\t"+branch,
+		"path\t"+claudetui.FormatCWD(cwd), "",
+		"brand\t● GoshCoder "+Version,
+	)
+	return lines
 }
 
 func compactNumber(value int) string {

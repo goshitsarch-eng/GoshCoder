@@ -1,5 +1,5 @@
 // Package claudetui is a native adaptation of pi-claude-code-tui for
-// GoshCoder's line-oriented terminal interface.
+// GoshCoder's line-oriented and fullscreen terminal interfaces.
 package claudetui
 
 import (
@@ -15,7 +15,14 @@ const Version = "0.1.12-native"
 // SessionInfo is the compact, OpenCode-inspired status shown on the right of
 // the startup card and by /status. Values are prepared by the CLI so this
 // rendering package stays independent of the agent and git implementations.
+type ChangedFile struct {
+	Path   string
+	Status string
+}
+
+// SessionInfo contains the live local session metrics used by status views.
 type SessionInfo struct {
+	Name         string
 	Model        string
 	ContextUsed  int
 	ContextLimit int
@@ -23,6 +30,7 @@ type SessionInfo struct {
 	Messages     int
 	Tools        int
 	ChangedFiles int
+	Changes      []ChangedFile
 	Branch       string
 	Mode         string
 	Thinking     string

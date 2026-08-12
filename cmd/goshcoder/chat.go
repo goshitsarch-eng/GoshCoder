@@ -1,12 +1,9 @@
 package main
 
-// Interactive chat mode: the REPL equivalent of pi's TUI, reduced to a
-// line-oriented interface.
-//
-// pi renders a full-screen terminal UI. GoshCoder keeps the same session
-// semantics (queued steering, follow-ups, abort, runtime model and thinking
-// changes, ralph loops) behind slash commands, so no terminal-control layer is
-// needed and output stays pipeable.
+// Interactive chat mode uses the native Bubble Tea fullscreen interface on a
+// TTY and falls back to a pipeable line-oriented REPL. Both paths share queued
+// steering, follow-ups, aborts, runtime model/thinking changes, local resources,
+// compaction, and native extension commands.
 
 import (
 	"bufio"
@@ -19,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +44,9 @@ const chatHelp = `Slash commands:
   /followup <text>      Queue a follow-up message
   /queue                Show whether messages are queued
   /clear, /new          Start a fresh conversation
+  /compact [focus]      Summarize older context and keep recent turns
+  /reload               Reload context files, prompts, and skills
+  /resources            Show loaded local resources
   /ralph <subcommand>   Manage ralph loops (list, status, resume, stop)
   /plannotator          Toggle native Plannotator planning mode
   /plannotator-review [PR URL]  Review git changes or a GitHub PR
@@ -119,7 +120,7 @@ func chatCommand(args []string) error {
 			// The line-oriented UI cannot pin a panel over scrolling output. Refresh
 			// it automatically whenever model usage, tools, git, or mode changes.
 			currentSidebar := s.sessionInfo()
-			if currentSidebar != lastSidebar {
+			if !reflect.DeepEqual(currentSidebar, lastSidebar) {
 				fmt.Fprintln(os.Stderr)
 				for _, statusLine := range claudetui.Sidebar(min(terminalWidth(), 42), currentSidebar, colorEnabled()) {
 					fmt.Fprintln(os.Stderr, statusLine)
@@ -142,6 +143,17 @@ func chatCommand(args []string) error {
 
 		input := strings.TrimSpace(line)
 		if input == "" {
+			continue
+		}
+
+		if expanded, ok, expandErr := s.expandResourceInput(input); ok {
+			if expandErr != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", expandErr)
+				continue
+			}
+			input = expanded
+		} else if expandErr != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", expandErr)
 			continue
 		}
 
@@ -325,8 +337,10 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			fmt.Fprintln(os.Stderr, current)
 			return false, nil
 		}
-		s.baseSystemPrompt = rest
-		s.agent.SetSystemPrompt(rest)
+		s.explicitSystemPrompt = rest
+		if err := s.reloadResources(); err != nil {
+			return false, err
+		}
 		fmt.Fprintf(os.Stderr, "%s\n", dim("system prompt updated"))
 
 	case "/tools":
@@ -352,9 +366,12 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 
 	case "/hotkeys":
 		fmt.Fprintln(os.Stderr, `Enter       send or accept selection
-Up/Down     command/model navigation or prompt history
+Shift-Enter insert a newline (Ctrl-J where distinguishable)
+Up/Down     move between editor lines, palette items, or history
+Alt-←/→     move by word; Home/End move within the current line
 Tab         complete the selected command
 Shift-Tab   cycle model-supported thinking levels
+Ctrl-L      open model picker; Ctrl-O expand tools; Ctrl-T toggle thinking
 PgUp/PgDn   scroll transcript
 Esc         close palette or abort a response
 Ctrl-C      clear input, abort, or quit
@@ -386,6 +403,35 @@ Ctrl-D      quit when the editor is empty`)
 			return false, err
 		}
 		fmt.Fprintf(os.Stderr, "%s\n", dim("transcript cleared"))
+
+	case "/compact":
+		before, after, err := s.compactContext(rest)
+		if err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("compacted context: %d messages → summary + %d recent messages", before, after-1)))
+
+	case "/reload":
+		if err := s.reloadResources(); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", dim("reloaded context files, prompt templates, and skills"))
+
+	case "/resources":
+		if s.resources == nil {
+			fmt.Fprintln(os.Stderr, "No resources loaded.")
+			return false, nil
+		}
+		fmt.Fprintf(os.Stderr, "Context files: %d\nPrompt templates: %d\nSkills: %d\n", len(s.resources.ContextFiles), len(s.resources.Templates), len(s.resources.Skills))
+		for _, file := range s.resources.ContextFiles {
+			fmt.Fprintln(os.Stderr, "  "+file.Path)
+		}
+		for _, template := range s.resources.Templates {
+			fmt.Fprintln(os.Stderr, "  /"+template.Name+" — "+template.Description)
+		}
+		for _, skill := range s.resources.Skills {
+			fmt.Fprintln(os.Stderr, "  /skill:"+skill.Name+" — "+skill.Description)
+		}
 
 	case "/ralph":
 		return false, s.handleRalphSlashCommand(rest)
@@ -479,8 +525,9 @@ func (s *session) handleRalphSlashCommand(rest string) error {
 		if err := s.loops.Complete(state); err != nil {
 			return err
 		}
-		// A stopped loop should no longer steer the model.
-		s.agent.SetSystemPrompt(s.baseSystemPrompt)
+		// A stopped loop should no longer steer the model, while other active
+		// modes continue to contribute their instructions.
+		s.agent.SetSystemPrompt(s.runtimeSystemPrompt())
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("stopped %s at iteration %d", state.Name, state.Iteration)))
 
 	default:
@@ -517,7 +564,22 @@ func (s *session) sessionInfoRealtime() claudetui.SessionInfo {
 	if s.plan != nil && s.plan.State().Phase != plannotator.PhaseIdle {
 		info.Mode = string(s.plan.State().Phase)
 	}
+	hasCompaction := false
 	for _, message := range state.Messages {
+		if info.Name == "" {
+			switch value := message.(type) {
+			case llm.UserMessage:
+				info.Name = sessionTitle(userText(value))
+			case *llm.UserMessage:
+				if value != nil {
+					info.Name = sessionTitle(userText(*value))
+				}
+			}
+		}
+		switch message.(type) {
+		case compactionSummaryMessage, *compactionSummaryMessage:
+			hasCompaction = true
+		}
 		var assistant *llm.AssistantMessage
 		switch value := message.(type) {
 		case llm.AssistantMessage:
@@ -525,15 +587,23 @@ func (s *session) sessionInfoRealtime() claudetui.SessionInfo {
 		case *llm.AssistantMessage:
 			assistant = value
 		}
-		if assistant == nil {
-			continue
-		}
-		info.Cost += assistant.Usage.Cost.Total
-		if assistant.Usage.TotalTokens > 0 {
+		if assistant != nil && assistant.Usage.TotalTokens > 0 {
 			info.ContextUsed = assistant.Usage.TotalTokens
 		}
 	}
+	info.Cost = conversationCost(state.Messages)
+	if hasCompaction {
+		info.ContextUsed = estimateMessagesTokens(state.Messages)
+	}
 	return info
+}
+
+func sessionTitle(text string) string {
+	text = strings.TrimSpace(strings.ReplaceAll(text, "\n", " "))
+	if text == "" {
+		return ""
+	}
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func (s *session) enrichSessionGit(info *claudetui.SessionInfo) {
@@ -556,9 +626,26 @@ func (s *session) enrichSessionGit(info *claudetui.SessionInfo) {
 			}
 			if line != "" {
 				info.ChangedFiles++
+				status, path := parseGitStatusLine(line)
+				if path != "" && len(info.Changes) < 50 {
+					info.Changes = append(info.Changes, claudetui.ChangedFile{Path: path, Status: status})
+				}
 			}
 		}
 	}
+}
+
+func parseGitStatusLine(line string) (status, path string) {
+	if len(line) < 3 {
+		return "", ""
+	}
+	status = strings.TrimSpace(line[:2])
+	path = strings.TrimSpace(line[3:])
+	if _, renamed, ok := strings.Cut(path, " -> "); ok {
+		path = renamed
+	}
+	path = strings.Trim(path, `"`)
+	return status, filepath.ToSlash(path)
 }
 
 type limitedCommandOutput struct {

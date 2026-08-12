@@ -36,6 +36,27 @@ func TestBubbleTeaEditorUnicodeNavigation(t *testing.T) {
 	}
 }
 
+func TestBubbleTeaEditorMultilineNavigation(t *testing.T) {
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	tuiModel := &fullscreenModel{session: fullscreenTestSession(model, llm.ThinkingOff)}
+	tuiModel.setInput("short\na longer line\nlast")
+	tuiModel.editor.cursor = len([]rune("short\na long"))
+	if !moveEditorCursorVertical(&tuiModel.editor, -1) || tuiModel.editor.cursor != 5 {
+		t.Fatalf("up cursor = %d", tuiModel.editor.cursor)
+	}
+	if !moveEditorCursorVertical(&tuiModel.editor, 1) || tuiModel.editor.cursor != len([]rune("short\na lon")) {
+		t.Fatalf("down cursor = %d", tuiModel.editor.cursor)
+	}
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyHome})
+	if tuiModel.editor.cursor != len([]rune("short\n")) {
+		t.Fatalf("home cursor = %d", tuiModel.editor.cursor)
+	}
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnd})
+	if tuiModel.editor.cursor != len([]rune("short\na longer line")) {
+		t.Fatalf("end cursor = %d", tuiModel.editor.cursor)
+	}
+}
+
 func TestThinkingSuggestionsFollowModelCapabilities(t *testing.T) {
 	model := &llm.Model{
 		ID: "reasoner", Provider: "vendor", Reasoning: true,
@@ -152,13 +173,13 @@ func TestFullscreenTranscriptKeepsToolActivityCompact(t *testing.T) {
 		llm.ToolResultMessage{Role: "toolResult", ToolName: "edit", Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: "secret/file.go changed"}}},
 	}
 	visible := fullscreenMessages(messages)
-	if len(visible) != 1 || visible[0].Role != "assistant" || strings.Contains(visible[0].Text, "secret/file.go") {
+	if len(visible) != 2 || visible[0].Role != "assistant" || visible[1].Role != "tool" || !strings.Contains(visible[1].Title, "secret/file.go") {
 		t.Fatalf("visible transcript = %#v", visible)
 	}
 
 	messages = append(messages, llm.ToolResultMessage{Role: "toolResult", ToolName: "edit", IsError: true, Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: "permission denied"}}})
 	visible = fullscreenMessages(messages)
-	if len(visible) != 2 || visible[1].Role != "Error" {
+	if len(visible) != 3 || visible[2].Role != "tool" || !visible[2].IsError {
 		t.Fatalf("tool error missing from transcript: %#v", visible)
 	}
 }

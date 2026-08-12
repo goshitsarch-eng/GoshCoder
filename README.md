@@ -64,7 +64,7 @@ be pointed at either tool.
 | `internal/llm` | Wire protocols, message types, event stream, retry, partial-JSON |
 | `internal/llm/catalog` | Provider catalog, model data, credential store, auth resolution |
 | `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
-| `internal/tools` | Built-in tools (read, write, edit, list, bash) |
+| `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Plan mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
@@ -92,10 +92,12 @@ host, so selected extension features are native built-ins:
 
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
 - `@plannotator/pi-extension`: `/plannotator`, browser plan approval/denial with
-  line annotations, planning write gates, persisted phase state, checklist
-  progress, `/plannotator-review`, `/plannotator-annotate`, and
-  `/plannotator-last`. Use `-plan` to begin in planning mode. PR URL review
-  uses the optional GitHub CLI (`gh`); local git review needs only `git`.
+  line annotations, overall notes, direct Markdown edits, resubmission change
+  views, responsive navigation, light/dark themes, planning write gates,
+  persisted phase state, checklist progress, `/plannotator-review`,
+  `/plannotator-annotate`, and `/plannotator-last`. Use `-plan` to begin in
+  planning mode. PR URL review uses the optional GitHub CLI (`gh`); local git
+  review needs only `git`.
 - `pi-claude-code-tui`: startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
   tools, changed files, branch, and active mode. The panel refreshes
@@ -108,9 +110,28 @@ The visual extensions are implemented by GoshCoder's lightweight, Crush-inspired
 Bubble Tea TUI rather than pi's TypeScript runtime. Type `/` to open the command
 palette; arrows select an item, Tab completes it, and Enter accepts it. `/model`
 opens a searchable picker containing models from authenticated providers, while
-`/thinking` contains only levels supported by the active model. Transient 429/5xx
-provider failures are retried automatically; live tool progress stays in the
-sidebar instead of filling the transcript with file-operation details.
+`/thinking` contains only levels supported by the active model. The composer
+supports up to three visible lines (`Shift+Enter`/`Ctrl+J` inserts a newline),
+word navigation, and line-aware Home/End. Tool calls render as compact cards;
+`Ctrl+O` expands their output and `Ctrl+T` toggles thinking. `/compact [focus]`
+creates a Pi-style structured summary while retaining recent turns; the same
+compaction runs automatically near the active model's context limit. Transient
+429/5xx provider failures are retried automatically.
+
+## Local resources
+
+GoshCoder discovers Pi-compatible inert resources at startup and with `/reload`:
+
+- ancestor `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` instructions;
+- `SYSTEM.md` and `APPEND_SYSTEM.md` under the agent directory, `.pi`, or
+  `.goshcoder`;
+- Markdown prompt templates under `prompts/`, including frontmatter and
+  positional arguments;
+- Agent Skills (`SKILL.md`) under agent, project, and `.agents/skills`
+  locations, available as `/skill:<name>`.
+
+Use `/resources` to inspect what was loaded. GoshCoder generates Pi's coding
+system prompt when no explicit or local `SYSTEM.md` override exists.
 
 ## Deviations from pi
 
@@ -124,8 +145,13 @@ Documented at the top of each ported file. The notable ones:
   Code. Kimi also supports API-key authentication.
 - **Interface.** Interactive chat uses a Bubble Tea alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
-  editor, and responsive information sidebar. Redirected input/output
-  automatically falls back to the pipeable line-oriented interface.
+  multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
+  Redirected input/output automatically falls back to the pipeable line-oriented
+  interface.
+- **Session scope.** Runtime transcript clearing and context compaction are
+  implemented. Pi's persisted JSONL session tree, resume picker, branching,
+  HTML export/share, TypeScript plugin host, packages, LSP, and MCP management
+  are not yet implemented.
 
 ## Development
 

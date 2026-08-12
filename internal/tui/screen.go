@@ -2,7 +2,9 @@
 package tui
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -10,10 +12,14 @@ import (
 	charmterm "github.com/charmbracelet/x/term"
 )
 
-const background = "\x1b[48;2;13;24;31m"
+const background = "\x1b[48;2;10;10;10m"
+const panelBackground = "\x1b[48;2;20;20;20m"
+const userBackground = "\x1b[48;2;30;30;30m"
+const toolBackground = "\x1b[48;2;24;24;24m"
 const accent = "\x1b[38;2;255;172;92m"
 const violet = "\x1b[38;2;73;166;191m"
-const cyan = "\x1b[38;2;83;210;172m"
+const cyan = "\x1b[38;2;86;182;194m"
+const green = "\x1b[38;2;127;216;143m"
 const blue = "\x1b[38;2;112;174;221m"
 const amber = "\x1b[38;2;242;201;108m"
 const red = "\x1b[38;2;246;116;116m"
@@ -28,8 +34,11 @@ const reset = clearStyle + background
 
 // Message is one transcript entry rendered in the main viewport.
 type Message struct {
-	Role string
-	Text string
+	Role    string
+	Title   string
+	Text    string
+	Detail  string
+	IsError bool
 }
 
 // Frame is a complete immutable screen snapshot.
@@ -48,6 +57,8 @@ type Frame struct {
 	Thinking           string
 	Mode               string
 	VirtualCursor      bool
+	ToolsExpanded      bool
+	HideThinking       bool
 }
 
 // Supported reports whether Bubble Tea can safely use both files as a TTY.
@@ -66,11 +77,11 @@ func View(frame Frame, width, height int) string {
 }
 
 func renderFrame(frame Frame, width, height int) ([]string, int, int) {
-	useSidebar := width >= 100
+	useSidebar := width >= 96
 	sideWidth, gutter := 0, 0
 	if useSidebar {
-		sideWidth = min(36, width/3)
-		gutter = 3
+		sideWidth = min(42, max(32, width/3))
+		gutter = 1
 	}
 	mainWidth := width - sideWidth - gutter
 	mainLines := make([]string, height)
@@ -86,15 +97,18 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 	}
 	mainLines[1] = accent + "  · · · · · ·" + reset
 
-	bodyTop, bodyBottom := 2, height-5
-	bodyHeight := max(1, bodyBottom-bodyTop+1)
+	promptWidth := max(1, mainWidth-8)
+	editor := layoutEditor(frame.Input, frame.Cursor, promptWidth, frame.VirtualCursor)
+	composerTop := height - len(editor.lines) - 3
+	bodyTop, bodyBottom := 2, composerTop-1
+	bodyHeight := max(0, bodyBottom-bodyTop+1)
 	suggestionRows := min(len(frame.Suggestions), min(9, max(0, bodyHeight-2)))
 	paletteHeight := 0
 	if suggestionRows > 0 {
 		paletteHeight = suggestionRows + 2
 	}
 	transcriptHeight := max(0, bodyHeight-paletteHeight)
-	transcript := renderMessages(frame.Messages, mainWidth)
+	transcript := renderMessages(frame.Messages, mainWidth, frame.ToolsExpanded, frame.HideThinking)
 	start := max(0, len(transcript)-transcriptHeight-frame.Scroll)
 	end := min(len(transcript), start+transcriptHeight)
 	visible := transcript[start:end]
@@ -141,40 +155,19 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 		mainLines[bodyTop+row] = line
 	}
 
-	composerRow := height - 3
-	promptWidth := max(1, mainWidth-8)
-	cursor := min(max(frame.Cursor, 0), len(frame.Input))
-	beforeWidth := runeSliceWidth(frame.Input[:cursor])
-	windowStart := 0
-	for windowStart < cursor && beforeWidth-runeSliceWidth(frame.Input[:windowStart]) >= promptWidth {
-		windowStart++
+	borderWidth := max(2, mainWidth-4)
+	mainLines[composerTop] = cyan + "  ╭" + strings.Repeat("─", max(0, borderWidth-2)) + "╮" + reset
+	for index, editorLine := range editor.lines {
+		mainLines[composerTop+1+index] = textColor + "    " + editorLine + reset
 	}
-	shown := truncateRunes(frame.Input[windowStart:], promptWidth)
-	editorText := string(shown)
-	if len(frame.Input) == 0 {
-		placeholder := truncate("Tell GoshCoder what to build…  / for commands", max(1, promptWidth-2))
-		if frame.VirtualCursor {
-			editorText = "\x1b[7m \x1b[27m" + muted + " " + placeholder + reset
-		} else {
-			editorText = muted + placeholder + reset
-		}
-	} else if frame.VirtualCursor {
-		relative := cursor - windowStart
-		if relative < len(shown) {
-			editorText = string(shown[:relative]) + "\x1b[7m" + string(shown[relative:relative+1]) + "\x1b[27m" + string(shown[relative+1:])
-		} else {
-			editorText += "\x1b[7m \x1b[27m"
-		}
-	}
-	mainLines[composerRow] = cyan + bold + "  > " + reset + textColor + editorText + reset
-	mainLines[composerRow+1] = cyan + "  ┊" + reset
+	mainLines[composerTop+len(editor.lines)+1] = cyan + "  ╰" + strings.Repeat("─", max(0, borderWidth-2)) + "╯" + reset
 
 	status := safeTerminalText(frame.Status)
 	leftStatus := cyan + "  ● " + reset + muted + status + reset
 	if frame.Streaming {
 		leftStatus = accent + "  ● " + reset + textColor + status + reset
 	}
-	hints := "enter send  ·  shift-tab thinking  ·  pgup scroll  ·  ctrl+c quit"
+	hints := "enter send · shift+enter newline · ctrl+l model · / commands"
 	if frame.Streaming {
 		hints = "esc abort  ·  type to steer"
 	}
@@ -195,27 +188,91 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 			if row < len(sideLines) {
 				right = sideLines[row]
 			}
-			lines[row] = canvasLine(left+strings.Repeat(" ", gutter)+pad(right, sideWidth), width)
+			right = strings.ReplaceAll(right, reset, clearStyle+panelBackground)
+			right = panelBackground + pad(right, sideWidth) + clearStyle + background
+			lines[row] = canvasLine(left+strings.Repeat(" ", gutter)+right, width)
 		} else {
 			lines[row] = canvasLine(left, width)
 		}
 	}
-	cursorCol := 5 + runeSliceWidth(frame.Input[windowStart:cursor])
-	return lines, composerRow + 1, min(mainWidth, cursorCol)
+	cursorRow := composerTop + 1 + editor.cursorRow
+	return lines, cursorRow + 1, min(mainWidth, 5+editor.cursorCol)
+}
+
+type editorLayout struct {
+	lines     []string
+	cursorRow int
+	cursorCol int
+}
+
+func layoutEditor(input []rune, cursor, width int, virtualCursor bool) editorLayout {
+	cursor = min(max(cursor, 0), len(input))
+	logical := strings.Split(string(input), "\n")
+	cursorLine, cursorInLine := 0, 0
+	for index := 0; index < cursor; index++ {
+		if input[index] == '\n' {
+			cursorLine++
+			cursorInLine = 0
+		} else {
+			cursorInLine++
+		}
+	}
+	if len(logical) == 0 {
+		logical = []string{""}
+	}
+	cursorLine = min(cursorLine, len(logical)-1)
+	startLine := max(0, cursorLine-2)
+	if len(logical)-startLine < 3 {
+		startLine = max(0, len(logical)-3)
+	}
+	endLine := min(len(logical), startLine+3)
+	visible := logical[startLine:endLine]
+	layout := editorLayout{lines: make([]string, len(visible)), cursorRow: cursorLine - startLine}
+	for visibleIndex, raw := range visible {
+		runes := []rune(raw)
+		lineIndex := startLine + visibleIndex
+		lineCursor := 0
+		if lineIndex == cursorLine {
+			lineCursor = min(cursorInLine, len(runes))
+		}
+		windowStart := 0
+		if lineIndex == cursorLine {
+			beforeWidth := runeSliceWidth(runes[:lineCursor])
+			for windowStart < lineCursor && beforeWidth-runeSliceWidth(runes[:windowStart]) >= width {
+				windowStart++
+			}
+		}
+		shown := truncateRunes(runes[windowStart:], width)
+		text := string(shown)
+		if lineIndex == cursorLine {
+			relative := lineCursor - windowStart
+			layout.cursorCol = runeSliceWidth(runes[windowStart:lineCursor])
+			if virtualCursor {
+				if relative < len(shown) {
+					text = string(shown[:relative]) + accent + "\x1b[7m" + string(shown[relative:relative+1]) + "\x1b[27m" + textColor + string(shown[relative+1:])
+				} else {
+					text += accent + "\x1b[7m \x1b[27m" + textColor
+				}
+			}
+		}
+		layout.lines[visibleIndex] = text
+	}
+	if len(input) == 0 {
+		placeholder := truncate("Tell GoshCoder what to build…  / for commands", max(1, width-2))
+		if virtualCursor {
+			layout.lines[0] = accent + "\x1b[7m \x1b[27m" + muted + " " + placeholder + reset
+		} else {
+			layout.lines[0] = muted + placeholder + reset
+		}
+	}
+	return layout
 }
 
 func renderSidebar(sidebar []string, width, height int) []string {
 	if width == 0 {
 		return nil
 	}
-	lines := []string{
-		violet + "  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱" + reset,
-		accent + bold + "  █▀▀ █▀█ █▀▀ █ █" + reset,
-		cyan + bold + "  █▄█ █▄█ ▄▄█ █▀█" + reset,
-		muted + "             C O D E R" + reset,
-		violet + "  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱" + reset,
-		"",
-	}
+	lines := []string{""}
 	for _, line := range sidebar {
 		lines = append(lines, styleSidebarLine(line, width))
 	}
@@ -225,47 +282,82 @@ func renderSidebar(sidebar []string, width, height int) []string {
 	return lines
 }
 
-func renderMessages(messages []Message, width int) []string {
+func renderMessages(messages []Message, width int, toolsExpanded, hideThinking bool) []string {
 	var lines []string
 	for _, message := range messages {
-		if strings.TrimSpace(message.Text) == "" {
+		if strings.TrimSpace(message.Text) == "" && strings.TrimSpace(message.Title) == "" {
 			continue
 		}
 		switch message.Role {
 		case "user":
-			lines = append(lines, accent+"  │ "+reset+muted+"YOU"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-7), "user") {
-				lines = append(lines, accent+"  │ "+reset+textColor+line+reset)
+			contentWidth := max(1, width-6)
+			lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
+			for _, line := range renderRichText(message.Text, contentWidth, "user") {
+				line = strings.ReplaceAll(line, reset, clearStyle+userBackground)
+				lines = append(lines, "  "+userBackground+" "+pad(line, contentWidth)+" "+reset)
 			}
+			lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
 		case "assistant":
-			lines = append(lines, violet+"  ◆ "+reset+bold+textColor+"GOSHCODER"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-5), "assistant") {
-				lines = append(lines, "    "+line)
+			for _, line := range renderRichText(strings.TrimSpace(message.Text), max(1, width-4), "assistant") {
+				lines = append(lines, "  "+line)
 			}
 		case "thinking":
-			lines = append(lines, amber+"  ◌ "+reset+muted+"THINKING"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-7), "thinking") {
-				lines = append(lines, muted+"  ┊ "+line+reset)
+			if hideThinking {
+				lines = append(lines, muted+dim+"  Thinking…"+reset)
+				break
+			}
+			for _, line := range renderRichText(strings.TrimSpace(message.Text), max(1, width-4), "thinking") {
+				lines = append(lines, muted+"\x1b[3m  "+line+"\x1b[23m"+reset)
 			}
 		case "tool":
-			lines = append(lines, cyan+"  ✓ "+reset+textColor+"Tool"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-7), "tool") {
-				lines = append(lines, faint+"  ┊ "+reset+muted+line+reset)
+			boxWidth := max(1, width-4)
+			icon, titleColor := "✓", cyan
+			if message.IsError {
+				icon, titleColor = "×", red
+			}
+			title := strings.TrimSpace(message.Title)
+			if title == "" {
+				title = "tool"
+			}
+			header := titleColor + icon + " " + bold + truncate(title, max(1, boxWidth-4)) + reset
+			lines = append(lines, "  "+toolBackground+" "+pad(header, max(1, boxWidth-2))+" "+reset)
+			detail := strings.TrimSpace(message.Text)
+			if toolsExpanded || message.IsError {
+				if strings.TrimSpace(message.Detail) != "" {
+					detail = strings.TrimSpace(message.Detail)
+				}
+			}
+			if detail != "" {
+				maxLines := 3
+				if toolsExpanded || message.IsError {
+					maxLines = 20
+				}
+				rendered := renderRichText(detail, max(1, boxWidth-4), "tool")
+				for index, line := range rendered {
+					line = strings.ReplaceAll(line, reset, clearStyle+toolBackground)
+					if index >= maxLines {
+						remaining := len(rendered) - index
+						more := fmt.Sprintf("… %d more lines (ctrl+o to expand)", remaining)
+						lines = append(lines, "  "+toolBackground+" "+muted+pad(more, max(1, boxWidth-2))+reset)
+						break
+					}
+					lines = append(lines, "  "+toolBackground+" "+muted+pad("  "+line, max(1, boxWidth-2))+reset)
+				}
 			}
 		case "Error":
-			lines = append(lines, red+bold+"  × ERROR"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-5), "error") {
-				lines = append(lines, red+"    "+line+reset)
+			lines = append(lines, red+bold+"  Error"+reset)
+			for _, line := range renderRichText(message.Text, max(1, width-4), "error") {
+				lines = append(lines, red+"  "+line+reset)
 			}
 		case "Command":
-			lines = append(lines, violet+"  ◇ "+reset+muted+"COMMAND"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-5), "command") {
-				lines = append(lines, textColor+"    "+line+reset)
+			lines = append(lines, violet+"  ◇ "+reset+muted+"Command"+reset)
+			for _, line := range renderRichText(message.Text, max(1, width-4), "command") {
+				lines = append(lines, textColor+"  "+line+reset)
 			}
 		default:
 			lines = append(lines, cyan+"  i "+reset+muted+strings.ToUpper(message.Role)+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-5), "notice") {
-				lines = append(lines, muted+"    "+line+reset)
+			for _, line := range renderRichText(message.Text, max(1, width-4), "notice") {
+				lines = append(lines, muted+"  "+line+reset)
 			}
 		}
 		lines = append(lines, "")
@@ -331,21 +423,88 @@ func renderRichText(source string, width int, role string) []string {
 
 func styleSidebarLine(line string, width int) string {
 	plain := safeTerminalText(line)
-	trimmed := strings.TrimSpace(plain)
-	if trimmed == "" {
+	if strings.TrimSpace(plain) == "" {
 		return ""
 	}
-	if trimmed == strings.ToUpper(trimmed) {
-		label := " " + trimmed + " "
-		return muted + "  " + label + faint + strings.Repeat("─", max(0, width-lipgloss.Width(label)-4)) + reset
+	parts := strings.Split(plain, "\t")
+	kind := parts[0]
+	value := ""
+	if len(parts) > 1 {
+		value = strings.TrimSpace(parts[1])
 	}
-	if strings.HasPrefix(trimmed, "◇") {
-		return violet + "  " + trimmed + reset
+	available := max(1, width-5)
+	switch kind {
+	case "title":
+		return textColor + bold + "  " + truncate(value, available) + reset
+	case "section":
+		return textColor + bold + "  " + truncate(value, available) + reset
+	case "accent":
+		return accent + "  " + truncate(value, available) + reset
+	case "active":
+		return green + "  ● " + reset + textColor + truncate(value, max(1, width-7)) + reset
+	case "meta":
+		return muted + "  " + truncate(value, available) + reset
+	case "path":
+		return muted + "  " + truncateLeft(value, available) + reset
+	case "brand":
+		return green + "  " + truncate(value, available) + reset
+	case "bar":
+		percent, _ := strconv.Atoi(value)
+		cells := max(4, width-9)
+		filled := min(cells, max(0, percent*cells/100))
+		return accent + "  " + strings.Repeat("━", filled) + faint + strings.Repeat("━", cells-filled) + reset
+	case "todo":
+		state, text := "open", ""
+		if len(parts) > 1 {
+			state = parts[1]
+		}
+		if len(parts) > 2 {
+			text = parts[2]
+		}
+		if state == "done" {
+			return green + "  ☑ " + reset + muted + truncate(text, max(1, width-7)) + reset
+		}
+		return muted + "  ☐ " + reset + textColor + truncate(text, max(1, width-7)) + reset
+	case "file":
+		status, path := "", ""
+		if len(parts) > 1 {
+			status = parts[1]
+		}
+		if len(parts) > 2 {
+			path = parts[2]
+		}
+		statusColor := amber
+		if strings.Contains(status, "?") || strings.Contains(status, "A") {
+			statusColor = green
+		} else if strings.Contains(status, "D") {
+			statusColor = red
+		}
+		return statusColor + "  " + pad(truncate(status, 2), 2) + " " + reset + muted + truncateLeft(path, max(1, width-8)) + reset
+	default:
+		return muted + "  " + truncate(strings.TrimSpace(plain), available) + reset
 	}
-	if strings.HasPrefix(trimmed, "●") {
-		return cyan + "  " + trimmed + reset
+}
+
+func truncateLeft(text string, width int) string {
+	text = safeTerminalText(stripANSI(text))
+	if lipgloss.Width(text) <= width {
+		return text
 	}
-	return muted + "  " + truncate(trimmed, max(1, width-4)) + reset
+	if width <= 1 {
+		return "…"
+	}
+	runes := []rune(text)
+	start := len(runes)
+	cells := 1
+	for start > 0 {
+		next := runeWidth(runes[start-1])
+		if cells+next > width {
+			break
+		}
+		cells += next
+		start--
+	}
+	return "…" + string(runes[start:])
 }
 
 func canvasLine(text string, width int) string {

@@ -47,6 +47,10 @@ type Reviewer interface {
 	Review(ctx context.Context, title, markdown string) (Decision, error)
 }
 
+type versionedReviewer interface {
+	ReviewVersion(ctx context.Context, title, markdown, previous string) (Decision, error)
+}
+
 type State struct {
 	Phase    Phase           `json:"phase"`
 	PlanPath string          `json:"planPath,omitempty"`
@@ -54,11 +58,12 @@ type State struct {
 }
 
 type Manager struct {
-	mu        sync.Mutex
-	root      string
-	state     State
-	reviewer  Reviewer
-	stateFile string
+	mu               sync.Mutex
+	root             string
+	state            State
+	reviewer         Reviewer
+	stateFile        string
+	lastReviewedPlan string
 }
 
 func New(root, stateFile string, reviewer Reviewer) (*Manager, error) {
@@ -219,13 +224,23 @@ func (m *Manager) Submit(ctx context.Context, inputPath string) (agent.ToolResul
 
 	decision := Decision{Approved: true}
 	if m.reviewer != nil {
-		decision, err = m.reviewer.Review(ctx, "Review plan: "+filepath.Base(inputPath), string(content))
+		m.mu.Lock()
+		previous := m.lastReviewedPlan
+		m.mu.Unlock()
+		if reviewer, ok := m.reviewer.(versionedReviewer); ok {
+			decision, err = reviewer.ReviewVersion(ctx, "Review plan: "+filepath.Base(inputPath), string(content), previous)
+		} else {
+			decision, err = m.reviewer.Review(ctx, "Review plan: "+filepath.Base(inputPath), string(content))
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return textResult("Plan review was cancelled. The plan was not approved; resubmit to review again."), nil
 			}
 			return agent.ToolResult{}, err
 		}
+		m.mu.Lock()
+		m.lastReviewedPlan = string(content)
+		m.mu.Unlock()
 	}
 	if !decision.Approved {
 		feedback := strings.TrimSpace(decision.Feedback)

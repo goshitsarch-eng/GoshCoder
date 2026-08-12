@@ -1,20 +1,23 @@
 // Package tools provides the built-in coding tools the agent exposes to models.
 //
-// These mirror the intent of pi's coding-agent tools (read, write, edit, bash,
-// list) with the same guardrails: paths are confined to the workspace root, and
+// These mirror pi's coding-agent tools (read, write, edit, bash, grep, find,
+// and ls) with the same guardrails: paths are confined to the workspace root, and
 // edits require an exact unique match.
 package tools
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +35,11 @@ const maxOutputBytes = 30 * 1024
 // maxEditBytes prevents an edit request from loading an unexpectedly huge
 // file into memory. Large files should be changed with a purpose-built tool.
 const maxEditBytes = 10 * 1024 * 1024
+
+const (
+	maxCandidateBytes = 8 * 1024 * 1024
+	maxCandidateFiles = 100_000
+)
 
 // Workspace confines tool file access to a single directory tree.
 type Workspace struct {
@@ -143,6 +151,12 @@ func (w *cappedOutput) Write(p []byte) (int, error) {
 	return originalLength, nil
 }
 
+func (w *cappedOutput) Truncated() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.truncated
+}
+
 func (w *cappedOutput) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -153,7 +167,7 @@ func (w *cappedOutput) String() string {
 	return text
 }
 
-// All returns the built-in tool set for a workspace.
+// All returns pi's seven built-in tools for a workspace.
 func (w *Workspace) All() []agent.Tool {
 	return append(w.Planning(), w.BashTool())
 }
@@ -162,7 +176,7 @@ func (w *Workspace) All() []agent.Tool {
 // intentionally excluded because shell commands can bypass markdown-only
 // write restrictions.
 func (w *Workspace) Planning() []agent.Tool {
-	return []agent.Tool{w.ReadTool(), w.WriteTool(), w.EditTool(), w.ListTool()}
+	return []agent.Tool{w.ReadTool(), w.WriteTool(), w.EditTool(), w.LsTool(), w.GrepTool(), w.FindTool()}
 }
 
 // ReadTool reads a UTF-8 text file.
@@ -174,7 +188,9 @@ func (w *Workspace) ReadTool() agent.Tool {
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path": {"type": "string", "description": "File path, relative to the workspace root"}
+				"path": {"type": "string", "description": "File path, relative to the workspace root"},
+				"offset": {"type": "number", "description": "Line number to start reading from (1-indexed)"},
+				"limit": {"type": "number", "description": "Maximum number of lines to read"}
 			},
 			"required": ["path"]
 		}`),
@@ -184,15 +200,39 @@ func (w *Workspace) ReadTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			content, truncated, err := w.readLimited(resolved, maxReadBytes)
+			content, _, err := w.readLimited(resolved, maxReadBytes*40)
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			text := string(content)
-			if truncated {
-				text += fmt.Sprintf("\n\n[truncated: showing first %d bytes]", maxReadBytes)
+			lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+			offset := numericParam(params["offset"], 1)
+			if offset < 1 {
+				offset = 1
 			}
-			return textResult(text), nil
+			if offset > len(lines) {
+				return agent.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", offset, len(lines))
+			}
+			end := len(lines)
+			if limit := numericParam(params["limit"], 0); limit > 0 {
+				end = min(end, offset-1+limit)
+			}
+			selected := strings.Join(lines[offset-1:end], "\n")
+			truncated := false
+			if len(selected) > maxReadBytes {
+				selected = selected[:maxReadBytes]
+				if cut := strings.LastIndexByte(selected, '\n'); cut >= 0 {
+					selected = selected[:cut]
+				}
+				truncated = true
+			}
+			shownLines := strings.Count(selected, "\n") + 1
+			lastLine := offset + shownLines - 1
+			if truncated {
+				selected += fmt.Sprintf("\n\n[truncated: showing at most %d bytes from line %d]", maxReadBytes, offset)
+			} else if lastLine < len(lines) {
+				selected += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", offset, lastLine, len(lines), lastLine+1)
+			}
+			return textResult(selected), nil
 		},
 	}
 }
@@ -331,10 +371,329 @@ func (w *Workspace) ListTool() agent.Tool {
 	}
 }
 
+// LsTool lists directory entries using pi's built-in tool name.
+func (w *Workspace) LsTool() agent.Tool {
+	tool := w.ListTool()
+	tool.Name = "ls"
+	tool.Label = "ls"
+	tool.Description = "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles."
+	tool.Parameters = json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"path":{"type":"string","description":"Directory to list (default: current directory)"},
+			"limit":{"type":"number","description":"Maximum number of entries (default: 500)"}
+		}
+	}`)
+	original := tool.Execute
+	tool.Execute = func(ctx context.Context, id string, params map[string]any, onUpdate func(agent.ToolResult)) (agent.ToolResult, error) {
+		result, err := original(ctx, id, params, onUpdate)
+		if err != nil {
+			return result, err
+		}
+		limit := numericParam(params["limit"], 500)
+		if limit <= 0 {
+			limit = 500
+		}
+		if len(result.Content) == 0 {
+			return result, nil
+		}
+		text, ok := result.Content[0].(llm.TextContent)
+		if !ok {
+			return result, nil
+		}
+		lines := strings.Split(text.Text, "\n")
+		if len(lines) > limit {
+			text.Text = strings.Join(lines[:limit], "\n") + fmt.Sprintf("\n\n[%d entries limit reached]", limit)
+			result.Content[0] = text
+		}
+		return result, nil
+	}
+	return tool
+}
+
+// GrepTool searches text files while using git's file list when available so
+// ignored files match pi's behavior without requiring a bundled ripgrep.
+func (w *Workspace) GrepTool() agent.Tool {
+	return agent.Tool{
+		Name: "grep", Label: "grep",
+		Description: "Search file contents for a regex or literal string. Returns matching lines with file paths and line numbers. Respects .gitignore in git workspaces. Output is limited to 100 matches by default.",
+		Parameters: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"pattern":{"type":"string","description":"Search pattern (regex or literal string)"},
+				"path":{"type":"string","description":"Directory or file to search (default: current directory)"},
+				"glob":{"type":"string","description":"Filter files by glob pattern"},
+				"ignoreCase":{"type":"boolean","description":"Case-insensitive search"},
+				"literal":{"type":"boolean","description":"Treat pattern as a literal string"},
+				"context":{"type":"number","description":"Lines before and after each match"},
+				"limit":{"type":"number","description":"Maximum matches (default: 100)"}
+			},
+			"required":["pattern"]
+		}`),
+		Execute: func(ctx context.Context, _ string, params map[string]any, _ func(agent.ToolResult)) (agent.ToolResult, error) {
+			pattern, _ := params["pattern"].(string)
+			if pattern == "" {
+				return agent.ToolResult{}, errors.New("pattern is required")
+			}
+			if literal, _ := params["literal"].(bool); literal {
+				pattern = regexp.QuoteMeta(pattern)
+			}
+			if ignoreCase, _ := params["ignoreCase"].(bool); ignoreCase {
+				pattern = "(?i)" + pattern
+			}
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				return agent.ToolResult{}, fmt.Errorf("invalid pattern: %w", err)
+			}
+			searchPath, _ := params["path"].(string)
+			if searchPath == "" {
+				searchPath = "."
+			}
+			resolved, err := w.resolve(searchPath)
+			if err != nil {
+				return agent.ToolResult{}, err
+			}
+			files, err := w.candidateFiles(ctx, resolved)
+			if err != nil {
+				return agent.ToolResult{}, err
+			}
+			glob, _ := params["glob"].(string)
+			limit := numericParam(params["limit"], 100)
+			if limit <= 0 {
+				limit = 100
+			}
+			contextLines := numericParam(params["context"], 0)
+			if contextLines < 0 {
+				contextLines = 0
+			}
+			var output []string
+			matches := 0
+			for _, file := range files {
+				if ctx.Err() != nil {
+					return agent.ToolResult{}, ctx.Err()
+				}
+				if glob != "" && !globMatches(glob, filepath.ToSlash(file)) {
+					continue
+				}
+				content, truncated, readErr := w.readLimited(file, 4*1024*1024)
+				if readErr != nil || truncated || strings.IndexByte(string(content), 0) >= 0 {
+					continue
+				}
+				lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+				for index, line := range lines {
+					if !re.MatchString(line) {
+						continue
+					}
+					matches++
+					start, end := max(0, index-contextLines), min(len(lines)-1, index+contextLines)
+					for row := start; row <= end; row++ {
+						separator := "-"
+						if row == index {
+							separator = ":"
+						}
+						value := lines[row]
+						if len(value) > 2000 {
+							value = value[:2000] + "…"
+						}
+						output = append(output, fmt.Sprintf("%s%s%d%s %s", filepath.ToSlash(file), separator, row+1, separator, value))
+					}
+					if matches >= limit {
+						output = append(output, fmt.Sprintf("\n[%d matches limit reached. Refine the pattern or increase limit.]", limit))
+						return textResult(strings.Join(output, "\n")), nil
+					}
+				}
+			}
+			if len(output) == 0 {
+				return textResult("No matches found"), nil
+			}
+			return textResult(strings.Join(output, "\n")), nil
+		},
+	}
+}
+
+// FindTool searches workspace paths by glob and respects gitignore when git
+// can provide the candidate list.
+func (w *Workspace) FindTool() agent.Tool {
+	return agent.Tool{
+		Name: "find", Label: "find",
+		Description: "Search for files by glob pattern. Returns paths relative to the search directory and respects .gitignore. Output is limited to 1000 results by default.",
+		Parameters: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"pattern":{"type":"string","description":"Glob pattern such as '*.go' or 'internal/**/*.go'"},
+				"path":{"type":"string","description":"Directory to search (default: current directory)"},
+				"limit":{"type":"number","description":"Maximum results (default: 1000)"}
+			},
+			"required":["pattern"]
+		}`),
+		Execute: func(ctx context.Context, _ string, params map[string]any, _ func(agent.ToolResult)) (agent.ToolResult, error) {
+			pattern, _ := params["pattern"].(string)
+			if pattern == "" {
+				return agent.ToolResult{}, errors.New("pattern is required")
+			}
+			searchPath, _ := params["path"].(string)
+			if searchPath == "" {
+				searchPath = "."
+			}
+			resolved, err := w.resolve(searchPath)
+			if err != nil {
+				return agent.ToolResult{}, err
+			}
+			files, err := w.candidateFiles(ctx, resolved)
+			if err != nil {
+				return agent.ToolResult{}, err
+			}
+			limit := numericParam(params["limit"], 1000)
+			if limit <= 0 {
+				limit = 1000
+			}
+			var matches []string
+			limited := false
+			for _, file := range files {
+				relative := filepath.ToSlash(file)
+				if resolved != "." {
+					relative = strings.TrimPrefix(relative, filepath.ToSlash(resolved)+"/")
+				}
+				if globMatches(pattern, relative) {
+					matches = append(matches, relative)
+					if len(matches) >= limit {
+						limited = true
+						break
+					}
+				}
+			}
+			if len(matches) == 0 {
+				return textResult("No files found matching pattern"), nil
+			}
+			sort.Strings(matches)
+			if limited {
+				matches = append(matches, fmt.Sprintf("\n[%d results limit reached. Refine the pattern or increase limit.]", limit))
+			}
+			return textResult(strings.Join(matches, "\n")), nil
+		},
+	}
+}
+
+func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]string, error) {
+	info, err := w.root.Stat(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode().IsRegular() {
+		return []string{resolved}, nil
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("not a regular file or directory: %s", resolved)
+	}
+
+	// git ls-files includes tracked and untracked files while applying the
+	// repository's complete ignore stack. Fall back to a conservative walk.
+	gitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(gitCtx, "git", "ls-files", "-co", "--exclude-standard", "--", resolved)
+	command.Dir = w.Root
+	command.WaitDelay = time.Second
+	output := cappedOutput{limit: maxCandidateBytes}
+	command.Stdout = &output
+	if commandErr := command.Run(); commandErr == nil {
+		if output.Truncated() {
+			return nil, fmt.Errorf("candidate file list exceeds %d bytes", maxCandidateBytes)
+		}
+		var files []string
+		for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+			line = filepath.Clean(line)
+			if line != "." && line != "" {
+				files = append(files, line)
+				if len(files) > maxCandidateFiles {
+					return nil, fmt.Errorf("candidate file list exceeds %d files", maxCandidateFiles)
+				}
+			}
+		}
+		sort.Strings(files)
+		return files, nil
+	}
+
+	var files []string
+	start := filepath.Join(w.Root, resolved)
+	err = filepath.WalkDir(start, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if entry.IsDir() {
+			if path != start && (entry.Name() == ".git" || entry.Name() == "node_modules") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		relative, relErr := filepath.Rel(w.Root, path)
+		if relErr == nil {
+			files = append(files, relative)
+			if len(files) > maxCandidateFiles {
+				return fmt.Errorf("candidate file list exceeds %d files", maxCandidateFiles)
+			}
+		}
+		return nil
+	})
+	sort.Strings(files)
+	return files, err
+}
+
+func globMatches(pattern, name string) bool {
+	pattern = filepath.ToSlash(pattern)
+	name = filepath.ToSlash(name)
+	var expression strings.Builder
+	expression.WriteByte('^')
+	for index := 0; index < len(pattern); index++ {
+		switch pattern[index] {
+		case '*':
+			if index+1 < len(pattern) && pattern[index+1] == '*' {
+				index++
+				if index+1 < len(pattern) && pattern[index+1] == '/' {
+					index++
+					expression.WriteString("(?:.*/)?")
+				} else {
+					expression.WriteString(".*")
+				}
+			} else {
+				expression.WriteString("[^/]*")
+			}
+		case '?':
+			expression.WriteString("[^/]")
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+		}
+	}
+	expression.WriteByte('$')
+	matched, _ := regexp.MatchString(expression.String(), name)
+	if matched {
+		return true
+	}
+	// A basename-only pattern applies at every depth, matching fd/rg globs.
+	return !strings.Contains(pattern, "/") && regexp.MustCompile(expression.String()).MatchString(filepath.Base(name))
+}
+
+func numericParam(value any, fallback int) int {
+	switch number := value.(type) {
+	case int:
+		return number
+	case float64:
+		return int(number)
+	case json.Number:
+		parsed, err := strconv.Atoi(number.String())
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
 // BashTool runs a shell command in the workspace.
 //
-// SECURITY: this executes arbitrary commands with the user's privileges. It is
-// the reason the CLI requires an explicit opt-in flag before enabling tools.
+// SECURITY: this executes arbitrary commands with the user's privileges. Chat
+// enables coding tools by default; callers can explicitly choose read-only mode.
 func (w *Workspace) BashTool() agent.Tool {
 	return agent.Tool{
 		Name:  "bash",

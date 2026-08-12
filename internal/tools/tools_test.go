@@ -235,6 +235,59 @@ func TestEditRejectsEmptyOldText(t *testing.T) {
 	}
 }
 
+func TestReadToolSupportsOffsetAndLimit(t *testing.T) {
+	workspace := newTestWorkspace(t)
+	if err := os.WriteFile(filepath.Join(workspace.Root, "lines.txt"), []byte("one\ntwo\nthree\nfour\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := runTool(t, workspace.ReadTool(), map[string]any{"path": "lines.txt", "offset": 2.0, "limit": 2.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, "two\nthree") || !strings.Contains(got, "offset=4") {
+		t.Fatalf("read = %q", got)
+	}
+}
+
+func TestSearchAndLsTools(t *testing.T) {
+	workspace := newTestWorkspace(t)
+	if err := os.MkdirAll(filepath.Join(workspace.Root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.Root, "src", "main.go"), []byte("package main\n// Needle\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	found, err := runTool(t, workspace.FindTool(), map[string]any{"pattern": "**/*.go"})
+	if err != nil || !strings.Contains(found, "src/main.go") {
+		t.Fatalf("find = %q, %v", found, err)
+	}
+	matched, err := runTool(t, workspace.GrepTool(), map[string]any{"pattern": "needle", "ignoreCase": true})
+	if err != nil || !strings.Contains(matched, "src/main.go:2:") {
+		t.Fatalf("grep = %q, %v", matched, err)
+	}
+	listed, err := runTool(t, workspace.LsTool(), map[string]any{"path": "src"})
+	if err != nil || !strings.Contains(listed, "main.go") {
+		t.Fatalf("ls = %q, %v", listed, err)
+	}
+}
+
+func TestFindLimitNoticeFollowsSortedResults(t *testing.T) {
+	workspace := newTestWorkspace(t)
+	for _, name := range []string{"b.go", "a.go"} {
+		if err := os.WriteFile(filepath.Join(workspace.Root, name), []byte("package p"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	found, err := runTool(t, workspace.FindTool(), map[string]any{"pattern": "*.go", "limit": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(found, "\n")
+	if lines[0] != "a.go" || !strings.Contains(lines[len(lines)-1], "limit reached") {
+		t.Fatalf("limited find = %q", found)
+	}
+}
+
 func TestListTool(t *testing.T) {
 	workspace := newTestWorkspace(t)
 	if err := os.MkdirAll(filepath.Join(workspace.Root, "sub"), 0o755); err != nil {
@@ -306,16 +359,16 @@ func TestBashToolRequiresCommand(t *testing.T) {
 func TestAllToolsHaveSchemas(t *testing.T) {
 	workspace := newTestWorkspace(t)
 	all := workspace.All()
-	if len(workspace.Planning()) != 4 {
-		t.Fatalf("planning tool count = %d, want 4", len(workspace.Planning()))
+	if len(workspace.Planning()) != 6 {
+		t.Fatalf("planning tool count = %d, want 6", len(workspace.Planning()))
 	}
 	for _, tool := range workspace.Planning() {
 		if tool.Name == "bash" {
 			t.Fatal("planning tools include bash")
 		}
 	}
-	if len(all) != 5 {
-		t.Fatalf("tool count = %d, want 5", len(all))
+	if len(all) != 7 {
+		t.Fatalf("tool count = %d, want 7", len(all))
 	}
 	seen := map[string]bool{}
 	for _, tool := range all {

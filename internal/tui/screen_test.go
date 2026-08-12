@@ -35,6 +35,32 @@ func TestRenderFrameShowsSlashSuggestions(t *testing.T) {
 	}
 }
 
+func TestRenderFrameRendersMultilineComposer(t *testing.T) {
+	input := []rune("first line\nsecond line\nthird line")
+	frame := Frame{Input: input, Cursor: len(input), VirtualCursor: true}
+	lines, row, col := renderFrame(frame, 80, 20)
+	output := stripANSI(strings.Join(lines, "\n"))
+	for _, text := range []string{"first line", "second line", "third line"} {
+		if !strings.Contains(output, text) {
+			t.Fatalf("composer missing %q: %s", text, output)
+		}
+	}
+	if row != 18 || col <= 5 {
+		t.Fatalf("multiline cursor = row %d, col %d", row, col)
+	}
+}
+
+func TestLayoutEditorKeepsCursorLineInThreeRowWindow(t *testing.T) {
+	input := []rune("one\ntwo\nthree\nfour")
+	layout := layoutEditor(input, len(input), 20, false)
+	if got := strings.Join(layout.lines, "|"); got != "two|three|four" {
+		t.Fatalf("visible editor = %q", got)
+	}
+	if layout.cursorRow != 2 || layout.cursorCol != 4 {
+		t.Fatalf("cursor = %d,%d", layout.cursorRow, layout.cursorCol)
+	}
+}
+
 func TestRenderFrameHidesSidebarWhenNarrow(t *testing.T) {
 	frame := Frame{
 		Title: "a/very-long-provider-and-model-name", Sidebar: []string{"SHOULD_NOT_APPEAR"},
