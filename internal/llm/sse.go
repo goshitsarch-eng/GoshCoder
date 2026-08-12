@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"strings"
 )
@@ -23,6 +24,16 @@ type SSEEvent struct {
 //   - lines starting with ':' are comments and ignored
 //   - a blank line dispatches the accumulated event (skipped if no data)
 //   - line endings may be \n or \r\n
+const (
+	maxSSELineBytes  = 16 << 20
+	maxSSEEventBytes = 32 << 20
+)
+
+var (
+	ErrSSELineTooLarge  = errors.New("SSE line exceeds size limit")
+	ErrSSEEventTooLarge = errors.New("SSE event exceeds size limit")
+)
+
 type SSEReader struct {
 	r *bufio.Reader
 }
@@ -41,6 +52,9 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 
 	for {
 		line, err := s.readLine()
+		if strings.HasPrefix(line, "data:") && data.Len()+len(line)+1 > maxSSEEventBytes {
+			return SSEEvent{}, ErrSSEEventTooLarge
+		}
 		if err != nil {
 			if err == io.EOF && line != "" {
 				// Process a final unterminated line, then report EOF on the
@@ -58,10 +72,20 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 }
 
 func (s *SSEReader) readLine() (string, error) {
-	line, err := s.r.ReadString('\n')
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, err
+	var line strings.Builder
+	for {
+		fragment, err := s.r.ReadSlice('\n')
+		if line.Len()+len(fragment) > maxSSELineBytes {
+			return "", ErrSSELineTooLarge
+		}
+		line.Write(fragment)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		text := strings.TrimSuffix(line.String(), "\n")
+		text = strings.TrimSuffix(text, "\r")
+		return text, err
+	}
 }
 
 // processLine handles one line; ok is true when a blank line dispatched an event.

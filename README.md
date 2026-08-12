@@ -28,6 +28,11 @@ goshcoder chat -m openai/gpt-5.1 -tools
 
 # Store a key (also reads the usual env vars, e.g. ANTHROPIC_API_KEY)
 goshcoder auth set anthropic
+
+# Or log in with an Anthropic, OpenAI Codex, or Kimi subscription
+goshcoder auth login anthropic
+goshcoder auth login openai-codex
+goshcoder auth login kimi-coding
 ```
 
 `run` and `chat` flags:
@@ -39,6 +44,8 @@ goshcoder auth set anthropic
 | `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `-tools` | Enable the built-in file and shell tools |
 | `-ralph` | Enable long-running ralph loops |
+| `-plan` | Start in native Plannotator planning/review mode |
+| `-claude-tui` | Use the native `pi-claude-code-tui` chat appearance (default true; disable with `-claude-tui=false`) |
 | `-C` | Workspace directory for tools |
 
 Credentials and config live in `~/.goshcoder/agent` (override with
@@ -54,29 +61,45 @@ be pointed at either tool.
 | `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
 | `internal/tools` | Built-in tools (read, write, edit, list, bash) |
 | `internal/ralph` | Long-running iterative development loops |
+| `internal/plannotator` | Plan mode, browser approval/annotations, and checklist progress |
+| `internal/claudetui` | Native startup card and half-open chat input styling |
 | `internal/config` | On-disk paths |
 | `cmd/goshcoder` | CLI |
 
 ## Provider coverage
 
-1213 of 1220 catalog models (99.4%) across eight wire protocols:
+All 1220 catalog models (100%) across nine wire protocols:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
-`azure-openai-responses`, `google-generative-ai`, `google-vertex`,
-`mistral-conversations`, `bedrock-converse-stream`.
+`openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
+`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
 
 Bedrock is reached without the AWS SDK: SigV4 signing and the binary
 event-stream framing are implemented against stdlib crypto.
 
-Not ported: `openai-codex-responses` (7 models). It needs a WebSocket
-transport, zstd compression, and JWT parsing, and is OAuth-only, so those models
-cannot authenticate without the OAuth login flows that are also out of scope.
+OpenAI Codex uses its supported uncompressed SSE transport. WebSocket session
+reuse and optional zstd request compression are intentionally omitted.
 
 ## Extensions
 
 pi extensions are TypeScript modules loaded at runtime. GoshCoder has no plugin
-host, so extension features are ported as built-ins instead. `internal/ralph`
-is a native port of `@tmustier/pi-ralph-wiggum`, keeping the same `.ralph`
-file format so a loop directory works with either tool.
+host, so selected extension features are native built-ins:
+
+- `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
+- `@plannotator/pi-extension`: `/plannotator`, browser plan approval/denial with
+  line annotations, planning write gates, persisted phase state, checklist
+  progress, `/plannotator-review`, `/plannotator-annotate`, and
+  `/plannotator-last`. Use `-plan` to begin in planning mode. PR URL review
+  uses the optional GitHub CLI (`gh`); local git review needs only `git`.
+- `pi-claude-code-tui`: startup card, half-open rounded chat prompt, and an
+  OpenCode-inspired right sidebar with model, context usage, cost, messages,
+  tools, changed files, branch, and active mode. The panel refreshes
+  automatically after turns and state changes; `/status` can also print it on
+  demand. It is enabled by default in chat. Use `/use-default-tui` or
+  `-claude-tui=false` for the plain interface, and `/use-claude-code-tui` to
+  switch back.
+
+The visual extensions are adapted to GoshCoder's line-oriented terminal rather
+than depending on pi's TypeScript TUI or an npm runtime.
 
 ## Deviations from pi
 
@@ -86,8 +109,8 @@ Documented at the top of each ported file. The notable ones:
   structs travel on the options struct.
 - **No SDKs.** Provider requests are hand-rolled `net/http` plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
-- **OAuth.** Stored, unexpired OAuth credentials resolve, but the login and
-  refresh flows are not ported.
+- **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, and Kimi
+  Code. Kimi also supports API-key authentication.
 - **Interface.** pi renders a full-screen TUI; `goshcoder chat` is
   line-oriented, keeping session semantics behind slash commands so stdout
   stays pipeable.

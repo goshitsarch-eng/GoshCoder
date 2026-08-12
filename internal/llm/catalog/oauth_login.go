@@ -255,16 +255,6 @@ func startCallbackServer(host string, port int, path, expectedState string) (*ca
 	return cs, nil
 }
 
-// wait blocks until a callback arrives or ctx is done.
-func (cs *callbackServer) wait(ctx context.Context) (callbackResult, bool) {
-	select {
-	case result := <-cs.results:
-		return result, true
-	case <-ctx.Done():
-		return callbackResult{}, false
-	}
-}
-
 func (cs *callbackServer) close() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -278,6 +268,9 @@ func writeCallbackPage(w http.ResponseWriter, status int, message string) {
 	fmt.Fprintf(w, "<!doctype html><meta charset=utf-8><title>GoshCoder</title>"+
 		"<body style=\"font:16px system-ui;padding:3rem\"><p>%s</p>", message)
 }
+
+// browserOpener is replaceable so login tests never launch a real browser.
+var browserOpener = openBrowser
 
 // openBrowser tries to open a URL in the user's browser. A failure is not fatal:
 // the flow prints the URL and accepts a pasted code instead.
@@ -345,7 +338,7 @@ func runLoopbackLogin(
 			"paste the final redirect URL here.",
 	})
 	// A failure to launch the browser is expected on headless machines.
-	_ = openBrowser(authURL)
+	_ = browserOpener(authURL)
 
 	// The prompt and the callback race; whichever finishes first cancels the
 	// other.
@@ -450,6 +443,149 @@ func (a anthropicOAuth) Login(ctx context.Context, interaction LoginInteraction,
 		return nil, fmt.Errorf("Anthropic token exchange: %w", err)
 	}
 	return cred, nil
+}
+
+// ---------------------------------------------------------------------------
+// Kimi Code login
+// ---------------------------------------------------------------------------
+
+const (
+	kimiDeviceCodeTimeout         = 15 * time.Minute
+	kimiDeviceCodeDefaultInterval = 5 * time.Second
+	kimiDeviceGrantType           = "urn:ietf:params:oauth:grant-type:device_code"
+)
+
+type kimiDeviceAuthorization struct {
+	DeviceCode              string  `json:"device_code"`
+	UserCode                string  `json:"user_code"`
+	VerificationURI         string  `json:"verification_uri"`
+	VerificationURIComplete string  `json:"verification_uri_complete"`
+	Interval                float64 `json:"interval"`
+	ExpiresIn               float64 `json:"expires_in"`
+}
+
+// Login runs Kimi's RFC 8628 device authorization flow.
+func (k kimiCodingOAuth) Login(ctx context.Context, interaction LoginInteraction, env map[string]string) (*Credential, error) {
+	host := kimiOAuthHost(env)
+	status, body, err := postForm(ctx, host+"/api/oauth/device_authorization", url.Values{
+		"client_id": {kimiOAuthClientID},
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ErrLoginCancelled
+		}
+		return nil, fmt.Errorf("Kimi Code device authorization request failed: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("Kimi Code device authorization failed (status %d): %s",
+			status, strings.TrimSpace(truncate(string(body), 300)))
+	}
+
+	var device kimiDeviceAuthorization
+	if err := json.Unmarshal(body, &device); err != nil {
+		return nil, fmt.Errorf("invalid Kimi Code device authorization response: %w", err)
+	}
+	if device.DeviceCode == "" || device.UserCode == "" ||
+		!trustedHTTPURL(device.VerificationURI) || !trustedHTTPURL(device.VerificationURIComplete) {
+		return nil, fmt.Errorf("invalid Kimi Code device authorization response: %s", truncate(string(body), 300))
+	}
+	interval := kimiDeviceCodeDefaultInterval
+	if device.Interval > 0 {
+		interval = max(time.Second, time.Duration(device.Interval*float64(time.Second)))
+	}
+	timeout := kimiDeviceCodeTimeout
+	if device.ExpiresIn > 0 {
+		timeout = time.Duration(device.ExpiresIn * float64(time.Second))
+	}
+
+	interaction.Notify(LoginEvent{
+		Kind:             "device_code",
+		UserCode:         device.UserCode,
+		VerificationURI:  device.VerificationURIComplete,
+		IntervalSeconds:  int(interval.Seconds()),
+		ExpiresInSeconds: int(timeout.Seconds()),
+	})
+	return k.pollDeviceToken(ctx, host, &device, interval, timeout)
+}
+
+func trustedHTTPURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Host != "" && (parsed.Scheme == "http" || parsed.Scheme == "https")
+}
+
+func (k kimiCodingOAuth) pollDeviceToken(ctx context.Context, host string, device *kimiDeviceAuthorization, interval, timeout time.Duration) (*Credential, error) {
+	deadline := time.Now().Add(timeout)
+	wait := func(delay time.Duration) error {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errors.New("device flow timed out")
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return ErrLoginCancelled
+		case <-time.After(delay):
+			return nil
+		}
+	}
+
+	// Kimi explicitly requires waiting before the first poll.
+	if err := wait(interval); err != nil {
+		return nil, err
+	}
+	for time.Now().Before(deadline) {
+		status, body, err := postForm(ctx, host+"/api/oauth/token", url.Values{
+			"client_id":   {kimiOAuthClientID},
+			"device_code": {device.DeviceCode},
+			"grant_type":  {kimiDeviceGrantType},
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ErrLoginCancelled
+			}
+			return nil, fmt.Errorf("Kimi Code device token request failed: %w", err)
+		}
+		if status >= 500 {
+			return nil, fmt.Errorf("Kimi Code device token request failed (status %d): %s",
+				status, strings.TrimSpace(truncate(string(body), 300)))
+		}
+
+		var parsed tokenResponse
+		_ = json.Unmarshal(body, &parsed)
+		if status >= 200 && status < 300 {
+			cred, err := credentialFrom(&parsed, 0)
+			if err != nil {
+				return nil, fmt.Errorf("Kimi Code token poll: %w", err)
+			}
+			return cred, nil
+		}
+		switch parsed.Error {
+		case "authorization_pending":
+		case "slow_down":
+			var payload struct {
+				Interval float64 `json:"interval"`
+			}
+			_ = json.Unmarshal(body, &payload)
+			if payload.Interval > 0 {
+				interval = max(time.Second, time.Duration(payload.Interval*float64(time.Second)))
+			} else {
+				interval += 5 * time.Second
+			}
+		case "expired_token":
+			return nil, errors.New("Kimi Code device authorization expired; restart login")
+		case "access_denied":
+			return nil, errors.New("Kimi Code login was denied")
+		default:
+			return nil, fmt.Errorf("Kimi Code device token request failed (status %d): %s",
+				status, strings.TrimSpace(truncate(string(body), 300)))
+		}
+		if err := wait(interval); err != nil {
+			return nil, err
+		}
+	}
+	return nil, errors.New("device flow timed out")
 }
 
 // ---------------------------------------------------------------------------

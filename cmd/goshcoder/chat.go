@@ -10,17 +10,24 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/claudetui"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/plannotator"
 )
 
 const chatHelp = `Slash commands:
@@ -30,11 +37,18 @@ const chatHelp = `Slash commands:
   /system [text]        Show or replace the system prompt
   /tools                List the available tools
   /messages             Show the transcript summary
+  /status               Show model, context, cost, git, and mode information
   /steer <text>         Queue a steering message for the next turn
   /followup <text>      Queue a follow-up message
   /queue                Show whether messages are queued
   /clear                Clear the transcript
   /ralph <subcommand>   Manage ralph loops (list, status, resume, stop)
+  /plannotator          Toggle native Plannotator planning mode
+  /plannotator-review [PR URL]  Review git changes or a GitHub PR
+  /plannotator-annotate <target> Annotate a file, folder, or URL
+  /plannotator-last     Annotate the last assistant response
+  /use-claude-code-tui  Enable the native startup/editor look
+  /use-default-tui      Restore the plain line-oriented look
   /exit                 Leave chat
 
 Anything else is sent to the model. Ctrl-C aborts a running turn; Ctrl-C while
@@ -48,11 +62,15 @@ func chatCommand(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	// Native extension commands are available in chat even when plan mode was
+	// not requested at startup.
+	cfg.LoadPlannotator = true
 
 	s, err := newSession(*cfg)
 	if err != nil {
 		return err
 	}
+	defer s.close()
 
 	// Ctrl-C aborts a turn; when idle it closes stdin so the read loop ends.
 	stop := s.handleInterrupts(func() {
@@ -61,12 +79,34 @@ func chatCommand(args []string) error {
 	})
 	defer stop()
 
-	fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf(
-		"goshcoder %s · %s/%s · /help for commands", Version, s.model.Provider, s.model.ID)))
+	var lastSidebar claudetui.SessionInfo
+	if s.claudeTUI {
+		lastSidebar = s.sessionInfo()
+		for _, line := range claudetui.HeaderWithInfo(terminalWidth(), Version, s.model.Provider+"/"+s.model.ID, s.agent.State().ThinkingLevel, s.workspaceRoot(), colorEnabled(), &lastSidebar) {
+			fmt.Fprintln(os.Stderr, line)
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf(
+			"goshcoder %s · %s/%s · /help for commands", Version, s.model.Provider, s.model.ID)))
+	}
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Fprint(os.Stderr, bold("\n> "))
+		if s.claudeTUI {
+			// The line-oriented UI cannot pin a panel over scrolling output. Refresh
+			// it automatically whenever model usage, tools, git, or mode changes.
+			currentSidebar := s.sessionInfo()
+			if currentSidebar != lastSidebar {
+				fmt.Fprintln(os.Stderr)
+				for _, statusLine := range claudetui.Sidebar(min(terminalWidth(), 42), currentSidebar, colorEnabled()) {
+					fmt.Fprintln(os.Stderr, statusLine)
+				}
+				lastSidebar = currentSidebar
+			}
+			fmt.Fprint(os.Stderr, "\n"+claudetui.InputPrompt(min(terminalWidth(), 88), colorEnabled()))
+		} else {
+			fmt.Fprint(os.Stderr, bold("\n> "))
+		}
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF || errors.Is(err, os.ErrClosed) {
@@ -174,6 +214,11 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	case "/messages":
 		printTranscriptSummary(s.agent.State().Messages)
 
+	case "/status", "/sidebar":
+		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
+			fmt.Fprintln(os.Stderr, line)
+		}
+
 	case "/steer":
 		if rest == "" {
 			return false, errors.New("usage: /steer <text>")
@@ -203,6 +248,37 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 
 	case "/ralph":
 		return false, s.handleRalphSlashCommand(rest)
+
+	case "/plannotator":
+		if s.plan == nil {
+			return false, errors.New("Plannotator is unavailable in this session")
+		}
+		phase, err := s.plan.Toggle()
+		if err != nil {
+			return false, err
+		}
+		s.syncPlanRuntime()
+		fmt.Fprintln(os.Stderr, dim("Plannotator: "+string(phase)))
+
+	case "/plannotator-review":
+		return false, s.reviewCode(rest)
+
+	case "/plannotator-annotate":
+		if rest == "" {
+			return false, errors.New("usage: /plannotator-annotate <file>")
+		}
+		return false, s.annotateFile(rest)
+
+	case "/plannotator-last":
+		return false, s.annotateLastMessage()
+
+	case "/use-claude-code-tui":
+		s.claudeTUI = true
+		fmt.Fprintln(os.Stderr, dim("Using native pi-claude-code-tui look"))
+
+	case "/use-default-tui":
+		s.claudeTUI = false
+		fmt.Fprintln(os.Stderr, dim("Using default GoshCoder interface"))
 
 	default:
 		return false, fmt.Errorf("unknown command %q; /help lists the commands", command)
@@ -270,6 +346,230 @@ func (s *session) handleRalphSlashCommand(rest string) error {
 		return fmt.Errorf("unknown ralph subcommand %q (status, list, resume, stop)", subcommand)
 	}
 	return nil
+}
+
+func terminalWidth() int {
+	if width, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && width > 0 {
+		return width
+	}
+	return 80
+}
+
+func (s *session) sessionInfo() claudetui.SessionInfo {
+	state := s.agent.State()
+	info := claudetui.SessionInfo{
+		Model:        s.model.Provider + "/" + s.model.ID,
+		ContextLimit: s.model.ContextWindow,
+		Messages:     len(state.Messages),
+		Tools:        len(state.Tools),
+		Mode:         "normal",
+		Thinking:     state.ThinkingLevel,
+	}
+	if s.plan != nil && s.plan.State().Phase != plannotator.PhaseIdle {
+		info.Mode = string(s.plan.State().Phase)
+	}
+	for _, message := range state.Messages {
+		var assistant *llm.AssistantMessage
+		switch value := message.(type) {
+		case llm.AssistantMessage:
+			assistant = &value
+		case *llm.AssistantMessage:
+			assistant = value
+		}
+		if assistant == nil {
+			continue
+		}
+		info.Cost += assistant.Usage.Cost.Total
+		if assistant.Usage.TotalTokens > 0 {
+			info.ContextUsed = assistant.Usage.TotalTokens
+		}
+	}
+	status := exec.Command("git", "status", "--short", "--branch", "--untracked-files=normal")
+	status.Dir = s.workspaceRoot()
+	if output, err := status.Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		for index, line := range lines {
+			if index == 0 && strings.HasPrefix(line, "## ") {
+				branch := strings.TrimPrefix(line, "## ")
+				branch, _, _ = strings.Cut(branch, "...")
+				if strings.HasPrefix(branch, "HEAD ") {
+					branch = "detached HEAD"
+				}
+				info.Branch = branch
+				continue
+			}
+			if line != "" {
+				info.ChangedFiles++
+			}
+		}
+	}
+	return info
+}
+
+func (s *session) workspaceRoot() string {
+	if s.workspace != nil {
+		return s.workspace.Root
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	return root
+}
+
+func (s *session) browserReview(title, content string) (plannotator.Decision, error) {
+	reviewer := plannotator.BrowserReviewer{Notify: func(message string) { fmt.Fprintln(os.Stderr, message) }}
+	return reviewer.Review(context.Background(), title, content)
+}
+
+func (s *session) deliverReviewFeedback(subject string, decision plannotator.Decision) error {
+	feedback := strings.TrimSpace(decision.Feedback)
+	if decision.Approved && feedback == "" {
+		fmt.Fprintln(os.Stderr, dim(subject+" approved"))
+		return nil
+	}
+	if feedback == "" {
+		feedback = subject + " was denied without notes."
+	}
+	status := "denied"
+	if decision.Approved {
+		status = "approved with notes"
+	}
+	return s.runTurn(fmt.Sprintf("Plannotator review of %s was %s. Address this feedback:\n\n%s", subject, status, feedback))
+}
+
+func (s *session) reviewCode(argument string) error {
+	target := strings.TrimSpace(argument)
+	var cmd *exec.Cmd
+	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+		cmd = exec.Command("gh", "pr", "diff", target)
+	} else {
+		cmd = exec.Command("git", "diff", "--no-ext-diff", "--")
+	}
+	cmd.Dir = s.workspaceRoot()
+	content, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("load review diff: %w: %s", err, strings.TrimSpace(string(content)))
+	}
+	if len(content) == 0 && target == "" {
+		cmd = exec.Command("git", "diff", "--cached", "--no-ext-diff", "--")
+		cmd.Dir = s.workspaceRoot()
+		content, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git diff --cached: %w", err)
+		}
+	}
+	if len(content) == 0 {
+		return errors.New("there are no changes to review")
+	}
+	decision, err := s.browserReview("Review code changes", "```diff\n"+string(content)+"\n```")
+	if err != nil {
+		return err
+	}
+	return s.deliverReviewFeedback("the code changes", decision)
+}
+
+func (s *session) annotateFile(path string) error {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		response, err := (&http.Client{Timeout: 30 * time.Second}).Get(path)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("fetch %s: status %d", path, response.StatusCode)
+		}
+		content, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
+		if err != nil {
+			return err
+		}
+		if len(content) > 2<<20 {
+			return errors.New("document is too large to annotate (maximum 2MB)")
+		}
+		decision, err := s.browserReview("Annotate "+path, string(content))
+		if err != nil {
+			return err
+		}
+		return s.deliverReviewFeedback(path, decision)
+	}
+
+	candidate := path
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(s.workspaceRoot(), candidate)
+	}
+	info, err := os.Stat(candidate)
+	if err != nil {
+		return err
+	}
+	var content []byte
+	if info.IsDir() {
+		var combined strings.Builder
+		err = filepath.WalkDir(candidate, func(filePath string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if entry.IsDir() {
+				if filePath != candidate && strings.HasPrefix(entry.Name(), ".") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(entry.Name()))
+			if ext != ".md" && ext != ".mdx" && ext != ".txt" && ext != ".html" && ext != ".htm" {
+				return nil
+			}
+			data, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				return readErr
+			}
+			if combined.Len()+len(data) > 2<<20 {
+				return errors.New("folder content is too large to annotate (maximum 2MB)")
+			}
+			relative, _ := filepath.Rel(candidate, filePath)
+			fmt.Fprintf(&combined, "\n\n## %s\n\n%s", filepath.ToSlash(relative), data)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		content = []byte(combined.String())
+		if len(content) == 0 {
+			return errors.New("folder has no annotatable text files")
+		}
+	} else {
+		content, err = os.ReadFile(candidate)
+		if err != nil {
+			return err
+		}
+	}
+	if len(content) > 2<<20 {
+		return errors.New("file is too large to annotate (maximum 2MB)")
+	}
+	decision, err := s.browserReview("Annotate "+filepath.Base(candidate), string(content))
+	if err != nil {
+		return err
+	}
+	return s.deliverReviewFeedback(candidate, decision)
+}
+
+func (s *session) annotateLastMessage() error {
+	messages := s.agent.State().Messages
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, ok := messages[index].(llm.AssistantMessage)
+		if !ok {
+			continue
+		}
+		content := blockSummary(message.Content)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		decision, err := s.browserReview("Annotate last assistant response", content)
+		if err != nil {
+			return err
+		}
+		return s.deliverReviewFeedback("the previous assistant response", decision)
+	}
+	return errors.New("no assistant response found")
 }
 
 // isThinkingLevel reports whether level is a recognized thinking level.

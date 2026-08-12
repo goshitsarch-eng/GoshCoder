@@ -18,6 +18,7 @@ func newTestWorkspace(t *testing.T) *Workspace {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = workspace.Close() })
 	return workspace
 }
 
@@ -140,6 +141,24 @@ func TestPathConfinement(t *testing.T) {
 	}
 }
 
+func TestNestedSymlinkCannotEscapeWorkspace(t *testing.T) {
+	workspace := newTestWorkspace(t)
+	outside := t.TempDir()
+	link := filepath.Join(workspace.Root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err := runTool(t, workspace.WriteTool(), map[string]any{
+		"path": "link/new/file.txt", "content": "secret",
+	})
+	if err == nil {
+		t.Fatal("write escaped through a symlinked ancestor")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "new", "file.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("outside file exists or stat failed unexpectedly: %v", statErr)
+	}
+}
+
 func TestEmptyPathIsRejected(t *testing.T) {
 	workspace := newTestWorkspace(t)
 	if _, err := runTool(t, workspace.ReadTool(), map[string]any{"path": ""}); err == nil {
@@ -255,6 +274,17 @@ func TestBashToolRunsInWorkspace(t *testing.T) {
 	}
 	if !strings.Contains(got, "marker.txt") {
 		t.Fatalf("bash output = %q, want the workspace listing", got)
+	}
+}
+
+func TestCappedOutputDiscardsExcessData(t *testing.T) {
+	var output cappedOutput
+	output.limit = 4
+	if n, err := output.Write([]byte("abcdef")); err != nil || n != 6 {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	if got := output.String(); got != "abcd\n[output truncated]" {
+		t.Fatalf("output = %q", got)
 	}
 }
 

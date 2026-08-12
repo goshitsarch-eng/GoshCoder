@@ -222,8 +222,6 @@ func (p *completionsStreamer) push(event AssistantMessageEvent) {
 	p.es.Push(event)
 }
 
-var errNoAPIKey = errors.New("no API key")
-
 func (p *completionsStreamer) streamOnce() error {
 	ctx := p.options.context()
 	opts := p.options

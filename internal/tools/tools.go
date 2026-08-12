@@ -6,16 +6,17 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"goshcoder/internal/agent"
@@ -28,6 +29,10 @@ const maxReadBytes = 50 * 1024
 // maxOutputBytes caps captured command output.
 const maxOutputBytes = 30 * 1024
 
+// maxEditBytes prevents an edit request from loading an unexpectedly huge
+// file into memory. Large files should be changed with a purpose-built tool.
+const maxEditBytes = 10 * 1024 * 1024
+
 // Workspace confines tool file access to a single directory tree.
 type Workspace struct {
 	// Root is the absolute workspace path. Tools refuse to touch anything
@@ -35,6 +40,8 @@ type Workspace struct {
 	Root string
 	// BashTimeout bounds command execution. Zero means 120s.
 	BashTimeout time.Duration
+
+	root *os.Root
 }
 
 // NewWorkspace resolves root to an absolute, symlink-free path.
@@ -53,49 +60,97 @@ func NewWorkspace(root string) (*Workspace, error) {
 	if !info.IsDir() {
 		return nil, fmt.Errorf("workspace %s is not a directory", root)
 	}
-	return &Workspace{Root: absolute}, nil
+	confinedRoot, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace %s: %w", root, err)
+	}
+	return &Workspace{Root: absolute, root: confinedRoot}, nil
 }
 
-// resolve maps a tool-supplied path into the workspace, rejecting escapes.
+// Close releases the operating-system handle used for race-free path
+// confinement. A closed workspace must not be reused.
+func (w *Workspace) Close() error {
+	if w == nil || w.root == nil {
+		return nil
+	}
+	return w.root.Close()
+}
+
+// resolve converts a tool path to a root-relative name. os.Root performs the
+// actual filesystem operation, preventing symlink and rename races from
+// escaping the workspace.
 func (w *Workspace) resolve(path string) (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("path is required")
 	}
-	candidate := path
-	if !filepath.IsAbs(candidate) {
-		candidate = filepath.Join(w.Root, candidate)
+	name := filepath.Clean(path)
+	if filepath.IsAbs(name) {
+		var err error
+		name, err = filepath.Rel(w.Root, name)
+		if err != nil {
+			return "", fmt.Errorf("path %s is outside the workspace", path)
+		}
 	}
-	candidate = filepath.Clean(candidate)
-
-	// Compare against the resolved parent so a new file in an existing
-	// directory is still allowed.
-	probe := candidate
-	if resolved, err := filepath.EvalSymlinks(candidate); err == nil {
-		probe = resolved
-	} else if resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(candidate)); err == nil {
-		probe = filepath.Join(resolvedParent, filepath.Base(candidate))
-	}
-
-	relative, err := filepath.Rel(w.Root, probe)
-	if err != nil {
+	if name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %s is outside the workspace", path)
 	}
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("path %s is outside the workspace", path)
-	}
-	return candidate, nil
+	return name, nil
 }
 
-// display renders a path relative to the workspace root for messages.
-func (w *Workspace) display(path string) string {
-	if relative, err := filepath.Rel(w.Root, path); err == nil {
-		return filepath.ToSlash(relative)
+func (w *Workspace) display(path string) string { return filepath.ToSlash(path) }
+
+func (w *Workspace) readLimited(path string, limit int64) ([]byte, bool, error) {
+	file, err := w.root.Open(path)
+	if err != nil {
+		return nil, false, err
 	}
-	return path
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(content)) > limit {
+		return content[:limit], true, nil
+	}
+	return content, false, nil
 }
 
 func textResult(text string) agent.ToolResult {
 	return agent.ToolResult{Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: text}}}
+}
+
+type cappedOutput struct {
+	mu        sync.Mutex
+	builder   strings.Builder
+	limit     int
+	truncated bool
+}
+
+func (w *cappedOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	originalLength := len(p)
+	remaining := w.limit - w.builder.Len()
+	if remaining <= 0 {
+		w.truncated = w.truncated || originalLength > 0
+		return originalLength, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+		w.truncated = true
+	}
+	_, _ = w.builder.Write(p)
+	return originalLength, nil
+}
+
+func (w *cappedOutput) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	text := w.builder.String()
+	if w.truncated {
+		text += "\n[output truncated]"
+	}
+	return text
 }
 
 // All returns the built-in tool set for a workspace.
@@ -128,18 +183,13 @@ func (w *Workspace) ReadTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			content, err := os.ReadFile(resolved)
+			content, truncated, err := w.readLimited(resolved, maxReadBytes)
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
 			text := string(content)
-			truncated := false
-			if len(content) > maxReadBytes {
-				text = string(content[:maxReadBytes])
-				truncated = true
-			}
 			if truncated {
-				text += fmt.Sprintf("\n\n[truncated: showing %d of %d bytes]", maxReadBytes, len(content))
+				text += fmt.Sprintf("\n\n[truncated: showing first %d bytes]", maxReadBytes)
 			}
 			return textResult(text), nil
 		},
@@ -167,10 +217,10 @@ func (w *Workspace) WriteTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+			if err := w.root.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 				return agent.ToolResult{}, err
 			}
-			if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
+			if err := w.root.WriteFile(resolved, []byte(content), 0o644); err != nil {
 				return agent.ToolResult{}, err
 			}
 			return textResult(fmt.Sprintf("Wrote %d bytes to %s", len(content), w.display(resolved))), nil
@@ -205,9 +255,12 @@ func (w *Workspace) EditTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			content, err := os.ReadFile(resolved)
+			content, truncated, err := w.readLimited(resolved, maxEditBytes)
 			if err != nil {
 				return agent.ToolResult{}, err
+			}
+			if truncated {
+				return agent.ToolResult{}, fmt.Errorf("%s exceeds the %d-byte edit limit", w.display(resolved), maxEditBytes)
 			}
 			text := string(content)
 			switch occurrences := strings.Count(text, oldText); occurrences {
@@ -219,7 +272,7 @@ func (w *Workspace) EditTool() agent.Tool {
 					occurrences, w.display(resolved))
 			}
 			updated := strings.Replace(text, oldText, newText, 1)
-			if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+			if err := w.root.WriteFile(resolved, []byte(updated), 0o644); err != nil {
 				return agent.ToolResult{}, err
 			}
 			return textResult("Edited " + w.display(resolved)), nil
@@ -248,9 +301,17 @@ func (w *Workspace) ListTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			entries, err := os.ReadDir(resolved)
+			directory, err := w.root.Open(resolved)
 			if err != nil {
 				return agent.ToolResult{}, err
+			}
+			entries, readErr := directory.ReadDir(-1)
+			closeErr := directory.Close()
+			if readErr != nil {
+				return agent.ToolResult{}, readErr
+			}
+			if closeErr != nil {
+				return agent.ToolResult{}, closeErr
 			}
 			names := make([]string, 0, len(entries))
 			for _, entry := range entries {
@@ -310,15 +371,12 @@ func (w *Workspace) BashTool() agent.Tool {
 
 			cmd := exec.CommandContext(runCtx, shell, append(args, command)...)
 			cmd.Dir = w.Root
-			var output bytes.Buffer
+			output := cappedOutput{limit: maxOutputBytes}
 			cmd.Stdout = &output
 			cmd.Stderr = &output
 
 			runErr := cmd.Run()
 			text := output.String()
-			if len(text) > maxOutputBytes {
-				text = text[:maxOutputBytes] + "\n[output truncated]"
-			}
 			if runCtx.Err() == context.DeadlineExceeded {
 				return agent.ToolResult{}, fmt.Errorf("command timed out after %s\n%s", timeout, text)
 			}

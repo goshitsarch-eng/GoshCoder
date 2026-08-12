@@ -92,6 +92,9 @@ type ConvertResponsesMessagesOptions struct {
 type ConvertResponsesToolsOptions struct {
 	// Strict is the default `strict` value; nil means false.
 	Strict *bool
+	// StrictNull emits an explicit JSON null when no constrained-sampling
+	// override applies. Codex uses this to let its backend choose strictness.
+	StrictNull bool
 	// SupportsStrictMode defaults to true when nil.
 	SupportsStrictMode         *bool
 	SupportsOpenAIGrammarTools bool
@@ -503,9 +506,12 @@ func ConvertResponsesTools(tools []Tool, options *ConvertResponsesToolsOptions) 
 			item["defer_loading"] = true
 		}
 		if supportsStrictMode {
-			if hasConstrainedStrict {
+			switch {
+			case hasConstrainedStrict:
 				item["strict"] = constrainedStrict
-			} else {
+			case options.StrictNull:
+				item["strict"] = nil
+			default:
 				item["strict"] = defaultStrict
 			}
 		}
@@ -660,6 +666,7 @@ type responsesResponse struct {
 	ID          string                `json:"id"`
 	Status      string                `json:"status"`
 	ServiceTier string                `json:"service_tier,omitempty"`
+	EndTurn     *bool                 `json:"end_turn,omitempty"`
 	Output      []responsesOutputItem `json:"output,omitempty"`
 	Usage       *responsesUsage       `json:"usage,omitempty"`
 

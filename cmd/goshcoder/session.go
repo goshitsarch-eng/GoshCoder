@@ -4,6 +4,8 @@ package main
 // interactive `chat` command.
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -12,20 +14,25 @@ import (
 	"syscall"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
+	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
 )
 
 // sessionConfig is the resolved command-line configuration for a session.
 type sessionConfig struct {
-	ModelRef     string
-	SystemPrompt string
-	Thinking     string
-	Workdir      string
-	EnableTools  bool
-	EnableRalph  bool
+	ModelRef          string
+	SystemPrompt      string
+	Thinking          string
+	Workdir           string
+	EnableTools       bool
+	EnableRalph       bool
+	EnablePlannotator bool
+	LoadPlannotator   bool
+	ClaudeTUI         bool
 	// Quiet suppresses the startup banner.
 	Quiet bool
 }
@@ -38,8 +45,11 @@ type session struct {
 	auth      *catalog.Auth
 	loops     *ralph.Store
 	workspace *tools.Workspace
-	// baseSystemPrompt is the prompt without any ralph loop suffix.
+	plan      *plannotator.Manager
+	// baseSystemPrompt is the prompt without extension suffixes.
 	baseSystemPrompt string
+	normalTools      []agent.Tool
+	claudeTUI        bool
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
@@ -57,20 +67,47 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
 	}
 
-	s := &session{model: model, auth: auth, baseSystemPrompt: cfg.SystemPrompt}
+	s := &session{model: model, auth: auth, baseSystemPrompt: cfg.SystemPrompt, claudeTUI: cfg.ClaudeTUI}
 
 	var agentTools []agent.Tool
-	if cfg.EnableTools {
+	if cfg.EnableTools || cfg.LoadPlannotator || cfg.EnablePlannotator {
 		workspace, err := tools.NewWorkspace(cfg.Workdir)
 		if err != nil {
 			return nil, err
 		}
 		s.workspace = workspace
-		agentTools = workspace.All()
-		if !cfg.Quiet {
+		if cfg.EnableTools {
+			agentTools = workspace.All()
+		}
+		if !cfg.Quiet && cfg.EnableTools {
 			// The bash tool runs arbitrary commands with the user's privileges.
 			fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf(
 				"tools enabled in %s (includes shell execution)", workspace.Root)))
+		}
+	}
+
+	s.normalTools = append([]agent.Tool(nil), agentTools...)
+	if cfg.LoadPlannotator || cfg.EnablePlannotator {
+		root := s.workspace.Root
+		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
+		reviewer := plannotator.BrowserReviewer{Notify: func(message string) { fmt.Fprintln(os.Stderr, message) }}
+		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
+		if err != nil {
+			_ = s.workspace.Close()
+			return nil, err
+		}
+		s.plan = manager
+		if cfg.EnablePlannotator && manager.State().Phase == plannotator.PhaseIdle {
+			if err := manager.Enter(); err != nil {
+				_ = s.workspace.Close()
+				return nil, err
+			}
+		}
+		if manager.State().Phase != plannotator.PhaseIdle {
+			agentTools = mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{manager.Tool()})
+		}
+		if !cfg.Quiet && manager.State().Phase != plannotator.PhaseIdle {
+			fmt.Fprintln(os.Stderr, dim(manager.StatusLine()))
 		}
 	}
 
@@ -79,6 +116,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 	if cfg.EnableRalph {
 		root, err := filepath.Abs(cfg.Workdir)
 		if err != nil {
+			if s.workspace != nil {
+				_ = s.workspace.Close()
+			}
 			return nil, err
 		}
 		s.loops = ralph.NewStore(root, fmt.Sprintf("cli-%d", os.Getpid()))
@@ -88,6 +128,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 	}
 
 	systemPrompt := cfg.SystemPrompt
+	if s.plan != nil {
+		systemPrompt = s.plan.Prompt(systemPrompt)
+	}
 	if s.loops != nil {
 		if state, ok := s.loops.Current(); ok {
 			systemPrompt = cfg.SystemPrompt + ralph.SystemPromptSuffix(state)
@@ -108,12 +151,27 @@ func newSession(cfg sessionConfig) (*session, error) {
 		// which the agent's default path does not carry.
 		StreamFn:  authStreamFn(auth),
 		GetAPIKey: func(string) string { return auth.APIKey },
-		// Refresh the loop banner between turns as the iteration advances, and
-		// close the loop out when the model emits the completion marker.
-		PrepareNextTurn: ralphPrepareNextTurn(s.loops, cfg.SystemPrompt),
+		BeforeToolCall: func(ctx context.Context, call agent.BeforeToolCallContext) *agent.BeforeToolCallResult {
+			if s.plan == nil {
+				return nil
+			}
+			return s.plan.BeforeToolCall(ctx, call)
+		},
+		// Compose native extension hooks in load order.
+		PrepareNextTurn: composePrepareNextTurn(
+			ralphPrepareNextTurn(s.loops, cfg.SystemPrompt),
+			s.planPrepareNextTurn(),
+		),
 	})
 	s.agent.Subscribe(renderEvent)
 	return s, nil
+}
+
+func (s *session) close() error {
+	if s == nil || s.workspace == nil {
+		return nil
+	}
+	return s.workspace.Close()
 }
 
 // handleInterrupts routes Ctrl-C to the agent so a run aborts and settles
@@ -156,13 +214,77 @@ func (s *session) handleInterrupts(onIdleInterrupt func()) (stop func()) {
 
 // runTurn prompts the agent and reports a run failure as an error.
 func (s *session) runTurn(prompt string) error {
+	s.syncPlanRuntime()
 	if err := s.agent.Prompt(prompt); err != nil {
 		return err
 	}
 	if message := s.agent.State().ErrorMessage; message != "" {
 		return errors.New(message)
 	}
+	s.syncPlanRuntime()
+	if s.plan != nil && s.plan.State().Phase != plannotator.PhaseIdle {
+		fmt.Fprintln(os.Stderr, dim(s.plan.StatusLine()))
+	}
 	return nil
+}
+
+func (s *session) planPrepareNextTurn() agent.PrepareNextTurnFunc {
+	if s.plan == nil {
+		return nil
+	}
+	return func(_ context.Context, turn agent.PrepareNextTurnContext) *agent.TurnUpdate {
+		s.plan.TrackAssistant(turn.Message)
+		updated := turn.Context
+		updated.SystemPrompt = s.plan.Prompt(updated.SystemPrompt)
+		return &agent.TurnUpdate{Context: &updated}
+	}
+}
+
+func composePrepareNextTurn(hooks ...agent.PrepareNextTurnFunc) agent.PrepareNextTurnFunc {
+	return func(ctx context.Context, turn agent.PrepareNextTurnContext) *agent.TurnUpdate {
+		updated := turn
+		changed := false
+		for _, hook := range hooks {
+			if hook == nil {
+				continue
+			}
+			if next := hook(ctx, updated); next != nil && next.Context != nil {
+				updated.Context = *next.Context
+				changed = true
+			}
+		}
+		if !changed {
+			return nil
+		}
+		return &agent.TurnUpdate{Context: &updated.Context}
+	}
+}
+
+func (s *session) syncPlanRuntime() {
+	if s.plan == nil || s.agent == nil {
+		return
+	}
+	s.agent.SetSystemPrompt(s.plan.Prompt(s.baseSystemPrompt))
+	if s.plan.State().Phase == plannotator.PhaseIdle {
+		s.agent.SetTools(s.normalTools)
+		return
+	}
+	s.agent.SetTools(mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}))
+}
+
+func mergeTools(groups ...[]agent.Tool) []agent.Tool {
+	seen := map[string]bool{}
+	var merged []agent.Tool
+	for _, group := range groups {
+		for _, tool := range group {
+			if seen[tool.Name] {
+				continue
+			}
+			seen[tool.Name] = true
+			merged = append(merged, tool)
+		}
+	}
+	return merged
 }
 
 // setModel swaps the active model, re-resolving credentials for its provider.

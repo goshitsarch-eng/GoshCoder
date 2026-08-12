@@ -7,7 +7,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,6 +32,7 @@ Usage:
   goshcoder providers                List providers and credential status
   goshcoder models [provider]        List available models
   goshcoder auth set <provider>      Store an API key (read from stdin)
+  goshcoder auth login <provider>    Log in with OAuth
   goshcoder auth list                List stored credentials
   goshcoder auth logout <provider>   Remove a stored credential
   goshcoder ralph list [--archived]  List ralph loops
@@ -46,6 +49,8 @@ Run flags:
   -thinking <level>   off|minimal|low|medium|high|xhigh|max (default off)
   -tools              Enable the built-in file and shell tools
   -ralph              Enable long-running ralph loops (ralph_start/ralph_done)
+  -plan               Start with native Plannotator plan review enabled
+  -claude-tui         Use the native pi-claude-code-tui look in chat (default true)
   -C <dir>            Workspace directory for tools (default: current directory)
 
 Environment:
@@ -116,6 +121,7 @@ func runCommand(args []string) error {
 	if err != nil {
 		return err
 	}
+	defer s.close()
 	stop := s.handleInterrupts(nil)
 	defer stop()
 
@@ -132,6 +138,8 @@ func bindSessionFlags(flags *flag.FlagSet) *sessionConfig {
 	flags.StringVar(&cfg.Thinking, "thinking", "off", "thinking level")
 	flags.BoolVar(&cfg.EnableTools, "tools", false, "enable built-in tools")
 	flags.BoolVar(&cfg.EnableRalph, "ralph", false, "enable long-running ralph loops")
+	flags.BoolVar(&cfg.EnablePlannotator, "plan", false, "start in Plannotator planning mode")
+	flags.BoolVar(&cfg.ClaudeTUI, "claude-tui", true, "use the pi-claude-code-tui look")
 	flags.StringVar(&cfg.Workdir, "C", ".", "workspace directory")
 	return cfg
 }
@@ -421,7 +429,7 @@ func printModels(provider *catalog.Provider) error {
 
 func authCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: goshcoder auth set|list|logout")
+		return errors.New("usage: goshcoder auth set|login|list|logout")
 	}
 	store := catalog.NewFileCredentialStore(config.AuthPath())
 
@@ -466,6 +474,35 @@ func authCommand(args []string) error {
 		fmt.Printf("Stored an API key for %s in %s\n", providerID, config.AuthPath())
 		return nil
 
+	case "login":
+		if len(args) < 2 {
+			return errors.New("usage: goshcoder auth login <provider>")
+		}
+		providerID := args[1]
+		c := catalog.NewCatalog(store)
+		if c.Provider(providerID) == nil {
+			return fmt.Errorf("unknown provider %q", providerID)
+		}
+		if _, ok := catalog.LoginProviderFor(providerID); !ok {
+			return fmt.Errorf("provider %q does not have an OAuth login flow; use 'goshcoder auth set %s' if it accepts an API key", providerID, providerID)
+		}
+		if _, err := config.EnsureAgentDir(); err != nil {
+			return err
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		visibleInput := false
+		if info, err := os.Stdin.Stat(); err == nil {
+			visibleInput = (info.Mode() & os.ModeCharDevice) != 0
+		}
+		interaction := newTerminalLoginInteraction(os.Stdin, os.Stderr, visibleInput)
+		if _, err := c.Login(ctx, providerID, interaction); err != nil {
+			return err
+		}
+		fmt.Printf("Logged in to %s; credential stored in %s\n", providerID, config.AuthPath())
+		return nil
+
 	case "logout":
 		if len(args) < 2 {
 			return errors.New("usage: goshcoder auth logout <provider>")
@@ -478,6 +515,94 @@ func authCommand(args []string) error {
 
 	default:
 		return fmt.Errorf("unknown auth subcommand %q", args[0])
+	}
+}
+
+// terminalLoginInteraction adapts OAuth flows to the line-oriented CLI.
+type terminalLoginInteraction struct {
+	reader       *bufio.Reader
+	out          io.Writer
+	visibleInput bool
+}
+
+func newTerminalLoginInteraction(in io.Reader, out io.Writer, visibleInput bool) *terminalLoginInteraction {
+	return &terminalLoginInteraction{reader: bufio.NewReader(in), out: out, visibleInput: visibleInput}
+}
+
+func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, error) {
+	fmt.Fprintln(i.out, prompt.Message)
+	if prompt.Kind == catalog.PromptSelect {
+		for index, option := range prompt.Options {
+			detail := option.Label
+			if option.Description != "" {
+				detail += " — " + option.Description
+			}
+			fmt.Fprintf(i.out, "  %d) %s\n", index+1, detail)
+		}
+		fmt.Fprint(i.out, "Choice [1]: ")
+	} else {
+		if prompt.Placeholder != "" {
+			fmt.Fprintf(i.out, "%s\n", dim("Example: "+prompt.Placeholder))
+		}
+		if prompt.Kind == catalog.PromptSecret && i.visibleInput {
+			fmt.Fprint(i.out, "(input is visible) ")
+		} else {
+			fmt.Fprint(i.out, "> ")
+		}
+	}
+
+	type lineResult struct {
+		line string
+		err  error
+	}
+	result := make(chan lineResult, 1)
+	go func() {
+		line, err := i.reader.ReadString('\n')
+		if err == io.EOF && line != "" {
+			err = nil
+		}
+		result <- lineResult{line: strings.TrimSpace(line), err: err}
+	}()
+
+	ctx := prompt.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return "", catalog.ErrLoginCancelled
+	case read := <-result:
+		if read.err != nil {
+			return "", read.err
+		}
+		if prompt.Kind != catalog.PromptSelect {
+			return read.line, nil
+		}
+		if read.line == "" && len(prompt.Options) > 0 {
+			return prompt.Options[0].ID, nil
+		}
+		for index, option := range prompt.Options {
+			if read.line == option.ID || read.line == fmt.Sprint(index+1) {
+				return option.ID, nil
+			}
+		}
+		return "", fmt.Errorf("invalid choice %q", read.line)
+	}
+}
+
+func (i *terminalLoginInteraction) Notify(event catalog.LoginEvent) {
+	switch event.Kind {
+	case "auth_url":
+		fmt.Fprintf(i.out, "\nOpen this URL to authenticate:\n%s\n", event.URL)
+		if event.Instructions != "" {
+			fmt.Fprintln(i.out, event.Instructions)
+		}
+	case "device_code":
+		fmt.Fprintf(i.out, "\nOpen %s and enter code: %s\n", event.VerificationURI, event.UserCode)
+	case "info", "progress":
+		if event.Message != "" {
+			fmt.Fprintln(i.out, event.Message)
+		}
 	}
 }
 

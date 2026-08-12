@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -19,6 +20,13 @@ func collectSSE(t *testing.T, input string) []SSEEvent {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		events = append(events, ev)
+	}
+}
+
+func TestSSEReaderRejectsOversizedLine(t *testing.T) {
+	reader := NewSSEReader(strings.NewReader(strings.Repeat("x", maxSSELineBytes+1)))
+	if _, err := reader.Next(); !errors.Is(err, ErrSSELineTooLarge) {
+		t.Fatalf("err = %v", err)
 	}
 }
 

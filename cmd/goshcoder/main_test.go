@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"flag"
+	"io"
 	"strings"
 	"testing"
 
@@ -9,6 +13,62 @@ import (
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 )
+
+func TestTerminalLoginInteractionSelectsByNumber(t *testing.T) {
+	var output bytes.Buffer
+	interaction := newTerminalLoginInteraction(strings.NewReader("2\n"), &output, false)
+	choice, err := interaction.Prompt(catalog.LoginPrompt{
+		Kind:    catalog.PromptSelect,
+		Message: "Choose:",
+		Options: []catalog.LoginPromptOption{{ID: "browser", Label: "Browser"}, {ID: "device", Label: "Device code"}},
+		Ctx:     t.Context(),
+	})
+	if err != nil || choice != "device" {
+		t.Fatalf("choice = %q, err = %v", choice, err)
+	}
+	if !strings.Contains(output.String(), "2) Device code") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestTerminalLoginInteractionDefaultsToFirstOption(t *testing.T) {
+	interaction := newTerminalLoginInteraction(strings.NewReader("\n"), io.Discard, false)
+	choice, err := interaction.Prompt(catalog.LoginPrompt{
+		Kind:    catalog.PromptSelect,
+		Options: []catalog.LoginPromptOption{{ID: "browser", Label: "Browser"}, {ID: "device", Label: "Device"}},
+		Ctx:     t.Context(),
+	})
+	if err != nil || choice != "browser" {
+		t.Fatalf("choice = %q, err = %v", choice, err)
+	}
+}
+
+func TestTerminalLoginInteractionHonorsPromptCancellation(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	interaction := newTerminalLoginInteraction(reader, io.Discard, false)
+	_, err := interaction.Prompt(catalog.LoginPrompt{Kind: catalog.PromptManualCode, Ctx: ctx})
+	if !errors.Is(err, catalog.ErrLoginCancelled) {
+		t.Fatalf("err = %v, want ErrLoginCancelled", err)
+	}
+}
+
+func TestTerminalLoginInteractionRendersOAuthEvents(t *testing.T) {
+	var output bytes.Buffer
+	interaction := newTerminalLoginInteraction(strings.NewReader(""), &output, false)
+	interaction.Notify(catalog.LoginEvent{Kind: "auth_url", URL: "https://example.com/auth", Instructions: "Sign in."})
+	interaction.Notify(catalog.LoginEvent{Kind: "device_code", VerificationURI: "https://example.com/device", UserCode: "ABCD"})
+	interaction.Notify(catalog.LoginEvent{Kind: "progress", Message: "Exchanging..."})
+	got := output.String()
+	for _, want := range []string{"https://example.com/auth", "Sign in.", "https://example.com/device", "ABCD", "Exchanging..."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output %q does not contain %q", got, want)
+		}
+	}
+}
 
 func TestFirstLine(t *testing.T) {
 	tests := []struct {
@@ -124,6 +184,8 @@ func TestBindSessionFlags(t *testing.T) {
 		"-thinking", "high",
 		"-tools",
 		"-ralph",
+		"-plan",
+		"-claude-tui",
 		"-C", "/tmp/work",
 		"trailing", "prompt",
 	}); err != nil {
@@ -133,7 +195,7 @@ func TestBindSessionFlags(t *testing.T) {
 	if cfg.ModelRef != "openai/gpt-4" || cfg.SystemPrompt != "be brief" {
 		t.Fatalf("cfg = %#v", cfg)
 	}
-	if cfg.Thinking != "high" || !cfg.EnableTools || !cfg.EnableRalph {
+	if cfg.Thinking != "high" || !cfg.EnableTools || !cfg.EnableRalph || !cfg.EnablePlannotator || !cfg.ClaudeTUI {
 		t.Fatalf("cfg = %#v", cfg)
 	}
 	if cfg.Workdir != "/tmp/work" {
@@ -166,8 +228,8 @@ func TestBindSessionFlagsDefaults(t *testing.T) {
 	if cfg.Thinking != "off" || cfg.Workdir != "." {
 		t.Fatalf("defaults = %#v", cfg)
 	}
-	if cfg.EnableTools || cfg.EnableRalph {
-		t.Fatalf("tools and ralph should default off: %#v", cfg)
+	if cfg.EnableTools || cfg.EnableRalph || cfg.EnablePlannotator || !cfg.ClaudeTUI {
+		t.Fatalf("unexpected native feature defaults: %#v", cfg)
 	}
 }
 

@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -26,7 +27,7 @@ func IsAbort(err error) bool {
 	if _, ok := err.(AbortError); ok {
 		return true
 	}
-	return err == context.Canceled
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // ProviderError is an HTTP-level provider failure, carrying what pi extracts
@@ -77,6 +78,12 @@ func isRetryableProviderError(err *ProviderError) bool {
 // server-requested delays, failing immediately when the cap is exceeded
 // (utils/provider-retry.ts).
 func validateServerRetryDelayMs(delayMs float64, maxRetryDelayMs *int64, providerErrorMessage string) (time.Duration, error) {
+	if math.IsNaN(delayMs) || math.IsInf(delayMs, 0) {
+		return 0, fmt.Errorf("invalid server retry delay")
+	}
+	if delayMs < 0 {
+		delayMs = 0
+	}
 	maxDelayMs := DefaultMaxRetryDelayMs
 	if maxRetryDelayMs != nil {
 		maxDelayMs = *maxRetryDelayMs
@@ -94,18 +101,17 @@ func validateServerRetryDelayMs(delayMs float64, maxRetryDelayMs *int64, provide
 func retryDelay(err *ProviderError, retryIndex int, maxRetryDelayMs *int64) (time.Duration, error) {
 	if err.Headers != nil {
 		if v := err.Headers.Get("retry-after-ms"); v != "" {
-			if ms, perr := strconv.ParseFloat(v, 64); perr == nil {
+			if ms, parseErr := strconv.ParseFloat(v, 64); parseErr == nil && !math.IsNaN(ms) && !math.IsInf(ms, 0) {
 				return validateServerRetryDelayMs(ms, maxRetryDelayMs, err.Error())
 			}
 		}
 		if v := err.Headers.Get("retry-after"); v != "" {
-			var delayMs float64
-			if seconds, perr := strconv.ParseFloat(v, 64); perr == nil {
-				delayMs = seconds * 1000
-			} else if t, perr := http.ParseTime(v); perr == nil {
-				delayMs = float64(time.Until(t).Milliseconds())
+			if seconds, parseErr := strconv.ParseFloat(v, 64); parseErr == nil && !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+				return validateServerRetryDelayMs(seconds*1000, maxRetryDelayMs, err.Error())
 			}
-			return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, err.Error())
+			if retryAt, parseErr := http.ParseTime(v); parseErr == nil {
+				return validateServerRetryDelayMs(float64(time.Until(retryAt).Milliseconds()), maxRetryDelayMs, err.Error())
+			}
 		}
 	}
 	exponentialMs := math.Min(0.5*math.Pow(2, float64(retryIndex)), 8) * 1000

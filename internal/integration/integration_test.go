@@ -6,6 +6,7 @@ package integration
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
@@ -204,6 +206,61 @@ func TestEndToEndTextTurn(t *testing.T) {
 	}
 }
 
+func TestEndToEndCodexOAuthTurn(t *testing.T) {
+	var requestPath string
+	var requestHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		requestHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w,
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n"+
+				"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Codex works\"}]}}\n\n"+
+				"data: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}\n\n")
+	}))
+	defer server.Close()
+
+	claim, _ := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-e2e"},
+	})
+	access := "header." + base64.RawURLEncoding.EncodeToString(claim) + ".signature"
+	store := catalog.NewFileCredentialStore(filepath.Join(t.TempDir(), "auth.json"))
+	if _, err := store.Modify("openai-codex", func(*catalog.Credential) (*catalog.Credential, error) {
+		cred := &catalog.Credential{Type: "oauth", Access: access, Refresh: "refresh", Expires: time.Now().Add(time.Hour).UnixMilli()}
+		if err := cred.SetExtra("accountId", "acct-e2e"); err != nil {
+			return nil, err
+		}
+		return cred, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := catalog.NewCatalog(store)
+	c.SetGetenv(func(string) string { return "" })
+	auth, ok := c.ResolveAuth("openai-codex")
+	if !ok {
+		t.Fatal("Codex OAuth credential did not resolve")
+	}
+	model := llm.Model{ID: "gpt-test", Name: "GPT Test", API: llm.APIOpenAICodexResponses,
+		Provider: "openai-codex", BaseURL: server.URL, Reasoning: true, Input: []string{"text"}, ContextWindow: 128000, MaxTokens: 4096}
+	a := agent.NewAgent(agent.AgentOptions{
+		InitialState: &agent.InitialState{Model: model}, StreamFn: authStreamFn(auth),
+		GetAPIKey: func(string) string { return auth.APIKey },
+	})
+	if err := a.Prompt("hi"); err != nil {
+		t.Fatal(err)
+	}
+	if a.State().ErrorMessage != "" {
+		t.Fatalf("run failed: %s", a.State().ErrorMessage)
+	}
+	if requestPath != "/codex/responses" || requestHeaders.Get("Chatgpt-Account-Id") != "acct-e2e" {
+		t.Fatalf("request path/headers = %q %#v", requestPath, requestHeaders)
+	}
+	final := a.State().Messages[1].(llm.AssistantMessage)
+	if final.Content[0].(llm.TextContent).Text != "Codex works" {
+		t.Fatalf("final = %#v", final)
+	}
+}
+
 // TestEndToEndToolUse is the full agentic loop: the model calls a real tool,
 // the tool touches the filesystem, and the result is replayed to the provider
 // on the next turn.
@@ -390,13 +447,10 @@ func TestEndToEndAmbientBedrockIsNotUsableAsAKey(t *testing.T) {
 	}
 }
 
-// TestEndToEndUnimplementedProtocolFailsCleanly confirms an unported protocol
+// TestEndToEndUnimplementedProtocolFailsCleanly confirms an unknown protocol
 // surfaces a clear error instead of panicking.
 func TestEndToEndUnimplementedProtocolFailsCleanly(t *testing.T) {
-	model := llm.Model{ID: "m", Name: "M", API: "bedrock-converse-stream", Provider: "amazon-bedrock"}
-	if _, ok := llm.GetStreamer(model.API); ok {
-		t.Skip("bedrock-converse-stream is now implemented; pick another unported protocol")
-	}
+	model := llm.Model{ID: "m", Name: "M", API: "test-unimplemented", Provider: "test"}
 
 	a := agent.NewAgent(agent.AgentOptions{
 		InitialState: &agent.InitialState{Model: model},
@@ -454,8 +508,7 @@ func TestRegisteredProtocolsCoverCatalog(t *testing.T) {
 		t.Logf("  MISSING     %-28s %d models", api, count)
 	}
 
-	// Every protocol ported so far must stay registered. Only
-	// openai-codex-responses remains unported.
+	// Every catalog protocol is now ported and must stay registered.
 	for _, api := range []string{
 		llm.APIOpenAICompletions,
 		llm.APIAnthropicMessages,
@@ -465,9 +518,13 @@ func TestRegisteredProtocolsCoverCatalog(t *testing.T) {
 		llm.APIGoogleVertex,
 		llm.APIMistralConversations,
 		llm.APIBedrockConverseStream,
+		llm.APIOpenAICodexResponses,
 	} {
 		if _, ok := llm.GetStreamer(api); !ok {
 			t.Errorf("protocol %q is no longer registered", api)
 		}
+	}
+	if len(missing) != 0 {
+		t.Errorf("catalog still has unimplemented protocols: %v", missing)
 	}
 }

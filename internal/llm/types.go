@@ -207,15 +207,11 @@ func (m *UserMessage) BlockContent() []ContentBlock {
 }
 
 func (m UserMessage) MarshalJSON() ([]byte, error) {
-	type alias struct {
-		Role      string `json:"role"`
-		Content   any    `json:"content"`
-		Timestamp int64  `json:"timestamp"`
-	}
+	type alias UserMessage
 	if m.Role == "" {
 		m.Role = "user"
 	}
-	return json.Marshal(alias{Role: m.Role, Content: m.Content, Timestamp: m.Timestamp})
+	return json.Marshal(alias(m))
 }
 
 func (m *UserMessage) UnmarshalJSON(data []byte) error {

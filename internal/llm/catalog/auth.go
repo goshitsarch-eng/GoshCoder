@@ -230,12 +230,28 @@ func (s *CredentialStore) writeLocked() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, content, 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), ".auth-*.tmp")
+	if err != nil {
+		return fmt.Errorf("catalog: failed to create auth.json temporary file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("catalog: failed to secure auth.json temporary file: %w", err)
+	}
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
 		return fmt.Errorf("catalog: failed to write auth.json: %w", err)
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		os.Remove(tmp)
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("catalog: failed to sync auth.json: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("catalog: failed to close auth.json: %w", err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
 		return fmt.Errorf("catalog: failed to write auth.json: %w", err)
 	}
 	// Best-effort: tighten permissions on platforms that honor chmod.
