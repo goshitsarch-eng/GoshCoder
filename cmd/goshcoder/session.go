@@ -33,6 +33,7 @@ type sessionConfig struct {
 	EnablePlannotator bool
 	LoadPlannotator   bool
 	ClaudeTUI         bool
+	Fullscreen        bool
 	// Quiet suppresses the startup banner.
 	Quiet bool
 }
@@ -166,7 +167,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 			s.planPrepareNextTurn(),
 		),
 	})
-	s.agent.Subscribe(renderEvent)
+	if !cfg.Fullscreen {
+		s.agent.Subscribe(renderEvent)
+	}
 	return s, nil
 }
 

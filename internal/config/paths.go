@@ -52,6 +52,42 @@ func AuthPath() string {
 	return filepath.Join(AgentDir(), "auth.json")
 }
 
+// DefaultModelPath is the small text file used to remember the last model
+// selected for interactive chat.
+func DefaultModelPath() string { return filepath.Join(AgentDir(), "default-model") }
+
+// ReadDefaultModel returns the remembered model reference, or an empty string
+// when no model has been selected yet.
+func ReadDefaultModel() string {
+	content, err := os.ReadFile(DefaultModelPath())
+	if err != nil || len(content) > 4096 {
+		return ""
+	}
+	return strings.TrimSpace(string(content))
+}
+
+// WriteDefaultModel atomically remembers the model used by interactive chat.
+func WriteDefaultModel(model string) error {
+	directory, err := EnsureAgentDir()
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".default-model-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := temporary.Name()
+	defer os.Remove(name)
+	if _, err := temporary.WriteString(strings.TrimSpace(model) + "\n"); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, DefaultModelPath())
+}
+
 // EnsureAgentDir creates the agent directory if it does not exist. The
 // directory is user-only (0700) because it holds credentials.
 func EnsureAgentDir() (string, error) {

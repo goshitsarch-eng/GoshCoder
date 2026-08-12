@@ -27,6 +27,8 @@ const Version = "0.1.0-dev"
 const usage = `GoshCoder - a Go coding agent
 
 Usage:
+  goshcoder                         Start fullscreen interactive chat
+  goshcoder [chat flags]            Start chat without typing the subcommand
   goshcoder run [flags] <prompt>     Run a single prompt
   goshcoder chat [flags]             Interactive session (slash commands, /help)
   goshcoder providers                List providers and credential status
@@ -43,14 +45,15 @@ Usage:
   goshcoder ralph delete <name>      Delete a loop and its task file
   goshcoder version                  Print the version
 
-Run flags:
-  -m, -model <ref>    Model as "provider/model" or a bare model id (required)
+Chat/run flags:
+  -m, -model <ref>    Model as "provider/model" or a bare model id (chat remembers the last model)
   -s, -system <text>  System prompt
   -thinking <level>   off|minimal|low|medium|high|xhigh|max (default off)
   -tools              Enable the built-in file and shell tools
   -ralph              Enable long-running ralph loops (ralph_start/ralph_done)
   -plan               Start with native Plannotator plan review enabled
-  -claude-tui         Use the native pi-claude-code-tui look in chat (default true)
+  -claude-tui         Use the native pi-claude-code-tui look in line mode (default true)
+  -fullscreen         Use the native fullscreen TUI in chat (default true on terminals)
   -C <dir>            Workspace directory for tools (default: current directory)
 
 Environment:
@@ -61,11 +64,21 @@ Environment:
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(2)
+		if err := chatCommand(nil); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	command, args := os.Args[1], os.Args[2:]
+	if strings.HasPrefix(command, "-") {
+		if err := chatCommand(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	var err error
 	switch command {
 	case "run":

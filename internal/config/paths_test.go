@@ -79,6 +79,19 @@ func TestAuthPath(t *testing.T) {
 	}
 }
 
+func TestDefaultModelRoundTrip(t *testing.T) {
+	t.Setenv(EnvAgentDir, t.TempDir())
+	if got := ReadDefaultModel(); got != "" {
+		t.Fatalf("initial model = %q", got)
+	}
+	if err := WriteDefaultModel(" openai-codex/gpt-5.4 "); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadDefaultModel(); got != "openai-codex/gpt-5.4" {
+		t.Fatalf("model = %q", got)
+	}
+}
+
 func TestEnsureAgentDir(t *testing.T) {
 	// A nested path exercises directory creation.
 	dir := filepath.Join(t.TempDir(), "nested", "agent")

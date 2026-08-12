@@ -160,16 +160,15 @@ The two user-requested packages are now native:
   state, `[DONE:n]` checklist tracking, and chat commands for plan, git-diff,
   file, and last-message review. `-plan` starts planning immediately; chat
   always loads `/plannotator` so it can be toggled later.
-- `internal/claudetui`: width-aware startup card, model/thinking/cwd display,
-  a half-open rounded prompt, and an OpenCode-inspired session sidebar showing
-  context, cost, transcript/tool counts, changed files, branch, and mode. It
-  refreshes automatically after turns and state changes; `/status` also prints
-  it on demand. It defaults on in chat; `-claude-tui=false` and the
-  `/use-claude-code-tui`/`/use-default-tui` commands control it.
+- `internal/claudetui`: model/context/cost/git/mode information used by both
+  the startup card and the responsive fullscreen sidebar.
+- `internal/tui`: dependency-free raw-terminal alternate-screen renderer with
+  a fixed transcript viewport, responsive sidebar, editor, cursor placement,
+  Unicode width handling, history, scrolling, and live agent updates.
 
-Both are dependency-free adaptations. They do not load npm or require pi's
-full-screen TypeScript TUI. Plannotator intentionally serves a compact native
-review page instead of embedding its roughly 39 MB generated SPA assets.
+These are dependency-free adaptations and do not load npm or pi's TypeScript
+TUI. Plannotator intentionally serves a compact native review page instead of
+embedding its roughly 39 MB generated SPA assets.
 
 ## 2026 Go quality and security audit
 
@@ -221,10 +220,10 @@ release builds. The repository still has no third-party Go dependencies and no
 - Compat travels on options structs, with `Model.RawCompat` as the fallback.
 - No vendor SDKs: hand-rolled `net/http` + SSE reader. Bedrock does SigV4 and
   binary event-stream framing against stdlib crypto.
-- `goshcoder chat` is line-oriented, not a full-screen TUI.
+- Interactive terminals use the native fullscreen TUI; pipes and unsupported
+  platforms fall back to the line-oriented interface.
 - Selected pi extensions are native built-ins: `internal/ralph`
   (`@tmustier/pi-ralph-wiggum`), `internal/plannotator`
   (`@plannotator/pi-extension`), and `internal/claudetui`
-  (`pi-claude-code-tui`). Plannotator uses a compact stdlib browser reviewer,
-  and the Claude-style UI is adapted to the line-oriented chat rather than
-  importing pi's npm/TUI runtime.
+  (`pi-claude-code-tui`). Plannotator uses a compact stdlib browser reviewer;
+  the visual UI is native Go rather than pi's npm/TUI runtime.

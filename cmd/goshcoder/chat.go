@@ -27,8 +27,10 @@ import (
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
+	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/tui"
 )
 
 const chatHelp = `Slash commands:
@@ -60,18 +62,32 @@ func chatCommand(args []string) error {
 	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	cfg := bindSessionFlags(flags)
+	flags.BoolVar(&cfg.Fullscreen, "fullscreen", true, "use the fullscreen interactive TUI")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	// Native extension commands are available in chat even when plan mode was
 	// not requested at startup.
 	cfg.LoadPlannotator = true
+	cfg.Fullscreen = cfg.Fullscreen && tui.Supported(os.Stdin, os.Stderr)
+	if cfg.ModelRef == "" {
+		modelRef, modelErr := defaultChatModel()
+		if modelErr != nil && tui.Supported(os.Stdin, os.Stderr) {
+			modelRef, modelErr = onboardChatModel()
+		}
+		if modelErr != nil { return modelErr }
+		cfg.ModelRef = modelRef
+	}
 
 	s, err := newSession(*cfg)
 	if err != nil {
 		return err
 	}
 	defer s.close()
+	_ = config.WriteDefaultModel(s.model.Provider + "/" + s.model.ID)
+	if cfg.Fullscreen {
+		return runFullscreenChat(s)
+	}
 
 	// Ctrl-C aborts a turn; when idle it closes stdin so the read loop ends.
 	stop := s.handleInterrupts(func() {
@@ -148,6 +164,77 @@ func chatCommand(args []string) error {
 	}
 }
 
+func onboardChatModel() (string, error) {
+	fmt.Fprintln(os.Stderr, "Welcome to GoshCoder. Choose a subscription login:")
+	fmt.Fprintln(os.Stderr, "  1. OpenAI Codex (recommended)")
+	fmt.Fprintln(os.Stderr, "  2. Anthropic")
+	fmt.Fprintln(os.Stderr, "  3. Kimi Coding")
+	fmt.Fprint(os.Stderr, "Choice [1]: ")
+	choice, err := readTerminalLine(os.Stdin)
+	if err != nil { return "", err }
+	provider := "openai-codex"
+	switch strings.TrimSpace(choice) {
+	case "", "1":
+	case "2": provider = "anthropic"
+	case "3": provider = "kimi-coding"
+	default: return "", fmt.Errorf("unknown login choice %q", strings.TrimSpace(choice))
+	}
+	if err := authCommand([]string{"login", provider}); err != nil { return "", err }
+	return defaultChatModel()
+}
+
+func readTerminalLine(input *os.File) (string, error) {
+	var line strings.Builder
+	var one [1]byte
+	for {
+		count, err := input.Read(one[:])
+		if count == 1 {
+			if one[0] == '\n' { return line.String(), nil }
+			if one[0] != '\r' { line.WriteByte(one[0]) }
+		}
+		if err != nil { return "", err }
+	}
+}
+
+func defaultChatModel() (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("GOSHCODER_MODEL")); configured != "" {
+		return configured, nil
+	}
+	if remembered := config.ReadDefaultModel(); remembered != "" {
+		if _, _, err := newCatalog().ResolveModel(remembered); err == nil {
+			return remembered, nil
+		}
+	}
+	catalog := newCatalog()
+	configured := catalog.ConfiguredProviderIDs()
+	preferred := []struct{ provider, model string }{
+		{"openai-codex", "gpt-5.4"},
+		{"anthropic", "claude-sonnet-4-5"},
+		{"kimi-coding", "kimi-for-coding"},
+		{"openai", "gpt-5.1"},
+	}
+	available := make(map[string]bool, len(configured))
+	for _, provider := range configured {
+		available[provider] = true
+	}
+	for _, candidate := range preferred {
+		if available[candidate.provider] && catalog.Model(candidate.provider, candidate.model) != nil {
+			return candidate.provider + "/" + candidate.model, nil
+		}
+	}
+	for _, providerID := range configured {
+		provider := catalog.Provider(providerID)
+		if provider == nil {
+			continue
+		}
+		models := provider.Models()
+		if len(models) > 0 {
+			return providerID + "/" + models[len(models)-1].ID, nil
+		}
+	}
+	return "", errors.New("no authenticated model is available; run 'goshcoder auth login openai-codex' or pass -m provider/model")
+}
+
 // userMessage builds a transcript user message.
 func userMessage(text string) llm.UserMessage {
 	return llm.UserMessage{Role: "user", Content: text, Timestamp: time.Now().UnixMilli()}
@@ -173,6 +260,7 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 		if err := s.setModel(rest); err != nil {
 			return false, err
 		}
+		_ = config.WriteDefaultModel(s.model.Provider + "/" + s.model.ID)
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("model set to %s/%s", s.model.Provider, s.model.ID)))
 
 	case "/thinking":

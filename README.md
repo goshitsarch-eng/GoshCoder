@@ -23,8 +23,11 @@ goshcoder models [provider]
 # One-shot prompt
 goshcoder run -m anthropic/claude-sonnet-4-5 "explain this repo"
 
-# Interactive session (/help lists slash commands)
-goshcoder chat -m openai/gpt-5.1 -tools
+# Fullscreen interactive session; the last selected model is remembered
+goshcoder -m openai/gpt-5.1 -tools
+
+# After the first launch, simply run
+goshcoder
 
 # Store a key (also reads the usual env vars, e.g. ANTHROPIC_API_KEY)
 goshcoder auth set anthropic
@@ -45,7 +48,8 @@ goshcoder auth login kimi-coding
 | `-tools` | Enable the built-in file and shell tools |
 | `-ralph` | Enable long-running ralph loops |
 | `-plan` | Start in native Plannotator planning/review mode |
-| `-claude-tui` | Use the native `pi-claude-code-tui` chat appearance (default true; disable with `-claude-tui=false`) |
+| `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
+| `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
 | `-C` | Workspace directory for tools |
 
 Credentials and config live in `~/.goshcoder/agent` (override with
@@ -62,7 +66,8 @@ be pointed at either tool.
 | `internal/tools` | Built-in tools (read, write, edit, list, bash) |
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Plan mode, browser approval/annotations, and checklist progress |
-| `internal/claudetui` | Native startup card and half-open chat input styling |
+| `internal/claudetui` | Claude-style cards and session information rendering |
+| `internal/tui` | Raw-terminal fullscreen renderer and responsive transcript layout |
 | `internal/config` | On-disk paths |
 | `cmd/goshcoder` | CLI |
 
@@ -98,8 +103,8 @@ host, so selected extension features are native built-ins:
   `-claude-tui=false` for the plain interface, and `/use-claude-code-tui` to
   switch back.
 
-The visual extensions are adapted to GoshCoder's line-oriented terminal rather
-than depending on pi's TypeScript TUI or an npm runtime.
+The visual extensions are implemented by GoshCoder's native Go TUI rather than
+depending on pi's TypeScript TUI or an npm runtime.
 
 ## Deviations from pi
 
@@ -111,9 +116,10 @@ Documented at the top of each ported file. The notable ones:
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, and Kimi
   Code. Kimi also supports API-key authentication.
-- **Interface.** pi renders a full-screen TUI; `goshcoder chat` is
-  line-oriented, keeping session semantics behind slash commands so stdout
-  stays pipeable.
+- **Interface.** Interactive chat now uses a native full-screen alternate-screen
+  TUI with a fixed transcript, editor, status line, and responsive information
+  sidebar. Redirected input/output automatically falls back to the pipeable
+  line-oriented interface.
 
 ## Development
 
