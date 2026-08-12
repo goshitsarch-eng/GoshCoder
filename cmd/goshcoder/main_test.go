@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,6 +14,24 @@ import (
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 )
+
+func TestProviderCredentialsAreAdditive(t *testing.T) {
+	store := catalog.NewFileCredentialStore(filepath.Join(t.TempDir(), "auth.json"))
+	for provider, key := range map[string]string{"anthropic": "sk-anthropic", "openai": "sk-openai"} {
+		if _, err := store.Modify(provider, func(*catalog.Credential) (*catalog.Credential, error) {
+			return &catalog.Credential{Type: "api_key", Key: key}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credentials, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(credentials) != 2 || credentials[0].ProviderID != "anthropic" || credentials[1].ProviderID != "openai" {
+		t.Fatalf("stored credentials = %#v", credentials)
+	}
+}
 
 func TestTerminalLoginInteractionSelectsByNumber(t *testing.T) {
 	var output bytes.Buffer
@@ -67,6 +86,31 @@ func TestTerminalLoginInteractionRendersOAuthEvents(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output %q does not contain %q", got, want)
 		}
+	}
+}
+
+func TestSessionRegistersNativeWebSearchWithCodingTools(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "sk-test-web-tool")
+	session, err := newSession(sessionConfig{
+		ModelRef: "openai/gpt-5.6-terra", Workdir: t.TempDir(), EnableTools: true, Quiet: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.close()
+	found := false
+	for _, tool := range session.agent.State().Tools {
+		if tool.Name == "web_search" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("web_search missing from tools: %#v", session.agent.State().Tools)
+	}
+	if !strings.Contains(session.agent.State().SystemPrompt, "web_search") {
+		t.Fatalf("system prompt does not advertise web_search: %q", session.agent.State().SystemPrompt)
 	}
 }
 

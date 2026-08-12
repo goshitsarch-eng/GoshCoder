@@ -246,7 +246,7 @@ func (set *Set) BuildSystemPrompt(explicit, cwd string, toolNames []string) stri
 	}
 	if base == "" {
 		var tools []string
-		for _, name := range []string{"read", "write", "edit", "bash", "grep", "find", "ls"} {
+		for _, name := range []string{"read", "write", "edit", "bash", "grep", "find", "ls", "web_search"} {
 			if selected[name] {
 				tools = append(tools, "- "+name+": "+toolSnippet(name))
 			}
@@ -308,6 +308,8 @@ func toolSnippet(name string) string {
 		return "Find files by glob pattern (respects .gitignore)"
 	case "ls":
 		return "List directory contents"
+	case "web_search":
+		return "Search the web and return cited sources"
 	default:
 		return name
 	}

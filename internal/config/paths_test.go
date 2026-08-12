@@ -79,6 +79,14 @@ func TestAuthPath(t *testing.T) {
 	}
 }
 
+func TestWebSearchPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvAgentDir, dir)
+	if got, want := WebSearchPath(), filepath.Join(dir, "web-search.json"); got != want {
+		t.Fatalf("WebSearchPath = %q, want %q", got, want)
+	}
+}
+
 func TestDefaultModelRoundTrip(t *testing.T) {
 	t.Setenv(EnvAgentDir, t.TempDir())
 	if got := ReadDefaultModel(); got != "" {

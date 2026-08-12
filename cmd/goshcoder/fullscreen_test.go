@@ -185,6 +185,28 @@ func TestFullscreenTranscriptKeepsToolActivityCompact(t *testing.T) {
 	}
 }
 
+func TestBubbleTeaCommandPaletteShowsAdditiveProviderLogin(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+
+	root := fullscreenSuggestions(session, "/log")
+	if len(root) != 1 || root[0].label != "/login" || root[0].execute || root[0].value != "/login " {
+		t.Fatalf("login root suggestion = %#v", root)
+	}
+	oauth := fullscreenSuggestions(session, "/login anthropic")
+	if len(oauth) != 1 || oauth[0].label != "anthropic" || !oauth[0].execute || !strings.Contains(oauth[0].description, "OAuth") {
+		t.Fatalf("Anthropic login suggestion = %#v", oauth)
+	}
+	apiKey := fullscreenSuggestions(session, "/login deepseek")
+	if len(apiKey) != 1 || apiKey[0].label != "deepseek" || !strings.Contains(apiKey[0].description, "API key") {
+		t.Fatalf("DeepSeek login suggestion = %#v", apiKey)
+	}
+	if title := fullscreenSuggestionTitle("/login "); !strings.Contains(title, "existing logins are kept") {
+		t.Fatalf("login picker title = %q", title)
+	}
+}
+
 func TestBubbleTeaCommandPaletteShowsRalphControls(t *testing.T) {
 	model := &llm.Model{ID: "chat", Provider: "vendor"}
 	session := fullscreenTestSession(model, llm.ThinkingOff)

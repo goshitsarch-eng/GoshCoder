@@ -154,6 +154,11 @@ models (100%)**.
 
 The two user-requested packages are now native:
 
+- **Web Search** (`internal/webaccess`): native `pi-web-access` adaptation registered
+  as `web_search`, with OpenAI/Codex auth reuse, zero-config Exa MCP fallback,
+  direct Exa, and Kagi Search (`KAGI_API_KEY` or `web-search.json`). The in-app
+  `/login` picker adds OAuth or API-key providers without replacing existing
+  credentials and refreshes `/model` choices immediately.
 - **Planner** (`internal/plannotator`): planning/executing/idle state machine,
   markdown-only planning write gate, `planner_submit_plan`, and a polished loopback review
   app with approve/deny, line annotations, notes, direct Markdown edits,

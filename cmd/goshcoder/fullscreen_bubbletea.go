@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/tui"
 )
@@ -42,6 +44,10 @@ type fullscreenModelChoice struct {
 type fullscreenAgentEvent struct{ event agent.Event }
 type fullscreenTurnFinished struct{ err error }
 type fullscreenCommandFinished struct{ result fullscreenResult }
+type fullscreenLoginFinished struct {
+	provider string
+	err      error
+}
 type fullscreenInfoRefreshed struct{ info claudetui.SessionInfo }
 type fullscreenTick time.Time
 
@@ -166,6 +172,21 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if model.applyCommandResult(value.result) {
 			return model, tea.Quit
 		}
+
+	case fullscreenLoginFinished:
+		model.busyCommand = false
+		model.activityAt = time.Time{}
+		if value.err != nil {
+			model.notices = appendNotice(model.notices, "Error", value.err.Error())
+			model.activity = "Ready"
+			break
+		}
+		// The child process wrote one provider entry without touching any of the
+		// others. Rebuild the picker so every authenticated provider is visible
+		// immediately.
+		model.models = availableFullscreenModels(model.session)
+		model.notices = appendNotice(model.notices, "Login", "Added "+value.provider+". Use /model to switch providers.")
+		model.activity = "Logged in to " + value.provider
 
 	case fullscreenInfoRefreshed:
 		model.info = value.info
@@ -501,7 +522,14 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 		if prompt == "/exit" || prompt == "/quit" {
 			return tea.Quit
 		}
-		model.activity = "Running " + strings.Fields(prompt)[0]
+		fields := strings.Fields(prompt)
+		if len(fields) == 2 && fields[0] == "/login" {
+			model.busyCommand = true
+			model.activity = "Logging in to " + fields[1]
+			model.activityAt = time.Now()
+			return fullscreenLoginCommand(fields[1])
+		}
+		model.activity = "Running " + fields[0]
 		if fullscreenCommandRunsAsync(prompt) {
 			model.busyCommand = true
 			model.activityAt = time.Now()
@@ -523,6 +551,27 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 	model.activity = "Sending message"
 	model.activityAt = time.Now()
 	return func() tea.Msg { return fullscreenTurnFinished{err: model.session.runTurn(prompt)} }
+}
+
+func fullscreenLoginCommand(providerID string) tea.Cmd {
+	provider := newCatalog().Provider(providerID)
+	if provider == nil {
+		return func() tea.Msg {
+			return fullscreenLoginFinished{provider: providerID, err: fmt.Errorf("unknown provider %q", providerID)}
+		}
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return func() tea.Msg { return fullscreenLoginFinished{provider: providerID, err: err} }
+	}
+	subcommand := "set"
+	if _, ok := catalog.LoginProviderFor(providerID); ok {
+		subcommand = "login"
+	}
+	command := exec.Command(executable, "auth", subcommand, providerID)
+	return tea.ExecProcess(command, func(err error) tea.Msg {
+		return fullscreenLoginFinished{provider: providerID, err: err}
+	})
 }
 
 func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
@@ -711,6 +760,13 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		}
 		return suggestions
 	}
+	if strings.HasPrefix(lower, "/login ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/login "))
+		if strings.ContainsAny(query, " \t\n") {
+			return nil
+		}
+		return fullscreenLoginSuggestions(query)
+	}
 	if strings.HasPrefix(lower, "/ralph ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/ralph "))
 		if strings.ContainsAny(query, " \t\n") {
@@ -766,7 +822,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/model", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
+		case "/model", "/login", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -789,6 +845,59 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 				suggestions = append(suggestions, fullscreenSuggestion{label: name, description: skill.Description, value: name, execute: true})
 			}
 		}
+	}
+	return suggestions
+}
+
+func fullscreenLoginSuggestions(query string) []fullscreenSuggestion {
+	models := newCatalog()
+	configured := make(map[string]bool)
+	for _, providerID := range models.ConfiguredProviderIDs() {
+		configured[providerID] = true
+	}
+	type choice struct {
+		id          string
+		description string
+		oauth       bool
+	}
+	var choices []choice
+	for _, providerID := range models.ProviderIDs() {
+		provider := models.Provider(providerID)
+		if provider == nil || !strings.Contains(strings.ToLower(providerID+" "+provider.Name), query) {
+			continue
+		}
+		supported := false
+		for _, model := range provider.Models() {
+			if _, ok := llm.GetStreamer(model.API); ok {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			continue
+		}
+		_, oauth := catalog.LoginProviderFor(providerID)
+		description := provider.Name + "  ·  API key"
+		if oauth {
+			description = provider.Name + "  ·  OAuth / subscription"
+		}
+		if configured[providerID] {
+			description = "SIGNED IN  ·  " + description
+		}
+		choices = append(choices, choice{id: providerID, description: description, oauth: oauth})
+	}
+	sort.SliceStable(choices, func(left, right int) bool {
+		if choices[left].oauth != choices[right].oauth {
+			return choices[left].oauth
+		}
+		return choices[left].id < choices[right].id
+	})
+	suggestions := make([]fullscreenSuggestion, 0, len(choices))
+	for _, choice := range choices {
+		suggestions = append(suggestions, fullscreenSuggestion{
+			label: choice.id, description: choice.description,
+			value: "/login " + choice.id, execute: true,
+		})
 	}
 	return suggestions
 }
@@ -886,6 +995,9 @@ func fullscreenSuggestionTitle(input string) string {
 	}
 	if strings.HasPrefix(lower, "/thinking ") {
 		return "THINKING LEVEL  ·  model-supported options"
+	}
+	if strings.HasPrefix(lower, "/login ") {
+		return "ADD PROVIDER  ·  OAuth or API key  ·  existing logins are kept"
 	}
 	if strings.HasPrefix(lower, "/ralph ") {
 		return "RALPH LOOP  ·  iterative development controls"

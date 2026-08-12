@@ -23,6 +23,10 @@ SOFTWARE.
 GoshCoder is a Go reimplementation derived from pi (https://github.com/earendil-works/pi),
 Copyright (c) 2025 Mario Zechner, used under the MIT License above.
 
+The native `pi-web-access` Web Search adaptation is based on pi-web-access by
+Nico Bailon (https://github.com/nicobailon/pi-web-access), Copyright (c) 2025
+Nico Bailon, used under the MIT License above.
+
 The native `pi-claude-code-tui` adaptation is based on the package by Phoobobo,
 Copyright (c) 2026 Phoobobo, used under the MIT License above.
 

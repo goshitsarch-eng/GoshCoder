@@ -21,6 +21,7 @@ import (
 	"goshcoder/internal/ralph"
 	coderresources "goshcoder/internal/resources"
 	"goshcoder/internal/tools"
+	"goshcoder/internal/webaccess"
 )
 
 // sessionConfig is the resolved command-line configuration for a session.
@@ -93,7 +94,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 		}
 		s.workspace = workspace
 		if cfg.EnableTools {
-			agentTools = workspace.All()
+			agentTools = append(workspace.All(), webaccess.New(
+				config.WebSearchPath(), resolveOpenAIWebSearchAuth,
+			).Tool())
 		}
 		if !cfg.Quiet && cfg.EnableTools {
 			// The bash tool runs arbitrary commands with the user's privileges.
@@ -211,6 +214,44 @@ func newSession(cfg sessionConfig) (*session, error) {
 		s.agent.Subscribe(renderEvent)
 	}
 	return s, nil
+}
+
+// resolveOpenAIWebSearchAuth gives the native web search port the same
+// credential reuse as pi-web-access: a stored Codex subscription is preferred,
+// then a regular OpenAI API credential. Resolving per call also refreshes OAuth
+// tokens without coupling the search service to the active chat model.
+func resolveOpenAIWebSearchAuth(ctx context.Context) (*webaccess.OpenAIAuth, error) {
+	var firstError error
+	for _, providerID := range []string{"openai-codex", "openai"} {
+		models := newCatalog()
+		models.SetOAuthContext(ctx)
+		auth, ok := models.ResolveAuth(providerID)
+		if !ok {
+			if err := models.OAuthError(providerID); err != nil && firstError == nil {
+				firstError = err
+			}
+			continue
+		}
+		modelID := "gpt-5.6-terra"
+		if models.Model(providerID, modelID) == nil {
+			provider := models.Provider(providerID)
+			if provider == nil {
+				continue
+			}
+			providerModels := provider.Models()
+			if len(providerModels) == 0 {
+				continue
+			}
+			modelID = providerModels[len(providerModels)-1].ID
+		}
+		return &webaccess.OpenAIAuth{
+			Provider: providerID,
+			APIKey:   auth.APIKey,
+			Model:    modelID,
+			Headers:  auth.Headers,
+		}, nil
+	}
+	return nil, firstError
 }
 
 func (s *session) expandResourceInput(input string) (string, bool, error) {

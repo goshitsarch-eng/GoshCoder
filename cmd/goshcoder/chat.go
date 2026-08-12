@@ -27,6 +27,7 @@ import (
 	"goshcoder/internal/claudetui"
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	"goshcoder/internal/tui"
@@ -35,6 +36,7 @@ import (
 const chatHelp = `Slash commands:
   /help                 Show this help
   /model [ref]          Show or switch the model
+  /login [provider]     Add an OAuth or API-key provider (keeps existing logins)
   /thinking [level]     Show or set the thinking level
   /system [text]        Show or replace the system prompt
   /tools                List the available tools
@@ -313,6 +315,30 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 		}
 		_ = config.WriteDefaultModel(s.model.Provider + "/" + s.model.ID)
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("model set to %s/%s", s.model.Provider, s.model.ID)))
+
+	case "/login":
+		if rest == "" {
+			fmt.Fprintln(os.Stderr, "Choose a provider from /login in the command palette, or run /login <provider>.")
+			fmt.Fprintln(os.Stderr, "OAuth subscriptions: "+strings.Join(catalog.OAuthProviderIDs(), ", "))
+			fmt.Fprintln(os.Stderr, "Other providers prompt for an API key; existing provider credentials are preserved.")
+			return false, nil
+		}
+		fields := strings.Fields(rest)
+		if len(fields) != 1 {
+			return false, errors.New("usage: /login <provider>")
+		}
+		providerID := fields[0]
+		if newCatalog().Provider(providerID) == nil {
+			return false, fmt.Errorf("unknown provider %q", providerID)
+		}
+		subcommand := "set"
+		if _, ok := catalog.LoginProviderFor(providerID); ok {
+			subcommand = "login"
+		}
+		if err := authCommand([]string{subcommand, providerID}); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "Added %s. Use /model to switch providers.\n", providerID)
 
 	case "/thinking":
 		available := llm.GetSupportedThinkingLevels(s.model)

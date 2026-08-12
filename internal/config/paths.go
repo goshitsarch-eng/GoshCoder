@@ -53,6 +53,10 @@ func AuthPath() string {
 	return filepath.Join(AgentDir(), "auth.json")
 }
 
+// WebSearchPath returns the pi-web-access-compatible search configuration
+// path used by the native web_search tool.
+func WebSearchPath() string { return filepath.Join(AgentDir(), "web-search.json") }
+
 // DefaultModelPath is the small text file used to remember the last model
 // selected for interactive chat.
 func DefaultModelPath() string { return filepath.Join(AgentDir(), "default-model") }

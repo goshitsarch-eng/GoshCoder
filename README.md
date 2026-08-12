@@ -39,6 +39,11 @@ goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
 ```
 
+Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
+providers are added to `auth.json` independently, so signing in to Anthropic,
+OpenAI Codex, or Kimi does not remove existing logins. Use `/model` immediately
+afterward to search models across every authenticated provider.
+
 `run` and `chat` flags:
 
 | Flag | Meaning |
@@ -65,6 +70,7 @@ be pointed at either tool.
 | `internal/llm/catalog` | Provider catalog, model data, credential store, auth resolution |
 | `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
 | `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
+| `internal/webaccess` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
@@ -90,6 +96,22 @@ reuse and optional zstd request compression are intentionally omitted.
 pi extensions are TypeScript modules loaded at runtime. GoshCoder has no plugin
 host, so selected extension features are native built-ins:
 
+- `pi-web-access` **Web Search** (native adaptation): the `web_search` tool is
+  enabled with the coding tools and supports single or batched queries, result
+  counts, recency/domain filters, cited output, OpenAI/Codex subscription auth,
+  zero-config Exa MCP fallback, direct Exa API keys, and Kagi Search. It reads
+  `web-search.json` from the agent directory. For Kagi, set `KAGI_API_KEY` or:
+
+  ```json
+  {
+    "provider": "kagi",
+    "kagiApiKey": "$KAGI_API_KEY"
+  }
+  ```
+
+  Set `provider` to `auto`, `openai`, `exa`, or `kagi`; `auto` reuses an
+  OpenAI/Codex login when suitable and otherwise works without a key through
+  Exa. This is a native Go port of the search tool, not an npm plugin runtime.
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. `/ralph` opens loop controls in the command palette.
