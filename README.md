@@ -1,7 +1,8 @@
 # GoshCoder
 
 A Go coding agent, ported from [pi](https://github.com/earendil-works/pi).
-No third-party dependencies: everything is Go's standard library.
+Its interactive interface is built with
+[Bubble Tea](https://github.com/charmbracelet/bubbletea) and Lip Gloss.
 
 ## Install
 
@@ -67,7 +68,7 @@ be pointed at either tool.
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Plan mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
-| `internal/tui` | Raw-terminal fullscreen renderer and responsive transcript layout |
+| `internal/tui` | Bubble Tea view renderer, responsive transcript, palette, composer, and sidebar |
 | `internal/config` | On-disk paths |
 | `cmd/goshcoder` | CLI |
 
@@ -103,8 +104,11 @@ host, so selected extension features are native built-ins:
   `-claude-tui=false` for the plain interface, and `/use-claude-code-tui` to
   switch back.
 
-The visual extensions are implemented by GoshCoder's native Go TUI rather than
-depending on pi's TypeScript TUI or an npm runtime.
+The visual extensions are implemented by GoshCoder's native Bubble Tea TUI
+rather than depending on pi's TypeScript TUI or an npm runtime. Type `/` to open the
+command palette; arrows select an item, Tab completes it, and Enter accepts it.
+`/thinking` opens a second palette containing only levels supported by the
+active provider/model.
 
 ## Deviations from pi
 
@@ -116,10 +120,10 @@ Documented at the top of each ported file. The notable ones:
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, and Kimi
   Code. Kimi also supports API-key authentication.
-- **Interface.** Interactive chat now uses a native full-screen alternate-screen
-  TUI with a fixed transcript, editor, status line, and responsive information
-  sidebar. Redirected input/output automatically falls back to the pipeable
-  line-oriented interface.
+- **Interface.** Interactive chat uses a Bubble Tea alternate-screen TUI with a
+  command palette, model-aware thinking picker, live activity, fixed transcript,
+  editor, and responsive information sidebar. Redirected input/output
+  automatically falls back to the pipeable line-oriented interface.
 
 ## Development
 

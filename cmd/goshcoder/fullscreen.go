@@ -1,18 +1,10 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"strings"
-	"sync"
-	"syscall"
-	"time"
-	"unicode/utf8"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
@@ -33,313 +25,33 @@ type fullscreenEditor struct {
 	historyIndex int
 	draft        string
 	scroll       int
-	pending      []byte
+	suggestion   int
 }
 
-func runFullscreenChat(session *session) error {
-	terminal, err := tui.Open(os.Stdin, os.Stderr)
-	if err != nil {
-		return err
-	}
-	defer terminal.Close()
-
-	var activityMu sync.Mutex
-	activity := "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
-	dirty := make(chan struct{}, 1)
-	requestRender := func() {
-		select {
-		case dirty <- struct{}{}:
-		default:
-		}
-	}
-	unsubscribe := session.agent.Subscribe(func(_ context.Context, event agent.Event) {
-		activityMu.Lock()
-		switch event.Type {
-		case agent.EventMessageUpdate:
-			activity = "Generating response…"
-		case agent.EventToolExecutionStart:
-			activity = "Running " + event.ToolName + "…"
-		case agent.EventToolExecutionEnd:
-			if event.IsError {
-				activity = event.ToolName + " failed"
-			} else {
-				activity = event.ToolName + " complete"
-			}
-		case agent.EventAgentEnd:
-			activity = "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
-		}
-		activityMu.Unlock()
-		requestRender()
-	})
-	defer unsubscribe()
-
-	inputEvents := make(chan []byte, 32)
-	inputErrors := make(chan error, 1)
-	go readTerminalInput(os.Stdin, inputEvents, inputErrors)
-
-	interrupts := make(chan os.Signal, 1)
-	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(interrupts)
-
-	editor := fullscreenEditor{historyIndex: -1}
-	var notices []tui.Message
-	for _, tool := range session.agent.State().Tools {
-		if tool.Name == "bash" {
-			notices = append(notices, tui.Message{Role: "Notice", Text: "Coding tools are enabled for " + session.workspaceRoot() + ". Shell commands run with your user privileges; use -tools=false for read-only chat."})
-			break
-		}
-	}
-	info := session.sessionInfo()
-	turnDone := make(chan error, 1)
-	commandDone := make(chan fullscreenResult, 1)
-	busyCommand := false
-	lastSize := ""
-
-	render := func() error {
-		width, height := terminal.Size()
-		size := fmt.Sprintf("%dx%d", width, height)
-		lastSize = size
-		activityMu.Lock()
-		status := activity
-		activityMu.Unlock()
-		messages := append(fullscreenMessages(session.agent.State().Messages), notices...)
-		frame := tui.Frame{
-			Title:    fmt.Sprintf("GoshCoder %s  ·  %s/%s", Version, session.model.Provider, session.model.ID),
-			Messages: messages, Sidebar: fullscreenSidebar(info),
-			Input: editor.input, Cursor: editor.cursor, Status: status,
-			Streaming: session.agent.State().IsStreaming || busyCommand, Scroll: editor.scroll,
-		}
-		return terminal.Render(frame)
-	}
-
-	startTurn := func(prompt string) {
-		if strings.TrimSpace(prompt) == "" {
-			return
-		}
-		editor.history = append(editor.history, prompt)
-		editor.historyIndex, editor.draft = -1, ""
-		editor.input, editor.cursor, editor.scroll = nil, 0, 0
-		go func() { turnDone <- session.runTurn(prompt) }()
-	}
-
-	requestRender()
-	ticker := time.NewTicker(80 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-dirty:
-			if err := render(); err != nil {
-				return err
-			}
-		case <-ticker.C:
-			width, height := terminal.Size()
-			if fmt.Sprintf("%dx%d", width, height) != lastSize {
-				if err := render(); err != nil {
-					return err
-				}
-			}
-		case data := <-inputEvents:
-			action := handleFullscreenInput(&editor, data, session.agent.State().IsStreaming)
-			switch action {
-			case "exit":
-				if session.agent.State().IsStreaming {
-					session.agent.Abort()
-				} else {
-					return nil
-				}
-			case "abort":
-				session.agent.Abort()
-			case "thinking":
-				cycleFullscreenThinking(session)
-				info = session.sessionInfo()
-				activityMu.Lock()
-				activity = "Thinking set to " + session.agent.State().ThinkingLevel
-				activityMu.Unlock()
-			case "submit":
-				prompt := strings.TrimSpace(string(editor.input))
-				if prompt == "" {
-					break
-				}
-				if session.agent.State().IsStreaming {
-					session.agent.Steer(userMessage(prompt))
-					editor.input, editor.cursor = nil, 0
-					activityMu.Lock()
-					activity = "Steering message queued"
-					activityMu.Unlock()
-				} else if !busyCommand && strings.HasPrefix(prompt, "/") {
-					editor.history = append(editor.history, prompt)
-					editor.input, editor.cursor, editor.historyIndex = nil, 0, -1
-					if prompt == "/exit" || prompt == "/quit" {
-						return nil
-					}
-					busyCommand = true
-					go func() { commandDone <- runFullscreenCommand(session, prompt) }()
-				} else if !busyCommand {
-					startTurn(prompt)
-				}
-			}
-			requestRender()
-		case err := <-inputErrors:
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		case err := <-turnDone:
-			if err != nil {
-				notices = appendNotice(notices, "Error", err.Error())
-			}
-			info = session.sessionInfo()
-			requestRender()
-		case result := <-commandDone:
-			busyCommand = false
-			if result.output != "" {
-				notices = appendNotice(notices, "Command", result.output)
-			}
-			if result.err != nil {
-				notices = appendNotice(notices, "Error", result.err.Error())
-			}
-			if result.exit {
-				return nil
-			}
-			info = session.sessionInfo()
-			activityMu.Lock()
-			activity = "Ready · Enter submit · Shift-Tab thinking · /help · Ctrl-D exit"
-			activityMu.Unlock()
-			requestRender()
-		case <-interrupts:
-			if session.agent.State().IsStreaming {
-				session.agent.Abort()
-				requestRender()
-			} else {
-				return nil
-			}
-		}
-	}
+type slashCommand struct {
+	name        string
+	description string
 }
 
-func readTerminalInput(input *os.File, events chan<- []byte, failures chan<- error) {
-	reader := bufio.NewReader(input)
-	for {
-		data := make([]byte, 256)
-		count, err := reader.Read(data)
-		if count > 0 {
-			events <- append([]byte(nil), data[:count]...)
-		}
-		if err != nil {
-			failures <- err
-			return
-		}
-	}
-}
-
-func handleFullscreenInput(editor *fullscreenEditor, data []byte, streaming bool) string {
-	if len(editor.pending) > 0 {
-		data = append(append([]byte(nil), editor.pending...), data...)
-		editor.pending = nil
-	}
-	for len(data) > 0 {
-		switch {
-		case strings.HasPrefix(string(data), "\x1b[Z"):
-			return "thinking"
-		case strings.HasPrefix(string(data), "\x1b[5~"):
-			editor.scroll += 10
-			data = data[4:]
-			continue
-		case strings.HasPrefix(string(data), "\x1b[6~"):
-			editor.scroll = max(0, editor.scroll-10)
-			data = data[4:]
-			continue
-		case strings.HasPrefix(string(data), "\x1b[D"):
-			editor.cursor = max(0, editor.cursor-1)
-			data = data[3:]
-			continue
-		case strings.HasPrefix(string(data), "\x1b[C"):
-			editor.cursor = min(len(editor.input), editor.cursor+1)
-			data = data[3:]
-			continue
-		case strings.HasPrefix(string(data), "\x1b[A"):
-			editorHistory(editor, -1)
-			data = data[3:]
-			continue
-		case strings.HasPrefix(string(data), "\x1b[B"):
-			editorHistory(editor, 1)
-			data = data[3:]
-			continue
-		}
-		value := data[0]
-		data = data[1:]
-		switch value {
-		case 3: // Ctrl-C: clear first, then abort/exit.
-			if len(editor.input) > 0 {
-				editor.input, editor.cursor = nil, 0
-				continue
-			}
-			if streaming {
-				return "abort"
-			}
-			return "exit"
-		case 4: // Ctrl-D.
-			if len(editor.input) == 0 {
-				return "exit"
-			}
-			if editor.cursor < len(editor.input) {
-				editor.input = append(editor.input[:editor.cursor], editor.input[editor.cursor+1:]...)
-			}
-		case 27:
-			if streaming {
-				return "abort"
-			}
-		case 13, 10:
-			return "submit"
-		case 127, 8:
-			if editor.cursor > 0 {
-				editor.input = append(editor.input[:editor.cursor-1], editor.input[editor.cursor:]...)
-				editor.cursor--
-			}
-		case 1:
-			editor.cursor = 0
-		case 5:
-			editor.cursor = len(editor.input)
-		case 11:
-			editor.input = editor.input[:editor.cursor]
-		case 21:
-			editor.input = append([]rune(nil), editor.input[editor.cursor:]...)
-			editor.cursor = 0
-		case 23:
-			for editor.cursor > 0 && editor.input[editor.cursor-1] == ' ' {
-				editor.input = append(editor.input[:editor.cursor-1], editor.input[editor.cursor:]...)
-				editor.cursor--
-			}
-			for editor.cursor > 0 && editor.input[editor.cursor-1] != ' ' {
-				editor.input = append(editor.input[:editor.cursor-1], editor.input[editor.cursor:]...)
-				editor.cursor--
-			}
-		default:
-			candidate := append([]byte{value}, data...)
-			if value >= utf8.RuneSelf && !utf8.FullRune(candidate) {
-				editor.pending = append(editor.pending[:0], candidate...)
-				return ""
-			}
-			r, size := utf8.DecodeRune(candidate)
-			if r == utf8.RuneError && size == 1 {
-				continue
-			}
-			if size > 1 {
-				data = data[size-1:]
-			}
-			if r >= 32 {
-				editor.input = append(editor.input, 0)
-				copy(editor.input[editor.cursor+1:], editor.input[editor.cursor:])
-				editor.input[editor.cursor] = r
-				editor.cursor++
-			}
-		}
-	}
-	return ""
+var fullscreenSlashCommands = []slashCommand{
+	{"/help", "Show all commands"}, {"/model", "Show or switch model"},
+	{"/thinking", "Choose reasoning effort for this model"}, {"/tools", "List active tools"},
+	{"/status", "Show session information"}, {"/messages", "Show transcript summary"},
+	{"/steer", "Guide the active response"}, {"/followup", "Queue the next message"},
+	{"/queue", "Show queued messages"}, {"/clear", "Clear the transcript"},
+	{"/plannotator", "Toggle planning mode"}, {"/plannotator-review", "Review code changes"},
+	{"/plannotator-annotate", "Annotate a target"}, {"/plannotator-last", "Annotate last response"},
+	{"/ralph", "Manage Ralph loops"}, {"/system", "Show or replace system prompt"},
+	{"/use-claude-code-tui", "Enable Claude-style UI"}, {"/use-default-tui", "Use default styling"},
+	{"/exit", "Exit GoshCoder"},
 }
 
 func cycleFullscreenThinking(session *session) {
-	levels := []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+	model := session.agent.State().Model
+	levels := llm.GetSupportedThinkingLevels(&model)
+	if len(levels) == 0 {
+		return
+	}
 	current := session.agent.State().ThinkingLevel
 	for index, level := range levels {
 		if level == current {
@@ -347,7 +59,7 @@ func cycleFullscreenThinking(session *session) {
 			return
 		}
 	}
-	session.agent.SetThinkingLevel("off")
+	session.agent.SetThinkingLevel(levels[0])
 }
 
 func editorHistory(editor *fullscreenEditor, direction int) {
@@ -384,9 +96,13 @@ func runFullscreenCommand(session *session, input string) fullscreenResult {
 	}
 	os.Stderr = writer
 	captured := make(chan string, 1)
-	go func() { data, _ := io.ReadAll(io.LimitReader(reader, 2<<20)); captured <- string(data); reader.Close() }()
+	go func() {
+		data, _ := io.ReadAll(io.LimitReader(reader, 2<<20))
+		captured <- string(data)
+		_ = reader.Close()
+	}()
 	exit, commandErr := session.handleSlashCommand(input)
-	writer.Close()
+	_ = writer.Close()
 	os.Stderr = oldStderr
 	return fullscreenResult{exit: exit, output: strings.TrimSpace(stripTerminalStyles(<-captured)), err: commandErr}
 }
@@ -424,6 +140,7 @@ func userText(message llm.UserMessage) string {
 	}
 	return blockSummary(message.BlockContent())
 }
+
 func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	var thinking, text strings.Builder
 	var tools []string
@@ -468,6 +185,7 @@ func fullscreenSidebar(info claudetui.SessionInfo) []string {
 	}
 	return []string{"", " SESSION", "", " Model", " " + info.Model, "", " Context", " " + contextText, "", fmt.Sprintf(" Cost  $%.4f", info.Cost), fmt.Sprintf(" Messages  %d", info.Messages), fmt.Sprintf(" Tools  %d", info.Tools), fmt.Sprintf(" Files  %d changed", info.ChangedFiles), "", " Branch", " " + branch, "", " Mode", " " + mode + " · " + info.Thinking}
 }
+
 func compactNumber(value int) string {
 	if value >= 1_000_000 {
 		return fmt.Sprintf("%.1fM", float64(value)/1_000_000)
@@ -477,6 +195,7 @@ func compactNumber(value int) string {
 	}
 	return fmt.Sprint(value)
 }
+
 func appendNotice(messages []tui.Message, role, text string) []tui.Message {
 	messages = append(messages, tui.Message{Role: role, Text: text})
 	if len(messages) > 20 {
@@ -484,6 +203,7 @@ func appendNotice(messages []tui.Message, role, text string) []tui.Message {
 	}
 	return messages
 }
+
 func stripTerminalStyles(text string) string {
 	var output strings.Builder
 	for index := 0; index < len(text); {

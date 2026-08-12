@@ -51,6 +51,7 @@ type session struct {
 	baseSystemPrompt string
 	normalTools      []agent.Tool
 	claudeTUI        bool
+	fullscreen       bool
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
@@ -68,7 +69,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
 	}
 
-	s := &session{model: model, auth: auth, baseSystemPrompt: cfg.SystemPrompt, claudeTUI: cfg.ClaudeTUI}
+	s := &session{model: model, auth: auth, baseSystemPrompt: cfg.SystemPrompt, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen}
 
 	var agentTools []agent.Tool
 	if cfg.EnableTools || cfg.LoadPlannotator || cfg.EnablePlannotator {
@@ -91,7 +92,11 @@ func newSession(cfg sessionConfig) (*session, error) {
 	if cfg.LoadPlannotator || cfg.EnablePlannotator {
 		root := s.workspace.Root
 		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
-		reviewer := plannotator.BrowserReviewer{Notify: func(message string) { fmt.Fprintln(os.Stderr, message) }}
+		reviewer := plannotator.BrowserReviewer{Notify: func(message string) {
+			if !cfg.Fullscreen {
+				fmt.Fprintln(os.Stderr, message)
+			}
+		}}
 		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
 		if err != nil {
 			_ = s.workspace.Close()
@@ -148,7 +153,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		InitialState: &agent.InitialState{
 			SystemPrompt:  systemPrompt,
 			Model:         *model,
-			ThinkingLevel: cfg.Thinking,
+			ThinkingLevel: llm.ClampThinkingLevel(model, cfg.Thinking),
 			Tools:         agentTools,
 		},
 		// A custom StreamFn injects the resolved auth headers and provider env,
@@ -228,7 +233,7 @@ func (s *session) runTurn(prompt string) error {
 		return errors.New(message)
 	}
 	s.syncPlanRuntime()
-	if s.plan != nil && s.plan.State().Phase != plannotator.PhaseIdle {
+	if !s.fullscreen && s.plan != nil && s.plan.State().Phase != plannotator.PhaseIdle {
 		fmt.Fprintln(os.Stderr, dim(s.plan.StatusLine()))
 	}
 	return nil
@@ -317,5 +322,10 @@ func (s *session) setModel(ref string) error {
 	}
 	s.model, s.auth = model, auth
 	s.agent.SetModel(*model)
+	// Model switches also update the UI-visible level. Provider streamers clamp
+	// defensively, but keeping agent state valid avoids advertising an option
+	// the newly selected model cannot use.
+	current := s.agent.State().ThinkingLevel
+	s.agent.SetThinkingLevel(llm.ClampThinkingLevel(model, current))
 	return nil
 }

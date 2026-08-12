@@ -162,12 +162,14 @@ The two user-requested packages are now native:
   always loads `/plannotator` so it can be toggled later.
 - `internal/claudetui`: model/context/cost/git/mode information used by both
   the startup card and the responsive fullscreen sidebar.
-- `internal/tui`: dependency-free raw-terminal alternate-screen renderer with
-  a fixed transcript viewport, responsive sidebar, editor, cursor placement,
-  Unicode width handling, history, scrolling, and live agent updates.
+- `internal/tui`: Bubble Tea/Lip Gloss alternate-screen interface with a fixed
+  transcript viewport, responsive sidebar, styled message cards and composer,
+  Unicode width handling, history, scrolling, live agent updates, and a nested
+  command palette. `/thinking` derives its choices from the active model's
+  supported thinking-level map.
 
-These are dependency-free adaptations and do not load npm or pi's TypeScript
-TUI. Plannotator intentionally serves a compact native review page instead of
+These are native adaptations and do not load npm or pi's TypeScript TUI.
+Plannotator intentionally serves a compact native review page instead of
 embedding its roughly 39 MB generated SPA assets.
 
 ## 2026 Go quality and security audit
@@ -196,8 +198,8 @@ repeated tests, and the race detector. Important hardening completed:
 
 Go 1.26.5 is the minimum because earlier 1.26 patch releases contain reachable
 standard-library vulnerabilities. Keep it patched and rerun `govulncheck` for
-release builds. The repository still has no third-party Go dependencies and no
-`go.sum`.
+release builds. The fullscreen interface now depends on Bubble Tea and Lip
+Gloss; dependency checksums are committed in `go.sum`.
 
 ## Conventions to keep
 
@@ -220,8 +222,8 @@ release builds. The repository still has no third-party Go dependencies and no
 - Compat travels on options structs, with `Model.RawCompat` as the fallback.
 - No vendor SDKs: hand-rolled `net/http` + SSE reader. Bedrock does SigV4 and
   binary event-stream framing against stdlib crypto.
-- Interactive terminals use the native fullscreen TUI; pipes and unsupported
-  platforms fall back to the line-oriented interface.
+- Interactive terminals use the native Bubble Tea fullscreen TUI; pipes and
+  unsupported platforms fall back to the line-oriented interface.
 - Selected pi extensions are native built-ins: `internal/ralph`
   (`@tmustier/pi-ralph-wiggum`), `internal/plannotator`
   (`@plannotator/pi-extension`), and `internal/claudetui`

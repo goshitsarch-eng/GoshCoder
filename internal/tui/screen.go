@@ -1,16 +1,23 @@
-// Package tui provides GoshCoder's dependency-free fullscreen terminal UI.
+// Package tui renders GoshCoder's Bubble Tea fullscreen interface.
 package tui
 
 import (
-	"fmt"
-	"io"
 	"os"
 	"strings"
-	"sync"
 	"unicode"
+
+	"github.com/charmbracelet/lipgloss"
+	charmterm "github.com/charmbracelet/x/term"
 )
 
-const accent = "\x1b[38;2;215;119;87m"
+const accent = "\x1b[38;2;139;124;246m"
+const cyan = "\x1b[38;2;69;214;181m"
+const blue = "\x1b[38;2;88;166;255m"
+const amber = "\x1b[38;2;245;184;91m"
+const red = "\x1b[38;2;244;112;122m"
+const muted = "\x1b[38;2;112;118;145m"
+const selected = "\x1b[48;2;61;57;92m\x1b[38;2;242;240;255m"
+const bold = "\x1b[1m"
 const reset = "\x1b[0m"
 const dim = "\x1b[2m"
 
@@ -22,93 +29,42 @@ type Message struct {
 
 // Frame is a complete immutable screen snapshot.
 type Frame struct {
-	Title     string
-	Messages  []Message
-	Sidebar   []string
-	Input     []rune
-	Cursor    int
-	Status    string
-	Streaming bool
-	Scroll    int
+	Title              string
+	Messages           []Message
+	Sidebar            []string
+	Input              []rune
+	Cursor             int
+	Status             string
+	Streaming          bool
+	Scroll             int
+	Suggestions        []string
+	SelectedSuggestion int
+	SuggestionTitle    string
+	Thinking           string
+	Mode               string
+	VirtualCursor      bool
 }
 
-// Terminal owns raw mode and the alternate screen.
-type Terminal struct {
-	in, out *os.File
-	state   *terminalState
-	mu      sync.Mutex
-	closed  bool
+// Supported reports whether Bubble Tea can safely use both files as a TTY.
+func Supported(in, out *os.File) bool {
+	return in != nil && out != nil && charmterm.IsTerminal(in.Fd()) && charmterm.IsTerminal(out.Fd())
 }
 
-// Supported reports whether both files are terminals with native raw-mode support.
-func Supported(in, out *os.File) bool { return isTerminal(in) && isTerminal(out) }
-
-// Open enters raw mode and switches to the terminal's alternate screen.
-func Open(in, out *os.File) (*Terminal, error) {
-	if !Supported(in, out) {
-		return nil, fmt.Errorf("fullscreen TUI requires a terminal")
-	}
-	state, err := makeRaw(in)
-	if err != nil {
-		return nil, err
-	}
-	terminal := &Terminal{in: in, out: out, state: state}
-	if _, err := io.WriteString(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"); err != nil {
-		_ = state.restore()
-		return nil, err
-	}
-	return terminal, nil
-}
-
-// Size returns the current terminal dimensions.
-func (terminal *Terminal) Size() (int, int) { return terminalSize(terminal.out) }
-
-// Close restores the normal screen and terminal settings.
-func (terminal *Terminal) Close() error {
-	terminal.mu.Lock()
-	defer terminal.mu.Unlock()
-	if terminal.closed {
-		return nil
-	}
-	terminal.closed = true
-	_, writeErr := io.WriteString(terminal.out, "\x1b[?25h\x1b[0m\x1b[?1049l")
-	restoreErr := terminal.state.restore()
-	if writeErr != nil {
-		return writeErr
-	}
-	return restoreErr
-}
-
-// Render repaints the screen and places the hardware cursor in the editor.
-func (terminal *Terminal) Render(frame Frame) error {
-	terminal.mu.Lock()
-	defer terminal.mu.Unlock()
-	if terminal.closed {
-		return nil
-	}
-	width, height := terminal.Size()
+// View renders a complete frame for Bubble Tea. The cursor is painted in the
+// composer so the view remains stable across terminal implementations.
+func View(frame Frame, width, height int) string {
 	if width < 20 || height < 8 {
-		return nil
+		return accent + bold + "GoshCoder" + reset + "\n" + muted + "Terminal is too small" + reset
 	}
-	lines, cursorRow, cursorCol := renderFrame(frame, width, height)
-	var output strings.Builder
-	output.WriteString("\x1b[?25l\x1b[H")
-	for row := 0; row < height; row++ {
-		fmt.Fprintf(&output, "\x1b[%d;1H\x1b[2K", row+1)
-		if row < len(lines) {
-			output.WriteString(lines[row])
-		}
-	}
-	fmt.Fprintf(&output, "\x1b[%d;%dH\x1b[?25h", cursorRow, cursorCol)
-	_, err := io.WriteString(terminal.out, output.String())
-	return err
+	lines, _, _ := renderFrame(frame, width, height)
+	return strings.Join(lines, "\n")
 }
 
 func renderFrame(frame Frame, width, height int) ([]string, int, int) {
-	useSidebar := width >= 90
+	useSidebar := width >= 96
 	sideWidth := 0
 	if useSidebar {
-		sideWidth = min(32, width/3)
+		sideWidth = min(34, width/3)
 	}
 	mainWidth := width
 	if useSidebar {
@@ -117,50 +73,121 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 	bodyTop, bodyBottom := 2, height-4
 	bodyHeight := max(1, bodyBottom-bodyTop+1)
 
+	suggestionRows := min(len(frame.Suggestions), min(7, max(0, bodyHeight-1)))
+	paletteHeight := 0
+	if suggestionRows > 0 {
+		paletteHeight = suggestionRows + 1
+	}
+	transcriptHeight := max(0, bodyHeight-paletteHeight)
 	transcript := renderMessages(frame.Messages, mainWidth)
-	start := max(0, len(transcript)-bodyHeight-frame.Scroll)
-	end := min(len(transcript), start+bodyHeight)
+	start := max(0, len(transcript)-transcriptHeight-frame.Scroll)
+	end := min(len(transcript), start+transcriptHeight)
 	visible := transcript[start:end]
 
 	lines := make([]string, height)
 	title := frame.Title
 	if title == "" {
-		title = "GoshCoder"
+		title = "interactive session"
 	}
-	lines[0] = accent + "● " + reset + truncate(title, width)
-	lines[1] = dim + strings.Repeat("─", width) + reset
+	headerLeft := accent + bold + "◆  GOSH CODER" + reset + muted + "  " + safeTerminalText(title) + reset
+	mode := frame.Mode
+	if mode == "" {
+		mode = "normal"
+	}
+	thinking := frame.Thinking
+	if thinking == "" {
+		thinking = "off"
+	}
+	headerRight := cyan + "● " + reset + mode + muted + "  ·  " + reset + accent + thinking + " thinking" + reset
+	gap := width - lipgloss.Width(headerLeft) - lipgloss.Width(headerRight)
+	if gap >= 2 {
+		lines[0] = headerLeft + strings.Repeat(" ", gap) + headerRight
+	} else {
+		lines[0] = accent + bold + truncate(stripANSI(headerLeft), width) + reset
+	}
+	lines[1] = muted + strings.Repeat("─", width) + reset
+
+	suggestionOffset := max(0, frame.SelectedSuggestion-suggestionRows+1)
+	paletteStart := bodyHeight - paletteHeight
 	for row := 0; row < bodyHeight; row++ {
 		left := ""
-		if row < len(visible) {
+		switch {
+		case paletteHeight > 0 && row == paletteStart:
+			title := frame.SuggestionTitle
+			if title == "" {
+				title = "COMMAND PALETTE"
+			}
+			left = muted + bold + "  " + truncate(title, max(1, mainWidth-2)) + reset
+		case paletteHeight > 0 && row > paletteStart:
+			index := suggestionOffset + row - paletteStart - 1
+			if index < len(frame.Suggestions) {
+				parts := strings.SplitN(frame.Suggestions[index], "\t", 2)
+				label, description := parts[0], ""
+				if len(parts) == 2 {
+					description = parts[1]
+				}
+				if index == frame.SelectedSuggestion {
+					left = selected + "  › " + bold + label + reset + muted + "  " + description + reset
+				} else {
+					left = "    " + accent + label + reset + muted + "  " + description + reset
+				}
+			}
+		case row < len(visible):
 			left = visible[row]
 		}
 		left = pad(left, mainWidth)
 		if useSidebar {
 			right := ""
 			if row < len(frame.Sidebar) {
-				right = frame.Sidebar[row]
+				right = styleSidebarLine(frame.Sidebar[row])
 			}
-			lines[bodyTop+row] = left + dim + "│" + reset + pad(truncate(right, sideWidth), sideWidth)
+			lines[bodyTop+row] = left + muted + "│" + reset + pad(right, sideWidth)
 		} else {
 			lines[bodyTop+row] = left
 		}
 	}
-	status := frame.Status
-	if frame.Streaming {
-		status = "◌ working  ·  Esc/Ctrl-C abort  ·  " + status
-	}
-	lines[height-3] = dim + truncate(status, width) + reset
-	lines[height-2] = accent + "╭" + strings.Repeat("─", width-2) + "╮" + reset
 
-	promptWidth := max(1, width-5)
+	status := frame.Status
+	hints := "Shift-Tab thinking  ·  PgUp scroll  ·  Ctrl-C exit"
+	if frame.Streaming {
+		hints = "Esc abort  ·  type to steer"
+	}
+	leftStatus := cyan + "● " + reset + safeTerminalText(status)
+	rightStatus := muted + hints + reset
+	statusGap := width - lipgloss.Width(leftStatus) - lipgloss.Width(rightStatus)
+	if statusGap >= 2 {
+		lines[height-3] = leftStatus + strings.Repeat(" ", statusGap) + rightStatus
+	} else {
+		lines[height-3] = truncate(status, width)
+	}
+	composerTitle := " Message "
+	lines[height-2] = accent + "╭─" + composerTitle + strings.Repeat("─", max(0, width-lipgloss.Width(composerTitle)-3)) + "╮" + reset
+
+	promptWidth := max(1, width-7)
 	cursor := min(max(frame.Cursor, 0), len(frame.Input))
 	beforeWidth := runeSliceWidth(frame.Input[:cursor])
 	windowStart := 0
-	for beforeWidth-runeSliceWidth(frame.Input[:windowStart]) >= promptWidth {
+	for windowStart < cursor && beforeWidth-runeSliceWidth(frame.Input[:windowStart]) >= promptWidth {
 		windowStart++
 	}
 	shown := truncateRunes(frame.Input[windowStart:], promptWidth)
-	lines[height-1] = accent + "╰─❯ " + reset + string(shown)
+	editorText := string(shown)
+	if len(frame.Input) == 0 {
+		placeholder := truncate("Ask anything, or type / for commands", max(1, promptWidth-2))
+		if frame.VirtualCursor {
+			editorText = "\x1b[7m \x1b[27m" + muted + " " + placeholder + reset
+		} else {
+			editorText = muted + placeholder + reset
+		}
+	} else if frame.VirtualCursor {
+		relative := cursor - windowStart
+		if relative < len(shown) {
+			editorText = string(shown[:relative]) + "\x1b[7m" + string(shown[relative:relative+1]) + "\x1b[27m" + string(shown[relative+1:])
+		} else {
+			editorText += "\x1b[7m \x1b[27m"
+		}
+	}
+	lines[height-1] = accent + "│ " + reset + bold + "❯ " + reset + editorText
 	cursorCol := 5 + runeSliceWidth(frame.Input[windowStart:cursor])
 	return lines, height, min(width, cursorCol)
 }
@@ -171,24 +198,53 @@ func renderMessages(messages []Message, width int) []string {
 		if strings.TrimSpace(message.Text) == "" {
 			continue
 		}
-		label := message.Role
-		switch label {
+		label, color := strings.ToUpper(message.Role), accent
+		icon := "•"
+		switch message.Role {
 		case "user":
-			label = "You"
+			label, color, icon = "YOU", blue, "›"
 		case "assistant":
-			label = "GoshCoder"
+			label, color, icon = "GOSH", accent, "✦"
 		case "tool":
-			label = "Tool"
+			label, color, icon = "TOOL", cyan, "⚙"
 		case "thinking":
-			label = "Thinking"
+			label, color, icon = "THINKING", amber, "◌"
+		case "Error":
+			label, color, icon = "ERROR", red, "!"
+		case "Notice":
+			label, color, icon = "NOTICE", cyan, "i"
+		case "Command":
+			label, color, icon = "COMMAND", cyan, "⌘"
 		}
-		lines = append(lines, accent+label+reset)
+		lines = append(lines, color+bold+icon+"  "+label+reset)
 		for _, paragraph := range strings.Split(strings.ReplaceAll(message.Text, "\t", "    "), "\n") {
-			lines = append(lines, wrap(paragraph, max(1, width-2))...)
+			wrapped := wrap(paragraph, max(1, width-4))
+			for _, line := range wrapped {
+				if message.Role == "thinking" {
+					lines = append(lines, muted+"│  "+line+reset)
+				} else {
+					lines = append(lines, "   "+line)
+				}
+			}
 		}
 		lines = append(lines, "")
 	}
 	return lines
+}
+
+func styleSidebarLine(line string) string {
+	plain := safeTerminalText(line)
+	trimmed := strings.TrimSpace(plain)
+	if trimmed == "SESSION" {
+		return accent + bold + "  ◆ SESSION" + reset
+	}
+	if strings.HasPrefix(plain, " ") && plain == " "+trimmed && (trimmed == "Model" || trimmed == "Context" || trimmed == "Branch" || trimmed == "Mode") {
+		return muted + strings.ToUpper(plain) + reset
+	}
+	if strings.Contains(plain, "changed") || strings.Contains(plain, "Cost") || strings.Contains(plain, "Messages") || strings.Contains(plain, "Tools") {
+		return cyan + plain + reset
+	}
+	return plain
 }
 
 func wrap(text string, width int) []string {
@@ -221,7 +277,7 @@ func truncate(text string, width int) string {
 	return string(truncateRunes([]rune(safeTerminalText(stripANSI(text))), width))
 }
 func pad(text string, width int) string {
-	plainWidth := runeSliceWidth([]rune(stripANSI(text)))
+	plainWidth := lipgloss.Width(text)
 	if plainWidth > width {
 		return truncate(text, width)
 	}

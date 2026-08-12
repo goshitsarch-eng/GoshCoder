@@ -262,6 +262,11 @@ func userMessage(text string) llm.UserMessage {
 func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	command, rest, _ := strings.Cut(input, " ")
 	rest = strings.TrimSpace(rest)
+	// Accept the common shorthand/misspelling without hiding the canonical
+	// Plannotator command from completion and help.
+	if command == "/plannator" {
+		command = "/plannotator"
+	}
 
 	switch command {
 	case "/help", "/?":
@@ -282,12 +287,30 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("model set to %s/%s", s.model.Provider, s.model.ID)))
 
 	case "/thinking":
+		available := llm.GetSupportedThinkingLevels(s.model)
+		availableNames := make([]string, len(available))
+		for index, level := range available {
+			availableNames[index] = string(level)
+		}
 		if rest == "" {
-			fmt.Fprintf(os.Stderr, "%s\n", s.agent.State().ThinkingLevel)
+			fmt.Fprintf(os.Stderr, "current: %s\navailable for %s/%s: %s\n",
+				s.agent.State().ThinkingLevel, s.model.Provider, s.model.ID, strings.Join(availableNames, ", "))
 			return false, nil
 		}
+		rest = strings.ToLower(rest)
 		if !isThinkingLevel(rest) {
 			return false, fmt.Errorf("unknown thinking level %q (off|minimal|low|medium|high|xhigh|max)", rest)
+		}
+		supported := false
+		for _, level := range available {
+			if level == rest {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return false, fmt.Errorf("thinking level %q is not supported by %s/%s (available: %s)",
+				rest, s.model.Provider, s.model.ID, strings.Join(availableNames, ", "))
 		}
 		s.agent.SetThinkingLevel(rest)
 		fmt.Fprintf(os.Stderr, "%s\n", dim("thinking set to "+rest))

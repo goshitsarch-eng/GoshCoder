@@ -1,35 +1,132 @@
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"strings"
+	"testing"
 
-func TestFullscreenEditorUnicodeAndNavigation(t *testing.T) {
-	editor := fullscreenEditor{}
-	if action := handleFullscreenInput(&editor, []byte("你好"), false); action != "" {
-		t.Fatalf("action = %q", action)
+	tea "github.com/charmbracelet/bubbletea"
+
+	"goshcoder/internal/agent"
+	"goshcoder/internal/llm"
+	"goshcoder/internal/plannotator"
+	"goshcoder/internal/tools"
+)
+
+func TestBubbleTeaEditorUnicodeNavigation(t *testing.T) {
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	tuiModel := &fullscreenModel{session: fullscreenTestSession(model, llm.ThinkingOff)}
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("你好")})
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyLeft})
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	if got := string(tuiModel.editor.input); got != "好" || tuiModel.editor.cursor != 0 {
+		t.Fatalf("editor = %q at %d", got, tuiModel.editor.cursor)
 	}
-	if string(editor.input) != "你好" || editor.cursor != 2 {
-		t.Fatalf("editor = %q, %d", editor.input, editor.cursor)
-	}
-	handleFullscreenInput(&editor, []byte("\x1b[D"), false)
-	handleFullscreenInput(&editor, []byte{127}, false)
-	if string(editor.input) != "好" || editor.cursor != 0 {
-		t.Fatalf("editor = %q, %d", editor.input, editor.cursor)
+
+	tuiModel.setInput("/pla")
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyTab})
+	if got := string(tuiModel.editor.input); got != "/plannotator" {
+		t.Fatalf("tab completion = %q", got)
 	}
 }
 
-func TestFullscreenEditorHandlesSplitUTF8(t *testing.T) {
-	editor := fullscreenEditor{}
-	bytes := []byte("你")
-	handleFullscreenInput(&editor, bytes[:1], false)
-	handleFullscreenInput(&editor, bytes[1:], false)
-	if string(editor.input) != "你" {
-		t.Fatalf("input = %q", editor.input)
+func TestThinkingSuggestionsFollowModelCapabilities(t *testing.T) {
+	model := &llm.Model{
+		ID: "reasoner", Provider: "vendor", Reasoning: true,
+		ThinkingLevelMap: llm.ThinkingLevelMap{
+			llm.ThinkingMinimal: nil,
+			llm.ThinkingMedium:  nil,
+		},
+	}
+	session := fullscreenTestSession(model, llm.ThinkingHigh)
+	items := fullscreenSuggestions(session, "/thinking ")
+	var labels []string
+	for _, item := range items {
+		labels = append(labels, item.label)
+	}
+	if got, want := strings.Join(labels, ","), "off,low,high"; got != want {
+		t.Fatalf("levels = %q, want %q", got, want)
+	}
+	if !items[2].current {
+		t.Fatal("current thinking level is not marked")
+	}
+
+	nonReasoning := fullscreenTestSession(&llm.Model{ID: "chat", Provider: "vendor"}, llm.ThinkingOff)
+	items = fullscreenSuggestions(nonReasoning, "/thinking ")
+	if len(items) != 1 || items[0].label != "off" {
+		t.Fatalf("non-reasoning levels = %#v", items)
 	}
 }
 
-func TestFullscreenEditorShiftTabAction(t *testing.T) {
-	if action := handleFullscreenInput(&fullscreenEditor{}, []byte("\x1b[Z"), false); action != "thinking" {
-		t.Fatalf("action = %q", action)
+func TestBubbleTeaCommandPaletteAcceptsThinkingChoice(t *testing.T) {
+	model := &llm.Model{ID: "reasoner", Provider: "vendor", Reasoning: true}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+	tuiModel := &fullscreenModel{session: session, editor: fullscreenEditor{input: []rune("/"), cursor: 1}}
+	items := tuiModel.suggestions()
+	for index, item := range items {
+		if item.label == "/thinking" {
+			tuiModel.editor.suggestion = index
+			break
+		}
+	}
+	if command := tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnter}); command != nil {
+		t.Fatal("opening the thinking submenu should not run a command")
+	}
+	if got := string(tuiModel.editor.input); got != "/thinking " {
+		t.Fatalf("input = %q", got)
+	}
+
+	items = tuiModel.suggestions()
+	for index, item := range items {
+		if item.label == "high" {
+			tuiModel.editor.suggestion = index
+			break
+		}
+	}
+	if command := tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnter}); command != nil {
+		t.Fatal("thinking command should complete immediately")
+	}
+	if got := session.agent.State().ThinkingLevel; got != llm.ThinkingHigh {
+		t.Fatalf("thinking = %q", got)
+	}
+}
+
+func TestBubbleTeaCommandPaletteRunsPlannotator(t *testing.T) {
+	workspace, err := tools.NewWorkspace(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	manager, err := plannotator.New(workspace.Root, filepath.Join(t.TempDir(), "plan.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+	session.workspace = workspace
+	session.plan = manager
+	session.normalTools = workspace.All()
+	session.agent.SetTools(session.normalTools)
+
+	tuiModel := &fullscreenModel{session: session, editor: fullscreenEditor{input: []rune("/pla"), cursor: 4}}
+	items := tuiModel.suggestions()
+	if len(items) == 0 || items[0].label != "/plannotator" {
+		t.Fatalf("suggestions = %#v", items)
+	}
+	if command := tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnter}); command != nil {
+		t.Fatal("Plannotator toggle should complete immediately")
+	}
+	if phase := manager.State().Phase; phase != plannotator.PhasePlanning {
+		t.Fatalf("phase = %q", phase)
+	}
+}
+
+func fullscreenTestSession(model *llm.Model, thinking llm.ModelThinkingLevel) *session {
+	return &session{
+		model: model,
+		agent: agent.NewAgent(agent.AgentOptions{InitialState: &agent.InitialState{
+			Model: *model, ThinkingLevel: thinking,
+		}}),
 	}
 }
 

@@ -3,6 +3,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestRenderFrameUsesResponsiveSidebar(t *testing.T) {
@@ -24,10 +26,28 @@ func TestRenderFrameUsesResponsiveSidebar(t *testing.T) {
 	}
 }
 
+func TestRenderFrameShowsSlashSuggestions(t *testing.T) {
+	frame := Frame{Suggestions: []string{"/help  Show help", "/model  Switch model"}, SelectedSuggestion: 1}
+	lines, _, _ := renderFrame(frame, 80, 18)
+	output := stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(output, "› /model") || !strings.Contains(output, "/help") {
+		t.Fatalf("suggestions missing: %s", output)
+	}
+}
+
 func TestRenderFrameHidesSidebarWhenNarrow(t *testing.T) {
-	lines, _, _ := renderFrame(Frame{Sidebar: []string{"SHOULD_NOT_APPEAR"}}, 60, 16)
+	frame := Frame{
+		Title: "a/very-long-provider-and-model-name", Sidebar: []string{"SHOULD_NOT_APPEAR"},
+		VirtualCursor: true,
+	}
+	lines, _, _ := renderFrame(frame, 30, 16)
 	if strings.Contains(strings.Join(lines, "\n"), "SHOULD_NOT_APPEAR") {
 		t.Fatal("sidebar visible on narrow screen")
+	}
+	for index, line := range lines {
+		if lipgloss.Width(line) > 30 {
+			t.Fatalf("line %d exceeds narrow width: %q", index, line)
+		}
 	}
 }
 
