@@ -158,8 +158,17 @@ func newSession(cfg sessionConfig) (*session, error) {
 		},
 		// A custom StreamFn injects the resolved auth headers and provider env,
 		// which the agent's default path does not carry.
-		StreamFn:  authStreamFn(auth),
-		GetAPIKey: func(string) string { return auth.APIKey },
+		StreamFn: func(model *llm.Model, ctx *llm.Context, opts *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
+			// Resolve auth at call time so /model can switch providers without
+			// leaving the stream function bound to the session's first provider.
+			return authStreamFn(s.auth)(model, ctx, opts)
+		},
+		GetAPIKey: func(string) string {
+			if s.auth == nil {
+				return ""
+			}
+			return s.auth.APIKey
+		},
 		BeforeToolCall: func(ctx context.Context, call agent.BeforeToolCallContext) *agent.BeforeToolCallResult {
 			if s.plan == nil {
 				return nil

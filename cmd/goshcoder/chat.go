@@ -40,11 +40,12 @@ const chatHelp = `Slash commands:
   /system [text]        Show or replace the system prompt
   /tools                List the available tools
   /messages             Show the transcript summary
-  /status               Show model, context, cost, git, and mode information
+  /status, /session     Show model, context, cost, git, and mode information
+  /hotkeys              Show interactive keyboard shortcuts
   /steer <text>         Queue a steering message for the next turn
   /followup <text>      Queue a follow-up message
   /queue                Show whether messages are queued
-  /clear                Clear the transcript
+  /clear, /new          Start a fresh conversation
   /ralph <subcommand>   Manage ralph loops (list, status, resume, stop)
   /plannotator          Toggle native Plannotator planning mode
   /plannotator-review [PR URL]  Review git changes or a GitHub PR
@@ -344,10 +345,20 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	case "/messages":
 		printTranscriptSummary(s.agent.State().Messages)
 
-	case "/status", "/sidebar":
+	case "/status", "/session", "/sidebar":
 		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
 			fmt.Fprintln(os.Stderr, line)
 		}
+
+	case "/hotkeys":
+		fmt.Fprintln(os.Stderr, `Enter       send or accept selection
+Up/Down     command/model navigation or prompt history
+Tab         complete the selected command
+Shift-Tab   cycle model-supported thinking levels
+PgUp/PgDn   scroll transcript
+Esc         close palette or abort a response
+Ctrl-C      clear input, abort, or quit
+Ctrl-D      quit when the editor is empty`)
 
 	case "/steer":
 		if rest == "" {
@@ -370,7 +381,7 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			fmt.Fprintln(os.Stderr, "No queued messages.")
 		}
 
-	case "/clear":
+	case "/clear", "/new":
 		if err := s.agent.Reset(); err != nil {
 			return false, err
 		}

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -28,6 +29,15 @@ type fullscreenSuggestion struct {
 	current     bool
 }
 
+type fullscreenModelChoice struct {
+	ref       string
+	name      string
+	provider  string
+	context   int
+	reasoning bool
+	current   bool
+}
+
 type fullscreenAgentEvent struct{ event agent.Event }
 type fullscreenTurnFinished struct{ err error }
 type fullscreenCommandFinished struct{ result fullscreenResult }
@@ -39,11 +49,13 @@ type fullscreenModel struct {
 	notices     []tui.Message
 	info        claudetui.SessionInfo
 	activity    string
+	activityAt  time.Time
 	width       int
 	height      int
 	busyCommand bool
 	spin        int
 	events      <-chan fullscreenAgentEvent
+	models      []fullscreenModelChoice
 }
 
 func newFullscreenModel(session *session, events <-chan fullscreenAgentEvent) *fullscreenModel {
@@ -55,6 +67,7 @@ func newFullscreenModel(session *session, events <-chan fullscreenAgentEvent) *f
 		width:    80,
 		height:   24,
 		events:   events,
+		models:   availableFullscreenModels(session),
 	}
 	for _, tool := range session.agent.State().Tools {
 		if tool.Name == "bash" {
@@ -118,6 +131,7 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		model.info = model.session.sessionInfo()
 		model.activity = "Ready"
+		model.activityAt = time.Time{}
 
 	case fullscreenCommandFinished:
 		if model.applyCommandResult(value.result) {
@@ -146,6 +160,9 @@ func (model *fullscreenModel) applyAgentEvent(event agent.Event) {
 	switch event.Type {
 	case agent.EventMessageUpdate:
 		model.activity = "Composing response"
+		if model.activityAt.IsZero() {
+			model.activityAt = time.Now()
+		}
 	case agent.EventToolExecutionStart:
 		model.activity = "Running " + event.ToolName
 	case agent.EventToolExecutionEnd:
@@ -156,6 +173,7 @@ func (model *fullscreenModel) applyAgentEvent(event agent.Event) {
 		}
 	case agent.EventAgentEnd:
 		model.activity = "Ready"
+		model.activityAt = time.Time{}
 		model.info = model.session.sessionInfo()
 	}
 }
@@ -169,27 +187,30 @@ func (model *fullscreenModel) View() string {
 	messages := append([]tui.Message(nil), fullscreenMessages(transcript)...)
 	messages = append(messages, model.notices...)
 
-	items := fullscreenSuggestions(model.session, string(model.editor.input))
+	items := model.suggestions()
 	model.clampSuggestion(len(items))
 	display := make([]string, 0, len(items))
 	for _, item := range items {
-		marker := ""
+		description := item.description
 		if item.current {
-			marker = "  • current"
+			description = "CURRENT  ·  " + description
 		}
-		display = append(display, item.label+"\t"+item.description+marker)
+		display = append(display, item.label+"\t"+description)
 	}
 
 	status := model.activity
 	if state.IsStreaming || model.busyCommand {
 		spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"}
 		status = spinner[model.spin] + "  " + status
+		if !model.activityAt.IsZero() {
+			status += fmt.Sprintf("  %.1fs", time.Since(model.activityAt).Seconds())
+		}
 	}
 
 	frame := tui.Frame{
 		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
 		Messages:           messages,
-		Sidebar:            fullscreenSidebar(model.info),
+		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot()),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,
 		Status:             status,
@@ -301,7 +322,9 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 		return model.submitInput(streaming)
 
 	default:
-		if key.Type == tea.KeyRunes {
+		// Bubble Tea emits a dedicated KeySpace event for a single space,
+		// while pasted text (including spaces) arrives as KeyRunes.
+		if key.Type == tea.KeyRunes || key.Type == tea.KeySpace {
 			for _, r := range key.Runes {
 				if unicode.IsControl(r) {
 					continue
@@ -330,11 +353,6 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 	model.editor.historyIndex, model.editor.draft = -1, ""
 	model.clearInput()
 
-	if streaming {
-		model.session.agent.Steer(userMessage(prompt))
-		model.activity = "Steering message queued"
-		return nil
-	}
 	if strings.HasPrefix(prompt, "/") {
 		if prompt == "/exit" || prompt == "/quit" {
 			return tea.Quit
@@ -342,6 +360,7 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 		model.activity = "Running " + strings.Fields(prompt)[0]
 		if fullscreenCommandNeedsBrowser(prompt) {
 			model.busyCommand = true
+			model.activityAt = time.Now()
 			return func() tea.Msg {
 				return fullscreenCommandFinished{result: runFullscreenCommand(model.session, prompt)}
 			}
@@ -351,8 +370,14 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 		}
 		return nil
 	}
+	if streaming {
+		model.session.agent.Steer(userMessage(prompt))
+		model.activity = "Steering message queued"
+		return nil
+	}
 
 	model.activity = "Sending message"
+	model.activityAt = time.Now()
 	return func() tea.Msg { return fullscreenTurnFinished{err: model.session.runTurn(prompt)} }
 }
 
@@ -365,7 +390,20 @@ func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 		model.notices = appendNotice(model.notices, "Error", result.err.Error())
 	}
 	model.info = model.session.sessionInfo()
-	model.activity = "Ready"
+	state := model.session.agent.State()
+	currentRef := state.Model.Provider + "/" + state.Model.ID
+	for index := range model.models {
+		model.models[index].current = model.models[index].ref == currentRef
+	}
+	if state.IsStreaming {
+		model.activity = "Composing response"
+		if model.activityAt.IsZero() {
+			model.activityAt = time.Now()
+		}
+	} else {
+		model.activity = "Ready"
+		model.activityAt = time.Time{}
+	}
 	return result.exit
 }
 
@@ -375,7 +413,7 @@ func fullscreenCommandNeedsBrowser(prompt string) bool {
 }
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
-	return fullscreenSuggestions(model.session, string(model.editor.input))
+	return fullscreenSuggestionsWithModels(model.session, string(model.editor.input), model.models)
 }
 
 func (model *fullscreenModel) selectedSuggestion(count int) int {
@@ -424,7 +462,34 @@ func (model *fullscreenModel) deletePreviousWord() {
 }
 
 func fullscreenSuggestions(session *session, input string) []fullscreenSuggestion {
+	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session))
+}
+
+func fullscreenSuggestionsWithModels(session *session, input string, models []fullscreenModelChoice) []fullscreenSuggestion {
 	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/model ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/model "))
+		terms := strings.Fields(query)
+		var suggestions []fullscreenSuggestion
+		for _, choice := range models {
+			haystack := strings.ToLower(choice.ref + " " + choice.name + " " + choice.provider)
+			matched := true
+			for _, term := range terms {
+				if !strings.Contains(haystack, term) {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			suggestions = append(suggestions, fullscreenSuggestion{
+				label: choice.name, description: modelChoiceDescription(choice),
+				value: "/model " + choice.ref, execute: true, current: choice.current,
+			})
+		}
+		return suggestions
+	}
 	if strings.HasPrefix(lower, "/thinking ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/thinking "))
 		if strings.ContainsAny(query, " \t\n") {
@@ -452,7 +517,7 @@ func fullscreenSuggestions(session *session, input string) []fullscreenSuggestio
 	query := strings.ToLower(input)
 	var suggestions []fullscreenSuggestion
 	for _, command := range fullscreenSlashCommands {
-		if !strings.HasPrefix(strings.ToLower(command.name), query) {
+		if !fullscreenCommandAvailable(session, command.name) || !strings.HasPrefix(strings.ToLower(command.name), query) {
 			continue
 		}
 		item := fullscreenSuggestion{
@@ -460,7 +525,7 @@ func fullscreenSuggestions(session *session, input string) []fullscreenSuggestio
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/thinking", "/plannotator-annotate", "/steer", "/followup":
+		case "/model", "/thinking", "/plannotator-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -469,11 +534,101 @@ func fullscreenSuggestions(session *session, input string) []fullscreenSuggestio
 	return suggestions
 }
 
+func fullscreenCommandAvailable(session *session, command string) bool {
+	if command == "/ralph" {
+		return session.loops != nil
+	}
+	if strings.HasPrefix(command, "/plannotator") {
+		return session.plan != nil
+	}
+	return true
+}
+
+func availableFullscreenModels(session *session) []fullscreenModelChoice {
+	state := session.agent.State()
+	currentRef := state.Model.Provider + "/" + state.Model.ID
+	catalog := newCatalog()
+	configured := catalog.ConfiguredProviderIDs()
+	if !containsString(configured, state.Model.Provider) {
+		configured = append(configured, state.Model.Provider)
+	}
+	seen := make(map[string]bool)
+	var choices []fullscreenModelChoice
+	for _, providerID := range configured {
+		provider := catalog.Provider(providerID)
+		if provider == nil {
+			continue
+		}
+		for _, candidate := range provider.Models() {
+			if _, supported := llm.GetStreamer(candidate.API); !supported {
+				continue
+			}
+			ref := providerID + "/" + candidate.ID
+			if seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			name := candidate.Name
+			if name == "" {
+				name = candidate.ID
+			}
+			choices = append(choices, fullscreenModelChoice{
+				ref: ref, name: name, provider: providerID, context: candidate.ContextWindow,
+				reasoning: candidate.Reasoning, current: ref == currentRef,
+			})
+		}
+	}
+	if !seen[currentRef] {
+		name := state.Model.Name
+		if name == "" {
+			name = state.Model.ID
+		}
+		choices = append(choices, fullscreenModelChoice{
+			ref: currentRef, name: name, provider: state.Model.Provider,
+			context: state.Model.ContextWindow, reasoning: state.Model.Reasoning, current: true,
+		})
+	}
+	sort.SliceStable(choices, func(left, right int) bool {
+		if choices[left].current != choices[right].current {
+			return choices[left].current
+		}
+		if choices[left].provider != choices[right].provider {
+			return choices[left].provider < choices[right].provider
+		}
+		return choices[left].name < choices[right].name
+	})
+	return choices
+}
+
+func modelChoiceDescription(choice fullscreenModelChoice) string {
+	parts := []string{choice.ref}
+	if choice.context > 0 {
+		parts = append(parts, compactNumber(choice.context)+" context")
+	}
+	if choice.reasoning {
+		parts = append(parts, "reasoning")
+	}
+	return strings.Join(parts, "  ·  ")
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func fullscreenSuggestionTitle(input string) string {
-	if strings.HasPrefix(strings.ToLower(input), "/thinking ") {
+	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/model ") {
+		return "SELECT MODEL  ·  type to filter authenticated providers"
+	}
+	if strings.HasPrefix(lower, "/thinking ") {
 		return "THINKING LEVEL  ·  model-supported options"
 	}
-	return "COMMAND PALETTE  ·  ↑/↓ navigate  ·  Tab complete  ·  Enter select"
+	return "COMMANDS  ·  ↑/↓ navigate  ·  Tab complete  ·  Enter select"
 }
 
 func thinkingLevelDescription(level string) string {

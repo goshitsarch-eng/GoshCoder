@@ -23,9 +23,15 @@ func TestBubbleTeaEditorUnicodeNavigation(t *testing.T) {
 		t.Fatalf("editor = %q at %d", got, tuiModel.editor.cursor)
 	}
 
-	tuiModel.setInput("/pla")
+	tuiModel.setInput("hello")
+	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+	if got := string(tuiModel.editor.input); got != "hello " {
+		t.Fatalf("space input = %q", got)
+	}
+
+	tuiModel.setInput("/mo")
 	tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyTab})
-	if got := string(tuiModel.editor.input); got != "/plannotator" {
+	if got := string(tuiModel.editor.input); got != "/model " {
 		t.Fatalf("tab completion = %q", got)
 	}
 }
@@ -55,6 +61,31 @@ func TestThinkingSuggestionsFollowModelCapabilities(t *testing.T) {
 	items = fullscreenSuggestions(nonReasoning, "/thinking ")
 	if len(items) != 1 || items[0].label != "off" {
 		t.Fatalf("non-reasoning levels = %#v", items)
+	}
+}
+
+func TestModelPickerFiltersAndMarksCurrentModel(t *testing.T) {
+	model := &llm.Model{ID: "alpha", Name: "Alpha", Provider: "vendor"}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+	choices := []fullscreenModelChoice{
+		{ref: "vendor/alpha", name: "Alpha", provider: "vendor", current: true},
+		{ref: "vendor/beta-code", name: "Beta Coder", provider: "vendor", context: 200_000, reasoning: true},
+	}
+	items := fullscreenSuggestionsWithModels(session, "/model beta", choices)
+	if len(items) != 1 || items[0].label != "Beta Coder" || items[0].value != "/model vendor/beta-code" {
+		t.Fatalf("model suggestions = %#v", items)
+	}
+	items = fullscreenSuggestionsWithModels(session, "/model ", choices)
+	if len(items) != 2 || !items[0].current {
+		t.Fatalf("unfiltered model suggestions = %#v", items)
+	}
+
+	tuiModel := &fullscreenModel{session: session, models: choices, editor: fullscreenEditor{input: []rune("/mo"), cursor: 3}}
+	if command := tuiModel.handleTeaKey(tea.KeyMsg{Type: tea.KeyEnter}); command != nil {
+		t.Fatal("opening the model picker should not execute a command")
+	}
+	if got := string(tuiModel.editor.input); got != "/model " {
+		t.Fatalf("model picker input = %q", got)
 	}
 }
 
@@ -88,6 +119,14 @@ func TestBubbleTeaCommandPaletteAcceptsThinkingChoice(t *testing.T) {
 	}
 	if got := session.agent.State().ThinkingLevel; got != llm.ThinkingHigh {
 		t.Fatalf("thinking = %q", got)
+	}
+
+	tuiModel.setInput("/thinking low")
+	if command := tuiModel.submitInput(true); command != nil {
+		t.Fatal("slash commands should execute immediately while streaming")
+	}
+	if got := session.agent.State().ThinkingLevel; got != llm.ThinkingLow {
+		t.Fatalf("streaming slash command set thinking = %q", got)
 	}
 }
 

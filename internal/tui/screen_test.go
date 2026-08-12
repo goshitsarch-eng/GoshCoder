@@ -10,11 +10,11 @@ import (
 func TestRenderFrameUsesResponsiveSidebar(t *testing.T) {
 	frame := Frame{Title: "test", Messages: []Message{{Role: "user", Text: strings.Repeat("hello ", 30)}}, Sidebar: []string{"Session", "model"}, Input: []rune("你好"), Cursor: 2}
 	lines, row, col := renderFrame(frame, 100, 24)
-	if len(lines) != 24 || row != 24 {
+	if len(lines) != 24 || row != 22 {
 		t.Fatalf("dimensions = %d, %d", len(lines), row)
 	}
-	if !strings.Contains(stripANSI(lines[2]), "Session") {
-		t.Fatalf("sidebar missing: %q", lines[2])
+	if !strings.Contains(stripANSI(strings.Join(lines, "\n")), "Session") {
+		t.Fatalf("sidebar missing: %q", strings.Join(lines, "\n"))
 	}
 	if col <= 5 {
 		t.Fatalf("cursor column = %d", col)
@@ -30,7 +30,7 @@ func TestRenderFrameShowsSlashSuggestions(t *testing.T) {
 	frame := Frame{Suggestions: []string{"/help  Show help", "/model  Switch model"}, SelectedSuggestion: 1}
 	lines, _, _ := renderFrame(frame, 80, 18)
 	output := stripANSI(strings.Join(lines, "\n"))
-	if !strings.Contains(output, "› /model") || !strings.Contains(output, "/help") {
+	if !strings.Contains(output, "▌  /model") || !strings.Contains(output, "/help") {
 		t.Fatalf("suggestions missing: %s", output)
 	}
 }

@@ -104,11 +104,11 @@ host, so selected extension features are native built-ins:
   `-claude-tui=false` for the plain interface, and `/use-claude-code-tui` to
   switch back.
 
-The visual extensions are implemented by GoshCoder's native Bubble Tea TUI
-rather than depending on pi's TypeScript TUI or an npm runtime. Type `/` to open the
-command palette; arrows select an item, Tab completes it, and Enter accepts it.
-`/thinking` opens a second palette containing only levels supported by the
-active provider/model.
+The visual extensions are implemented by GoshCoder's lightweight, Crush-inspired
+Bubble Tea TUI rather than pi's TypeScript runtime. Type `/` to open the command
+palette; arrows select an item, Tab completes it, and Enter accepts it. `/model`
+opens a searchable picker containing models from authenticated providers, while
+`/thinking` contains only levels supported by the active model.
 
 ## Deviations from pi
 

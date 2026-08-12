@@ -165,8 +165,8 @@ The two user-requested packages are now native:
 - `internal/tui`: Bubble Tea/Lip Gloss alternate-screen interface with a fixed
   transcript viewport, responsive sidebar, styled message cards and composer,
   Unicode width handling, history, scrolling, live agent updates, and a nested
-  command palette. `/thinking` derives its choices from the active model's
-  supported thinking-level map.
+  command palette. `/model` searches models from authenticated providers and
+  `/thinking` derives its choices from the active model's supported level map.
 
 These are native adaptations and do not load npm or pi's TypeScript TUI.
 Plannotator intentionally serves a compact native review page instead of
