@@ -313,7 +313,6 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 		if err := s.setModel(rest); err != nil {
 			return false, err
 		}
-		_ = config.WriteDefaultModel(s.model.Provider + "/" + s.model.ID)
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf("model set to %s/%s", s.model.Provider, s.model.ID)))
 
 	case "/login":
@@ -501,10 +500,18 @@ Ctrl-D      quit when the editor is empty`)
 		return false, s.annotateLastMessage()
 
 	case "/use-claude-code-tui":
+		if s.fullscreen {
+			fmt.Fprintln(os.Stderr, dim("The fullscreen interface already uses the native sidebar layout; this switch only affects line mode."))
+			return false, nil
+		}
 		s.claudeTUI = true
 		fmt.Fprintln(os.Stderr, dim("Using native pi-claude-code-tui look"))
 
 	case "/use-default-tui":
+		if s.fullscreen {
+			fmt.Fprintln(os.Stderr, dim("The fullscreen layout cannot be changed in-place; restart with -fullscreen=false for the line-mode interface."))
+			return false, nil
+		}
 		s.claudeTUI = false
 		fmt.Fprintln(os.Stderr, dim("Using default GoshCoder interface"))
 

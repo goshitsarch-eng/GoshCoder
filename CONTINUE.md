@@ -152,8 +152,13 @@ models (100%)**.
 
 ## Native extension ports
 
-The two user-requested packages are now native:
+The requested extension features are now native:
 
+- Provider auth is re-resolved for every model request, so long sessions refresh
+  OAuth and in-app credential replacement takes effect immediately. The same
+  authenticated stream path is used by the nested compaction agent.
+- Planner phase changes update both prompt and tools inside the active agent
+  loop; approval exposes full tools on the immediately following model turn.
 - **Web Search** (`internal/webaccess`): native `pi-web-access` adaptation registered
   as `web_search`, with OpenAI/Codex auth reuse, zero-config Exa MCP fallback,
   direct Exa, and Kagi Search (`KAGI_API_KEY` or `web-search.json`). The in-app
@@ -242,4 +247,5 @@ Gloss; dependency checksums are committed in `go.sum`.
   (`pi-claude-code-tui`). Planner uses a dependency-free stdlib browser
   reviewer; the visual UI is native Go rather than pi's npm/TUI runtime.
 - Persisted JSONL session trees, resume/branch pickers, TypeScript packages and
-  plugins, LSP/MCP management, and export/share remain outside current parity.
+  plugins, custom `models.json`, LSP/MCP management, and export/share remain
+  outside current parity.

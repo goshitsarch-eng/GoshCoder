@@ -51,13 +51,12 @@ type Provider struct {
 	EnvKeys []string
 	// Kind selects the resolution strategy.
 	Kind AuthKind
-	// OAuth reports whether pi supports an OAuth login for this provider.
-	// OAuth flows themselves are not ported; a stored, unexpired OAuth
-	// credential still resolves (its access token is used as the API key).
+	// OAuth reports whether the provider supports OAuth. Login and refresh are
+	// implemented for Anthropic, OpenAI Codex, and Kimi Coding.
 	OAuth bool
 
-	// models is the provider's current model list (builtin + models.json
-	// overrides), keyed by model id in rawCompat.
+	// models is the provider's built-in model list, keyed by model id in
+	// rawCompat. Custom models.json loading is not ported.
 	models    []llm.Model
 	rawCompat map[string]json.RawMessage
 }

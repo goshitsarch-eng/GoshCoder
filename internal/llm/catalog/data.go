@@ -1,12 +1,10 @@
-// Package catalog is a Go port of pi's provider catalog, Models collection,
-// and credential storage (reference/pi/packages/ai/src/providers/*,
-// models.ts, auth/*, plus the coding-agent's models.json handling in
-// core/model-config.ts and core/provider-composer.ts).
+// Package catalog is a Go port of pi's built-in provider catalog and
+// credential storage (reference/pi/packages/ai/src/providers/*, models.ts,
+// and auth/*).
 //
 // The builtin model data lives in catalog.json, generated from the pi
 // reference by .tmp/regen-catalog.sh (pi's scripts/generate-models.ts in
-// --json-only mode). JSON field names are kept identical to pi so auth.json
-// and models.json stay interoperable.
+// --json-only mode). Custom coding-agent models.json loading is not ported.
 package catalog
 
 import (
@@ -101,8 +99,7 @@ func init() {
 	sort.Strings(builtin.order)
 }
 
-// cloneModel deep-copies a model so callers and models.json overrides never
-// mutate the shared builtin data.
+// cloneModel deep-copies a model so callers never mutate shared builtin data.
 func cloneModel(m *llm.Model) *llm.Model {
 	data, err := json.Marshal(m)
 	if err != nil {

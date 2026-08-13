@@ -16,7 +16,6 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
-	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	coderresources "goshcoder/internal/resources"
@@ -43,9 +42,8 @@ type sessionConfig struct {
 // session bundles an agent with the pieces its tools and hooks need.
 type session struct {
 	agent *agent.Agent
-	// model and auth are retained so /model can swap them at runtime.
+	// model is retained so /model can swap it at runtime.
 	model     *llm.Model
-	auth      *catalog.Auth
 	loops     *ralph.Store
 	workspace *tools.Workspace
 	plan      *plannotator.Manager
@@ -65,7 +63,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, errors.New("a model is required (-m provider/model); run 'goshcoder models' to see options")
 	}
 
-	model, auth, err := newCatalog().ResolveModel(cfg.ModelRef)
+	model, _, err := newCatalog().ResolveModel(cfg.ModelRef)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +80,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, fmt.Errorf("discover local resources: %w", err)
 	}
 	s := &session{
-		model: model, auth: auth, explicitSystemPrompt: cfg.SystemPrompt,
+		model: model, explicitSystemPrompt: cfg.SystemPrompt,
 		resources: loadedResources, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen,
 	}
 
@@ -181,23 +179,14 @@ func newSession(cfg sessionConfig) (*session, error) {
 			ThinkingLevel: llm.ClampThinkingLevel(model, cfg.Thinking),
 			Tools:         agentTools,
 		},
-		// A custom StreamFn injects the resolved auth headers and provider env,
-		// which the agent's default path does not carry.
-		StreamFn: func(model *llm.Model, ctx *llm.Context, opts *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
-			// Resolve auth at call time so /model can switch providers without
-			// leaving the stream function bound to the session's first provider.
-			return authStreamFn(s.auth)(model, ctx, opts)
-		},
+		// Resolve credentials for every provider call. Besides following /model,
+		// this refreshes OAuth during long-running sessions and observes a
+		// credential added or replaced through /login without restarting.
+		StreamFn:     s.streamAuthenticated,
 		ConvertToLLM: convertSessionMessages,
 		// Brief provider outages should recover in-place instead of forcing the
 		// user to restart the app and reconstruct the task with "continue".
 		MaxRetries: 2,
-		GetAPIKey: func(string) string {
-			if s.auth == nil {
-				return ""
-			}
-			return s.auth.APIKey
-		},
 		BeforeToolCall: func(ctx context.Context, call agent.BeforeToolCallContext) *agent.BeforeToolCallResult {
 			if s.plan == nil {
 				return nil
@@ -252,6 +241,23 @@ func resolveOpenAIWebSearchAuth(ctx context.Context) (*webaccess.OpenAIAuth, err
 		}, nil
 	}
 	return nil, firstError
+}
+
+func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, options *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
+	ctx := context.Background()
+	if options != nil && options.Ctx != nil {
+		ctx = options.Ctx
+	}
+	models := newCatalog()
+	models.SetOAuthContext(ctx)
+	auth, ok := models.ResolveAuth(model.Provider)
+	if !ok {
+		if err := models.OAuthError(model.Provider); err != nil {
+			return errorStream(model, fmt.Sprintf("refresh credentials for %s: %v", model.Provider, err))
+		}
+		return errorStream(model, fmt.Sprintf("provider %q has no credentials configured", model.Provider))
+	}
+	return authStreamFn(auth)(model, request, options)
 }
 
 func (s *session) expandResourceInput(input string) (string, bool, error) {
@@ -352,6 +358,12 @@ func (s *session) planPrepareNextTurn() agent.PrepareNextTurnFunc {
 		s.plan.TrackAssistant(turn.Message)
 		updated := turn.Context
 		updated.SystemPrompt = s.runtimeSystemPrompt()
+		// planner_submit_plan can change planning → executing inside an active
+		// agent run. Update the low-level loop context now so the very next model
+		// turn receives full tools rather than waiting for Prompt to return.
+		if s.workspace != nil {
+			updated.Tools = s.planRuntimeTools()
+		}
 		return &agent.TurnUpdate{Context: &updated}
 	}
 }
@@ -394,16 +406,22 @@ func (s *session) syncPlanRuntime() {
 		return
 	}
 	s.agent.SetSystemPrompt(s.runtimeSystemPrompt())
-	if s.plan == nil {
-		return
+	if s.plan != nil && s.workspace != nil {
+		s.agent.SetTools(s.planRuntimeTools())
+	}
+}
+
+func (s *session) planRuntimeTools() []agent.Tool {
+	if s.plan == nil || s.workspace == nil {
+		return append([]agent.Tool(nil), s.normalTools...)
 	}
 	switch s.plan.State().Phase {
-	case plannotator.PhaseIdle:
-		s.agent.SetTools(s.normalTools)
 	case plannotator.PhasePlanning:
-		s.agent.SetTools(mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}))
+		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()})
 	case plannotator.PhaseExecuting:
-		s.agent.SetTools(mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}))
+		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()})
+	default:
+		return append([]agent.Tool(nil), s.normalTools...)
 	}
 }
 
@@ -434,15 +452,17 @@ func mergeTools(groups ...[]agent.Tool) []agent.Tool {
 
 // setModel swaps the active model, re-resolving credentials for its provider.
 func (s *session) setModel(ref string) error {
-	model, auth, err := newCatalog().ResolveModel(ref)
+	model, _, err := newCatalog().ResolveModel(ref)
 	if err != nil {
 		return err
 	}
 	if _, ok := llm.GetStreamer(model.API); !ok {
 		return fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
 	}
-	s.model, s.auth = model, auth
+	s.model = model
 	s.agent.SetModel(*model)
+	// Persist every switch path, including Ctrl+P model cycling in fullscreen.
+	_ = config.WriteDefaultModel(model.Provider + "/" + model.ID)
 	// Model switches also update the UI-visible level. Provider streamers clamp
 	// defensively, but keeping agent state valid avoids advertising an option
 	// the newly selected model cannot use.

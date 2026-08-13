@@ -44,7 +44,7 @@ providers are added to `auth.json` independently, so signing in to Anthropic,
 OpenAI Codex, or Kimi does not remove existing logins. Use `/model` immediately
 afterward to search models across every authenticated provider.
 
-`run` and `chat` flags:
+Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 
 | Flag | Meaning |
 | --- | --- |
@@ -112,6 +112,8 @@ host, so selected extension features are native built-ins:
   Set `provider` to `auto`, `openai`, `exa`, or `kagi`; `auto` reuses an
   OpenAI/Codex login when suitable and otherwise works without a key through
   Exa. This is a native Go port of the search tool, not an npm plugin runtime.
+  The package's `fetch_content`, `get_search_content`, `source_check`, browser
+  curator, video/PDF handling, and providers not listed above are not ported.
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. `/ralph` opens loop controls in the command palette.
@@ -126,9 +128,10 @@ host, so selected extension features are native built-ins:
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
   tools, changed files, branch, and active mode. The panel refreshes
   automatically after turns and state changes; `/status` can also print it on
-  demand. It is enabled by default in chat. Use `/use-default-tui` or
-  `-claude-tui=false` for the plain interface, and `/use-claude-code-tui` to
-  switch back.
+  demand. It is enabled by default in chat. In line mode, use
+  `/use-default-tui` or `-claude-tui=false` for the plain interface and
+  `/use-claude-code-tui` to switch back. The fullscreen layout is fixed for the
+  lifetime of the process.
 
 The visual extensions are implemented by GoshCoder's lightweight, Crush-inspired
 Bubble Tea TUI rather than pi's TypeScript runtime. Type `/` to open the command
@@ -174,8 +177,8 @@ Documented at the top of each ported file. The notable ones:
   interface.
 - **Session scope.** Runtime transcript clearing and context compaction are
   implemented. Pi's persisted JSONL session tree, resume picker, branching,
-  HTML export/share, TypeScript plugin host, packages, LSP, and MCP management
-  are not yet implemented.
+  HTML export/share, TypeScript plugin host, packages, custom `models.json`
+  loading, LSP, and MCP management are not yet implemented.
 
 ## Development
 

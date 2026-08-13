@@ -221,6 +221,10 @@ func ralphPrepareNextTurn(loops *ralph.Store, baseSystemPrompt func() string) ag
 func authStreamFn(auth *catalog.Auth) agent.StreamFn {
 	return func(model *llm.Model, ctx *llm.Context, opts *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
 		if auth != nil {
+			// Some agent callers populate APIKey through GetAPIKey, but nested agents
+			// such as context compaction call this stream adapter directly. Apply
+			// the complete credential here so those paths authenticate too.
+			opts.APIKey = auth.APIKey
 			opts.Headers = auth.Headers
 			opts.Env = auth.Env
 		}

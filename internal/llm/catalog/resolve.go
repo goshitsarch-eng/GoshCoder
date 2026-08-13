@@ -8,9 +8,8 @@ package catalog
 // credential owns the provider, and ambient environment/file credentials are
 // consulted only when nothing is stored.
 //
-// Not ported: OAuth login and refresh flows. A stored, unexpired OAuth
-// credential still resolves (its access token becomes the API key), but an
-// expired one is reported as unconfigured rather than refreshed.
+// OAuth login and refresh are supported for Anthropic, OpenAI Codex, and Kimi
+// Coding. Other providers use their static or ambient credential strategies.
 
 import (
 	"context"

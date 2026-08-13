@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 )
@@ -86,6 +87,52 @@ func TestTerminalLoginInteractionRendersOAuthEvents(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("output %q does not contain %q", got, want)
 		}
+	}
+}
+
+func TestSessionStreamReResolvesChangedCredentials(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	store := catalog.NewFileCredentialStore(config.AuthPath())
+	setKey := func(key string) {
+		t.Helper()
+		if _, err := store.Modify("openai", func(*catalog.Credential) (*catalog.Credential, error) {
+			return &catalog.Credential{Type: "api_key", Key: key}, nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setKey("first-key")
+	session := &session{}
+	model := &llm.Model{ID: "m", API: "unknown-api", Provider: "openai"}
+	for _, expected := range []string{"first-key", "replacement-key"} {
+		if expected == "replacement-key" {
+			setKey(expected)
+		}
+		options := &llm.SimpleStreamOptions{}
+		options.Ctx = t.Context()
+		stream := session.streamAuthenticated(model, &llm.Context{}, options)
+		if _, err := stream.Result(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if options.APIKey != expected {
+			t.Fatalf("resolved API key = %q, want %q", options.APIKey, expected)
+		}
+	}
+}
+
+func TestSetModelPersistsAllSwitchPaths(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	t.Setenv("OPENAI_API_KEY", "sk-model-switch")
+	initial := llm.Model{ID: "initial", Provider: "openai"}
+	session := &session{
+		model: &initial,
+		agent: agent.NewAgent(agent.AgentOptions{InitialState: &agent.InitialState{Model: initial}}),
+	}
+	if err := session.setModel("openai/gpt-5.6-terra"); err != nil {
+		t.Fatal(err)
+	}
+	if got := config.ReadDefaultModel(); got != "openai/gpt-5.6-terra" {
+		t.Fatalf("remembered model = %q", got)
 	}
 }
 
@@ -431,6 +478,9 @@ func TestAuthStreamFnAppliesCredentials(t *testing.T) {
 		t.Fatalf("Result: %v", err)
 	}
 
+	if opts.APIKey != "sk-test" {
+		t.Fatalf("api key = %q", opts.APIKey)
+	}
 	if opts.Headers == nil || opts.Headers["Authorization"] == nil {
 		t.Fatalf("headers = %#v", opts.Headers)
 	}

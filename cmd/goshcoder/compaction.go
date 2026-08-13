@@ -323,9 +323,7 @@ func (s *session) generateCompactionSummary(ctx context.Context, source, instruc
 			SystemPrompt: "You are a context compactor. Produce a precise continuity summary, not a reply to the conversation. Preserve requirements, decisions, progress, unresolved work, exact paths/symbols, and file operations. Use the requested structured headings. Never invent completion.",
 			Model:        model, ThinkingLevel: level,
 		},
-		StreamFn: func(model *llm.Model, request *llm.Context, options *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
-			return authStreamFn(s.auth)(model, request, options)
-		},
+		StreamFn:   s.streamAuthenticated,
 		MaxRetries: 2,
 	})
 	focus := ""
