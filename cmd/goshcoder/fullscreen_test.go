@@ -58,6 +58,29 @@ func TestBubbleTeaEditorMultilineNavigation(t *testing.T) {
 	}
 }
 
+func TestOmniNetworkCommandsRunOffTheFullscreenUpdateLoop(t *testing.T) {
+	for _, command := range []string{"/omni status", "/omni sync", "/omni dashboard"} {
+		if !fullscreenCommandRunsAsync(command) {
+			t.Fatalf("%s should run asynchronously", command)
+		}
+	}
+	if fullscreenCommandRunsAsync("/omni setup") {
+		t.Fatal("setup uses Tea ExecProcess and should not use the captured command path")
+	}
+}
+
+func TestFullscreenSuggestionsIncludeNativeOmniAndBTWCommands(t *testing.T) {
+	session := &session{}
+	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil)
+	if len(omni) != 3 || omni[0].label != "status" || omni[1].label != "sync" || omni[2].label != "setup" {
+		t.Fatalf("omni suggestions = %#v", omni)
+	}
+	btw := fullscreenSuggestionsWithModels(session, "/btw r", nil)
+	if len(btw) != 1 || btw[0].label != "resume" || btw[0].execute {
+		t.Fatalf("btw suggestions = %#v", btw)
+	}
+}
+
 func TestThinkingSuggestionsFollowModelCapabilities(t *testing.T) {
 	model := &llm.Model{
 		ID: "reasoner", Provider: "vendor", Reasoning: true,

@@ -57,6 +57,13 @@ func AuthPath() string {
 // path used by the native web_search tool.
 func WebSearchPath() string { return filepath.Join(AgentDir(), "web-search.json") }
 
+// OmniRoutePath stores the native OmniRoute server and synchronized catalog.
+// Credentials remain in auth.json rather than being duplicated in this file.
+func OmniRoutePath() string { return filepath.Join(AgentDir(), "omniroute.json") }
+
+// BTWPath stores the native pi-btw model and thinking preferences.
+func BTWPath() string { return filepath.Join(AgentDir(), "pi-btw.json") }
+
 // DefaultModelPath is the small text file used to remember the last model
 // selected for interactive chat.
 func DefaultModelPath() string { return filepath.Join(AgentDir(), "default-model") }

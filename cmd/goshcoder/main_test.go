@@ -90,6 +90,15 @@ func TestTerminalLoginInteractionRendersOAuthEvents(t *testing.T) {
 	}
 }
 
+func TestGrokCodeAliasesAreAvailable(t *testing.T) {
+	for _, id := range []string{"grok-build-0.1", "grok-code-fast-1", "grok-code-fast", "grok-code-fast-1-0825"} {
+		model := newCatalog().Model("xai", id)
+		if model == nil || model.Provider != "xai" || model.API != llm.APIOpenAICompletions {
+			t.Fatalf("xai/%s = %#v", id, model)
+		}
+	}
+}
+
 func TestSessionStreamReResolvesChangedCredentials(t *testing.T) {
 	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
 	store := catalog.NewFileCredentialStore(config.AuthPath())

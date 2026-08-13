@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/btw"
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
@@ -45,6 +46,7 @@ type session struct {
 	// model is retained so /model can swap it at runtime.
 	model     *llm.Model
 	loops     *ralph.Store
+	btw       *btw.Manager
 	workspace *tools.Workspace
 	plan      *plannotator.Manager
 	// baseSystemPrompt is the prompt without extension suffixes.
@@ -80,7 +82,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		return nil, fmt.Errorf("discover local resources: %w", err)
 	}
 	s := &session{
-		model: model, explicitSystemPrompt: cfg.SystemPrompt,
+		model: model, btw: btw.NewManager(), explicitSystemPrompt: cfg.SystemPrompt,
 		resources: loadedResources, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen,
 	}
 

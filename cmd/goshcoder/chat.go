@@ -37,6 +37,8 @@ const chatHelp = `Slash commands:
   /help                 Show this help
   /model [ref]          Show or switch the model
   /login [provider]     Add an OAuth or API-key provider (keeps existing logins)
+  /omni [command]       Setup, sync, inspect, or open OmniRoute
+  /btw [question]       Ask in an ephemeral, context-aware side thread
   /thinking [level]     Show or set the thinking level
   /system [text]        Show or replace the system prompt
   /tools                List the available tools
@@ -338,6 +340,19 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			return false, err
 		}
 		fmt.Fprintf(os.Stderr, "Added %s. Use /model to switch providers.\n", providerID)
+
+	case "/omni":
+		output, commandErr := runOmniCommand(context.Background(), strings.Fields(rest), true)
+		if output != "" {
+			fmt.Fprintln(os.Stderr, output)
+		}
+		return false, commandErr
+
+	case "/btw":
+		if s.agent.State().IsStreaming {
+			return false, errors.New("wait for the active response before opening /btw")
+		}
+		return false, s.handleBTWCommand(rest)
 
 	case "/thinking":
 		available := llm.GetSupportedThinkingLevels(s.model)

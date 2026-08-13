@@ -87,6 +87,17 @@ func TestWebSearchPath(t *testing.T) {
 	}
 }
 
+func TestNativeExtensionPaths(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvAgentDir, dir)
+	if got, want := OmniRoutePath(), filepath.Join(dir, "omniroute.json"); got != want {
+		t.Fatalf("OmniRoutePath = %q, want %q", got, want)
+	}
+	if got, want := BTWPath(), filepath.Join(dir, "pi-btw.json"); got != want {
+		t.Fatalf("BTWPath = %q, want %q", got, want)
+	}
+}
+
 func TestDefaultModelRoundTrip(t *testing.T) {
 	t.Setenv(EnvAgentDir, t.TempDir())
 	if got := ReadDefaultModel(); got != "" {

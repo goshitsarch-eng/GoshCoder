@@ -34,3 +34,11 @@ The native Plannotator workflow is based on @plannotator/pi-extension by the
 Plannotator contributors (https://github.com/backnotprop/plannotator), offered
 under MIT OR Apache-2.0. GoshCoder does not bundle Plannotator's generated web
 assets or npm dependencies.
+
+The native OmniRoute integration is based on omniroute-pi-ext-integration by
+Oscar Andrea / md-riaz (https://github.com/md-riaz/omniroute-pi-ext-integration),
+Copyright (c) 2026 Oscar Andrea, used under the MIT License above.
+
+The native BTW side-thread integration is based on @narumitw/pi-btw by
+narumiruna (https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw),
+Copyright (c) 2026 narumiruna, used under the MIT License above.

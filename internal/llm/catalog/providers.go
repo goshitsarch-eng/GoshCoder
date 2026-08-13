@@ -212,6 +212,10 @@ var builtinProviderConfigs = map[string]builtinProviderConfig{
 		name: "OpenRouter", baseURL: "https://openrouter.ai/api/v1",
 		keyName: "OpenRouter API key", envKeys: []string{"OPENROUTER_API_KEY"}, oauth: true,
 	},
+	"omni": {
+		name: "OmniRoute", baseURL: "http://127.0.0.1:20128/v1",
+		keyName: "OmniRoute API key", envKeys: []string{"OMNIROUTE_API_KEY"},
+	},
 	"qwen-token-plan": {
 		name: "Qwen Token Plan", baseURL: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
 		keyName: "Qwen Token Plan API key", envKeys: []string{"QWEN_TOKEN_PLAN_API_KEY"},

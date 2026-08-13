@@ -159,6 +159,18 @@ The requested extension features are now native:
   authenticated stream path is used by the nested compaction agent.
 - Planner phase changes update both prompt and tools inside the active agent
   loop; approval exposes full tools on the immediately following model turn.
+- **Grok Code/xAI**: `xai` uses `XAI_API_KEY` or `auth set xai`; the current
+  canonical coding model `grok-build-0.1` and documented aliases
+  `grok-code-fast-1`, `grok-code-fast`, and `grok-code-fast-1-0825` are in the
+  model picker.
+- **OmniRoute** (`internal/omniroute`, `internal/llm/omni_prompt_tools.go`):
+  `/omni setup|sync|status|dashboard`, dynamically discovered models in
+  `/model` and Ctrl+P, normalized metadata, and prompt-emulated tools for
+  web/chat-only models. Config is `omniroute.json`; auth stays in `auth.json`.
+- **BTW** (`internal/btw`): native ephemeral side threads with main-transcript
+  context, follow-ups, queued Steering, session-memory resume, dedicated
+  fullscreen view, independent model/thinking settings, and latest-answer
+  bring-to-main. Exact text-range selection is the documented parity exception.
 - **Web Search** (`internal/webaccess`): native `pi-web-access` adaptation registered
   as `web_search`, with OpenAI/Codex auth reuse, zero-config Exa MCP fallback,
   direct Exa, and Kagi Search (`KAGI_API_KEY` or `web-search.json`). The in-app

@@ -21,7 +21,9 @@ import (
 	"sync"
 	"time"
 
+	goshconfig "goshcoder/internal/config"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/omniroute"
 )
 
 // authenticatedSentinel is pi's marker for ambient credentials that are
@@ -116,6 +118,15 @@ func (c *Catalog) Provider(id string) *Provider {
 		provider.models = append(provider.models, *cloneModel(models[modelID]))
 	}
 	provider.rawCompat = builtin.rawCompat[id]
+	if id == "omni" {
+		if configured, err := omniroute.Load(goshconfig.OmniRoutePath()); err == nil {
+			provider.BaseURL = configured.APIBaseURL()
+			provider.models = make([]llm.Model, 0, len(configured.Models))
+			for _, dynamic := range configured.Models {
+				provider.models = append(provider.models, dynamic.LLMModel(configured))
+			}
+		}
+	}
 	return provider
 }
 

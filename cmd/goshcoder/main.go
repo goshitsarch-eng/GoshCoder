@@ -37,6 +37,8 @@ Usage:
   goshcoder auth login <provider>    Log in with OAuth
   goshcoder auth list                List stored credentials
   goshcoder auth logout <provider>   Remove a stored credential
+  goshcoder omni [status|sync|setup|dashboard]
+                                     Manage an OmniRoute gateway
   goshcoder ralph list [--archived]  List ralph loops
   goshcoder ralph status             Show the active ralph loop
   goshcoder ralph resume <name>      Reactivate a paused loop
@@ -59,7 +61,7 @@ Chat/run flags:
 Environment:
   GOSHCODER_AGENT_DIR   Override the config directory (default ~/.goshcoder/agent)
   Provider API keys are read from the usual variables, e.g. ANTHROPIC_API_KEY,
-  OPENAI_API_KEY, GEMINI_API_KEY.
+  OPENAI_API_KEY, GEMINI_API_KEY, XAI_API_KEY, OMNIROUTE_API_KEY.
 `
 
 func main() {
@@ -91,6 +93,8 @@ func main() {
 		err = modelsCommand(args)
 	case "auth":
 		err = authCommand(args)
+	case "omni":
+		err = omniCommand(args)
 	case "ralph":
 		err = ralphCommand(args)
 	case "version", "--version", "-v":

@@ -17,7 +17,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/btw"
 	"goshcoder/internal/claudetui"
+	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
@@ -49,7 +51,21 @@ type fullscreenLoginFinished struct {
 	err      error
 }
 type fullscreenInfoRefreshed struct{ info claudetui.SessionInfo }
+type fullscreenBTWFinished struct {
+	threadID string
+	question string
+	answer   string
+	err      error
+}
 type fullscreenTick time.Time
+
+type fullscreenBTWState struct {
+	thread   *btw.Thread
+	running  bool
+	question string
+	queued   []string
+	cancel   context.CancelFunc
+}
 
 type fullscreenModel struct {
 	session       *session
@@ -68,6 +84,7 @@ type fullscreenModel struct {
 	recentTool    string
 	toolsExpanded bool
 	hideThinking  bool
+	btw           *fullscreenBTWState
 }
 
 func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAgentEvent) *fullscreenModel {
@@ -169,6 +186,7 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		model.activityAt = time.Time{}
 
 	case fullscreenCommandFinished:
+		model.models = availableFullscreenModels(model.session)
 		if model.applyCommandResult(value.result) {
 			return model, tea.Quit
 		}
@@ -190,6 +208,25 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fullscreenInfoRefreshed:
 		model.info = value.info
+
+	case fullscreenBTWFinished:
+		if model.btw == nil || model.btw.thread.ID != value.threadID {
+			break
+		}
+		model.btw.running = false
+		model.btw.cancel = nil
+		model.btw.question = ""
+		if value.err != nil {
+			model.activity = "BTW question failed"
+			model.notices = appendNotice(model.notices, "BTW Error", value.err.Error())
+		} else {
+			model.activity = "BTW answer ready"
+		}
+		if len(model.btw.queued) > 0 {
+			next := model.btw.queued[0]
+			model.btw.queued = model.btw.queued[1:]
+			return model, model.startBTWQuestion(next)
+		}
 
 	case fullscreenTick:
 		model.spin = (model.spin + 1) % 8
@@ -242,6 +279,9 @@ func (model *fullscreenModel) refreshRealtimeInfo() {
 }
 
 func (model *fullscreenModel) View() string {
+	if model.btw != nil {
+		return model.viewBTW()
+	}
 	state := model.session.agent.State()
 	transcript := state.Messages
 	if state.StreamingMessage != nil {
@@ -296,6 +336,9 @@ func (model *fullscreenModel) View() string {
 }
 
 func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
+	if model.btw != nil {
+		return model.handleBTWTeaKey(key)
+	}
 	streaming := model.session.agent.State().IsStreaming
 	switch key.String() {
 	case "ctrl+c":
@@ -505,6 +548,20 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 	model.editor.historyIndex, model.editor.draft = -1, ""
 	model.clearInput()
 
+	if strings.HasPrefix(prompt, "/btw") && (prompt == "/btw" || strings.HasPrefix(prompt, "/btw ")) {
+		if streaming {
+			model.activity = "Wait for the main response before opening BTW"
+			return nil
+		}
+		return model.openBTW(strings.TrimSpace(strings.TrimPrefix(prompt, "/btw")))
+	}
+	if prompt == "/omni setup" {
+		model.busyCommand = true
+		model.activity = "Opening OmniRoute setup"
+		model.activityAt = time.Now()
+		return fullscreenOmniSetupCommand()
+	}
+
 	if expanded, ok, expandErr := model.session.expandResourceInput(prompt); ok {
 		if expandErr != nil {
 			model.notices = appendNotice(model.notices, "Error", expandErr.Error())
@@ -551,6 +608,234 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 	model.activity = "Sending message"
 	model.activityAt = time.Now()
 	return func() tea.Msg { return fullscreenTurnFinished{err: model.session.runTurn(prompt)} }
+}
+
+func (model *fullscreenModel) openBTW(arguments string) tea.Cmd {
+	fields := strings.Fields(arguments)
+	if len(fields) > 0 {
+		switch strings.ToLower(fields[0]) {
+		case "settings", "list", "bring":
+			result := runFullscreenCommand(model.session, "/btw "+arguments)
+			model.applyCommandResult(result)
+			return nil
+		}
+	}
+	selection, warnings, err := model.session.resolveBTWSelection()
+	if err != nil {
+		model.notices = appendNotice(model.notices, "Error", err.Error())
+		return nil
+	}
+	for _, warning := range warnings {
+		model.notices = appendNotice(model.notices, "BTW", warning)
+	}
+	var thread *btw.Thread
+	question := arguments
+	if len(fields) >= 2 && strings.EqualFold(fields[0], "resume") {
+		thread = model.session.btw.Get(fields[1])
+		if thread == nil {
+			model.notices = appendNotice(model.notices, "Error", "Unknown BTW thread "+fields[1])
+			return nil
+		}
+		question = strings.TrimSpace(strings.Join(fields[2:], " "))
+	}
+	if thread == nil {
+		thread = model.session.btw.New(btw.BuildConversationContext(model.session.agent.State().Messages), selection.thinking)
+	}
+	model.btw = &fullscreenBTWState{thread: thread}
+	model.editor.scroll = 0
+	model.activity = "BTW side thread"
+	if question != "" {
+		return model.startBTWQuestion(question)
+	}
+	return nil
+}
+
+func (model *fullscreenModel) startBTWQuestion(question string) tea.Cmd {
+	if model.btw == nil || strings.TrimSpace(question) == "" {
+		return nil
+	}
+	question = strings.TrimSpace(question)
+	if model.btw.running {
+		model.btw.queued = append(model.btw.queued, question)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	state := model.btw
+	thinking := model.session.btw.Snapshot(state.thread).ThinkingLevel
+	state.running, state.question, state.cancel = true, question, cancel
+	model.activity = "Answering BTW question"
+	return func() tea.Msg {
+		answer, err := model.session.askBTW(ctx, state.thread, question, thinking)
+		return fullscreenBTWFinished{threadID: state.thread.ID, question: question, answer: answer, err: err}
+	}
+}
+
+func (model *fullscreenModel) closeBTW() {
+	if model.btw != nil && model.btw.cancel != nil {
+		model.btw.cancel()
+	}
+	model.btw = nil
+	model.editor.scroll = 0
+	model.activity = "Ready"
+}
+
+func (model *fullscreenModel) handleBTWTeaKey(key tea.KeyMsg) tea.Cmd {
+	state := model.btw
+	if state == nil {
+		return nil
+	}
+	switch key.String() {
+	case "ctrl+c":
+		model.clearInput()
+		state.queued = nil
+		model.closeBTW()
+		return nil
+	case "esc":
+		if !state.running {
+			model.closeBTW()
+		}
+		return nil
+	case "ctrl+r":
+		segments := btw.LatestSegments(state.thread)
+		if len(segments) == 0 {
+			model.activity = "No successful BTW answer to bring"
+			return nil
+		}
+		draft := btw.FormatBringToMain(segments)
+		model.closeBTW()
+		if len(model.editor.input) > 0 {
+			model.insertRunes([]rune("\n\n" + draft))
+		} else {
+			model.setInput(draft)
+		}
+		model.activity = fmt.Sprintf("Brought ~%d BTW tokens to the editor", btw.EstimateTokens(segments))
+		return nil
+	case "shift+tab":
+		selection, _, err := model.session.resolveBTWSelection()
+		if err != nil {
+			return nil
+		}
+		levels := llm.GetSupportedThinkingLevels(selection.model)
+		current := model.session.btw.Snapshot(state.thread).ThinkingLevel
+		next := current
+		for index, level := range levels {
+			if level == current {
+				next = levels[(index+1)%len(levels)]
+				goto persist
+			}
+		}
+		if len(levels) > 0 {
+			next = levels[0]
+		}
+	persist:
+		model.session.btw.SetThinkingLevel(state.thread, next)
+		if selection.remember {
+			level := next
+			if _, err := btw.UpdateSettings(config.BTWPath(), &level, nil); err != nil {
+				model.activity = "BTW thinking changed but was not remembered"
+			}
+		}
+		return nil
+	case "enter":
+		question := strings.TrimSpace(string(model.editor.input))
+		if question == "" {
+			return nil
+		}
+		model.clearInput()
+		if state.running {
+			state.queued = append(state.queued, question)
+			model.activity = "BTW steering question queued"
+			return nil
+		}
+		return model.startBTWQuestion(question)
+	case "shift+enter", "ctrl+j":
+		model.insertRunes([]rune{'\n'})
+	case "up":
+		if !moveEditorCursorVertical(&model.editor, -1) {
+			editorHistory(&model.editor, -1)
+		}
+	case "down":
+		if !moveEditorCursorVertical(&model.editor, 1) {
+			editorHistory(&model.editor, 1)
+		}
+	case "left", "ctrl+b":
+		model.editor.cursor = max(0, model.editor.cursor-1)
+	case "right", "ctrl+f":
+		model.editor.cursor = min(len(model.editor.input), model.editor.cursor+1)
+	case "home", "ctrl+a":
+		model.editor.cursor = editorLineStart(model.editor.input, model.editor.cursor)
+	case "end", "ctrl+e":
+		model.editor.cursor = editorLineEnd(model.editor.input, model.editor.cursor)
+	case "pgup":
+		model.editor.scroll += 10
+	case "pgdown":
+		model.editor.scroll = max(0, model.editor.scroll-10)
+	case "backspace":
+		if model.editor.cursor > 0 {
+			model.editor.input = append(model.editor.input[:model.editor.cursor-1], model.editor.input[model.editor.cursor:]...)
+			model.editor.cursor--
+		}
+	case "delete":
+		model.deleteAtCursor()
+	case "ctrl+k":
+		model.editor.input = model.editor.input[:model.editor.cursor]
+	case "ctrl+u":
+		model.editor.input = append([]rune(nil), model.editor.input[model.editor.cursor:]...)
+		model.editor.cursor = 0
+	case "ctrl+w":
+		model.deletePreviousWord()
+	default:
+		if key.Type == tea.KeyRunes || key.Type == tea.KeySpace {
+			var input []rune
+			for _, r := range key.Runes {
+				if !unicode.IsControl(r) {
+					input = append(input, r)
+				}
+			}
+			model.insertRunes(input)
+		}
+	}
+	return nil
+}
+
+func (model *fullscreenModel) viewBTW() string {
+	state := model.btw
+	if state == nil {
+		return ""
+	}
+	thread := model.session.btw.Snapshot(state.thread)
+	messages := make([]tui.Message, 0, len(thread.Turns)*2+1)
+	for _, turn := range thread.Turns {
+		messages = append(messages, tui.Message{Role: "user", Text: turn.Question})
+		if turn.Kind == "error" {
+			messages = append(messages, tui.Message{Role: "Error", Text: turn.Answer, IsError: true})
+		} else {
+			messages = append(messages, tui.Message{Role: "assistant", Text: turn.Answer})
+		}
+	}
+	if state.running {
+		messages = append(messages, tui.Message{Role: "user", Text: state.question})
+	}
+	for _, question := range state.queued {
+		messages = append(messages, tui.Message{Role: "Notice", Text: "Steering · " + question})
+	}
+	status := "Type a side question · Esc close · Ctrl+R bring latest to main"
+	if state.running {
+		status = "Answering… · Enter queues Steering · Ctrl+C cancel and close"
+	}
+	sidebar := []string{"title\tBTW · side thread", "accent\t" + thread.ID, "meta\t" + thread.ThinkingLevel + " thinking", "", "section\tEphemeral", "meta\tNever added to main context", fmt.Sprintf("meta\t%d recorded question(s)", len(thread.Turns)), "", "section\tKeys", "meta\tShift+Tab  thinking", "meta\tCtrl+R  bring latest", "meta\tEsc  close", "", "brand\t● GoshCoder BTW"}
+	return tui.View(tui.Frame{Title: "btw · side thread · " + thread.ID, Messages: messages, Sidebar: sidebar, Input: model.editor.input, Cursor: model.editor.cursor, Status: status, Streaming: state.running, Scroll: model.editor.scroll, Thinking: thread.ThinkingLevel, Mode: "BTW", VirtualCursor: true}, model.width, model.height)
+}
+
+func fullscreenOmniSetupCommand() tea.Cmd {
+	executable, err := os.Executable()
+	if err != nil {
+		return func() tea.Msg { return fullscreenCommandFinished{result: fullscreenResult{err: err}} }
+	}
+	command := exec.Command(executable, "omni", "setup")
+	return tea.ExecProcess(command, func(err error) tea.Msg {
+		return fullscreenCommandFinished{result: fullscreenResult{err: err, output: map[bool]string{true: "OmniRoute setup complete. Run /omni sync.", false: ""}[err == nil]}}
+	})
 }
 
 func fullscreenLoginCommand(providerID string) tea.Cmd {
@@ -606,7 +891,8 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 		return false
 	}
 	command := fields[0]
-	return command == "/compact" || command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
+	return command == "/compact" || (command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
+		command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
 		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
 		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
 }
@@ -767,6 +1053,43 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		}
 		return fullscreenLoginSuggestions(query)
 	}
+	if strings.HasPrefix(lower, "/omni ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/omni "))
+		if strings.ContainsAny(query, " \t\n") {
+			return nil
+		}
+		commands := []fullscreenSuggestion{
+			{label: "status", description: "Check gateway health and synchronized models", value: "/omni status", execute: true},
+			{label: "sync", description: "Refresh models from /v1/models", value: "/omni sync", execute: true},
+			{label: "setup", description: "Configure URL and API key", value: "/omni setup", execute: true},
+			{label: "dashboard", description: "Show the management dashboard URL", value: "/omni dashboard", execute: true},
+		}
+		var suggestions []fullscreenSuggestion
+		for _, command := range commands {
+			if strings.HasPrefix(command.label, query) {
+				suggestions = append(suggestions, command)
+			}
+		}
+		return suggestions
+	}
+	if strings.HasPrefix(lower, "/btw ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/btw "))
+		if strings.ContainsAny(query, " \t\n") {
+			return nil
+		}
+		commands := []fullscreenSuggestion{
+			{label: "list", description: "List in-memory side threads", value: "/btw list", execute: true},
+			{label: "resume", description: "Resume a side thread by ID", value: "/btw resume ", execute: false},
+			{label: "settings", description: "View or change side-thread settings", value: "/btw settings", execute: true},
+		}
+		var suggestions []fullscreenSuggestion
+		for _, command := range commands {
+			if strings.HasPrefix(command.label, query) {
+				suggestions = append(suggestions, command)
+			}
+		}
+		return suggestions
+	}
 	if strings.HasPrefix(lower, "/ralph ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/ralph "))
 		if strings.ContainsAny(query, " \t\n") {
@@ -822,7 +1145,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/model", "/login", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
+		case "/model", "/login", "/omni", "/btw", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -998,6 +1321,12 @@ func fullscreenSuggestionTitle(input string) string {
 	}
 	if strings.HasPrefix(lower, "/login ") {
 		return "ADD PROVIDER  ·  OAuth or API key  ·  existing logins are kept"
+	}
+	if strings.HasPrefix(lower, "/omni ") {
+		return "OMNIROUTE  ·  setup, synchronize, and inspect the gateway"
+	}
+	if strings.HasPrefix(lower, "/btw ") {
+		return "BTW  ·  ephemeral side questions that do not pollute main context"
 	}
 	if strings.HasPrefix(lower, "/ralph ") {
 		return "RALPH LOOP  ·  iterative development controls"

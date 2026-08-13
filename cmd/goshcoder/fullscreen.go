@@ -37,6 +37,7 @@ type slashCommand struct {
 var fullscreenSlashCommands = []slashCommand{
 	{"/help", "Show all commands"}, {"/model", "Choose from authenticated models"},
 	{"/login", "Add an OAuth or API-key provider"},
+	{"/omni", "Manage an OmniRoute gateway"}, {"/btw", "Open an ephemeral side-question thread"},
 	{"/thinking", "Choose reasoning effort for this model"}, {"/tools", "List active tools"},
 	{"/status", "Show session information"}, {"/session", "Show session information"},
 	{"/sidebar", "Show session information"}, {"/hotkeys", "Show keyboard shortcuts"},

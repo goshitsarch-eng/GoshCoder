@@ -37,6 +37,10 @@ goshcoder auth set anthropic
 goshcoder auth login anthropic
 goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
+
+# xAI/Grok Code (API-key account)
+goshcoder auth set xai
+# Then select xai/grok-build-0.1 or its grok-code-fast-1 alias
 ```
 
 Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
@@ -71,6 +75,8 @@ be pointed at either tool.
 | `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
 | `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `internal/webaccess` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
+| `internal/omniroute` | OmniRoute setup, public catalog synchronization, and metadata normalization |
+| `internal/btw` | Ephemeral context-aware side threads and settings |
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
@@ -80,7 +86,7 @@ be pointed at either tool.
 
 ## Provider coverage
 
-All 1220 catalog models (100%) across nine wire protocols:
+The built-in catalog covers all bundled models across nine wire protocols:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
@@ -114,6 +120,26 @@ host, so selected extension features are native built-ins:
   Exa. This is a native Go port of the search tool, not an npm plugin runtime.
   The package's `fetch_content`, `get_search_content`, `source_check`, browser
   curator, video/PDF handling, and providers not listed above are not ported.
+- `omniroute-pi-ext-integration` **OmniRoute** (native adaptation): `/omni
+  setup` validates and stores a local or remote gateway, `/omni sync` imports
+  `/v1/models` into GoshCoder's live `/model`/Ctrl+P picker, `/omni status`
+  checks health, and `/omni dashboard` reports the management URL. Synchronized
+  context, output, reasoning, vision, and native-tool metadata are retained.
+  Web/chat-only models use the package version 2.0.1 buffered `<tool_call>`
+  prompt adapter and are converted back into normal agent tool events. Config
+  is in `omniroute.json`; its API key stays independently in `auth.json` or
+  `OMNIROUTE_API_KEY`.
+- `@narumitw/pi-btw` **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
+  context-aware side thread without adding the question or answer to the main
+  transcript. The fullscreen side UI supports follow-ups, queued Steering,
+  in-memory resume, independent model/thinking settings in `pi-btw.json`,
+  Shift+Tab thinking changes, scrolling, cancellation, and Ctrl+R to bring the
+  latest Q&A into the editable main composer. GoshCoder requires the main agent
+  to be idle before opening BTW rather than rendering both agents concurrently.
+  `/btw` lists retained threads;
+  `/btw resume <id> <question>` resumes one. The original's exact character/
+  line range selector and nested bring-preview menus are not ported; native
+  line mode offers deterministic `latest`, `all`, and `from:N` export instead.
 - `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. `/ralph` opens loop controls in the command palette.
@@ -169,7 +195,10 @@ Documented at the top of each ported file. The notable ones:
 - **No SDKs.** Provider requests are hand-rolled `net/http` plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, and Kimi
-  Code. Kimi also supports API-key authentication.
+  Code. Kimi also supports API-key authentication. xAI/Grok Code uses an xAI
+  API key (`XAI_API_KEY` or `goshcoder auth set xai`); a grok.com consumer
+  subscription is not an API credential and no unofficial browser-login flow
+  is used.
 - **Interface.** Interactive chat uses a Bubble Tea alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
