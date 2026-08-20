@@ -180,6 +180,7 @@ func TestFirstLine(t *testing.T) {
 		{"trims surrounding space", "  hello  ", "hello"},
 		{"multiline is elided", "first\nsecond", "first ..."},
 		{"empty", "", ""},
+		{"cjk is not split", strings.Repeat("你", 200), strings.Repeat("你", 120) + " ..."},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

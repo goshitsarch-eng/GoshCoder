@@ -7,7 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 const Version = "0.1.12-native"
@@ -36,7 +37,7 @@ type SessionInfo struct {
 	Thinking     string
 }
 
-func displayWidth(text string) int { return utf8.RuneCountInString(stripANSI(text)) }
+func displayWidth(text string) int { return ansi.StringWidth(text) }
 
 func stripANSI(text string) string {
 	var out strings.Builder
@@ -64,11 +65,10 @@ func truncate(text string, width int) string {
 	if displayWidth(text) <= width {
 		return text
 	}
-	runes := []rune(stripANSI(text))
 	if width == 1 {
 		return "…"
 	}
-	return string(runes[:width-1]) + "…"
+	return ansi.Truncate(text, width, "…")
 }
 
 func pad(text string, width int) string {
@@ -124,6 +124,9 @@ func HeaderWithInfo(width int, appVersion, model, thinking, cwd string, color bo
 	tips := []string{"", "Getting started", "Ask GoshCoder to build it", "────────────────", "Commands", "/help", "/model", "/planner"}
 	if info != nil {
 		tips = infoLines(*info)
+	}
+	for len(tips) < len(left) {
+		tips = append(tips, "")
 	}
 	label := " GoshCoder v" + appVersion + " "
 	topFill := max(0, width-2-displayWidth(label)-3)

@@ -52,6 +52,49 @@ func newTestManager(t *testing.T, reviewer Reviewer) *Manager {
 	return manager
 }
 
+func TestParseChecklistAcceptsNumberedAndPlusItems(t *testing.T) {
+	items := ParseChecklist("1. [ ] First\n+ [x] Second\n- [ ] Third")
+	if len(items) != 3 || items[0].Text != "First" || !items[1].Completed || items[2].Step != 3 {
+		t.Fatalf("items = %#v", items)
+	}
+}
+
+func TestPrepareReviewDocumentKeepsHeadingsAndNumberedSections(t *testing.T) {
+	lines, headings := prepareReviewDocument("# Plan\n#include <stdio.h>\n\n1. First section\n- [x] done\n- [ ] open\n")
+	if len(headings) != 1 || headings[0].Text != "Plan" {
+		t.Fatalf("headings = %#v", headings)
+	}
+	kinds := make([]string, 0, len(lines))
+	displays := make([]string, 0, len(lines))
+	for _, line := range lines {
+		kinds = append(kinds, line.Kind)
+		displays = append(displays, line.Display)
+	}
+	joined := strings.Join(displays, "\n")
+	if !strings.Contains(joined, "#include <stdio.h>") {
+		t.Fatalf("C include was rewritten: %q", joined)
+	}
+	if !strings.Contains(strings.Join(kinds, ","), "numbered") || !strings.Contains(strings.Join(kinds, ","), "task-done") {
+		t.Fatalf("kinds = %s", strings.Join(kinds, ","))
+	}
+}
+
+func TestPrepareReviewDocumentIndentsNestedSections(t *testing.T) {
+	lines, _ := prepareReviewDocument("# Plan\n- Parent\n  - Nested child\n    1. Deep numbered\n")
+	if len(lines) < 4 {
+		t.Fatalf("lines = %#v", lines)
+	}
+	if lines[1].Kind != "bullet" || lines[1].Indent != 0 {
+		t.Fatalf("parent = %#v", lines[1])
+	}
+	if lines[2].Kind != "bullet" || lines[2].Indent != 1 {
+		t.Fatalf("nested bullet = %#v", lines[2])
+	}
+	if lines[3].Kind != "numbered" || lines[3].Indent != 2 {
+		t.Fatalf("nested numbered = %#v", lines[3])
+	}
+}
+
 func TestParseChecklistAndDoneMarkers(t *testing.T) {
 	items := ParseChecklist("- [ ] First\n* [x] Second\nnot a task\n- [ ] Third")
 	if len(items) != 3 || items[0].Text != "First" || !items[1].Completed || items[2].Step != 3 {

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
@@ -123,6 +124,19 @@ func (w *Workspace) readLimited(path string, limit int64) ([]byte, bool, error) 
 	return content, false, nil
 }
 
+func clipUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 func textResult(text string) agent.ToolResult {
 	return agent.ToolResult{Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: text}}}
 }
@@ -219,7 +233,7 @@ func (w *Workspace) ReadTool() agent.Tool {
 			selected := strings.Join(lines[offset-1:end], "\n")
 			truncated := false
 			if len(selected) > maxReadBytes {
-				selected = selected[:maxReadBytes]
+				selected = clipUTF8(selected, maxReadBytes)
 				if cut := strings.LastIndexByte(selected, '\n'); cut >= 0 {
 					selected = selected[:cut]
 				}
@@ -493,7 +507,7 @@ func (w *Workspace) GrepTool() agent.Tool {
 						}
 						value := lines[row]
 						if len(value) > 2000 {
-							value = value[:2000] + "…"
+							value = clipUTF8(value, 2000) + "…"
 						}
 						output = append(output, fmt.Sprintf("%s%s%d%s %s", filepath.ToSlash(file), separator, row+1, separator, value))
 					}
@@ -590,8 +604,9 @@ func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]stri
 	// repository's complete ignore stack. Fall back to a conservative walk.
 	gitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	command := exec.CommandContext(gitCtx, "git", "ls-files", "-co", "--exclude-standard", "--", resolved)
+	command := exec.CommandContext(gitCtx, "git", "-C", w.Root, "ls-files", "-co", "--exclude-standard", "--", resolved)
 	command.Dir = w.Root
+	command.Env = withoutGitOverrideEnv(os.Environ())
 	command.WaitDelay = time.Second
 	output := cappedOutput{limit: maxCandidateBytes}
 	command.Stdout = &output
@@ -623,7 +638,7 @@ func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]stri
 			return ctx.Err()
 		}
 		if entry.IsDir() {
-			if path != start && (entry.Name() == ".git" || entry.Name() == "node_modules") {
+			if path != start && skipSearchDir(entry.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -673,6 +688,30 @@ func globMatches(pattern, name string) bool {
 	}
 	// A basename-only pattern applies at every depth, matching fd/rg globs.
 	return !strings.Contains(pattern, "/") && regexp.MustCompile(expression.String()).MatchString(filepath.Base(name))
+}
+
+func skipSearchDir(name string) bool {
+	switch name {
+	case ".git", "node_modules", "vendor", "dist", "build", ".venv", "target", "__pycache__":
+		return true
+	default:
+		return false
+	}
+}
+
+func withoutGitOverrideEnv(env []string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, item := range env {
+		if strings.HasPrefix(item, "GIT_DIR=") ||
+			strings.HasPrefix(item, "GIT_WORK_TREE=") ||
+			strings.HasPrefix(item, "GIT_INDEX_FILE=") ||
+			strings.HasPrefix(item, "GIT_OBJECT_DIRECTORY=") ||
+			strings.HasPrefix(item, "GIT_COMMON_DIR=") {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
 }
 
 func numericParam(value any, fallback int) int {

@@ -12,10 +12,14 @@ const MaxProviderErrorBodyChars = 4000
 
 // TruncateErrorText truncates long provider error text (utils/error-body.ts).
 func TruncateErrorText(text string, maxChars int) string {
-	if len(text) <= maxChars {
+	runes := []rune(text)
+	if maxChars < 0 {
+		maxChars = 0
+	}
+	if len(runes) <= maxChars {
 		return text
 	}
-	return fmt.Sprintf("%s... [truncated %d chars]", text[:maxChars], len(text)-maxChars)
+	return fmt.Sprintf("%s... [truncated %d chars]", string(runes[:maxChars]), len(runes)-maxChars)
 }
 
 // FormatProviderError composes the display string for a provider failure.

@@ -303,8 +303,13 @@ func renderEvent(ctx context.Context, ev agent.Event) {
 
 func lastAssistant(messages []agent.Message) (llm.AssistantMessage, bool) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if message, ok := messages[i].(llm.AssistantMessage); ok {
+		switch message := messages[i].(type) {
+		case llm.AssistantMessage:
 			return message, true
+		case *llm.AssistantMessage:
+			if message != nil {
+				return *message, true
+			}
 		}
 	}
 	return llm.AssistantMessage{}, false
@@ -325,13 +330,27 @@ func resultText(result *agent.ToolResult) string {
 
 func firstLine(text string) string {
 	text = strings.TrimSpace(text)
+	elided := false
 	if index := strings.IndexByte(text, '\n'); index >= 0 {
-		return text[:index] + " ..."
+		text = text[:index]
+		elided = true
 	}
-	if len(text) > 120 {
-		return text[:120] + " ..."
+	runes := []rune(text)
+	if len(runes) > 120 {
+		return string(runes[:120]) + " ..."
+	}
+	if elided {
+		return text + " ..."
 	}
 	return text
+}
+
+func clipRunes(text string, limit int) string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	return string(runes[:limit]) + "..."
 }
 
 // summarizeArgs renders tool arguments compactly for the activity line.
@@ -347,8 +366,8 @@ func summarizeArgs(args map[string]any) string {
 	var parts []string
 	for _, key := range keys {
 		value := fmt.Sprint(args[key])
-		if len(value) > 60 {
-			value = value[:60] + "..."
+		if len([]rune(value)) > 60 {
+			value = clipRunes(value, 60)
 		}
 		parts = append(parts, key+"="+strings.ReplaceAll(value, "\n", " "))
 	}

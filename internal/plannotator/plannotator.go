@@ -286,7 +286,7 @@ func (m *Manager) IsPlanPathAllowed(inputPath string) bool {
 	return ext == ".md" || ext == ".mdx"
 }
 
-var checklistPattern = regexp.MustCompile(`(?m)^[-*]\s*\[([ xX])\]\s+(.+)$`)
+var checklistPattern = regexp.MustCompile(`(?m)^(?:[-*+]|\d+[.)])\s*\[([ xX])\]\s+(.+)$`)
 var donePattern = regexp.MustCompile(`(?i)\[DONE:(\d+)\]`)
 
 func ParseChecklist(content string) []ChecklistItem {

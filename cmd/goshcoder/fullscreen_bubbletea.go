@@ -332,7 +332,9 @@ func (model *fullscreenModel) View() string {
 		ToolsExpanded:      model.toolsExpanded,
 		HideThinking:       model.hideThinking,
 	}
-	return tui.View(frame, model.width, model.height)
+	view, scroll := tui.Render(frame, model.width, model.height)
+	model.editor.scroll = scroll
+	return view
 }
 
 func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
@@ -439,6 +441,9 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 	case "shift+enter", "ctrl+j":
 		model.insertRunes([]rune{'\n'})
 
+	case " ":
+		model.insertRunes([]rune{' '})
+
 	case "backspace":
 		if model.editor.cursor > 0 {
 			model.editor.input = append(model.editor.input[:model.editor.cursor-1], model.editor.input[model.editor.cursor:]...)
@@ -482,6 +487,9 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 				if !unicode.IsControl(r) {
 					input = append(input, r)
 				}
+			}
+			if key.Type == tea.KeySpace && len(input) == 0 {
+				input = []rune{' '}
 			}
 			model.insertRunes(input)
 		}
@@ -750,6 +758,8 @@ func (model *fullscreenModel) handleBTWTeaKey(key tea.KeyMsg) tea.Cmd {
 		return model.startBTWQuestion(question)
 	case "shift+enter", "ctrl+j":
 		model.insertRunes([]rune{'\n'})
+	case " ":
+		model.insertRunes([]rune{' '})
 	case "up":
 		if !moveEditorCursorVertical(&model.editor, -1) {
 			editorHistory(&model.editor, -1)
@@ -792,6 +802,9 @@ func (model *fullscreenModel) handleBTWTeaKey(key tea.KeyMsg) tea.Cmd {
 					input = append(input, r)
 				}
 			}
+			if key.Type == tea.KeySpace && len(input) == 0 {
+				input = []rune{' '}
+			}
 			model.insertRunes(input)
 		}
 	}
@@ -814,7 +827,14 @@ func (model *fullscreenModel) viewBTW() string {
 		}
 	}
 	if state.running {
-		messages = append(messages, tui.Message{Role: "user", Text: state.question})
+		already := false
+		if len(thread.Turns) > 0 && thread.Turns[len(thread.Turns)-1].Question == state.question {
+			already = true
+		}
+		if !already {
+			messages = append(messages, tui.Message{Role: "user", Text: state.question})
+			messages = append(messages, tui.Message{Role: "thinking", Text: "Answering…"})
+		}
 	}
 	for _, question := range state.queued {
 		messages = append(messages, tui.Message{Role: "Notice", Text: "Steering · " + question})
@@ -824,7 +844,9 @@ func (model *fullscreenModel) viewBTW() string {
 		status = "Answering… · Enter queues Steering · Ctrl+C cancel and close"
 	}
 	sidebar := []string{"title\tBTW · side thread", "accent\t" + thread.ID, "meta\t" + thread.ThinkingLevel + " thinking", "", "section\tEphemeral", "meta\tNever added to main context", fmt.Sprintf("meta\t%d recorded question(s)", len(thread.Turns)), "", "section\tKeys", "meta\tShift+Tab  thinking", "meta\tCtrl+R  bring latest", "meta\tEsc  close", "", "brand\t● GoshCoder BTW"}
-	return tui.View(tui.Frame{Title: "btw · side thread · " + thread.ID, Messages: messages, Sidebar: sidebar, Input: model.editor.input, Cursor: model.editor.cursor, Status: status, Streaming: state.running, Scroll: model.editor.scroll, Thinking: thread.ThinkingLevel, Mode: "BTW", VirtualCursor: true}, model.width, model.height)
+	view, scroll := tui.Render(tui.Frame{Title: "btw · side thread · " + thread.ID, Messages: messages, Sidebar: sidebar, Input: model.editor.input, Cursor: model.editor.cursor, Status: status, Streaming: state.running, Scroll: model.editor.scroll, Thinking: thread.ThinkingLevel, Mode: "BTW", VirtualCursor: true}, model.width, model.height)
+	model.editor.scroll = scroll
+	return view
 }
 
 func fullscreenOmniSetupCommand() tea.Cmd {
