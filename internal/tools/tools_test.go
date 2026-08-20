@@ -315,6 +315,34 @@ func TestListTool(t *testing.T) {
 	}
 }
 
+func TestFindSkipsVendorAndDependencyTrees(t *testing.T) {
+	workspace := newTestWorkspace(t)
+	for _, dir := range []string{"src", "vendor/pkg", "node_modules/dep"} {
+		if err := os.MkdirAll(filepath.Join(workspace.Root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(workspace.Root, "src", "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.Root, "vendor", "pkg", "lib.go"), []byte("package pkg"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace.Root, "node_modules", "dep", "index.go"), []byte("package dep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	found, err := runTool(t, workspace.FindTool(), map[string]any{"pattern": "**/*.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(found, "src/main.go") {
+		t.Fatalf("workspace go file missing: %q", found)
+	}
+	if strings.Contains(found, "vendor") || strings.Contains(found, "node_modules") {
+		t.Fatalf("dependency tree was searched: %q", found)
+	}
+}
+
 func TestBashToolRunsInWorkspace(t *testing.T) {
 	workspace := newTestWorkspace(t)
 	if err := os.WriteFile(filepath.Join(workspace.Root, "marker.txt"), []byte("x"), 0o644); err != nil {

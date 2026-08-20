@@ -340,7 +340,7 @@ func renderMessages(messages []Message, width int, toolsExpanded, hideThinking b
 			}
 			lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
 		case "assistant":
-			for _, line := range renderRichText(strings.TrimSpace(message.Text), max(1, width-4), "assistant") {
+			for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "assistant") {
 				lines = append(lines, "  "+line)
 			}
 		case "thinking":
@@ -348,8 +348,8 @@ func renderMessages(messages []Message, width int, toolsExpanded, hideThinking b
 				lines = append(lines, muted+dim+"  Thinking…"+reset)
 				break
 			}
-			for _, line := range renderRichText(strings.TrimSpace(message.Text), max(1, width-4), "thinking") {
-				lines = append(lines, muted+"\x1b[3m  "+line+"\x1b[23m"+reset)
+			for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "thinking") {
+				lines = append(lines, "  "+line)
 			}
 		case "tool":
 			boxWidth := max(1, width-4)

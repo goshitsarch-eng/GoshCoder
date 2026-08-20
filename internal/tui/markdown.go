@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -16,7 +17,7 @@ import (
 
 var (
 	atxHeading     = regexp.MustCompile(`^(#{1,6})[ \t]+(.+?)(?:[ \t]+#+[ \t]*)?$`)
-	listItem       = regexp.MustCompile(`^([ \t]*)([-*+]|\d+[.)])[ \t]+(.*)$`)
+	listItem       = regexp.MustCompile(`^([ \t]*)([-*+]|\d+[.)])(?:[ \t]+(.*))?$`)
 	taskPrefix     = regexp.MustCompile(`^\[([ xX])\][ \t]+(.*)$`)
 	horizontalRule = regexp.MustCompile(`^((?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$`)
 	tableDivider   = regexp.MustCompile(`^\s*:?-{3,}:?\s*$`)
@@ -37,6 +38,18 @@ func renderRichText(source string, width int, role string) []string {
 	inCode := false
 	fenceMarker := ""
 	orderedAt := map[int]int{}
+	hangAt := map[int]int{}
+	inQuote := false
+
+	endList := func() {
+		for indent := range orderedAt {
+			delete(orderedAt, indent)
+		}
+		for indent := range hangAt {
+			delete(hangAt, indent)
+		}
+	}
+	inList := func() bool { return len(hangAt) > 0 }
 
 	for index := 0; index < len(rawLines); index++ {
 		raw := rawLines[index]
@@ -44,6 +57,8 @@ func renderRichText(source string, width int, role string) []string {
 		if marker, ok := parseFence(trimmed); ok {
 			if !inCode {
 				inCode, fenceMarker = true, marker
+				endList()
+				inQuote = false
 				continue
 			}
 			if strings.HasPrefix(trimmed, fenceMarker) {
@@ -59,46 +74,57 @@ func renderRichText(source string, width int, role string) []string {
 			table, consumed := collectTable(rawLines, index)
 			index = consumed
 			lines = append(lines, renderTable(table, width)...)
-			for indent := range orderedAt {
-				delete(orderedAt, indent)
-			}
+			endList()
+			inQuote = false
 			continue
 		}
 		if trimmed == "" {
 			lines = append(lines, "")
-			for indent := range orderedAt {
-				delete(orderedAt, indent)
-			}
+			inQuote = false
 			continue
 		}
 		if isHorizontalRule(trimmed) {
 			lines = append(lines, faint+strings.Repeat("─", max(3, width))+reset)
+			endList()
+			inQuote = false
 			continue
 		}
 		if heading, ok := parseATXHeading(trimmed); ok {
 			lines = append(lines, wrapStyled(accent+bold+heading+reset, width)...)
-			for indent := range orderedAt {
-				delete(orderedAt, indent)
-			}
+			endList()
+			inQuote = false
 			continue
 		}
 		if indent, marker, body, ok := parseListItem(raw); ok {
+			inQuote = false
 			nest := indent / 2
 			pad := strings.Repeat(" ", nest*4)
-			display := marker
-			if number, ordered := orderedMarker(marker); ordered {
+			display := "-"
+			if number, suffix, ordered := orderedNumber(marker); ordered {
+				if _, exists := orderedAt[nest]; !exists {
+					orderedAt[nest] = number - 1
+				}
 				orderedAt[nest]++
 				for deeper := range orderedAt {
 					if deeper > nest {
 						delete(orderedAt, deeper)
 					}
 				}
-				display = fmt.Sprintf("%d%s", orderedAt[nest], numberSuffix(number))
+				for deeper := range hangAt {
+					if deeper > nest {
+						delete(hangAt, deeper)
+					}
+				}
+				display = fmt.Sprintf("%d%s", orderedAt[nest], suffix)
 			} else {
-				display = "-"
 				for deeper := range orderedAt {
 					if deeper >= nest {
 						delete(orderedAt, deeper)
+					}
+				}
+				for deeper := range hangAt {
+					if deeper > nest {
+						delete(hangAt, deeper)
 					}
 				}
 			}
@@ -116,6 +142,11 @@ func renderRichText(source string, width int, role string) []string {
 				prefix = pad + cyan + display + " " + box + reset + " "
 			}
 			hang := ansi.StringWidth(stripANSI(prefix))
+			hangAt[nest] = hang
+			if quote, isQuote := parseQuoteLine(content); isQuote {
+				lines = append(lines, wrapQuote(quote, prefix, hang, width)...)
+				continue
+			}
 			wrapped := wrapStyled(styleInline(content, color), max(1, width-hang))
 			for lineIndex, line := range wrapped {
 				if lineIndex == 0 {
@@ -126,24 +157,65 @@ func renderRichText(source string, width int, role string) []string {
 			}
 			continue
 		}
-		for indent := range orderedAt {
-			delete(orderedAt, indent)
-		}
-		if strings.HasPrefix(trimmed, "> ") || trimmed == ">" {
-			quote := strings.TrimSpace(strings.TrimPrefix(trimmed, ">"))
-			wrapped := wrapStyled(styleInline(quote, muted), max(1, width-2))
+		if inList() && leadingWidth(raw) >= 2 {
+			inQuote = false
+			hang := deepestHang(hangAt)
+			content := strings.TrimSpace(raw)
+			if quote, isQuote := parseQuoteLine(content); isQuote {
+				lines = append(lines, wrapQuote(quote, strings.Repeat(" ", hang), hang, width)...)
+				continue
+			}
+			wrapped := wrapStyled(styleInline(content, color), max(1, width-hang))
 			for _, line := range wrapped {
-				lines = append(lines, faint+"│ "+reset+line)
+				lines = append(lines, strings.Repeat(" ", hang)+line)
 			}
 			continue
 		}
+		if index+1 < len(rawLines) {
+			if level := setextLevel(strings.TrimSpace(rawLines[index+1])); level > 0 {
+				heading := strings.TrimSpace(raw)
+				if heading != "" {
+					lines = append(lines, wrapStyled(accent+bold+heading+reset, width)...)
+					index++
+					endList()
+					inQuote = false
+					continue
+				}
+			}
+		}
+		endList()
+		if depth, quote, ok := parseQuote(trimmed); ok || inQuote {
+			if !ok {
+				quote = trimmed
+				depth = 1
+			}
+			inQuote = true
+			border := strings.Repeat(faint+"│ "+reset, max(1, depth))
+			borderWidth := 2 * max(1, depth)
+			wrapped := wrapStyled(styleInline(quote, muted), max(1, width-borderWidth))
+			for _, line := range wrapped {
+				lines = append(lines, border+line)
+			}
+			continue
+		}
+		inQuote = false
 		if leadingWidth(raw) >= 4 {
-			lines = append(lines, wrapCode(strings.TrimRight(raw, " "), width)...)
+			lines = append(lines, wrapCode(stripIndentPrefix(strings.TrimRight(raw, " "), 4), width)...)
 			continue
 		}
 		lines = append(lines, wrapStyled(styleInline(strings.TrimRight(raw, " "), color), width)...)
 	}
 	return lines
+}
+
+func deepestHang(hangAt map[int]int) int {
+	nest, hang := -1, 2
+	for level, value := range hangAt {
+		if level >= nest {
+			nest, hang = level, value
+		}
+	}
+	return hang
 }
 
 func isHorizontalRule(trimmed string) bool {
@@ -177,12 +249,40 @@ func parseATXHeading(trimmed string) (string, bool) {
 	return strings.TrimSpace(match[2]), true
 }
 
+func setextLevel(trimmed string) int {
+	if trimmed == "" {
+		return 0
+	}
+	marker := trimmed[0]
+	if marker != '=' && marker != '-' {
+		return 0
+	}
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] != marker {
+			return 0
+		}
+	}
+	if marker == '=' {
+		return 1
+	}
+	if len(trimmed) < 3 {
+		// A thematic break needs three dashes; a short underline is still a
+		// setext heading so "Section\n--" renders as a heading, not a paragraph.
+		return 2
+	}
+	return 2
+}
+
 func parseListItem(raw string) (indent int, marker, body string, ok bool) {
 	match := listItem.FindStringSubmatch(raw)
 	if match == nil {
 		return 0, "", "", false
 	}
-	return leadingWidth(match[1]), match[2], match[3], true
+	body = ""
+	if len(match) > 3 {
+		body = match[3]
+	}
+	return leadingWidth(match[1]), match[2], body, true
 }
 
 func parseTask(body string) (state, rest string, ok bool) {
@@ -193,27 +293,56 @@ func parseTask(body string) (state, rest string, ok bool) {
 	return match[1], match[2], true
 }
 
-func orderedMarker(marker string) (string, bool) {
+func orderedNumber(marker string) (number int, suffix string, ok bool) {
 	if marker == "" {
-		return "", false
+		return 0, "", false
 	}
 	last := marker[len(marker)-1]
 	if last != '.' && last != ')' {
-		return "", false
+		return 0, "", false
 	}
-	for _, r := range marker[:len(marker)-1] {
-		if r < '0' || r > '9' {
-			return "", false
-		}
+	value, err := strconv.Atoi(marker[:len(marker)-1])
+	if err != nil {
+		return 0, "", false
 	}
-	return marker, true
+	return value, string(last), true
 }
 
-func numberSuffix(marker string) string {
-	if strings.HasSuffix(marker, ")") {
-		return ")"
+func parseQuote(trimmed string) (depth int, body string, ok bool) {
+	if !strings.HasPrefix(trimmed, ">") {
+		return 0, "", false
 	}
-	return "."
+	rest := trimmed
+	for strings.HasPrefix(rest, ">") {
+		depth++
+		rest = strings.TrimPrefix(rest, ">")
+		if strings.HasPrefix(rest, " ") {
+			rest = rest[1:]
+		}
+	}
+	return depth, rest, depth > 0
+}
+
+func parseQuoteLine(text string) (string, bool) {
+	_, body, ok := parseQuote(strings.TrimSpace(text))
+	return body, ok
+}
+
+func wrapQuote(quote, prefix string, hang, width int) []string {
+	border := faint + "│ " + reset
+	wrapped := wrapStyled(styleInline(quote, muted), max(1, width-hang-2))
+	lines := make([]string, 0, len(wrapped))
+	for lineIndex, line := range wrapped {
+		lead := prefix
+		if lineIndex > 0 {
+			lead = strings.Repeat(" ", hang)
+		}
+		lines = append(lines, lead+border+line)
+	}
+	if len(lines) == 0 {
+		return []string{prefix + border}
+	}
+	return lines
 }
 
 func leadingWidth(text string) int {
@@ -230,6 +359,15 @@ func leadingWidth(text string) int {
 		break
 	}
 	return count
+}
+
+func stripIndentPrefix(raw string, n int) string {
+	i := 0
+	for i < len(raw) && n > 0 && raw[i] == ' ' {
+		i++
+		n--
+	}
+	return raw[i:]
 }
 
 func wrapCode(raw string, width int) []string {
@@ -376,7 +514,7 @@ func renderTable(rows [][]string, width int) []string {
 			if index < len(row) {
 				value = row[index]
 			}
-			widths[index] = max(widths[index], ansi.StringWidth(value))
+			widths[index] = max(widths[index], ansi.StringWidth(value), longestWord(value))
 		}
 	}
 	available := max(8, width-columns*3-1)
@@ -386,19 +524,37 @@ func renderTable(rows [][]string, width int) []string {
 	}
 	if total > available {
 		for index := range widths {
-			widths[index] = max(3, widths[index]*available/max(1, total))
+			widths[index] = max(3, max(longestWord(cellAt(rows, index)), widths[index]*available/max(1, total)))
 		}
 	}
 	var lines []string
 	lines = append(lines, tableRule(widths, "┌", "┬", "┐"))
 	for rowIndex, row := range rows {
 		lines = append(lines, tableRow(row, widths))
-		if rowIndex == 0 && len(rows) > 1 {
+		if rowIndex < len(rows)-1 {
 			lines = append(lines, tableRule(widths, "├", "┼", "┤"))
 		}
 	}
 	lines = append(lines, tableRule(widths, "└", "┴", "┘"))
 	return lines
+}
+
+func cellAt(rows [][]string, column int) string {
+	longest := ""
+	for _, row := range rows {
+		if column < len(row) && ansi.StringWidth(row[column]) > ansi.StringWidth(longest) {
+			longest = row[column]
+		}
+	}
+	return longest
+}
+
+func longestWord(text string) int {
+	best := 0
+	for _, word := range strings.Fields(text) {
+		best = max(best, ansi.StringWidth(word))
+	}
+	return best
 }
 
 func tableRule(widths []int, left, mid, right string) string {

@@ -303,8 +303,13 @@ func renderEvent(ctx context.Context, ev agent.Event) {
 
 func lastAssistant(messages []agent.Message) (llm.AssistantMessage, bool) {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if message, ok := messages[i].(llm.AssistantMessage); ok {
+		switch message := messages[i].(type) {
+		case llm.AssistantMessage:
 			return message, true
+		case *llm.AssistantMessage:
+			if message != nil {
+				return *message, true
+			}
 		}
 	}
 	return llm.AssistantMessage{}, false

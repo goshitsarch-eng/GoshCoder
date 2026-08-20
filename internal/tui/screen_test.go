@@ -91,3 +91,11 @@ func TestRuneWidthHandlesCJKAndCombiningMarks(t *testing.T) {
 		t.Fatalf("width = %d", got)
 	}
 }
+
+func TestRenderMessagesKeepsLeadingIndentedCode(t *testing.T) {
+	lines := renderMessages([]Message{{Role: "assistant", Text: "    func main() {}"}}, 80, false, false)
+	plain := stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(plain, "func main() {}") || !strings.Contains(plain, "│") {
+		t.Fatalf("indented assistant code lost: %q", plain)
+	}
+}

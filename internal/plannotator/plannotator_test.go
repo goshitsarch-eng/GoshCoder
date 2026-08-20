@@ -79,6 +79,22 @@ func TestPrepareReviewDocumentKeepsHeadingsAndNumberedSections(t *testing.T) {
 	}
 }
 
+func TestPrepareReviewDocumentIndentsNestedSections(t *testing.T) {
+	lines, _ := prepareReviewDocument("# Plan\n- Parent\n  - Nested child\n    1. Deep numbered\n")
+	if len(lines) < 4 {
+		t.Fatalf("lines = %#v", lines)
+	}
+	if lines[1].Kind != "bullet" || lines[1].Indent != 0 {
+		t.Fatalf("parent = %#v", lines[1])
+	}
+	if lines[2].Kind != "bullet" || lines[2].Indent != 1 {
+		t.Fatalf("nested bullet = %#v", lines[2])
+	}
+	if lines[3].Kind != "numbered" || lines[3].Indent != 2 {
+		t.Fatalf("nested numbered = %#v", lines[3])
+	}
+}
+
 func TestParseChecklistAndDoneMarkers(t *testing.T) {
 	items := ParseChecklist("- [ ] First\n* [x] Second\nnot a task\n- [ ] Third")
 	if len(items) != 3 || items[0].Text != "First" || !items[1].Completed || items[2].Step != 3 {

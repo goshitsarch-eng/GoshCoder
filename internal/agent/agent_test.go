@@ -1242,6 +1242,41 @@ func TestAgentAbortCancelsRun(t *testing.T) {
 	}
 }
 
+func TestAgentAbortUnblocksHungStream(t *testing.T) {
+	started := make(chan struct{})
+	streamFn := func(model *llm.Model, ctx *llm.Context, opts *llm.SimpleStreamOptions) *llm.AssistantMessageEventStream {
+		close(started)
+		// Return an open stream that never pushes. Abort must still settle the run.
+		return llm.NewAssistantMessageEventStream()
+	}
+	agent, rec := newTestAgent(t, AgentOptions{StreamFn: streamFn})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = agent.Prompt("hi")
+	}()
+
+	<-started
+	agent.Abort()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Abort left Prompt blocked on a hung stream")
+	}
+
+	if got := len(rec.ofType(EventAgentEnd)); got != 1 {
+		t.Fatalf("agent_end events = %d", got)
+	}
+	if got := agent.State().ErrorMessage; got != "Request was aborted" {
+		t.Fatalf("errorMessage = %q", got)
+	}
+	if agent.State().IsStreaming {
+		t.Fatal("the agent should be idle after an abort")
+	}
+}
+
 func TestAgentRunContextClearedWhenIdle(t *testing.T) {
 	streamFn, _ := streamOf(assistantText("ok"))
 	agent, _ := newTestAgent(t, AgentOptions{StreamFn: streamFn})

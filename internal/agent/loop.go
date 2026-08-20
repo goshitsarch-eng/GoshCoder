@@ -281,7 +281,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *Context, config *loo
 	}
 
 	for {
-		event, ok := response.Next(context.Background())
+		event, ok := response.Next(ctx)
 		if !ok {
 			break
 		}
@@ -303,7 +303,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *Context, config *loo
 			}
 
 		case llm.EventDone, llm.EventError:
-			finalMessage := streamResult(response)
+			finalMessage := streamResult(ctx, response, partialMessage)
 			if addedPartial {
 				replaceLast(finalMessage)
 			} else {
@@ -315,8 +315,9 @@ func streamAssistantResponse(ctx context.Context, agentCtx *Context, config *loo
 		}
 	}
 
-	// Stream ended without a terminal done/error event.
-	finalMessage := streamResult(response)
+	// Stream ended without a terminal done/error event, or the run context was
+	// canceled while waiting. Abort must not wait on a hung provider.
+	finalMessage := streamResult(ctx, response, partialMessage)
 	if addedPartial {
 		replaceLast(finalMessage)
 	} else {
@@ -329,20 +330,31 @@ func streamAssistantResponse(ctx context.Context, agentCtx *Context, config *loo
 
 // streamResult resolves the stream's final message. A stream that closes
 // without a terminal event yields an error stop message so the loop can exit
-// through the normal error path.
-func streamResult(response *llm.AssistantMessageEventStream) llm.AssistantMessage {
-	final, err := response.Result(context.Background())
+// through the normal error path. Cancellation becomes stopReason "aborted".
+func streamResult(ctx context.Context, response *llm.AssistantMessageEventStream, partial *llm.AssistantMessage) llm.AssistantMessage {
+	final, err := response.Result(ctx)
 	if err == nil && final != nil {
 		return *final
 	}
+	stop := llm.StopError
 	errText := llm.ErrStreamClosedWithoutResult.Error()
 	if err != nil {
 		errText = err.Error()
 	}
+	if ctx.Err() != nil {
+		stop = llm.StopAborted
+		errText = "Request was aborted"
+	}
+	if partial != nil {
+		message := *partial
+		message.StopReason = stop
+		message.ErrorMessage = errText
+		return message
+	}
 	return llm.AssistantMessage{
 		Role:         "assistant",
 		Content:      []llm.ContentBlock{llm.TextContent{Type: "text", Text: ""}},
-		StopReason:   llm.StopError,
+		StopReason:   stop,
 		ErrorMessage: errText,
 		Timestamp:    nowMillis(),
 	}
