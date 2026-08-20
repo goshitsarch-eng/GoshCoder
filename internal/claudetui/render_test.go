@@ -49,6 +49,22 @@ func TestStandaloneSidebarFitsWidth(t *testing.T) {
 	}
 }
 
+func TestWideHeaderDoesNotDuplicateCommandSection(t *testing.T) {
+	wide := strings.Join(Header(100, "1", "p/m", "off", "/x", false), "\n")
+	if strings.Count(wide, "/planner") != 1 {
+		t.Fatalf("Commands section duplicated: %q", wide)
+	}
+}
+
+func TestHeaderFitsCJKPath(t *testing.T) {
+	lines := Header(40, "1", "p/m", "off", "/工作/项目目录", false)
+	for _, line := range lines {
+		if displayWidth(line) > 40 {
+			t.Fatalf("CJK path overflow: %d %q", displayWidth(line), line)
+		}
+	}
+}
+
 func TestInputPromptUsesHalfOpenRoundedBox(t *testing.T) {
 	prompt := InputPrompt(20, false)
 	if !strings.Contains(prompt, "╭") || !strings.Contains(prompt, "╮") || !strings.Contains(prompt, "╰─❯") {

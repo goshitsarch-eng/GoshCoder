@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
@@ -160,7 +161,7 @@ func (s *Service) Tool() agent.Tool {
 			}
 			output := formatResponses(responses)
 			if len(output) > maxToolOutput {
-				output = output[:maxToolOutput] + "\n\n[web search output truncated at 50 KiB]"
+				output = clipUTF8(output, maxToolOutput) + "\n\n[web search output truncated at 50 KiB]"
 			}
 			return agent.ToolResult{
 				Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: output}},
@@ -387,7 +388,7 @@ func formatResponses(responses []Response) string {
 func compactText(value string, limit int) string {
 	value = strings.Join(strings.Fields(value), " ")
 	if len(value) > limit {
-		return value[:limit-3] + "..."
+		return clipUTF8(value, max(0, limit-3)) + "..."
 	}
 	return value
 }
@@ -410,4 +411,17 @@ func firstNonempty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func clipUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

@@ -876,7 +876,8 @@ func (s *session) annotateFile(path string) error {
 				return walkErr
 			}
 			if entry.IsDir() {
-				if filePath != candidate && strings.HasPrefix(entry.Name(), ".") {
+				name := entry.Name()
+				if filePath != candidate && (strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "dist" || name == "build" || name == ".venv") {
 					return filepath.SkipDir
 				}
 				return nil
@@ -938,11 +939,17 @@ func readFileLimited(path string, limit int) ([]byte, error) {
 func (s *session) annotateLastMessage() error {
 	messages := s.agent.State().Messages
 	for index := len(messages) - 1; index >= 0; index-- {
-		message, ok := messages[index].(llm.AssistantMessage)
-		if !ok {
+		var content string
+		switch message := messages[index].(type) {
+		case llm.AssistantMessage:
+			content = blockSummary(message.Content)
+		case *llm.AssistantMessage:
+			if message != nil {
+				content = blockSummary(message.Content)
+			}
+		default:
 			continue
 		}
-		content := blockSummary(message.Content)
 		if strings.TrimSpace(content) == "" {
 			continue
 		}

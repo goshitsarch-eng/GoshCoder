@@ -387,3 +387,13 @@ func TestAllToolsHaveSchemas(t *testing.T) {
 		seen[tool.Name] = true
 	}
 }
+
+func TestClipUTF8DoesNotSplitRunes(t *testing.T) {
+	text := "你"
+	if got := clipUTF8(text, 1); got != "" {
+		t.Fatalf("partial rune = %q", got)
+	}
+	if got := clipUTF8(text+text, len(text)+1); got != text {
+		t.Fatalf("split pair = %q", got)
+	}
+}

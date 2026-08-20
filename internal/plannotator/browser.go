@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -215,24 +216,22 @@ func prepareReviewDocument(markdown string) ([]reviewLine, []reviewHeading) {
 					line.Kind = "diff-hunk"
 				}
 			}
-		} else if strings.HasPrefix(trimmed, "#") {
-			level := 0
-			for level < len(trimmed) && trimmed[level] == '#' {
-				level++
-			}
-			if level > 6 {
-				level = 6
-			}
-			display := strings.TrimSpace(trimmed[level:])
+		} else if heading, level, ok := parseReviewHeading(trimmed); ok {
 			line.Kind = fmt.Sprintf("heading-%d", level)
-			line.Display = display
-			headings = append(headings, reviewHeading{Number: line.Number, Level: level, Text: display})
-		} else if strings.HasPrefix(trimmed, "- [ ] ") || strings.HasPrefix(strings.ToLower(trimmed), "- [x] ") {
+			line.Display = heading
+			headings = append(headings, reviewHeading{Number: line.Number, Level: level, Text: heading})
+		} else if display, done, ok := parseReviewTask(trimmed); ok {
 			line.Kind = "task"
-			line.Display = strings.TrimSpace(trimmed[6:])
-		} else if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+			if done {
+				line.Kind = "task-done"
+			}
+			line.Display = display
+		} else if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "+ ") {
 			line.Kind = "bullet"
 			line.Display = strings.TrimSpace(trimmed[2:])
+		} else if numbered, body, ok := parseReviewNumbered(trimmed); ok {
+			line.Kind = "numbered"
+			line.Display = numbered + " " + body
 		} else if strings.HasPrefix(trimmed, "> ") {
 			line.Kind = "quote"
 			line.Display = strings.TrimSpace(trimmed[2:])
@@ -243,6 +242,52 @@ func prepareReviewDocument(markdown string) ([]reviewLine, []reviewHeading) {
 	}
 	return lines, headings
 }
+
+func parseReviewHeading(trimmed string) (string, int, bool) {
+	level := 0
+	for level < len(trimmed) && trimmed[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level >= len(trimmed) {
+		return "", 0, false
+	}
+	if trimmed[level] != ' ' && trimmed[level] != '\t' {
+		return "", 0, false
+	}
+	return strings.TrimSpace(trimmed[level:]), level, true
+}
+
+func parseReviewTask(trimmed string) (display string, done, ok bool) {
+	prefixes := []string{"- [ ] ", "* [ ] ", "+ [ ] "}
+	donePrefixes := []string{"- [x] ", "- [X] ", "* [x] ", "* [X] ", "+ [x] ", "+ [X] "}
+	for _, prefix := range donePrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):]), true, true
+		}
+	}
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):]), false, true
+		}
+	}
+	if match := reviewNumberedTask.FindStringSubmatch(trimmed); match != nil {
+		return match[3], match[2] != " ", true
+	}
+	return "", false, false
+}
+
+func parseReviewNumbered(trimmed string) (marker, body string, ok bool) {
+	match := reviewNumbered.FindStringSubmatch(trimmed)
+	if match == nil {
+		return "", "", false
+	}
+	return match[1], strings.TrimSpace(match[2]), true
+}
+
+var (
+	reviewNumbered     = regexp.MustCompile(`^(\d+[.)])\s+(.+)$`)
+	reviewNumberedTask = regexp.MustCompile(`^(\d+[.)])\s+\[([ xX])\]\s+(.+)$`)
+)
 
 func openBrowser(target string) error {
 	parsed, err := url.Parse(target)
@@ -268,7 +313,7 @@ var reviewPage = template.Must(template.New("review").Parse(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{.Title}} · Planner</title><style>
 :root{color-scheme:dark;--bg:#090b10;--panel:#0f131b;--panel2:#131924;--line:#242b38;--line2:#30394a;--text:#edf0f6;--muted:#8993a5;--faint:#596274;--accent:#a99cff;--accent2:#7869ea;--ok:#65d38a;--danger:#ef7777;--warning:#e7ad61;--code:#0a0e15;--shadow:0 22px 70px #0007}
 :root.light{color-scheme:light;--bg:#f5f6f8;--panel:#fff;--panel2:#f8f9fb;--line:#dfe3e9;--line2:#cbd1db;--text:#1c2230;--muted:#687184;--faint:#9299a8;--accent:#6957d9;--accent2:#5945d1;--ok:#27844b;--danger:#c04444;--warning:#aa681f;--code:#f1f3f6;--shadow:0 22px 70px #2232}
-*{box-sizing:border-box}html,body{height:100%}body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,textarea{font:inherit}button{color:inherit}.header{height:52px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(16px);position:relative;z-index:10}.brand{font-weight:700;letter-spacing:-.02em}.crumb{min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.actions{margin-left:auto;display:flex;align-items:center;gap:8px}.btn{height:32px;padding:0 13px;border:1px solid var(--line2);border-radius:7px;background:var(--panel2);cursor:pointer;font-size:12px;font-weight:650;transition:.15s}.btn:hover{border-color:var(--faint);transform:translateY(-1px)}.btn.primary{border-color:#0000;background:var(--ok);color:#07130b}.btn.feedback{border-color:var(--accent2);background:var(--accent2);color:white}.iconbtn{width:32px;padding:0;color:var(--muted)}.layout{height:calc(100% - 52px);display:grid;grid-template-columns:248px minmax(0,1fr) 304px}.left,.right{min-width:0;background:var(--panel);overflow:auto}.left{border-right:1px solid var(--line);padding:14px 10px}.right{border-left:1px solid var(--line);display:flex;flex-direction:column}.side-title{padding:4px 9px 10px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.toc{display:block;padding:7px 9px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toc:hover{color:var(--text);background:var(--panel2)}.toc.l2{padding-left:18px}.toc.l3,.toc.l4,.toc.l5,.toc.l6{padding-left:28px;color:var(--faint)}.meta-card{margin-top:16px;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--panel2);color:var(--muted);font-size:12px;line-height:1.55}.main{min-width:0;overflow:auto;background:radial-gradient(circle at 50% -20%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 38%),var(--bg)}.toolbar{position:sticky;top:0;z-index:4;display:flex;justify-content:center;padding:12px;pointer-events:none}.toolgroup{pointer-events:auto;display:flex;align-items:center;gap:3px;padding:4px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--panel) 90%,transparent);box-shadow:0 8px 30px #0003;backdrop-filter:blur(12px)}.tool{border:0;border-radius:6px;padding:7px 10px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.tool:hover,.tool.active{background:var(--panel2);color:var(--text)}.document{width:min(880px,calc(100% - 48px));margin:0 auto 80px;padding:44px 58px 70px;border:1px solid var(--line);border-radius:13px;background:var(--panel);box-shadow:var(--shadow)}.line{position:relative;min-height:1.55em;padding:1px 12px 1px 34px;border-radius:5px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.line:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}.line.selected{background:color-mix(in srgb,var(--accent) 15%,transparent);box-shadow:inset 2px 0 var(--accent)}.ln{position:absolute;left:4px;top:4px;width:22px;text-align:right;color:transparent;font:10px ui-monospace,monospace;user-select:none}.line:hover .ln,.line.selected .ln{color:var(--faint)}.heading-1{font-size:26px;font-weight:750;letter-spacing:-.025em;margin:12px 0 18px}.heading-2{font-size:19px;font-weight:700;margin:25px 0 9px}.heading-3{font-size:16px;font-weight:680;margin:18px 0 6px}.heading-4,.heading-5,.heading-6{font-weight:680;margin-top:12px}.blank{height:12px;min-height:12px}.bullet:before{content:"•";position:absolute;left:20px;color:var(--accent)}.task:before{content:"☐";position:absolute;left:17px;color:var(--accent)}.quote{margin:6px 0;border-left:2px solid var(--accent);border-radius:0;color:var(--muted);font-style:italic}.code,.diff-add,.diff-remove,.diff-hunk{border-radius:0;background:var(--code);font:12px/1.6 "Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace}.fence{display:none}.diff-add{color:#9be5b2;background:color-mix(in srgb,var(--ok) 12%,var(--code))}.diff-remove{color:#ffaaaa;background:color-mix(in srgb,var(--danger) 12%,var(--code))}.diff-hunk{color:#aaa0ef}.line code{padding:2px 5px;border:1px solid var(--line);border-radius:5px;background:var(--code);color:var(--accent);font:12px ui-monospace,monospace}.line a{color:var(--accent);text-decoration:none}.line a:hover{text-decoration:underline}.right-head{height:43px;display:flex;align-items:center;padding:0 14px;border-bottom:1px solid var(--line);font-size:12px;font-weight:700}.badge{margin-left:7px;min-width:18px;height:18px;padding:0 5px;display:inline-grid;place-items:center;border-radius:10px;background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent);font:10px ui-monospace,monospace}.annotations{flex:1;overflow:auto;padding:10px}.empty{height:100%;display:grid;place-content:center;text-align:center;color:var(--muted);line-height:1.6}.empty-icon{font-size:25px;color:var(--faint)}.annotation{padding:11px;margin-bottom:8px;border:1px solid var(--line);border-radius:8px;background:var(--panel2)}.annotation-top{display:flex;gap:8px;align-items:center;color:var(--warning);font-size:11px;font-weight:700}.remove{margin-left:auto;border:0;background:transparent;color:var(--faint);cursor:pointer}.quote-text{margin:8px 0;color:var(--muted);font:11px ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.comment{width:100%;min-height:72px;resize:vertical;padding:9px;border:1px solid var(--line);border-radius:6px;background:var(--code);color:var(--text);outline:none;font-size:12px}.comment:focus,.notes:focus{border-color:var(--accent)}.notes-wrap{padding:12px;border-top:1px solid var(--line)}.notes-label{display:block;margin-bottom:7px;color:var(--muted);font-size:11px;font-weight:700}.notes{width:100%;min-height:76px;resize:vertical;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--code);color:var(--text);outline:none;font-size:12px}.edit-pane{display:none;width:min(980px,calc(100% - 48px));height:calc(100% - 74px);margin:0 auto 28px}.edit-pane.open{display:flex}.editor{width:100%;height:100%;resize:none;padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--code);color:var(--text);font:13px/1.65 "Geist Mono",ui-monospace,monospace;outline:none}.diff-view{display:none;width:min(980px,calc(100% - 48px));margin:0 auto 70px;padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.diff-view.open{display:block}.diff-row{display:grid;grid-template-columns:40px 1fr;padding:2px 8px;font:12px/1.55 ui-monospace,monospace;white-space:pre-wrap}.diff-row.add{background:color-mix(in srgb,var(--ok) 12%,transparent);color:#9be5b2}.diff-row.remove{background:color-mix(in srgb,var(--danger) 12%,transparent);color:#ffaaaa}.mobile-panel{display:none}@media(max-width:1050px){.layout{grid-template-columns:0 minmax(0,1fr) 288px}.left{visibility:hidden}.document{width:calc(100% - 28px);padding:34px 34px 60px}}@media(max-width:760px){.layout{grid-template-columns:1fr}.right{display:flex;position:fixed;z-index:20;inset:52px 0 0 15%;box-shadow:-24px 0 70px #0008;transform:translateX(110%);transition:transform .2s}.right.open{transform:translateX(0)}.crumb{display:none}.header{padding:0 9px}.btn{padding:0 9px}.btn .wide{display:none}.document{padding:26px 18px 50px}.toolbar{justify-content:flex-start}.mobile-panel{display:inline-block}}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,textarea{font:inherit}button{color:inherit}.header{height:52px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--panel) 92%,transparent);backdrop-filter:blur(16px);position:relative;z-index:10}.brand{font-weight:700;letter-spacing:-.02em}.crumb{min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.actions{margin-left:auto;display:flex;align-items:center;gap:8px}.btn{height:32px;padding:0 13px;border:1px solid var(--line2);border-radius:7px;background:var(--panel2);cursor:pointer;font-size:12px;font-weight:650;transition:.15s}.btn:hover{border-color:var(--faint);transform:translateY(-1px)}.btn.primary{border-color:#0000;background:var(--ok);color:#07130b}.btn.feedback{border-color:var(--accent2);background:var(--accent2);color:white}.iconbtn{width:32px;padding:0;color:var(--muted)}.layout{height:calc(100% - 52px);display:grid;grid-template-columns:248px minmax(0,1fr) 304px}.left,.right{min-width:0;background:var(--panel);overflow:auto}.left{border-right:1px solid var(--line);padding:14px 10px}.right{border-left:1px solid var(--line);display:flex;flex-direction:column}.side-title{padding:4px 9px 10px;color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.toc{display:block;padding:7px 9px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.toc:hover{color:var(--text);background:var(--panel2)}.toc.l2{padding-left:18px}.toc.l3,.toc.l4,.toc.l5,.toc.l6{padding-left:28px;color:var(--faint)}.meta-card{margin-top:16px;padding:12px;border:1px solid var(--line);border-radius:9px;background:var(--panel2);color:var(--muted);font-size:12px;line-height:1.55}.main{min-width:0;overflow:auto;background:radial-gradient(circle at 50% -20%,color-mix(in srgb,var(--accent) 8%,transparent),transparent 38%),var(--bg)}.toolbar{position:sticky;top:0;z-index:4;display:flex;justify-content:center;padding:12px;pointer-events:none}.toolgroup{pointer-events:auto;display:flex;align-items:center;gap:3px;padding:4px;border:1px solid var(--line);border-radius:9px;background:color-mix(in srgb,var(--panel) 90%,transparent);box-shadow:0 8px 30px #0003;backdrop-filter:blur(12px)}.tool{border:0;border-radius:6px;padding:7px 10px;background:transparent;color:var(--muted);font-size:12px;cursor:pointer}.tool:hover,.tool.active{background:var(--panel2);color:var(--text)}.document{width:min(880px,calc(100% - 48px));margin:0 auto 80px;padding:44px 58px 70px;border:1px solid var(--line);border-radius:13px;background:var(--panel);box-shadow:var(--shadow)}.line{position:relative;min-height:1.55em;padding:1px 12px 1px 34px;border-radius:5px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.line:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}.line.selected{background:color-mix(in srgb,var(--accent) 15%,transparent);box-shadow:inset 2px 0 var(--accent)}.ln{position:absolute;left:4px;top:4px;width:22px;text-align:right;color:transparent;font:10px ui-monospace,monospace;user-select:none}.line:hover .ln,.line.selected .ln{color:var(--faint)}.heading-1{font-size:26px;font-weight:750;letter-spacing:-.025em;margin:12px 0 18px}.heading-2{font-size:19px;font-weight:700;margin:25px 0 9px}.heading-3{font-size:16px;font-weight:680;margin:18px 0 6px}.heading-4,.heading-5,.heading-6{font-weight:680;margin-top:12px}.blank{height:12px;min-height:12px}.bullet:before{content:"•";position:absolute;left:20px;color:var(--accent)}.task:before{content:"☐";position:absolute;left:17px;color:var(--accent)}.task-done:before{content:"☑";position:absolute;left:17px;color:var(--ok)}.numbered{padding-left:34px}.quote{margin:6px 0;border-left:2px solid var(--accent);border-radius:0;color:var(--muted);font-style:italic}.code,.diff-add,.diff-remove,.diff-hunk{border-radius:0;background:var(--code);font:12px/1.6 "Geist Mono",ui-monospace,SFMono-Regular,Consolas,monospace}.fence{display:none}.diff-add{color:#9be5b2;background:color-mix(in srgb,var(--ok) 12%,var(--code))}.diff-remove{color:#ffaaaa;background:color-mix(in srgb,var(--danger) 12%,var(--code))}.diff-hunk{color:#aaa0ef}.line code{padding:2px 5px;border:1px solid var(--line);border-radius:5px;background:var(--code);color:var(--accent);font:12px ui-monospace,monospace}.line a{color:var(--accent);text-decoration:none}.line a:hover{text-decoration:underline}.right-head{height:43px;display:flex;align-items:center;padding:0 14px;border-bottom:1px solid var(--line);font-size:12px;font-weight:700}.badge{margin-left:7px;min-width:18px;height:18px;padding:0 5px;display:inline-grid;place-items:center;border-radius:10px;background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent);font:10px ui-monospace,monospace}.annotations{flex:1;overflow:auto;padding:10px}.empty{height:100%;display:grid;place-content:center;text-align:center;color:var(--muted);line-height:1.6}.empty-icon{font-size:25px;color:var(--faint)}.annotation{padding:11px;margin-bottom:8px;border:1px solid var(--line);border-radius:8px;background:var(--panel2)}.annotation-top{display:flex;gap:8px;align-items:center;color:var(--warning);font-size:11px;font-weight:700}.remove{margin-left:auto;border:0;background:transparent;color:var(--faint);cursor:pointer}.quote-text{margin:8px 0;color:var(--muted);font:11px ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.comment{width:100%;min-height:72px;resize:vertical;padding:9px;border:1px solid var(--line);border-radius:6px;background:var(--code);color:var(--text);outline:none;font-size:12px}.comment:focus,.notes:focus{border-color:var(--accent)}.notes-wrap{padding:12px;border-top:1px solid var(--line)}.notes-label{display:block;margin-bottom:7px;color:var(--muted);font-size:11px;font-weight:700}.notes{width:100%;min-height:76px;resize:vertical;padding:10px;border:1px solid var(--line);border-radius:7px;background:var(--code);color:var(--text);outline:none;font-size:12px}.edit-pane{display:none;width:min(980px,calc(100% - 48px));height:calc(100% - 74px);margin:0 auto 28px}.edit-pane.open{display:flex}.editor{width:100%;height:100%;resize:none;padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--code);color:var(--text);font:13px/1.65 "Geist Mono",ui-monospace,monospace;outline:none}.diff-view{display:none;width:min(980px,calc(100% - 48px));margin:0 auto 70px;padding:24px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.diff-view.open{display:block}.diff-row{display:grid;grid-template-columns:40px 1fr;padding:2px 8px;font:12px/1.55 ui-monospace,monospace;white-space:pre-wrap}.diff-row.add{background:color-mix(in srgb,var(--ok) 12%,transparent);color:#9be5b2}.diff-row.remove{background:color-mix(in srgb,var(--danger) 12%,transparent);color:#ffaaaa}.mobile-panel{display:none}@media(max-width:1050px){.layout{grid-template-columns:0 minmax(0,1fr) 288px}.left{visibility:hidden}.document{width:calc(100% - 28px);padding:34px 34px 60px}}@media(max-width:760px){.layout{grid-template-columns:1fr}.right{display:flex;position:fixed;z-index:20;inset:52px 0 0 15%;box-shadow:-24px 0 70px #0008;transform:translateX(110%);transition:transform .2s}.right.open{transform:translateX(0)}.crumb{display:none}.header{padding:0 9px}.btn{padding:0 9px}.btn .wide{display:none}.document{padding:26px 18px 50px}.toolbar{justify-content:flex-start}.mobile-panel{display:inline-block}}
 </style></head><body>
 <header class="header"><div class="brand">Planner</div><div class="crumb">{{.Title}}</div><div class="actions"><button class="btn mobile-panel" type="button" id="toggle-panel" title="Toggle annotations">Comments</button><button class="btn iconbtn" type="button" id="theme" title="Toggle theme">◐</button><button class="btn feedback" type="submit" form="decision-form" name="action" value="deny"><span class="wide">Send </span>Feedback</button><button class="btn primary" type="submit" form="decision-form" name="action" value="approve">✓ Approve</button></div></header>
 <form id="decision-form" method="post" action="/api/decision"><input type="hidden" name="token" value="{{.Token}}"><input type="hidden" id="feedback" name="feedback">

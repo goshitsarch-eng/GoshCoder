@@ -8,11 +8,33 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"goshcoder/internal/agent"
+	"goshcoder/internal/btw"
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
 )
+
+func TestBTWViewDoesNotDuplicateAnsweredQuestion(t *testing.T) {
+	model := &llm.Model{ID: "chat", Provider: "vendor"}
+	session := fullscreenTestSession(model, llm.ThinkingOff)
+	session.btw = btw.NewManager()
+	thread := session.btw.New("ctx", llm.ThinkingOff)
+	session.btw.RecordAnswered(thread, "what?", llm.AssistantMessage{Content: []llm.ContentBlock{
+		llm.TextContent{Type: "text", Text: "an answer"},
+	}})
+	tuiModel := &fullscreenModel{
+		session: session, width: 100, height: 24,
+		btw: &fullscreenBTWState{thread: thread, running: true, question: "what?"},
+	}
+	output := stripTerminalStyles(tuiModel.viewBTW())
+	if strings.Count(output, "what?") != 1 {
+		t.Fatalf("duplicated in-flight question:\n%s", output)
+	}
+	if !strings.Contains(output, "an answer") {
+		t.Fatalf("answer missing:\n%s", output)
+	}
+}
 
 func TestBubbleTeaEditorUnicodeNavigation(t *testing.T) {
 	model := &llm.Model{ID: "chat", Provider: "vendor"}
@@ -75,9 +97,9 @@ func TestFullscreenSuggestionsIncludeNativeOmniAndBTWCommands(t *testing.T) {
 	if len(omni) != 3 || omni[0].label != "status" || omni[1].label != "sync" || omni[2].label != "setup" {
 		t.Fatalf("omni suggestions = %#v", omni)
 	}
-	btw := fullscreenSuggestionsWithModels(session, "/btw r", nil)
-	if len(btw) != 1 || btw[0].label != "resume" || btw[0].execute {
-		t.Fatalf("btw suggestions = %#v", btw)
+	side := fullscreenSuggestionsWithModels(session, "/btw r", nil)
+	if len(side) != 1 || side[0].label != "resume" || side[0].execute {
+		t.Fatalf("btw suggestions = %#v", side)
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
@@ -123,6 +124,19 @@ func (w *Workspace) readLimited(path string, limit int64) ([]byte, bool, error) 
 	return content, false, nil
 }
 
+func clipUTF8(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
 func textResult(text string) agent.ToolResult {
 	return agent.ToolResult{Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: text}}}
 }
@@ -219,7 +233,7 @@ func (w *Workspace) ReadTool() agent.Tool {
 			selected := strings.Join(lines[offset-1:end], "\n")
 			truncated := false
 			if len(selected) > maxReadBytes {
-				selected = selected[:maxReadBytes]
+				selected = clipUTF8(selected, maxReadBytes)
 				if cut := strings.LastIndexByte(selected, '\n'); cut >= 0 {
 					selected = selected[:cut]
 				}
@@ -493,7 +507,7 @@ func (w *Workspace) GrepTool() agent.Tool {
 						}
 						value := lines[row]
 						if len(value) > 2000 {
-							value = value[:2000] + "…"
+							value = clipUTF8(value, 2000) + "…"
 						}
 						output = append(output, fmt.Sprintf("%s%s%d%s %s", filepath.ToSlash(file), separator, row+1, separator, value))
 					}

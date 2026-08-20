@@ -253,9 +253,13 @@ func toolTUIMessage(call llm.ToolCall, result *llm.ToolResultMessage) tui.Messag
 		return message
 	}
 	switch call.Name {
-	case "bash", "grep", "find", "ls", "list", "planner_submit_plan":
+	case "bash", "grep", "find", "ls", "list", "planner_submit_plan", "web_search":
 		lines := strings.Split(strings.TrimSpace(message.Detail), "\n")
 		message.Text = strings.Join(lines[:min(3, len(lines))], "\n")
+	default:
+		if preview := firstLine(message.Detail); preview != "" {
+			message.Text = preview
+		}
 	}
 	return message
 }

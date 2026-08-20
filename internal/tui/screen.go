@@ -9,7 +9,9 @@ import (
 	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	charmterm "github.com/charmbracelet/x/term"
+	"github.com/mattn/go-runewidth"
 )
 
 const background = "\x1b[48;2;10;10;10m"
@@ -69,14 +71,21 @@ func Supported(in, out *os.File) bool {
 // View renders a complete frame for Bubble Tea. The cursor is painted in the
 // composer so the view remains stable across terminal implementations.
 func View(frame Frame, width, height int) string {
-	if width < 20 || height < 8 {
-		return background + accent + bold + "GoshCoder" + reset + "\n" + muted + "Terminal is too small" + clearStyle
-	}
-	lines, _, _ := renderFrame(frame, width, height)
-	return strings.Join(lines, "\n")
+	view, _ := Render(frame, width, height)
+	return view
 }
 
-func renderFrame(frame Frame, width, height int) ([]string, int, int) {
+// Render paints a frame and returns the clamped transcript scroll so the
+// editor does not get stuck after over-scrolling.
+func Render(frame Frame, width, height int) (string, int) {
+	if width < 20 || height < 8 {
+		return background + accent + bold + "GoshCoder" + reset + "\n" + muted + "Terminal is too small" + clearStyle, 0
+	}
+	lines, _, _, scroll := renderFrame(frame, width, height)
+	return strings.Join(lines, "\n"), scroll
+}
+
+func renderFrame(frame Frame, width, height int) ([]string, int, int, int) {
 	useSidebar := width >= 96
 	sideWidth, gutter := 0, 0
 	if useSidebar {
@@ -109,6 +118,10 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 	}
 	transcriptHeight := max(0, bodyHeight-paletteHeight)
 	transcript := renderMessages(frame.Messages, mainWidth, frame.ToolsExpanded, frame.HideThinking)
+	maxScroll := max(0, len(transcript)-transcriptHeight)
+	if frame.Scroll > maxScroll {
+		frame.Scroll = maxScroll
+	}
 	start := max(0, len(transcript)-transcriptHeight-frame.Scroll)
 	end := min(len(transcript), start+transcriptHeight)
 	visible := transcript[start:end]
@@ -196,7 +209,7 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int) {
 		}
 	}
 	cursorRow := composerTop + 1 + editor.cursorRow
-	return lines, cursorRow + 1, min(mainWidth, 5+editor.cursorCol)
+	return lines, cursorRow + 1, min(mainWidth, 5+editor.cursorCol), frame.Scroll
 }
 
 type editorLayout struct {
@@ -276,10 +289,39 @@ func renderSidebar(sidebar []string, width, height int) []string {
 	for _, line := range sidebar {
 		lines = append(lines, styleSidebarLine(line, width))
 	}
-	if len(lines) > height {
-		lines = lines[:height]
+	return fitSidebar(lines, height)
+}
+
+func fitSidebar(lines []string, height int) []string {
+	if height <= 0 || len(lines) <= height {
+		return lines
 	}
-	return lines
+	footerStart := lastSidebarFooter(lines)
+	footer := lines[footerStart:]
+	if len(footer) >= height {
+		return footer[len(footer)-height:]
+	}
+	headBudget := height - len(footer)
+	if headBudget <= 1 {
+		return append([]string{muted + "  …" + reset}, footer[max(0, len(footer)-(height-1)):]...)
+	}
+	head := append([]string{}, lines[:min(headBudget-1, footerStart)]...)
+	head = append(head, muted+"  …"+reset)
+	return append(head, footer...)
+}
+
+func lastSidebarFooter(lines []string) int {
+	blanks := 0
+	for index := len(lines) - 1; index >= 0; index-- {
+		if strings.TrimSpace(stripANSI(lines[index])) != "" {
+			continue
+		}
+		blanks++
+		if blanks == 2 {
+			return index
+		}
+	}
+	return max(0, len(lines)-6)
 }
 
 func renderMessages(messages []Message, width int, toolsExpanded, hideThinking bool) []string {
@@ -365,62 +407,6 @@ func renderMessages(messages []Message, width int, toolsExpanded, hideThinking b
 	return lines
 }
 
-func renderRichText(source string, width int, role string) []string {
-	source = safeTerminalText(strings.ReplaceAll(source, "\t", "    "))
-	var lines []string
-	inCode := false
-	for _, raw := range strings.Split(source, "\n") {
-		trimmed := strings.TrimSpace(raw)
-		if strings.HasPrefix(trimmed, "```") {
-			inCode = !inCode
-			continue
-		}
-		if inCode {
-			for _, line := range wrap(raw, max(1, width-2)) {
-				lines = append(lines, faint+"│ "+reset+blue+line+reset)
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "#") {
-			heading := strings.TrimSpace(strings.TrimLeft(trimmed, "#"))
-			for _, line := range wrapWords(heading, width) {
-				lines = append(lines, accent+bold+line+reset)
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
-			body := strings.TrimSpace(trimmed[2:])
-			wrapped := wrapWords(body, max(1, width-2))
-			for index, line := range wrapped {
-				prefix := "  "
-				if index == 0 {
-					prefix = cyan + "• " + reset
-				}
-				lines = append(lines, prefix+line)
-			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "> ") {
-			for _, line := range wrapWords(strings.TrimSpace(trimmed[2:]), max(1, width-2)) {
-				lines = append(lines, faint+"│ "+reset+muted+line+reset)
-			}
-			continue
-		}
-		if trimmed == "" {
-			lines = append(lines, "")
-			continue
-		}
-		for _, line := range wrapWords(raw, width) {
-			if role == "thinking" {
-				lines = append(lines, muted+line+reset)
-			} else {
-				lines = append(lines, textColor+line+reset)
-			}
-		}
-	}
-	return lines
-}
-
 func styleSidebarLine(line string, width int) string {
 	plain := safeTerminalText(line)
 	if strings.TrimSpace(plain) == "" {
@@ -487,103 +473,43 @@ func styleSidebarLine(line string, width int) string {
 
 func truncateLeft(text string, width int) string {
 	text = safeTerminalText(stripANSI(text))
-	if lipgloss.Width(text) <= width {
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(text) <= width {
 		return text
 	}
 	if width <= 1 {
 		return "…"
 	}
-	runes := []rune(text)
-	start := len(runes)
-	cells := 1
-	for start > 0 {
-		next := runeWidth(runes[start-1])
-		if cells+next > width {
-			break
-		}
-		cells += next
-		start--
-	}
-	return "…" + string(runes[start:])
+	return ansi.TruncateLeft(text, ansi.StringWidth(text)-width+1, "…")
 }
 
 func canvasLine(text string, width int) string {
 	return background + pad(text, width) + clearStyle
 }
 
-func wrapWords(text string, width int) []string {
-	text = safeTerminalText(text)
-	if text == "" {
-		return []string{""}
-	}
-	words := strings.Fields(text)
-	if len(words) == 0 {
-		return []string{""}
-	}
-	var lines []string
-	current := ""
-	for _, word := range words {
-		if runeSliceWidth([]rune(word)) > width {
-			if current != "" {
-				lines = append(lines, current)
-				current = ""
-			}
-			parts := wrap(word, width)
-			lines = append(lines, parts[:len(parts)-1]...)
-			current = parts[len(parts)-1]
-			continue
-		}
-		candidate := word
-		if current != "" {
-			candidate = current + " " + word
-		}
-		if runeSliceWidth([]rune(candidate)) > width {
-			lines = append(lines, current)
-			current = word
-		} else {
-			current = candidate
-		}
-	}
-	if current != "" {
-		lines = append(lines, current)
-	}
-	return lines
-}
-
-func wrap(text string, width int) []string {
-	text = safeTerminalText(text)
-	if text == "" {
-		return []string{""}
-	}
-	var lines []string
-	remaining := []rune(text)
-	for len(remaining) > 0 {
-		count, cells := 0, 0
-		for count < len(remaining) {
-			next := runeWidth(remaining[count])
-			if cells+next > width {
-				break
-			}
-			cells += next
-			count++
-		}
-		if count == 0 {
-			count = 1
-		}
-		lines = append(lines, string(remaining[:count]))
-		remaining = remaining[count:]
-	}
-	return lines
-}
-
 func truncate(text string, width int) string {
-	return string(truncateRunes([]rune(safeTerminalText(stripANSI(text))), width))
+	text = safeTerminalText(stripANSI(text))
+	if width <= 0 {
+		return ""
+	}
+	if ansi.StringWidth(text) <= width {
+		return text
+	}
+	if width == 1 {
+		return "…"
+	}
+	return ansi.Truncate(text, width, "…")
 }
 
 func pad(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	plainWidth := lipgloss.Width(text)
 	if plainWidth > width {
-		return truncate(text, width)
+		return ansi.Truncate(text, width, "…")
 	}
 	return text + strings.Repeat(" ", width-plainWidth)
 }
@@ -606,13 +532,7 @@ func runeSliceWidth(input []rune) int {
 }
 
 func runeWidth(r rune) int {
-	if r == 0 || unicode.Is(unicode.Mn, r) {
-		return 0
-	}
-	if r >= 0x1100 && (r <= 0x115f || r == 0x2329 || r == 0x232a || r >= 0x2e80 && r <= 0xa4cf || r >= 0xac00 && r <= 0xd7a3 || r >= 0xf900 && r <= 0xfaff || r >= 0xfe10 && r <= 0xfe19 || r >= 0xfe30 && r <= 0xfe6f || r >= 0xff00 && r <= 0xff60 || r >= 0xffe0 && r <= 0xffe6 || r >= 0x1f300 && r <= 0x1faff) {
-		return 2
-	}
-	return 1
+	return runewidth.RuneWidth(r)
 }
 
 func safeTerminalText(text string) string {
