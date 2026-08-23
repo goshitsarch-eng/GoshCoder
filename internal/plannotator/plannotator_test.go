@@ -134,6 +134,40 @@ func TestPlanningWriteGate(t *testing.T) {
 	}
 }
 
+// TestPlanPathGateIsPlatformIndependent covers the spellings of "rooted" that
+// only one platform recognises. filepath.IsAbs says no to "/plans/a.md" on
+// Windows -- there it is relative to the current drive -- so the gate used to
+// join it onto the workspace and accept a path Unix rejected outright. A write
+// gate that means different things on different platforms is the bug; the
+// cases below therefore run everywhere rather than behind a GOOS check.
+func TestPlanPathGateIsPlatformIndependent(t *testing.T) {
+	manager := newTestManager(t, nil)
+	if err := manager.Enter(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{
+		"/plans/a.md",             // rooted on Unix, drive-relative on Windows
+		"\\plans\\a.md",           // the same thing spelled for Windows
+		"C:\\plans\\a.md",         // an absolute path on another drive
+		"c:/plans/a.md",           // lowercase drive, forward slashes
+		"\\\\server\\share\\a.md", // UNC
+		"../escape.md",            // ordinary traversal, rejected before and now
+	} {
+		if manager.IsPlanPathAllowed(path) {
+			t.Errorf("IsPlanPathAllowed(%q) = true, want it refused on every platform", path)
+		}
+	}
+
+	// The negative control: the gate still has to accept the thing it exists
+	// to allow, or it would pass by refusing everything.
+	for _, path := range []string{"PLAN.md", "plans/a.md", "docs/design.mdx"} {
+		if !manager.IsPlanPathAllowed(path) {
+			t.Errorf("IsPlanPathAllowed(%q) = false, want a workspace-relative plan accepted", path)
+		}
+	}
+}
+
 func TestSubmitDeniedThenApproved(t *testing.T) {
 	root := t.TempDir()
 	plan := "# Plan\n- [ ] Implement\n- [ ] Test\n"

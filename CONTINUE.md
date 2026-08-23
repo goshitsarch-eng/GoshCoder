@@ -342,6 +342,20 @@ lost. The generated data wins on a collision and
 `TestExtraCatalogIsNotShadowed` fails if pi ever ships the same model, so the
 duplicate is deleted rather than quietly diverging.
 
+The same file carries the Grok models pi's snapshot predates: `grok-4.6` (the
+current flagship) and the three `grok-4.20-*` variants. Prices, context windows
+and the 200K long-context tier come from `docs.x.ai/docs/models`. **Max output
+tokens is the one figure xAI does not publish**, so each entry mirrors its
+closest sibling -- `grok-4.6` follows `grok-4.5`, the 4.20 family follows
+`grok-4.3`, which they match on context window, pricing and wire protocol. A
+value that is too low truncates a reply where one that is too high is refused
+by the API, so mirroring downward is the safer error.
+
+Note that the *generated* `xai` entries still carry no `tiers`, so a
+long-context turn on `grok-4.3` or `grok-4.5` is costed at the sub-200K rate.
+That is pi's data, and correcting it in `catalog_extra.json` would not help:
+the generated definition wins on a collision by design.
+
 The client ids are public desktop clients with no secret -- PKCE and the device
 flow replace one -- and `GOSHCODER_XAI_OAUTH_CLIENT_ID` /
 `GOSHCODER_META_OAUTH_CLIENT_ID` override them.
@@ -357,6 +371,33 @@ afterwards: a login can succeed and inference still answer 403 for an account
 without the plan the endpoint wants. That is xAI's decision, not a client bug.
 `XAI_API_KEY` and `goshcoder auth set xai` remain the route for a developer
 account and are unaffected.
+
+## Windows CI
+
+`build & test (windows-latest)` was red on `main` from the repository's first
+CI run until this change -- four failures, none of them Windows-specific
+flakiness, all of them real differences the other two platforms hide.
+
+- **`internal/plannotator`.** `IsPlanPathAllowed` gated on `filepath.IsAbs`,
+  which is false for `/plans/a.md` on Windows: that path is relative to the
+  current drive, so the gate joined it onto the workspace and accepted a path
+  Unix rejected outright. Confinement still held -- the write landed inside the
+  root -- so this was a write gate that meant two different things rather than
+  an escape. `isRootedPath` now recognises every rooted spelling on every
+  platform: leading slash or backslash, drive letter, and UNC.
+  `TestPlanPathGateIsPlatformIndependent` fails on Linux without the fix, which
+  is the point: the rule is now testable everywhere it applies.
+- **`internal/integration` (two tests).** `Workspace` holds an open `os.Root`
+  for race-free path confinement and has always had a `Close`; the `cmd` tests
+  called it and these did not. Unix lets `t.TempDir` unlink a directory out
+  from under an open handle, so the leak was invisible there. Windows refuses,
+  and the cleanup failure failed the test.
+- **`internal/omniroute`.** The test asserted the config file is written
+  `0600`. Windows has no Unix permission bits -- `Chmod` there toggles only the
+  read-only flag -- so it reports `0666`. The assertion is now made where it
+  means something rather than dropped everywhere. **The 0600 guarantee is a
+  Unix guarantee**; on Windows the file is protected by directory ACLs
+  inherited from the user profile, not by mode bits.
 
 ## Known deviations from pi (unchanged)
 

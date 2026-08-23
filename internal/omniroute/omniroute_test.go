@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -27,7 +28,11 @@ func TestNormalizeServerURLAndAtomicConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits: Chmod there can only toggle the
+	// read-only flag, so a file written 0600 reports 0666. The guarantee is
+	// real on Unix and unavailable on Windows, so it is asserted where it
+	// means something rather than dropped everywhere.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %o", info.Mode().Perm())
 	}
 	loaded, err := Load(path)
