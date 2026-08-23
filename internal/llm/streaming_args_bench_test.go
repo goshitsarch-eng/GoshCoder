@@ -2,6 +2,7 @@ package llm
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,105 @@ func TestStreamingParseThrottleStaysLiveAndBounded(t *testing.T) {
 	// than growing with its square.
 	if work > 10*large {
 		t.Fatalf("re-scanned %d bytes for a %d-byte payload", work, large)
+	}
+}
+
+// largeTextStream builds an SSE body streaming a long prose answer in
+// token-sized chunks.
+func largeTextStream(tb testing.TB) string {
+	tb.Helper()
+	answer := strings.Repeat("This is a sentence of a fairly long explanation. ", 1200) // ~58 KB
+
+	var sse strings.Builder
+	sse.WriteString(`data: {"id":"c1","model":"gpt-test","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}` + "\n\n")
+	const chunkSize = 4
+	for i := 0; i < len(answer); i += chunkSize {
+		fragment, err := json.Marshal(answer[i:min(i+chunkSize, len(answer))])
+		if err != nil {
+			tb.Fatal(err)
+		}
+		sse.WriteString(`data: {"id":"c1","choices":[{"index":0,"delta":{"content":` + string(fragment) + `},"finish_reason":null}]}` + "\n\n")
+	}
+	sse.WriteString(`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n")
+	sse.WriteString("data: [DONE]\n\n")
+	return sse.String()
+}
+
+// BenchmarkLargeTextStream measures assembling one long prose answer.
+func BenchmarkLargeTextStream(b *testing.B) {
+	server := sseServerB(b, largeTextStream(b))
+	defer server.Close()
+
+	model := testModel(server.URL)
+	conv := &Context{Messages: []Message{UserMessage{Role: "user", Content: "explain"}}}
+
+	for b.Loop() {
+		drainEvents(Stream(model, conv, &OpenAICompletionsOptions{StreamOptions: StreamOptions{APIKey: "k"}}))
+	}
+}
+
+// TestAnthropicManyContentBlocksDoesNotPanic covers the accumulator's storage.
+// The per-block accumulators live in a slice that grows as blocks arrive, and
+// strings.Builder panics if it is used after being copied by value -- which is
+// exactly what appending to that slice does when it reallocates.
+func TestAnthropicManyContentBlocksDoesNotPanic(t *testing.T) {
+	var sse strings.Builder
+	sse.WriteString(`event: message_start
+data: {"type":"message_start","message":{"id":"m1","model":"claude-test","role":"assistant","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}
+
+`)
+	// Far more blocks than any initial slice capacity, each written to after
+	// later blocks have forced the slice to grow.
+	const blockCount = 64
+	for index := range blockCount {
+		fmt.Fprintf(&sse, `event: content_block_start
+data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}
+
+`, index)
+	}
+	for index := range blockCount {
+		fmt.Fprintf(&sse, `event: content_block_delta
+data: {"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":"chunk-%d "}}
+
+`, index, index)
+	}
+	for index := range blockCount {
+		fmt.Fprintf(&sse, `event: content_block_stop
+data: {"type":"content_block_stop","index":%d}
+
+`, index)
+	}
+	sse.WriteString(`event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`)
+
+	server := sseServerB(t, sse.String())
+	defer server.Close()
+
+	model := &Model{ID: "claude-test", Name: "Claude Test", API: APIAnthropicMessages,
+		Provider: "anthropic", BaseURL: server.URL, Input: []string{"text"},
+		ContextWindow: 200000, MaxTokens: 8192}
+	options := &AnthropicOptions{}
+	options.APIKey = "k"
+
+	result, err := StreamAnthropicMessages(model, &Context{Messages: []Message{UserMessage{Role: "user", Content: "hi"}}}, options).Result(t.Context())
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if result.StopReason == StopError {
+		t.Fatalf("stream failed: %s", result.ErrorMessage)
+	}
+	var seen int
+	for _, block := range result.Content {
+		if text, ok := block.(TextContent); ok && strings.HasPrefix(text.Text, "chunk-") {
+			seen++
+		}
+	}
+	if seen != blockCount {
+		t.Fatalf("recovered %d of %d text blocks", seen, blockCount)
 	}
 }

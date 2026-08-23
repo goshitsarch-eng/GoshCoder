@@ -557,8 +557,13 @@ type mistralContentChunk struct {
 // mistralStreamingToolCall tracks a tool call being assembled.
 type mistralStreamingToolCall struct {
 	ToolCall
-	partialArgs  string
-	contentIndex int
+	// partialArgs accumulates argument deltas; see streamingToolCall for why
+	// this is a Builder rather than a string.
+	partialArgs strings.Builder
+	// parsedArgsLen is how much of partialArgs the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedArgsLen int
+	contentIndex  int
 }
 
 // consumeStream folds the SSE body into the output message.
@@ -569,6 +574,9 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	// Only one of these is set at a time: the open text or thinking block.
 	var currentText *TextContent
 	var currentThinking *ThinkingContent
+	// Accumulators for the blocks above; see textAccumulator. Reset whenever a
+	// new block starts.
+	var textAccum, thinkingAccum textAccumulator
 	toolCallsByKey := map[string]*mistralStreamingToolCall{}
 	var toolCallOrder []string
 
@@ -598,22 +606,24 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	appendText := func(delta string) {
 		if currentText == nil {
 			closeCurrent()
+			textAccum.reset()
 			currentText = &TextContent{Type: "text"}
 			output.Content = append(output.Content, *currentText)
 			p.push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: blockIndex()})
 		}
-		currentText.Text += delta
+		currentText.Text = textAccum.add(delta)
 		syncCurrent()
 		p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: blockIndex(), Delta: delta})
 	}
 	appendThinking := func(delta string) {
 		if currentThinking == nil {
 			closeCurrent()
+			thinkingAccum.reset()
 			currentThinking = &ThinkingContent{Type: "thinking"}
 			output.Content = append(output.Content, *currentThinking)
 			p.push(AssistantMessageEvent{Type: EventThinkingStart, ContentIndex: blockIndex()})
 		}
-		currentThinking.Thinking += delta
+		currentThinking.Thinking = thinkingAccum.add(delta)
 		syncCurrent()
 		p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: blockIndex(), Delta: delta})
 	}
@@ -753,8 +763,11 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 					argsDelta = string(raw.Function.Arguments)
 				}
 			}
-			block.partialArgs += argsDelta
-			block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+			block.partialArgs.WriteString(argsDelta)
+			if shouldReparseStreamingJSON(block.parsedArgsLen, block.partialArgs.Len()) {
+				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
+				block.parsedArgsLen = block.partialArgs.Len()
+			}
 			output.Content[block.contentIndex] = block.ToolCall
 			p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: block.contentIndex, Delta: argsDelta})
 		}
@@ -765,7 +778,7 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	// Finalize tool calls in the order they first appeared.
 	for _, key := range toolCallOrder {
 		block := toolCallsByKey[key]
-		block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+		block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
 		output.Content[block.contentIndex] = block.ToolCall
 		tc := block.ToolCall
 		p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: block.contentIndex, ToolCall: &tc})

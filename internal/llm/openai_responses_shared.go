@@ -532,7 +532,10 @@ type responsesStreamingToolCall struct {
 	partialJSON *string
 	// parsedJSONLen is how much of partialJSON the Arguments map reflects.
 	// See shouldReparseStreamingJSON.
-	parsedJSONLen  int
+	parsedJSONLen int
+	// argsAccum accumulates the argument deltas behind partialJSON; see
+	// textAccumulator. Safe by value because the block is only held by pointer.
+	argsAccum      textAccumulator
 	customProperty string
 	customBuffer   *GrammarToolInputJSONBuffer
 }
@@ -541,10 +544,13 @@ func (t *responsesStreamingToolCall) content() ContentBlock { return t.ToolCall 
 
 // responsesSlot links one Responses output item to a pi content block.
 type responsesSlot struct {
-	kind         string // "thinking" | "text" | "toolCall"
-	thinking     *ThinkingContent
-	text         *TextContent
-	toolCall     *responsesStreamingToolCall
+	kind     string // "thinking" | "text" | "toolCall"
+	thinking *ThinkingContent
+	text     *TextContent
+	toolCall *responsesStreamingToolCall
+	// accum accumulates this slot's text or thinking deltas; see
+	// textAccumulator. Safe by value because a slot is only held by pointer.
+	accum        textAccumulator
 	contentIndex int
 }
 
@@ -775,6 +781,7 @@ func (p *responsesStreamProcessor) createSlot(outputIndex int, item *responsesOu
 			},
 			partialJSON: &partialJSON,
 		}
+		block.argsAccum.add(partialJSON)
 		p.blocks = append(p.blocks, block)
 		slot := &responsesSlot{kind: "toolCall", toolCall: block, contentIndex: len(p.blocks) - 1}
 		p.slots[outputIndex] = slot
@@ -823,13 +830,13 @@ func (p *responsesStreamProcessor) applyMessagePhaseStopReason(item *responsesOu
 }
 
 func (p *responsesStreamProcessor) pushThinkingDelta(slot *responsesSlot, delta string) {
-	slot.thinking.Thinking += delta
+	slot.thinking.Thinking = slot.accum.add(delta)
 	p.syncContent()
 	p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: slot.contentIndex, Delta: delta})
 }
 
 func (p *responsesStreamProcessor) pushTextDelta(slot *responsesSlot, delta string) {
-	slot.text.Text += delta
+	slot.text.Text = slot.accum.add(delta)
 	p.syncContent()
 	p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: slot.contentIndex, Delta: delta})
 }
@@ -899,7 +906,7 @@ func (p *responsesStreamProcessor) ProcessEvent(event *responsesStreamEvent) err
 		if slot == nil || slot.toolCall.partialJSON == nil {
 			return nil
 		}
-		*slot.toolCall.partialJSON += event.Delta
+		*slot.toolCall.partialJSON = slot.toolCall.argsAccum.add(event.Delta)
 		if shouldReparseStreamingJSON(slot.toolCall.parsedJSONLen, len(*slot.toolCall.partialJSON)) {
 			slot.toolCall.Arguments = ParseStreamingJSON(*slot.toolCall.partialJSON)
 			slot.toolCall.parsedJSONLen = len(*slot.toolCall.partialJSON)

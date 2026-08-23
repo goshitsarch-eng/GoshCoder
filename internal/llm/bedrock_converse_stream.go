@@ -927,11 +927,20 @@ type bedrockStreamEvent struct {
 // bedrockBlock tracks one in-flight content block, keyed by the wire's
 // contentBlockIndex.
 type bedrockBlock struct {
-	kind         string // "text" | "thinking" | "toolCall"
-	text         *TextContent
-	thinking     *ThinkingContent
-	toolCall     *ToolCall
-	partialJSON  string
+	kind     string // "text" | "thinking" | "toolCall"
+	text     *TextContent
+	thinking *ThinkingContent
+	toolCall *ToolCall
+	// partialJSON accumulates tool-use input deltas; see streamingToolCall for
+	// why this is a Builder rather than a string.
+	partialJSON strings.Builder
+	// parsedJSONLen is how much of partialJSON the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedJSONLen int
+	// textAccum accumulates text or thinking deltas for this block; see
+	// textAccumulator. Safe by value here because bedrockBlock is only ever
+	// held through a pointer.
+	textAccum    textAccumulator
 	wireIndex    int
 	contentIndex int
 }
@@ -1038,7 +1047,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 				if block.kind != "text" {
 					continue
 				}
-				block.text.Text += *event.Delta.Text
+				block.text.Text = block.textAccum.add(*event.Delta.Text)
 				sync(block)
 				p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: block.contentIndex, Delta: *event.Delta.Text})
 
@@ -1046,8 +1055,11 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 				if block == nil || block.kind != "toolCall" {
 					continue
 				}
-				block.partialJSON += event.Delta.ToolUse.Input
-				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON)
+				block.partialJSON.WriteString(event.Delta.ToolUse.Input)
+				if shouldReparseStreamingJSON(block.parsedJSONLen, block.partialJSON.Len()) {
+					block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON.String())
+					block.parsedJSONLen = block.partialJSON.Len()
+				}
 				sync(block)
 				p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: block.contentIndex, Delta: event.Delta.ToolUse.Input})
 
@@ -1066,7 +1078,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 					continue
 				}
 				if text := event.Delta.ReasoningContent.Text; text != "" {
-					block.thinking.Thinking += text
+					block.thinking.Thinking = block.textAccum.add(text)
 					sync(block)
 					p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: block.contentIndex, Delta: text})
 				}
@@ -1092,7 +1104,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 			case "thinking":
 				p.push(AssistantMessageEvent{Type: EventThinkingEnd, ContentIndex: block.contentIndex, Content: block.thinking.Thinking})
 			case "toolCall":
-				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON)
+				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON.String())
 				sync(block)
 				tc := *block.toolCall
 				p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: block.contentIndex, ToolCall: &tc})
