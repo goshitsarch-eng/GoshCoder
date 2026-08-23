@@ -6,10 +6,45 @@ Its interactive interface is built with
 
 ## Install
 
-Requires Go 1.26.5 or newer. The patch-level minimum avoids known standard-library security vulnerabilities in earlier Go 1.26 releases.
+**Linux and macOS**
 
 ```sh
-go build -o bin/goshcoder ./cmd/goshcoder
+curl -fsSL https://raw.githubusercontent.com/goshitsarch-eng/goshcoder/main/install.sh | sh
+```
+
+**Windows** (PowerShell)
+
+```powershell
+irm https://raw.githubusercontent.com/goshitsarch-eng/goshcoder/main/install.ps1 | iex
+```
+
+Both installers download the release for your platform, verify its SHA-256
+against the published checksums file, and refuse to install anything that does
+not match. When no release is published they fall back to building from source.
+Re-running upgrades in place. Useful flags: `--dir <path>` to choose the install
+location, `--version <tag>` to pin a release, `--from-source` to always compile,
+`--no-modify-path` to leave your shell profile alone.
+
+**From a checkout**
+
+Requires Go 1.26.6 or newer; earlier 1.26 patch releases carry standard-library
+vulnerabilities that `govulncheck` reports as reachable from this tree.
+
+```sh
+make build      # stamped binary in bin/
+make install    # and onto your PATH
+make check      # the full gate: gofmt, vet, staticcheck, race tests, govulncheck
+```
+
+`make help` lists every target. `make dist` cross-compiles release archives for
+Linux, macOS, and Windows on amd64 and arm64, with checksums.
+
+**First run**
+
+```sh
+goshcoder auth login anthropic   # or: auth set <provider>, or an env var
+goshcoder providers              # shows what is configured and how to fix what is not
+goshcoder                        # start coding
 ```
 
 ## Use
@@ -181,10 +216,50 @@ GoshCoder discovers Pi-compatible inert resources at startup and with `/reload`:
 - Markdown prompt templates under `prompts/`, including frontmatter and
   positional arguments;
 - Agent Skills (`SKILL.md`) under agent, project, and `.agents/skills`
-  locations, available as `/skill:<name>`.
+  locations, available as `/skill:<name>`. Ancestor discovery stops at the
+  repository root, so a sibling checkout's skills are not offered as this
+  project's.
 
-Use `/resources` to inspect what was loaded. GoshCoder generates Pi's coding
+Use `/resources` to inspect what was loaded; it also lists any warning raised
+during discovery, including a workspace `SYSTEM.md` that replaced the prompt
+and any context file skipped for being a symbolic link. GoshCoder generates Pi's coding
 system prompt when no explicit or local `SYSTEM.md` override exists.
+
+## Security notes
+
+GoshCoder reads instructions out of whatever repository you open, so the trust
+boundary matters:
+
+- **`AGENTS.md` / `CLAUDE.md`** from the workspace are added as project context.
+  Their content is framed so it cannot break out of its container and address
+  the model as if it were the harness. Symlinked context files are skipped: a
+  repository could otherwise point `AGENTS.md` at your SSH key and have it sent
+  to the model provider.
+- **`.pi/SYSTEM.md` / `.goshcoder/SYSTEM.md`** in a workspace *replace* the whole
+  system prompt. Your own `SYSTEM.md` in the agent directory takes precedence,
+  and a workspace one is reported in `/resources` rather than applied silently.
+  Treat it like any other executable content in a repository you did not write.
+- **Filesystem tools** are confined to the workspace with `os.Root`, so symlink
+  and rename races cannot escape it. The `bash` tool runs with your privileges;
+  planning mode removes it and independently blocks shell execution.
+- **Credentials** live in `auth.json` (mode 0600) and are never echoed to the
+  terminal. Concurrent sessions coordinate through a heartbeat lock file so a
+  refreshed token cannot be lost to a racing writer.
+- **Local servers** (OAuth callback, Planner review) bind loopback only, validate
+  state/CSRF tokens and the `Host` header, and set no-store and CSP headers.
+
+`make check` runs `govulncheck`; keep the Go toolchain patched and rerun it for
+release builds.
+
+## Known gaps
+
+- Two sessions open on the same workspace share one Planner state file with no
+  cross-process lock, so the last writer wins on phase changes. Nothing is
+  corrupted -- writes are atomic -- but a plan phase set in one session can be
+  reverted by the other. Use one session per workspace for planning.
+- Session transcripts are not persisted: pi's JSONL session tree, resume picker,
+  branching, and export/share are not implemented. Closing the process discards
+  the conversation, which is why Ctrl+C at an idle prompt asks for confirmation.
 
 ## Deviations from pi
 
@@ -207,17 +282,26 @@ Documented at the top of each ported file. The notable ones:
 - **Session scope.** Runtime transcript clearing and context compaction are
   implemented. Pi's persisted JSONL session tree, resume picker, branching,
   HTML export/share, TypeScript plugin host, packages, custom `models.json`
-  loading, LSP, and MCP management are not yet implemented.
+  loading, LSP, and MCP management are not yet implemented. See **Known gaps**.
 
 ## Development
 
 ```sh
-go build ./... && go vet -all ./... && go test ./...
-staticcheck ./...   # optional external audit tool
-govulncheck ./...   # optional external vulnerability scanner
+make check          # what CI runs: gofmt, vet, staticcheck, race tests, govulncheck
+make tools          # install staticcheck and govulncheck first, if needed
 ```
 
-Release validation also runs the race detector. Filesystem tools use Go's
+Individual targets: `make test`, `make test-race`, `make cover`, `make lint`,
+`make vuln`. `make test-hermetic` runs the suite with deliberately wrong
+provider credentials exported, so a test that reads the developer's real
+environment instead of its own fixtures fails loudly rather than passing on one
+machine and failing on another.
+
+GitHub Actions runs the same gate on Linux, macOS, and Windows, cross-compiles
+every release target, and exercises both installer scripts -- including a
+round-trip that serves real release archives over HTTP and drives the
+installer's actual download path, so the Makefile and the installers cannot
+drift apart into a release that 404s. Filesystem tools use Go's
 `os.Root` confinement, planning mode disables shell execution, local callback
 servers bind only to loopback, and network, disk, and subprocess inputs have
 explicit resource limits.
