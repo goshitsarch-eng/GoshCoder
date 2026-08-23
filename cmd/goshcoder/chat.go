@@ -449,6 +449,53 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			fmt.Fprintln(os.Stderr, dim(line))
 		}
 
+	case "/tree":
+		if s.log == nil {
+			return false, errors.New("this session is not being saved, so it has no tree")
+		}
+		for _, line := range treeLines(s.log.snapshot(), s.log.leaf()) {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/fork":
+		if err := s.forkTo(rest); err != nil {
+			return false, err
+		}
+
+	case "/label":
+		if err := s.labelPoint(rest); err != nil {
+			return false, err
+		}
+
+	case "/clone":
+		if err := s.cloneSession(); err != nil {
+			return false, err
+		}
+		for _, notice := range s.drainNotices() {
+			fmt.Fprintln(os.Stderr, dim(notice.Kind+": "+notice.Text))
+		}
+
+	case "/export":
+		if s.log == nil {
+			return false, errors.New("this session is not being saved, so there is nothing to export")
+		}
+		s.log.sync()
+		args := []string{s.log.id()}
+		if rest != "" {
+			args = append(args, strings.Fields(rest)...)
+		}
+		if err := sessionsExport(args); err != nil {
+			return false, err
+		}
+
+	case "/import":
+		if rest == "" {
+			return false, errors.New("/import needs a path to a .jsonl session file")
+		}
+		if err := sessionsImport(strings.Fields(rest)); err != nil {
+			return false, err
+		}
+
 	case "/prompt", "/prompts":
 		if err := s.handlePromptCommand(rest); err != nil {
 			return false, err

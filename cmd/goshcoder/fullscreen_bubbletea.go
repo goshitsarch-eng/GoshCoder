@@ -1057,6 +1057,8 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 	}
 	command := fields[0]
 	return command == "/compact" || command == "/sessions" || command == "/resume" ||
+		command == "/tree" || command == "/fork" || command == "/clone" ||
+		command == "/export" || command == "/import" ||
 		(command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
 		command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
 		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
