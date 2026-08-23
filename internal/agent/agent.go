@@ -288,18 +288,36 @@ func (a *Agent) SetSystemPrompt(s string) {
 	a.mu.Unlock()
 }
 
-// SetModel sets the model for future turns.
+// SetModel sets the model for future turns, emitting model_change when the
+// model actually differs.
+//
+// Emitting only on a real change is not an optimization: syncPlanRuntime calls
+// the setters twice per turn, so emitting on every call would write two no-op
+// entries into the session log for every turn, forever.
 func (a *Agent) SetModel(m llm.Model) {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
 	a.mu.Lock()
+	changed := a.state.model.Provider != m.Provider || a.state.model.ID != m.ID
 	a.state.model = m
 	a.mu.Unlock()
+	if changed {
+		a.emitLocked(nil, Event{Type: EventModelChange, Provider: m.Provider, ModelID: m.ID})
+	}
 }
 
-// SetThinkingLevel sets the reasoning level for future turns.
+// SetThinkingLevel sets the reasoning level for future turns, emitting
+// thinking_level_change when it actually differs.
 func (a *Agent) SetThinkingLevel(level llm.ModelThinkingLevel) {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
 	a.mu.Lock()
+	changed := a.state.thinkingLevel != level
 	a.state.thinkingLevel = level
 	a.mu.Unlock()
+	if changed {
+		a.emitLocked(nil, Event{Type: EventThinkingLevelChange, ThinkingLevel: level})
+	}
 }
 
 // SetTools replaces the tool list. The slice is copied (TS tools setter).
@@ -311,6 +329,12 @@ func (a *Agent) SetTools(tools []Tool) {
 
 // SetMessages replaces the transcript. The slice is copied (TS messages
 // setter).
+//
+// This is unrecorded: it emits nothing, so a session recorder cannot see it.
+// It exists for seeding an agent at construction and for tests. Anything that
+// rewrites a live transcript must go through Compact or Reset instead, or the
+// log and the transcript diverge and the next resume replays a conversation
+// that never happened.
 func (a *Agent) SetMessages(messages []Message) {
 	a.mu.Lock()
 	a.state.messages = append([]Message(nil), messages...)
@@ -428,10 +452,19 @@ var errBusy = errors.New("agent is already processing a prompt; use Steer or Fol
 
 // Reset clears transcript state, runtime state, and queued messages. It
 // returns an error while a run is active (TS Agent.reset).
-func (a *Agent) Reset() error {
+func (a *Agent) Reset() error { return a.ResetWithReason("") }
+
+// ResetWithReason is Reset, naming what cleared the transcript so the session
+// log can record it.
+//
+// The emit happens after a.mu is released: emit takes a.mu itself, and a
+// listener -- the session recorder is one -- writes to disk while it runs.
+func (a *Agent) ResetWithReason(reason string) error {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.run != nil {
+		a.mu.Unlock()
 		return errors.New("agent is already processing; wait for completion before resetting")
 	}
 	a.state.messages = nil
@@ -441,6 +474,43 @@ func (a *Agent) Reset() error {
 	a.state.errorMessage = ""
 	a.steeringQueue.clear()
 	a.followUpQueue.clear()
+	a.mu.Unlock()
+
+	a.emitLocked(nil, Event{Type: EventTranscriptReset, Reason: reason})
+	return nil
+}
+
+// Compact replaces the transcript with a summary marker followed by the
+// messages worth keeping, and emits context_compacted so the session log
+// records the same cut the agent just made.
+//
+// It exists because compaction previously called SetMessages, which emits
+// nothing: a recorder watching only Subscribe would keep appending onto the
+// pre-compaction prefix, and the next resume would replay the full uncompacted
+// transcript and exceed the context window on its first turn.
+//
+// Like Reset, it refuses while a run is active: rewriting the transcript out
+// from under a streaming turn would strand the run's own message list.
+func (a *Agent) Compact(marker Message, kept []Message, info CompactionInfo) error {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
+	a.mu.Lock()
+	if a.run != nil {
+		a.mu.Unlock()
+		return errors.New("agent is already processing; wait for completion before compacting")
+	}
+	compacted := make([]Message, 0, len(kept)+1)
+	compacted = append(compacted, marker)
+	compacted = append(compacted, kept...)
+	a.state.messages = compacted
+	a.mu.Unlock()
+
+	a.emitLocked(nil, Event{
+		Type:       EventContextCompacted,
+		Message:    marker,
+		Kept:       append([]Message(nil), kept...),
+		Compaction: &info,
+	})
 	return nil
 }
 
@@ -656,7 +726,17 @@ func (a *Agent) handleRunFailure(emit func(Event), err error, aborted bool) {
 func (a *Agent) emit(run *activeRun, ev Event) {
 	a.emitMu.Lock()
 	defer a.emitMu.Unlock()
+	a.emitLocked(run, ev)
+}
 
+// emitLocked is emit with emitMu already held. The state setters below take
+// emitMu themselves so that their mutation and their event are one atomic step
+// with respect to every other emit -- otherwise two concurrent SetModel calls
+// can mutate in one order and emit in the other, and the session log ends up
+// claiming a turn was held on a model it was not.
+//
+// No listener may call back into a setter: emitMu is not reentrant.
+func (a *Agent) emitLocked(run *activeRun, ev Event) {
 	a.mu.Lock()
 	switch ev.Type {
 	case EventMessageStart, EventMessageUpdate:
@@ -678,7 +758,12 @@ func (a *Agent) emit(run *activeRun, ev Event) {
 	listeners := append([]*listenerEntry(nil), a.listeners...)
 	a.mu.Unlock()
 
+	// A setter emits while idle, so there is no run to borrow a context from.
+	ctx := context.Background()
+	if run != nil {
+		ctx = run.ctx
+	}
 	for _, l := range listeners {
-		l.fn(run.ctx, ev)
+		l.fn(ctx, ev)
 	}
 }
