@@ -84,6 +84,9 @@ func chatCommand(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if err := validateSessionFlags(cfg); err != nil {
+		return err
+	}
 	// Planner commands are available in chat even when plan mode was not
 	// requested at startup.
 	cfg.LoadPlannotator = true
@@ -392,7 +395,7 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			fmt.Fprintln(os.Stderr, current)
 			return false, nil
 		}
-		s.explicitSystemPrompt = rest
+		s.setExplicitSystemPrompt(rest)
 		if err := s.reloadResources(); err != nil {
 			return false, err
 		}
@@ -473,18 +476,19 @@ Ctrl-D      quit when the editor is empty`)
 		fmt.Fprintf(os.Stderr, "%s\n", dim("reloaded context files, prompt templates, and skills"))
 
 	case "/resources":
-		if s.resources == nil {
+		loaded := s.currentResources()
+		if loaded == nil {
 			fmt.Fprintln(os.Stderr, "No resources loaded.")
 			return false, nil
 		}
-		fmt.Fprintf(os.Stderr, "Context files: %d\nPrompt templates: %d\nSkills: %d\n", len(s.resources.ContextFiles), len(s.resources.Templates), len(s.resources.Skills))
-		for _, file := range s.resources.ContextFiles {
+		fmt.Fprintf(os.Stderr, "Context files: %d\nPrompt templates: %d\nSkills: %d\n", len(loaded.ContextFiles), len(loaded.Templates), len(loaded.Skills))
+		for _, file := range loaded.ContextFiles {
 			fmt.Fprintln(os.Stderr, "  "+file.Path)
 		}
-		for _, template := range s.resources.Templates {
+		for _, template := range loaded.Templates {
 			fmt.Fprintln(os.Stderr, "  /"+template.Name+" — "+template.Description)
 		}
-		for _, skill := range s.resources.Skills {
+		for _, skill := range loaded.Skills {
 			fmt.Fprintln(os.Stderr, "  /skill:"+skill.Name+" — "+skill.Description)
 		}
 
@@ -673,7 +677,7 @@ func (s *session) sessionInfoRealtime() claudetui.SessionInfo {
 	}
 	info.Cost = conversationCost(state.Messages)
 	if hasCompaction {
-		info.ContextUsed = estimateMessagesTokens(state.Messages)
+		info.ContextUsed = s.contextEstimate.estimate(state.Messages)
 	}
 	return info
 }

@@ -39,25 +39,6 @@ type SessionInfo struct {
 
 func displayWidth(text string) int { return ansi.StringWidth(text) }
 
-func stripANSI(text string) string {
-	var out strings.Builder
-	for i := 0; i < len(text); {
-		if text[i] == 0x1b && i+1 < len(text) && text[i+1] == '[' {
-			i += 2
-			for i < len(text) && (text[i] < '@' || text[i] > '~') {
-				i++
-			}
-			if i < len(text) {
-				i++
-			}
-			continue
-		}
-		out.WriteByte(text[i])
-		i++
-	}
-	return out.String()
-}
-
 func truncate(text string, width int) string {
 	if width <= 0 {
 		return ""

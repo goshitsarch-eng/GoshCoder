@@ -305,14 +305,16 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 		case *ThinkingContent:
 			p.push(AssistantMessageEvent{Type: EventThinkingEnd, ContentIndex: idx, Content: b.Thinking})
 		case *streamingToolCall:
-			b.ToolCall.Arguments = ParseStreamingJSON(b.partialArgs)
+			b.ToolCall.Arguments = ParseStreamingJSON(b.partialArgs.String())
 			syncContent()
 			tc := b.ToolCall
 			p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: idx, ToolCall: &tc})
 		}
 	}
+	var textAccum, thinkingAccum textAccumulator
 	ensureTextBlock := func() *TextContent {
 		if textBlock == nil {
+			textAccum.reset()
 			textBlock = &TextContent{Type: "text"}
 			blocks = append(blocks, textBlock)
 			syncContent()
@@ -322,6 +324,7 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 	}
 	ensureThinkingBlock := func(thinkingSignature string) *ThinkingContent {
 		if thinkingBlock == nil {
+			thinkingAccum.reset()
 			thinkingBlock = &ThinkingContent{Type: "thinking", ThinkingSignature: thinkingSignature}
 			blocks = append(blocks, thinkingBlock)
 			syncContent()
@@ -435,7 +438,7 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 		delta := choice.Delta
 		if delta.Content != nil && *delta.Content != "" {
 			block := ensureTextBlock()
-			block.Text += *delta.Content
+			block.Text = textAccum.add(*delta.Content)
 			syncContent()
 			p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: contentIndex(block), Delta: *delta.Content})
 		}
@@ -464,7 +467,7 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 				thinkingSignature = "reasoning_content"
 			}
 			block := ensureThinkingBlock(thinkingSignature)
-			block.Thinking += reasoningDelta
+			block.Thinking = thinkingAccum.add(reasoningDelta)
 			syncContent()
 			p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: contentIndex(block), Delta: reasoningDelta})
 		}
@@ -488,16 +491,22 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 			deltaStr := ""
 			if tc.Function != nil && tc.Function.Arguments != "" {
 				deltaStr = tc.Function.Arguments
-				block.partialArgs += tc.Function.Arguments
-				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+				block.partialArgs.WriteString(tc.Function.Arguments)
+				if shouldReparseStreamingJSON(block.parsedArgsLen, block.partialArgs.Len()) {
+					block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
+					block.parsedArgsLen = block.partialArgs.Len()
+				}
 			} else if tc.Custom != nil && tc.Custom.Input != "" {
 				// Custom (grammar) tool input: constrained sampling is out of
 				// scope for this port slice, so the raw input accumulates into
 				// partialArgs like function arguments (the TS original wraps it
 				// via appendGrammarToolInputJsonDelta).
 				deltaStr = tc.Custom.Input
-				block.partialArgs += tc.Custom.Input
-				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+				block.partialArgs.WriteString(tc.Custom.Input)
+				if shouldReparseStreamingJSON(block.parsedArgsLen, block.partialArgs.Len()) {
+					block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
+					block.parsedArgsLen = block.partialArgs.Len()
+				}
 			}
 			syncContent()
 			p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: contentIndex(block), Delta: deltaStr})
@@ -565,7 +574,17 @@ type streamingBlock interface {
 
 type streamingToolCall struct {
 	ToolCall
-	partialArgs string
+	// partialArgs accumulates argument deltas.
+	//
+	// A strings.Builder rather than a string: `s += delta` allocates and copies
+	// the whole accumulated value on every chunk, so assembling one tool call
+	// was quadratic in its size. Measured on a 54 KB argument arriving in
+	// token-sized chunks, that concatenation alone accounted for 1.2 GB of the
+	// 1.35 GB the stream allocated.
+	partialArgs strings.Builder
+	// parsedArgsLen is how much of partialArgs the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedArgsLen int
 }
 
 func (t *TextContent) content() ContentBlock       { return *t }

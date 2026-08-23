@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -93,5 +94,76 @@ func TestParseJSONWithRepair(t *testing.T) {
 	// Unrepairable input errors.
 	if _, err := ParseJSONWithRepair(`{"a": }`); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+// TestPartialParserDecodesEscapes covers a disagreement between the two
+// parsers: the strict path (ParseJSONWithRepair) decodes JSON escapes, while
+// the tolerant partial path copied them verbatim. Streaming previews therefore
+// showed literal backslash-n and backslash-quote, and any tool call that ended
+// up going through the tolerant path was executed with the wrong string.
+func TestPartialParserDecodesEscapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		partial string
+		key     string
+		want    string
+	}{
+		{"newline", `{"command":"echo one\ntwo`, "command", "echo one\ntwo"},
+		{"quote", `{"command":"grep -n \"foo\" bar`, "command", `grep -n "foo" bar`},
+		{"tab and backslash", `{"path":"a\tb\\c`, "path", "a\tb\\c"},
+		{"forward slash", `{"path":"a\/b`, "path", "a/b"},
+		{"unicode", `{"text":"café`, "text", "café"},
+		{"surrogate pair", `{"text":"😀 hi`, "text", "\U0001F600 hi"},
+		{"carriage return", `{"text":"a\r\nb`, "text", "a\r\nb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := ParsePartialJSON(tc.partial)
+			if err != nil {
+				t.Fatalf("ParsePartialJSON: %v", err)
+			}
+			object, ok := value.(map[string]any)
+			if !ok {
+				t.Fatalf("value = %#v", value)
+			}
+			if got, _ := object[tc.key].(string); got != tc.want {
+				t.Fatalf("%s = %q, want %q", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPartialParserAgreesWithStrictParser is the property behind the case
+// above: for input that is complete and valid, both parsers must produce the
+// same value.
+func TestPartialParserAgreesWithStrictParser(t *testing.T) {
+	complete := `{"command":"echo \"a\"\n\tb\\c","path":"café/😀.txt"}`
+
+	strict, err := ParseJSONWithRepair(complete)
+	if err != nil {
+		t.Fatalf("ParseJSONWithRepair: %v", err)
+	}
+	tolerant, err := ParsePartialJSON(complete)
+	if err != nil {
+		t.Fatalf("ParsePartialJSON: %v", err)
+	}
+	strictJSON, _ := json.Marshal(strict)
+	tolerantJSON, _ := json.Marshal(tolerant)
+	if string(strictJSON) != string(tolerantJSON) {
+		t.Fatalf("parsers disagree:\n strict:   %s\n tolerant: %s", strictJSON, tolerantJSON)
+	}
+}
+
+// TestPartialParserWaitsForASurrogatePair keeps a half-arrived pair out of the
+// preview instead of emitting a replacement character a later delta contradicts.
+func TestPartialParserWaitsForASurrogatePair(t *testing.T) {
+	value, err := ParsePartialJSON(`{"text":"hi \ud83d`)
+	if err != nil {
+		t.Fatalf("ParsePartialJSON: %v", err)
+	}
+	object, _ := value.(map[string]any)
+	if got, _ := object["text"].(string); got != "hi " {
+		t.Fatalf("text = %q, want the incomplete pair dropped", got)
 	}
 }

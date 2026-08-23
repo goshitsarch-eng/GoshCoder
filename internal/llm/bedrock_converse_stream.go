@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -280,16 +281,43 @@ func configuredBedrockRegion(options *BedrockOptions) string {
 	return getProviderEnvValue("AWS_DEFAULT_REGION", options.Env)
 }
 
+// resolveBedrockProfile picks the AWS profile to sign with.
+//
+// An ambient AWS_PROFILE must not override credentials the user configured for
+// this provider. resolveAWSCredentials short-circuits to the profile whenever
+// one is named, so consulting the process environment unconditionally means a
+// user who happens to export AWS_PROFILE for an unrelated project has their
+// configured Bedrock keys silently ignored -- and either fails with "no
+// credentials for AWS profile" or signs against the wrong AWS account.
+//
+// Precedence therefore is: an explicit option, then an explicitly configured
+// AWS_PROFILE, then the ambient one but only when no static key pair was
+// configured to be overridden.
+func resolveBedrockProfile(options *BedrockOptions) string {
+	if options == nil {
+		return ""
+	}
+	if options.Profile != "" {
+		return options.Profile
+	}
+	if options.Env != nil {
+		if profile := options.Env["AWS_PROFILE"]; profile != "" {
+			return profile
+		}
+		if options.Env["AWS_ACCESS_KEY_ID"] != "" && options.Env["AWS_SECRET_ACCESS_KEY"] != "" {
+			return ""
+		}
+	}
+	return os.Getenv("AWS_PROFILE")
+}
+
 // resolveBedrockTarget resolves the region and endpoint for a request.
 //
 // Region precedence matches the TS: an ARN-embedded region, then an explicit
 // option or env var, then a standard endpoint's region, then the profile's
 // configured region, then us-east-1.
 func resolveBedrockTarget(model *Model, options *BedrockOptions) (region string, endpoint string) {
-	profile := options.Profile
-	if profile == "" {
-		profile = getProviderEnvValue("AWS_PROFILE", options.Env)
-	}
+	profile := resolveBedrockProfile(options)
 	configured := configuredBedrockRegion(options)
 	endpointRegion := standardBedrockEndpointRegion(model.BaseURL)
 
@@ -899,11 +927,20 @@ type bedrockStreamEvent struct {
 // bedrockBlock tracks one in-flight content block, keyed by the wire's
 // contentBlockIndex.
 type bedrockBlock struct {
-	kind         string // "text" | "thinking" | "toolCall"
-	text         *TextContent
-	thinking     *ThinkingContent
-	toolCall     *ToolCall
-	partialJSON  string
+	kind     string // "text" | "thinking" | "toolCall"
+	text     *TextContent
+	thinking *ThinkingContent
+	toolCall *ToolCall
+	// partialJSON accumulates tool-use input deltas; see streamingToolCall for
+	// why this is a Builder rather than a string.
+	partialJSON strings.Builder
+	// parsedJSONLen is how much of partialJSON the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedJSONLen int
+	// textAccum accumulates text or thinking deltas for this block; see
+	// textAccumulator. Safe by value here because bedrockBlock is only ever
+	// held through a pointer.
+	textAccum    textAccumulator
 	wireIndex    int
 	contentIndex int
 }
@@ -1010,7 +1047,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 				if block.kind != "text" {
 					continue
 				}
-				block.text.Text += *event.Delta.Text
+				block.text.Text = block.textAccum.add(*event.Delta.Text)
 				sync(block)
 				p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: block.contentIndex, Delta: *event.Delta.Text})
 
@@ -1018,8 +1055,11 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 				if block == nil || block.kind != "toolCall" {
 					continue
 				}
-				block.partialJSON += event.Delta.ToolUse.Input
-				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON)
+				block.partialJSON.WriteString(event.Delta.ToolUse.Input)
+				if shouldReparseStreamingJSON(block.parsedJSONLen, block.partialJSON.Len()) {
+					block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON.String())
+					block.parsedJSONLen = block.partialJSON.Len()
+				}
 				sync(block)
 				p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: block.contentIndex, Delta: event.Delta.ToolUse.Input})
 
@@ -1038,7 +1078,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 					continue
 				}
 				if text := event.Delta.ReasoningContent.Text; text != "" {
-					block.thinking.Thinking += text
+					block.thinking.Thinking = block.textAccum.add(text)
 					sync(block)
 					p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: block.contentIndex, Delta: text})
 				}
@@ -1064,7 +1104,7 @@ func (p *bedrockStreamer) consumeStream(ctx context.Context, body io.Reader) err
 			case "thinking":
 				p.push(AssistantMessageEvent{Type: EventThinkingEnd, ContentIndex: block.contentIndex, Content: block.thinking.Thinking})
 			case "toolCall":
-				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON)
+				block.toolCall.Arguments = ParseStreamingJSON(block.partialJSON.String())
 				sync(block)
 				tc := *block.toolCall
 				p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: block.contentIndex, ToolCall: &tc})
@@ -1211,11 +1251,7 @@ func doBedrockRequest(ctx context.Context, model *Model, options *BedrockOptions
 	case bearerToken != "":
 		req.Header.Set("Authorization", "Bearer "+bearerToken)
 	default:
-		profile := options.Profile
-		if profile == "" {
-			profile = getProviderEnvValue("AWS_PROFILE", options.Env)
-		}
-		creds, err := resolveAWSCredentials(profile, options.Env)
+		creds, err := resolveAWSCredentials(resolveBedrockProfile(options), options.Env)
 		if err != nil {
 			return nil, err
 		}

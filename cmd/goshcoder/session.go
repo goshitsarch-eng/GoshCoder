@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"goshcoder/internal/agent"
@@ -49,13 +50,37 @@ type session struct {
 	btw       *btw.Manager
 	workspace *tools.Workspace
 	plan      *plannotator.Manager
+	// promptMu guards baseSystemPrompt, explicitSystemPrompt and resources.
+	//
+	// /reload and /system rewrite all three from whichever goroutine runs the
+	// slash command -- the Bubble Tea update loop in the fullscreen UI -- while
+	// the agent's PrepareNextTurn hook reads baseSystemPrompt between tool
+	// turns on the run goroutine. A Go string is a two-word value with no
+	// atomicity, so an unsynchronized overlap can hand the agent one string's
+	// pointer with another's length.
+	promptMu sync.RWMutex
 	// baseSystemPrompt is the prompt without extension suffixes.
 	baseSystemPrompt     string
 	explicitSystemPrompt string
 	resources            *coderresources.Set
 	normalTools          []agent.Tool
-	claudeTUI            bool
-	fullscreen           bool
+	// contextEstimate caches the transcript's token estimate; see its type.
+	contextEstimate contextEstimate
+	// noticeMu guards pendingNotices.
+	noticeMu sync.Mutex
+	// pendingNotices carries messages raised from agent-goroutine work -- the
+	// Planner's review URL, for instance -- to whichever interface is running.
+	// The fullscreen UI owns the screen, so such work cannot write to stderr;
+	// dropping the message instead left the Planner blocking on a review the
+	// user had no way to reach.
+	pendingNotices []sessionNotice
+	// loopTools are the Ralph tools. They are kept separately from
+	// normalTools because planRuntimeTools rebuilds the agent's tool list from
+	// normalTools before every turn, and anything not merged back in there is
+	// silently dropped from the running agent.
+	loopTools  []agent.Tool
+	claudeTUI  bool
+	fullscreen bool
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
@@ -114,7 +139,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 	for _, tool := range promptTools {
 		toolNames = append(toolNames, tool.Name)
 	}
-	s.baseSystemPrompt = s.resources.BuildSystemPrompt(cfg.SystemPrompt, resourceRoot, toolNames)
+	s.setSystemPromptBase(s.resources.BuildSystemPrompt(cfg.SystemPrompt, resourceRoot, toolNames))
 	if !cfg.Quiet {
 		for _, warning := range s.resources.Warnings {
 			fmt.Fprintln(os.Stderr, dim("resource warning: "+warning))
@@ -124,9 +149,13 @@ func newSession(cfg sessionConfig) (*session, error) {
 		root := s.workspace.Root
 		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
 		reviewer := plannotator.BrowserReviewer{Notify: func(message string) {
-			if !cfg.Fullscreen {
-				fmt.Fprintln(os.Stderr, message)
+			if cfg.Fullscreen {
+				// The fullscreen UI owns the terminal, so this cannot go to
+				// stderr; it is queued for the interface to render instead.
+				s.pushNotice("Planner", message)
+				return
 			}
+			fmt.Fprintln(os.Stderr, message)
 		}}
 		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
 		if err != nil {
@@ -164,7 +193,8 @@ func newSession(cfg sessionConfig) (*session, error) {
 		s.loops = ralph.NewStore(root, fmt.Sprintf("cli-%d", os.Getpid()))
 		// The ralph tools queue follow-ups on the agent, so they are registered
 		// against a pointer the agent is assigned to below.
-		agentTools = append(agentTools, s.loops.Tools(agentQueue{&s.agent})...)
+		s.loopTools = s.loops.Tools(agentQueue{&s.agent})
+		agentTools = append(agentTools, s.loopTools...)
 	}
 
 	systemPrompt := s.runtimeSystemPrompt()
@@ -197,7 +227,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		},
 		// Compose native extension hooks in load order.
 		PrepareNextTurn: composePrepareNextTurn(
-			ralphPrepareNextTurn(s.loops, func() string { return s.baseSystemPrompt }),
+			ralphPrepareNextTurn(s.loops, s.systemPromptBase),
 			s.planPrepareNextTurn(),
 		),
 	})
@@ -251,6 +281,9 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 		ctx = options.Ctx
 	}
 	models := newCatalog()
+	// A real request carries its own cancellation, so the incidental cap must
+	// not cut a legitimate refresh short.
+	models.SetOAuthTimeout(0)
 	models.SetOAuthContext(ctx)
 	auth, ok := models.ResolveAuth(model.Provider)
 	if !ok {
@@ -262,11 +295,72 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 	return authStreamFn(auth)(model, request, options)
 }
 
+// sessionNotice is one message raised for the user from background work.
+type sessionNotice struct {
+	Kind string
+	Text string
+}
+
+// pushNotice queues a message for the interface to display.
+func (s *session) pushNotice(kind, text string) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	// Bounded: a runaway producer must not grow this without limit.
+	if len(s.pendingNotices) >= 64 {
+		s.pendingNotices = s.pendingNotices[1:]
+	}
+	s.pendingNotices = append(s.pendingNotices, sessionNotice{Kind: kind, Text: text})
+}
+
+// drainNotices removes and returns the queued messages.
+func (s *session) drainNotices() []sessionNotice {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	if len(s.pendingNotices) == 0 {
+		return nil
+	}
+	drained := s.pendingNotices
+	s.pendingNotices = nil
+	return drained
+}
+
+// systemPromptBase returns the prompt without extension suffixes.
+func (s *session) systemPromptBase() string {
+	s.promptMu.RLock()
+	defer s.promptMu.RUnlock()
+	return s.baseSystemPrompt
+}
+
+// setSystemPromptBase replaces the prompt without extension suffixes.
+func (s *session) setSystemPromptBase(prompt string) {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	s.baseSystemPrompt = prompt
+}
+
+// setExplicitSystemPrompt records a user-supplied /system override.
+func (s *session) setExplicitSystemPrompt(prompt string) {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	s.explicitSystemPrompt = prompt
+}
+
+// currentResources returns the loaded resource set, which /reload replaces.
+func (s *session) currentResources() *coderresources.Set {
+	if s == nil {
+		return nil
+	}
+	s.promptMu.RLock()
+	defer s.promptMu.RUnlock()
+	return s.resources
+}
+
 func (s *session) expandResourceInput(input string) (string, bool, error) {
-	if s == nil || s.resources == nil {
+	loaded := s.currentResources()
+	if loaded == nil {
 		return "", false, nil
 	}
-	return s.resources.Expand(input)
+	return loaded.Expand(input)
 }
 
 func (s *session) reloadResources() error {
@@ -282,8 +376,12 @@ func (s *session) reloadResources() error {
 	for _, tool := range promptTools {
 		toolNames = append(toolNames, tool.Name)
 	}
+
+	s.promptMu.Lock()
 	s.resources = loaded
 	s.baseSystemPrompt = loaded.BuildSystemPrompt(s.explicitSystemPrompt, s.workspaceRoot(), toolNames)
+	s.promptMu.Unlock()
+
 	s.syncPlanRuntime()
 	return nil
 }
@@ -391,7 +489,7 @@ func composePrepareNextTurn(hooks ...agent.PrepareNextTurnFunc) agent.PrepareNex
 }
 
 func (s *session) runtimeSystemPrompt() string {
-	prompt := s.baseSystemPrompt
+	prompt := s.systemPromptBase()
 	if s.loops != nil {
 		if state, ok := s.loops.Current(); ok && state.Status == ralph.StatusActive {
 			prompt += ralph.SystemPromptSuffix(state)
@@ -414,16 +512,20 @@ func (s *session) syncPlanRuntime() {
 }
 
 func (s *session) planRuntimeTools() []agent.Tool {
+	// loopTools is merged into every branch: this list replaces the agent's
+	// tools wholesale before each turn, so anything omitted here is
+	// unregistered for the rest of the session even though the system prompt
+	// still instructs the model to call it.
 	if s.plan == nil || s.workspace == nil {
-		return append([]agent.Tool(nil), s.normalTools...)
+		return mergeTools(s.normalTools, s.loopTools)
 	}
 	switch s.plan.State().Phase {
 	case plannotator.PhasePlanning:
-		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()})
+		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}, s.loopTools)
 	case plannotator.PhaseExecuting:
-		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()})
+		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}, s.loopTools)
 	default:
-		return append([]agent.Tool(nil), s.normalTools...)
+		return mergeTools(s.normalTools, s.loopTools)
 	}
 }
 

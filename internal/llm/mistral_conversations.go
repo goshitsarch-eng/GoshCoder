@@ -557,8 +557,13 @@ type mistralContentChunk struct {
 // mistralStreamingToolCall tracks a tool call being assembled.
 type mistralStreamingToolCall struct {
 	ToolCall
-	partialArgs  string
-	contentIndex int
+	// partialArgs accumulates argument deltas; see streamingToolCall for why
+	// this is a Builder rather than a string.
+	partialArgs strings.Builder
+	// parsedArgsLen is how much of partialArgs the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedArgsLen int
+	contentIndex  int
 }
 
 // consumeStream folds the SSE body into the output message.
@@ -569,7 +574,13 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	// Only one of these is set at a time: the open text or thinking block.
 	var currentText *TextContent
 	var currentThinking *ThinkingContent
+	// Accumulators for the blocks above; see textAccumulator. Reset whenever a
+	// new block starts.
+	var textAccum, thinkingAccum textAccumulator
 	toolCallsByKey := map[string]*mistralStreamingToolCall{}
+	// Wire index -> key, so a continuation delta that omits the id still finds
+	// the block its first chunk created.
+	toolCallKeyByIndex := map[int]string{}
 	var toolCallOrder []string
 
 	blockIndex := func() int { return len(output.Content) - 1 }
@@ -598,22 +609,24 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	appendText := func(delta string) {
 		if currentText == nil {
 			closeCurrent()
+			textAccum.reset()
 			currentText = &TextContent{Type: "text"}
 			output.Content = append(output.Content, *currentText)
 			p.push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: blockIndex()})
 		}
-		currentText.Text += delta
+		currentText.Text = textAccum.add(delta)
 		syncCurrent()
 		p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: blockIndex(), Delta: delta})
 	}
 	appendThinking := func(delta string) {
 		if currentThinking == nil {
 			closeCurrent()
+			thinkingAccum.reset()
 			currentThinking = &ThinkingContent{Type: "thinking"}
 			output.Content = append(output.Content, *currentThinking)
 			p.push(AssistantMessageEvent{Type: EventThinkingStart, ContentIndex: blockIndex()})
 		}
-		currentThinking.Thinking += delta
+		currentThinking.Thinking = thinkingAccum.add(delta)
 		syncCurrent()
 		p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: blockIndex(), Delta: delta})
 	}
@@ -720,11 +733,21 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 			if raw.Index != nil {
 				index = *raw.Index
 			}
+			// Continuation deltas carry only the index; the id appears once, on
+			// the first chunk. Deriving a synthetic id from the index produced
+			// a different key from the id-bearing block, so every subsequent
+			// chunk forked a second tool call that carried the arguments while
+			// the original kept the name -- and the model's single request
+			// reached the agent as two broken ones.
+			key, known := toolCallKeyByIndex[index]
 			callID := raw.ID
-			if callID == "" || callID == "null" {
-				callID = deriveMistralToolCallID(fmt.Sprintf("toolcall:%d", index), 0)
+			if !known {
+				if callID == "" || callID == "null" {
+					callID = deriveMistralToolCallID(fmt.Sprintf("toolcall:%d", index), 0)
+				}
+				key = fmt.Sprintf("%s:%d", callID, index)
+				toolCallKeyByIndex[index] = key
 			}
-			key := fmt.Sprintf("%s:%d", callID, index)
 
 			block, exists := toolCallsByKey[key]
 			if !exists {
@@ -753,8 +776,11 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 					argsDelta = string(raw.Function.Arguments)
 				}
 			}
-			block.partialArgs += argsDelta
-			block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+			block.partialArgs.WriteString(argsDelta)
+			if shouldReparseStreamingJSON(block.parsedArgsLen, block.partialArgs.Len()) {
+				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
+				block.parsedArgsLen = block.partialArgs.Len()
+			}
 			output.Content[block.contentIndex] = block.ToolCall
 			p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: block.contentIndex, Delta: argsDelta})
 		}
@@ -765,7 +791,7 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	// Finalize tool calls in the order they first appeared.
 	for _, key := range toolCallOrder {
 		block := toolCallsByKey[key]
-		block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+		block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
 		output.Content[block.contentIndex] = block.ToolCall
 		tc := block.ToolCall
 		p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: block.contentIndex, ToolCall: &tc})
@@ -828,7 +854,20 @@ func doMistralRequest(ctx context.Context, model *Model, options *MistralOptions
 	if options.TimeoutMs > 0 {
 		timeout = time.Duration(options.TimeoutMs) * time.Millisecond
 	}
-	client := &http.Client{Timeout: timeout}
+	// The bound goes on the transport, not on the client.
+	//
+	// http.Client.Timeout covers the whole exchange including reading the
+	// response body, and this is a streaming request: a model that took longer
+	// than the timeout to finish answering had its stream cut off mid-response
+	// with "context deadline exceeded (Client.Timeout ... while reading body)",
+	// the partial answer discarded, and the identical request retried -- each
+	// attempt paying for the input again and dying at the same point.
+	// ResponseHeaderTimeout bounds time-to-first-byte instead, so a slow or
+	// unreachable endpoint still fails fast while a long answer streams to
+	// completion. Cancellation remains the request context's job.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	client := &http.Client{Transport: transport}
 
 	resp, err := client.Do(req)
 	if err != nil {

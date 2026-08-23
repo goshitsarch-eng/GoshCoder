@@ -53,7 +53,7 @@ func (s *Service) searchExaMCP(ctx context.Context, query string, options Option
 		"x-exa-source": "pi-web-access",
 	}, "")
 	if err != nil {
-		return Response{}, fmt.Errorf("Exa MCP search: %w", err)
+		return Response{}, fmt.Errorf("search via Exa MCP: %w", err)
 	}
 	text, err := parseExaMCPEnvelope(raw)
 	if err != nil {
@@ -61,7 +61,7 @@ func (s *Service) searchExaMCP(ctx context.Context, query string, options Option
 	}
 	results := parseExaTextResults(text, options.NumResults)
 	if len(results) == 0 {
-		return Response{}, errors.New("Exa MCP returned no parseable results")
+		return Response{}, errors.New("no parseable results from Exa MCP")
 	}
 	return Response{Provider: "exa", Query: query, Answer: answerFromResults(results), Results: results}, nil
 }
@@ -95,7 +95,7 @@ func parseExaMCPEnvelope(raw []byte) (string, error) {
 			continue
 		}
 		if envelope.Error != nil {
-			return "", fmt.Errorf("Exa MCP error %d: %s", envelope.Error.Code, envelope.Error.Message)
+			return "", fmt.Errorf("error %d from Exa MCP: %s", envelope.Error.Code, envelope.Error.Message)
 		}
 		for _, content := range envelope.Result.Content {
 			if content.Type == "text" && strings.TrimSpace(content.Text) != "" {
@@ -106,7 +106,7 @@ func parseExaMCPEnvelope(raw []byte) (string, error) {
 			}
 		}
 	}
-	return "", errors.New("Exa MCP returned an empty response")
+	return "", errors.New("empty response from Exa MCP")
 }
 
 func parseExaTextResults(text string, limit int) []Result {
@@ -163,7 +163,7 @@ func (s *Service) searchExaAPI(ctx context.Context, apiKey, query string, option
 		"x-api-key": apiKey, "x-exa-integration": "pi-web-access",
 	}, apiKey)
 	if err != nil {
-		return Response{}, fmt.Errorf("Exa API search: %w", err)
+		return Response{}, fmt.Errorf("search via the Exa API: %w", err)
 	}
 	var payload struct {
 		Results []struct {
@@ -174,7 +174,7 @@ func (s *Service) searchExaAPI(ctx context.Context, apiKey, query string, option
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return Response{}, fmt.Errorf("Exa API returned invalid JSON: %w", err)
+		return Response{}, fmt.Errorf("invalid JSON from the Exa API: %w", err)
 	}
 	results := make([]Result, 0, min(len(payload.Results), options.NumResults))
 	for _, item := range payload.Results {
@@ -191,7 +191,7 @@ func (s *Service) searchExaAPI(ctx context.Context, apiKey, query string, option
 		}
 	}
 	if len(results) == 0 {
-		return Response{}, errors.New("Exa API returned no results")
+		return Response{}, errors.New("no results from the Exa API")
 	}
 	return Response{Provider: "exa", Query: query, Answer: answerFromResults(results), Results: results}, nil
 }
@@ -223,25 +223,25 @@ func applyExaFilters(body map[string]any, options Options) {
 func (s *Service) searchKagi(ctx context.Context, cfg configFile, query string, options Options) (Response, error) {
 	apiKey := s.credential(cfg.KagiAPIKey, "KAGI_API_KEY")
 	if apiKey == "" {
-		return Response{}, fmt.Errorf("Kagi API key not found; set KAGI_API_KEY or kagiApiKey in %s", s.ConfigPath)
+		return Response{}, fmt.Errorf("no Kagi API key; set KAGI_API_KEY or kagiApiKey in %s", s.ConfigPath)
 	}
 	raw, err := s.doJSON(ctx, http.MethodPost, s.kagiSearchURL, map[string]any{
 		"query": query, "limit": options.NumResults,
 	}, map[string]string{"Authorization": "Bearer " + apiKey, "Accept": "application/json"}, apiKey)
 	if err != nil {
-		return Response{}, fmt.Errorf("Kagi API search: %w", err)
+		return Response{}, fmt.Errorf("search via the Kagi API: %w", err)
 	}
 	var payload any
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return Response{}, fmt.Errorf("Kagi API returned invalid JSON: %w", err)
+		return Response{}, fmt.Errorf("invalid JSON from the Kagi API: %w", err)
 	}
 	if message := kagiError(payload); message != "" {
-		return Response{}, fmt.Errorf("Kagi API returned an error: %s", message)
+		return Response{}, fmt.Errorf("error from the Kagi API: %s", message)
 	}
 	var results []Result
 	appendKagiResults(kagiData(payload), &results, options.NumResults)
 	if len(results) == 0 {
-		return Response{}, errors.New("Kagi API returned no results")
+		return Response{}, errors.New("no results from the Kagi API")
 	}
 	return Response{Provider: "kagi", Query: query, Answer: answerFromResults(results), Results: results}, nil
 }

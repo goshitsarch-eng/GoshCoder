@@ -45,6 +45,9 @@ type Message struct {
 
 // Frame is a complete immutable screen snapshot.
 type Frame struct {
+	// Cache memoizes per-message rendering across frames. Optional: a nil
+	// cache renders everything every time.
+	Cache              *MessageCache
 	Title              string
 	Messages           []Message
 	Sidebar            []string
@@ -117,7 +120,7 @@ func renderFrame(frame Frame, width, height int) ([]string, int, int, int) {
 		paletteHeight = suggestionRows + 2
 	}
 	transcriptHeight := max(0, bodyHeight-paletteHeight)
-	transcript := renderMessages(frame.Messages, mainWidth, frame.ToolsExpanded, frame.HideThinking)
+	transcript := renderMessages(frame.Messages, mainWidth, frame.ToolsExpanded, frame.HideThinking, frame.Cache)
 	maxScroll := max(0, len(transcript)-transcriptHeight)
 	if frame.Scroll > maxScroll {
 		frame.Scroll = maxScroll
@@ -324,86 +327,140 @@ func lastSidebarFooter(lines []string) int {
 	return max(0, len(lines)-6)
 }
 
-func renderMessages(messages []Message, width int, toolsExpanded, hideThinking bool) []string {
+// MessageCache memoizes per-message rendering across frames.
+//
+// renderMessages markdown-parses, wraps, and styles every transcript entry, and
+// the fullscreen UI re-renders the whole transcript on every frame -- every
+// keystroke and every stream delta. At a few hundred turns that is tens of
+// milliseconds of work per frame for messages that have not changed since the
+// last one, which shows up as visible typing lag.
+//
+// Completed messages are immutable, so their rendered lines are reusable as
+// long as the width and the display toggles are the same. The cache is owned by
+// the caller (one per UI model) rather than being a package global, so its
+// lifetime matches the screen it belongs to.
+type MessageCache struct {
+	width         int
+	toolsExpanded bool
+	hideThinking  bool
+	entries       map[Message][]string
+}
+
+// NewMessageCache returns an empty cache.
+func NewMessageCache() *MessageCache { return &MessageCache{} }
+
+// render returns the lines for one message, rendering it only on a miss.
+func (c *MessageCache) render(message Message, width int, toolsExpanded, hideThinking bool) []string {
+	if c == nil {
+		return renderMessage(message, width, toolsExpanded, hideThinking)
+	}
+	// Any change to the layout inputs invalidates everything at once.
+	if c.entries == nil || c.width != width || c.toolsExpanded != toolsExpanded || c.hideThinking != hideThinking {
+		c.entries = make(map[Message][]string)
+		c.width, c.toolsExpanded, c.hideThinking = width, toolsExpanded, hideThinking
+	}
+	if lines, ok := c.entries[message]; ok {
+		return lines
+	}
+	lines := renderMessage(message, width, toolsExpanded, hideThinking)
+	// Bound the cache so a very long session cannot grow it without limit; the
+	// visible window is what gets hit, so a generous cap behaves like an
+	// LRU in practice.
+	if len(c.entries) > 4096 {
+		c.entries = make(map[Message][]string)
+		c.width, c.toolsExpanded, c.hideThinking = width, toolsExpanded, hideThinking
+	}
+	c.entries[message] = lines
+	return lines
+}
+
+func renderMessages(messages []Message, width int, toolsExpanded, hideThinking bool, cache *MessageCache) []string {
 	var lines []string
 	for _, message := range messages {
-		if strings.TrimSpace(message.Text) == "" && strings.TrimSpace(message.Title) == "" {
-			continue
-		}
-		switch message.Role {
-		case "user":
-			contentWidth := max(1, width-6)
-			lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
-			for _, line := range renderRichText(message.Text, contentWidth, "user") {
-				line = strings.ReplaceAll(line, reset, clearStyle+userBackground)
-				lines = append(lines, "  "+userBackground+" "+pad(line, contentWidth)+" "+reset)
-			}
-			lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
-		case "assistant":
-			for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "assistant") {
-				lines = append(lines, "  "+line)
-			}
-		case "thinking":
-			if hideThinking {
-				lines = append(lines, muted+dim+"  Thinking…"+reset)
-				break
-			}
-			for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "thinking") {
-				lines = append(lines, "  "+line)
-			}
-		case "tool":
-			boxWidth := max(1, width-4)
-			icon, titleColor := "✓", cyan
-			if message.IsError {
-				icon, titleColor = "×", red
-			}
-			title := strings.TrimSpace(message.Title)
-			if title == "" {
-				title = "tool"
-			}
-			header := titleColor + icon + " " + bold + truncate(title, max(1, boxWidth-4)) + reset
-			lines = append(lines, "  "+toolBackground+" "+pad(header, max(1, boxWidth-2))+" "+reset)
-			detail := strings.TrimSpace(message.Text)
-			if toolsExpanded || message.IsError {
-				if strings.TrimSpace(message.Detail) != "" {
-					detail = strings.TrimSpace(message.Detail)
-				}
-			}
-			if detail != "" {
-				maxLines := 3
-				if toolsExpanded || message.IsError {
-					maxLines = 20
-				}
-				rendered := renderRichText(detail, max(1, boxWidth-4), "tool")
-				for index, line := range rendered {
-					line = strings.ReplaceAll(line, reset, clearStyle+toolBackground)
-					if index >= maxLines {
-						remaining := len(rendered) - index
-						more := fmt.Sprintf("… %d more lines (ctrl+o to expand)", remaining)
-						lines = append(lines, "  "+toolBackground+" "+muted+pad(more, max(1, boxWidth-2))+reset)
-						break
-					}
-					lines = append(lines, "  "+toolBackground+" "+muted+pad("  "+line, max(1, boxWidth-2))+reset)
-				}
-			}
-		case "Error":
-			lines = append(lines, red+bold+"  Error"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-4), "error") {
-				lines = append(lines, red+"  "+line+reset)
-			}
-		case "Command":
-			lines = append(lines, violet+"  ◇ "+reset+muted+"Command"+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-4), "command") {
-				lines = append(lines, textColor+"  "+line+reset)
-			}
-		default:
-			lines = append(lines, cyan+"  i "+reset+muted+strings.ToUpper(message.Role)+reset)
-			for _, line := range renderRichText(message.Text, max(1, width-4), "notice") {
-				lines = append(lines, muted+"  "+line+reset)
-			}
-		}
-		lines = append(lines, "")
+		lines = append(lines, cache.render(message, width, toolsExpanded, hideThinking)...)
 	}
+	return lines
+}
+
+// renderMessage renders one transcript entry.
+func renderMessage(message Message, width int, toolsExpanded, hideThinking bool) []string {
+	var lines []string
+	if strings.TrimSpace(message.Text) == "" && strings.TrimSpace(message.Title) == "" {
+		return nil
+	}
+	switch message.Role {
+	case "user":
+		contentWidth := max(1, width-6)
+		lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
+		for _, line := range renderRichText(message.Text, contentWidth, "user") {
+			line = strings.ReplaceAll(line, reset, clearStyle+userBackground)
+			lines = append(lines, "  "+userBackground+" "+pad(line, contentWidth)+" "+reset)
+		}
+		lines = append(lines, "  "+userBackground+strings.Repeat(" ", max(1, width-4))+reset)
+	case "assistant":
+		for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "assistant") {
+			lines = append(lines, "  "+line)
+		}
+	case "thinking":
+		if hideThinking {
+			lines = append(lines, muted+dim+"  Thinking…"+reset)
+			break
+		}
+		for _, line := range renderRichText(strings.TrimRight(message.Text, "\n"), max(1, width-4), "thinking") {
+			lines = append(lines, "  "+line)
+		}
+	case "tool":
+		boxWidth := max(1, width-4)
+		icon, titleColor := "✓", cyan
+		if message.IsError {
+			icon, titleColor = "×", red
+		}
+		title := strings.TrimSpace(message.Title)
+		if title == "" {
+			title = "tool"
+		}
+		header := titleColor + icon + " " + bold + truncate(title, max(1, boxWidth-4)) + reset
+		lines = append(lines, "  "+toolBackground+" "+pad(header, max(1, boxWidth-2))+" "+reset)
+		detail := strings.TrimSpace(message.Text)
+		if toolsExpanded || message.IsError {
+			if strings.TrimSpace(message.Detail) != "" {
+				detail = strings.TrimSpace(message.Detail)
+			}
+		}
+		if detail != "" {
+			maxLines := 3
+			if toolsExpanded || message.IsError {
+				maxLines = 20
+			}
+			rendered := renderRichText(detail, max(1, boxWidth-4), "tool")
+			for index, line := range rendered {
+				line = strings.ReplaceAll(line, reset, clearStyle+toolBackground)
+				if index >= maxLines {
+					remaining := len(rendered) - index
+					more := fmt.Sprintf("… %d more lines (ctrl+o to expand)", remaining)
+					lines = append(lines, "  "+toolBackground+" "+muted+pad(more, max(1, boxWidth-2))+reset)
+					break
+				}
+				lines = append(lines, "  "+toolBackground+" "+muted+pad("  "+line, max(1, boxWidth-2))+reset)
+			}
+		}
+	case "Error":
+		lines = append(lines, red+bold+"  Error"+reset)
+		for _, line := range renderRichText(message.Text, max(1, width-4), "error") {
+			lines = append(lines, red+"  "+line+reset)
+		}
+	case "Command":
+		lines = append(lines, violet+"  ◇ "+reset+muted+"Command"+reset)
+		for _, line := range renderRichText(message.Text, max(1, width-4), "command") {
+			lines = append(lines, textColor+"  "+line+reset)
+		}
+	default:
+		lines = append(lines, cyan+"  i "+reset+muted+strings.ToUpper(message.Role)+reset)
+		for _, line := range renderRichText(message.Text, max(1, width-4), "notice") {
+			lines = append(lines, muted+"  "+line+reset)
+		}
+	}
+	lines = append(lines, "")
 	return lines
 }
 

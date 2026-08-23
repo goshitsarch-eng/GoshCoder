@@ -26,6 +26,12 @@ func testModel(baseURL string) *Model {
 
 func sseServer(t *testing.T, body string) *httptest.Server {
 	t.Helper()
+	return sseServerB(t, body)
+}
+
+// sseServerB is sseServer for any testing.TB, so benchmarks can use it too.
+func sseServerB(tb testing.TB, body string) *httptest.Server {
+	tb.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, body)

@@ -384,3 +384,53 @@ func TestLoginProviderRegistry(t *testing.T) {
 		}
 	}
 }
+
+// TestLoopbackLoginFallsBackWhenThePortIsBusy covers a busy callback port. The
+// ports are fixed and shared with the vendors' own CLIs -- Codex binds 1455 too
+// -- so a conflict is ordinary. Treating it as fatal made the manual-paste path
+// this function exists to offer unreachable: the auth URL was never shown, and
+// there was no way to log in until the other process was found and killed.
+func TestLoopbackLoginFallsBackWhenThePortIsBusy(t *testing.T) {
+	// Hold the port the login flow will try to bind.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	busyPort := occupied.Addr().(*net.TCPAddr).Port
+
+	restore := browserOpener
+	browserOpener = func(string) error { return errors.New("no browser here") }
+	t.Cleanup(func() { browserOpener = restore })
+
+	interaction := &recordingInteraction{answer: "http://127.0.0.1/callback?code=pasted-code&state=the-state"}
+
+	code, err := runLoopbackLogin(t.Context(), interaction,
+		"https://example.test/authorize", "http://127.0.0.1/callback", "the-state",
+		"127.0.0.1", busyPort, "/callback")
+	if err != nil {
+		t.Fatalf("login aborted instead of offering the manual paste: %v", err)
+	}
+	if code != "pasted-code" {
+		t.Fatalf("code = %q", code)
+	}
+	if !interaction.sawAuthURL {
+		t.Fatal("the authorization URL was never shown, so the user could not log in at all")
+	}
+}
+
+// recordingInteraction answers the manual-code prompt and records what it saw.
+type recordingInteraction struct {
+	answer     string
+	sawAuthURL bool
+}
+
+func (r *recordingInteraction) Prompt(prompt LoginPrompt) (string, error) {
+	return r.answer, nil
+}
+
+func (r *recordingInteraction) Notify(event LoginEvent) {
+	if event.Kind == "auth_url" {
+		r.sawAuthURL = true
+	}
+}

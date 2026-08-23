@@ -13,3 +13,9 @@ go.work.sum
 
 # Local scratch
 .tmp/
+
+# Release output
+dist/
+
+# Coverage output
+coverage.out

@@ -93,6 +93,7 @@ func (s *session) compactContext(instructions string) (int, int, error) {
 	})
 	compacted = append(compacted, recent...)
 	s.agent.SetMessages(compacted)
+	s.contextEstimate.reset()
 	s.agent.ClearAllQueues()
 	return len(state.Messages), len(compacted), nil
 }
@@ -198,6 +199,41 @@ func conversationCost(messages []agent.Message) float64 {
 	}
 	return cost
 }
+
+// contextEstimate caches the transcript's estimated token count.
+//
+// sessionInfoRealtime runs on every agent event, and once a compaction has
+// happened it measured the whole transcript by serialising every message to a
+// string. The cost of drawing the sidebar therefore grew with the conversation
+// and was paid on every stream delta. Committed messages never change, so only
+// what has been appended since the last call needs measuring.
+type contextEstimate struct {
+	measured int // number of leading messages already counted
+	total    int
+}
+
+// estimate returns the transcript's token estimate, measuring only what is new.
+func (c *contextEstimate) estimate(messages []agent.Message) int {
+	if len(messages) == 0 {
+		c.reset()
+		return 0
+	}
+	// The final message is still being rewritten while a response streams, so
+	// only the prefix before it can be cached.
+	stable := len(messages) - 1
+	if stable < c.measured {
+		// The transcript shrank, which means a compaction replaced it.
+		c.reset()
+	}
+	for _, message := range messages[c.measured:stable] {
+		c.total += estimateMessageTokens(message)
+	}
+	c.measured = stable
+	return c.total + estimateMessageTokens(messages[len(messages)-1])
+}
+
+// reset discards the cache, for when the transcript is replaced wholesale.
+func (c *contextEstimate) reset() { c.measured, c.total = 0, 0 }
 
 func estimateMessagesTokens(messages []agent.Message) int {
 	total := 0

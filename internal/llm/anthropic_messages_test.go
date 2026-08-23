@@ -650,3 +650,85 @@ func TestAnthropicStreamSimpleReasoningBudget(t *testing.T) {
 		t.Fatalf("thinking = %#v", captured["thinking"])
 	}
 }
+
+// TestAnthropicUnknownStopReasonKeepsTheTurn covers a stop reason the port has
+// not seen. Erroring out discarded a complete, already-paid-for response --
+// Anthropic adds stop reasons over time, and model_context_window_exceeded is
+// one this port did not handle.
+func TestAnthropicUnknownStopReasonKeepsTheTurn(t *testing.T) {
+	for _, reason := range []string{"model_context_window_exceeded", "some_future_reason"} {
+		t.Run(reason, func(t *testing.T) {
+			stop, message, err := mapAnthropicStopReason(reason, "")
+			if err != nil {
+				t.Fatalf("mapAnthropicStopReason(%q) errored, discarding the turn: %v", reason, err)
+			}
+			if stop == StopError {
+				t.Fatalf("stop = %q, want the response kept", stop)
+			}
+			if message != "" {
+				t.Fatalf("message = %q", message)
+			}
+		})
+	}
+	// A context-window overflow is a length stop, so the truncation guard fires.
+	if stop, _, _ := mapAnthropicStopReason("model_context_window_exceeded", ""); stop != StopLength {
+		t.Fatalf("model_context_window_exceeded mapped to %q, want StopLength", stop)
+	}
+}
+
+// TestAnthropicThinkingSendsTheEnlargedMaxTokens covers the extended-thinking
+// budget. max_tokens is spent on reasoning as well as the answer, which is why
+// the adjustment enlarges it -- but the enlarged value was computed and then
+// dropped, so the request carried the original and the model ran out of room
+// mid-answer.
+func TestAnthropicThinkingSendsTheEnlargedMaxTokens(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `event: message_start
+data: {"type":"message_start","message":{"id":"m1","model":"claude-test","role":"assistant","content":[],"usage":{"input_tokens":5,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`)
+	}))
+	defer server.Close()
+
+	model := &Model{
+		ID: "claude-test", Name: "Claude Test", API: APIAnthropicMessages, Provider: "anthropic",
+		BaseURL: server.URL, Input: []string{"text"}, ContextWindow: 200000, MaxTokens: 64000,
+		Reasoning: true,
+		ThinkingLevelMap: map[ThinkingLevel]*string{
+			ThinkingHigh: func() *string { s := "high"; return &s }(),
+		},
+	}
+	options := &SimpleStreamOptions{Reasoning: ThinkingHigh}
+	options.APIKey = "k"
+	options.MaxTokens = 4096
+
+	if _, err := StreamAnthropicMessagesSimple(model,
+		&Context{Messages: []Message{UserMessage{Role: "user", Content: "think hard"}}},
+		options).Result(t.Context()); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	sent, ok := captured["max_tokens"].(float64)
+	if !ok {
+		t.Fatalf("max_tokens missing from the request: %#v", captured)
+	}
+	budget, ok := captured["thinking"].(map[string]any)["budget_tokens"].(float64)
+	if !ok {
+		t.Fatalf("thinking budget missing: %#v", captured["thinking"])
+	}
+	// The answer needs room beyond the reasoning budget; the un-enlarged
+	// value would leave none.
+	if sent <= budget {
+		t.Fatalf("max_tokens = %v is not greater than the thinking budget %v: the enlarged value was not sent",
+			sent, budget)
+	}
+}

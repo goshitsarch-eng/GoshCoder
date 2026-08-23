@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -508,7 +509,7 @@ func TestCredentialStoreRecoversStaleLock(t *testing.T) {
 	if err := os.WriteFile(lockPath, []byte("stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * lockFileTimeout)
+	old := time.Now().Add(-2 * defaultLockTiming().stale)
 	if err := os.Chtimes(lockPath, old, old); err != nil {
 		t.Fatal(err)
 	}
@@ -773,4 +774,74 @@ func TestCredentialsAccessor(t *testing.T) {
 	if c.Credentials() != store {
 		t.Fatal("Credentials() should return the backing store")
 	}
+}
+
+// TestImplicitRefreshIsBoundedAndNotRetriedForever covers the paths that merely
+// enumerate providers -- the startup model default, the model and login
+// pickers, `goshcoder providers`. Each resolves every provider, and resolution
+// can trigger a token refresh; with no deadline that ran on
+// context.Background() against a hanging auth host and blocked the caller for
+// minutes with nothing on screen, then did it again on the next rebuild.
+func TestImplicitRefreshIsBoundedAndNotRetriedForever(t *testing.T) {
+	// An auth host that accepts the connection and never answers. The handler
+	// waits on a channel the test controls rather than on the request context,
+	// so shutting the server down cannot deadlock on an in-flight handler.
+	var attempts atomic.Int32
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandlers := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseHandlers()
+
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		<-release
+	}))
+	defer hang.Close()
+
+	restore := anthropicTokenURL
+	anthropicTokenURL = hang.URL
+	t.Cleanup(func() { anthropicTokenURL = restore })
+
+	path := filepath.Join(t.TempDir(), "auth.json")
+	store := NewFileCredentialStore(path)
+	if _, err := store.Modify("anthropic", func(*Credential) (*Credential, error) {
+		return &Credential{
+			Type:    "oauth",
+			Access:  "expired",
+			Refresh: "refresh-token",
+			Expires: time.Now().Add(-time.Hour).UnixMilli(),
+		}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCatalog(store)
+	c.SetOAuthTimeout(300 * time.Millisecond)
+
+	start := time.Now()
+	if _, ok := c.ResolveAuth("anthropic"); ok {
+		t.Fatal("a hanging refresh resolved successfully")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("an implicit refresh blocked for %v; the cap did not apply", elapsed)
+	}
+	if c.OAuthError("anthropic") == nil {
+		t.Fatal("the failure was not recorded, so the CLI cannot say the login expired")
+	}
+
+	// A picker rebuild must not re-spend the whole budget against a host
+	// already known to be failing.
+	before := attempts.Load()
+	second := time.Now()
+	if _, ok := c.ResolveAuth("anthropic"); ok {
+		t.Fatal("resolved after a recorded failure")
+	}
+	if took := time.Since(second); took > 100*time.Millisecond {
+		t.Fatalf("the second resolution took %v; the failure was not remembered", took)
+	}
+	if attempts.Load() != before {
+		t.Fatal("the auth host was contacted again after a recorded failure")
+	}
+
+	releaseHandlers()
 }

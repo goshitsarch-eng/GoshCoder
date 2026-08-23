@@ -13,6 +13,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
+
+	charmterm "github.com/charmbracelet/x/term"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/config"
@@ -20,9 +24,6 @@ import (
 	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/ralph"
 )
-
-// Version is the CLI version.
-const Version = "0.2.0-dev"
 
 const usage = `GoshCoder - a Go coding agent
 
@@ -74,6 +75,20 @@ func main() {
 	}
 
 	command, args := os.Args[1], os.Args[2:]
+
+	// The flag forms must be handled before the dash branch below hands
+	// anything starting with "-" to chatCommand: routing them there made the
+	// switch cases for them dead code, so `goshcoder --version` started a chat
+	// session and `goshcoder -h` printed the chat flag list and exited 1.
+	switch command {
+	case "--version", "-v":
+		fmt.Print(versionInfo())
+		return
+	case "--help", "-h":
+		fmt.Print(usage)
+		return
+	}
+
 	if strings.HasPrefix(command, "-") {
 		if err := chatCommand(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -97,9 +112,9 @@ func main() {
 		err = omniCommand(args)
 	case "ralph":
 		err = ralphCommand(args)
-	case "version", "--version", "-v":
-		fmt.Println("goshcoder", Version)
-	case "help", "--help", "-h":
+	case "version":
+		fmt.Print(versionInfo())
+	case "help":
 		fmt.Print(usage)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", command, usage)
@@ -113,9 +128,21 @@ func main() {
 }
 
 // newCatalog builds a catalog backed by the on-disk credential store.
+// newCatalog builds a catalog backed by the on-disk credential store.
+//
+// The refresh cap keeps the paths that merely enumerate providers responsive.
+// Callers that have a real context of their own -- a model request, an
+// interactive login -- install it with SetOAuthContext and get the full
+// allowance; see Catalog.SetOAuthTimeout.
 func newCatalog() *catalog.Catalog {
-	return catalog.NewCatalog(catalog.NewFileCredentialStore(config.AuthPath()))
+	c := catalog.NewCatalog(catalog.NewFileCredentialStore(config.AuthPath()))
+	c.SetOAuthTimeout(implicitOAuthRefreshTimeout)
+	return c
 }
+
+// implicitOAuthRefreshTimeout caps a token refresh triggered incidentally, by
+// listing providers or rebuilding a picker rather than by an actual request.
+const implicitOAuthRefreshTimeout = 15 * time.Second
 
 // ---------------------------------------------------------------------------
 // run
@@ -126,6 +153,9 @@ func runCommand(args []string) error {
 	flags.SetOutput(os.Stderr)
 	cfg := bindSessionFlags(flags)
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if err := validateSessionFlags(cfg); err != nil {
 		return err
 	}
 
@@ -146,6 +176,26 @@ func runCommand(args []string) error {
 }
 
 // bindSessionFlags registers the flags shared by run and chat.
+// validateSessionFlags rejects values the session would otherwise accept and
+// then quietly reinterpret.
+//
+// -thinking took any string: ClampThinkingLevel falls back to the model's
+// lowest supported level for anything it does not recognise, so `-thinking
+// hihg` ran with thinking off and said nothing, and the user only found out
+// from the bill or the answer quality.
+func validateSessionFlags(cfg *sessionConfig) error {
+	if cfg.Thinking == "" {
+		return nil
+	}
+	for _, level := range llm.ThinkingLevels() {
+		if cfg.Thinking == level {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown -thinking level %q; use one of: %s",
+		cfg.Thinking, strings.Join(llm.ThinkingLevels(), ", "))
+}
+
 func bindSessionFlags(flags *flag.FlagSet) *sessionConfig {
 	cfg := &sessionConfig{}
 	flags.StringVar(&cfg.ModelRef, "m", "", "model reference")
@@ -412,8 +462,8 @@ func providersCommand() error {
 			if auth.IsAmbient() {
 				detail += " (ambient)"
 			}
-		} else if names := providerEnvNames(provider); names != "" {
-			detail = "set " + names
+		} else {
+			detail = providerSetupHint(provider)
 		}
 		fmt.Printf("%s %-24s %-22s %s\n", status, provider.ID, provider.Name, dim(detail))
 	}
@@ -425,6 +475,32 @@ func providerEnvNames(provider *catalog.Provider) string {
 		return ""
 	}
 	return strings.Join(provider.EnvKeys, " or ")
+}
+
+// providerSetupHint says how to configure an unconfigured provider.
+//
+// Listing only the environment variables left every OAuth provider, and the
+// ones authenticated by cloud credentials, with a blank column -- so the
+// providers most users start with looked unsupported rather than unconfigured.
+func providerSetupHint(provider *catalog.Provider) string {
+	if _, ok := catalog.LoginProviderFor(provider.ID); ok {
+		if names := providerEnvNames(provider); names != "" {
+			return "run: goshcoder auth login " + provider.ID + " (or set " + names + ")"
+		}
+		return "run: goshcoder auth login " + provider.ID
+	}
+	if names := providerEnvNames(provider); names != "" {
+		return "set " + names + ", or run: goshcoder auth set " + provider.ID
+	}
+	switch provider.ID {
+	case "amazon-bedrock":
+		return "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or AWS_BEARER_TOKEN_BEDROCK"
+	case "google-vertex", "google-vertex-anthropic":
+		return "set GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_PROJECT"
+	case "azure":
+		return "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT"
+	}
+	return "run: goshcoder auth set " + provider.ID
 }
 
 func modelsCommand(args []string) error {
@@ -542,6 +618,9 @@ func authCommand(args []string) error {
 			visibleInput = (info.Mode() & os.ModeCharDevice) != 0
 		}
 		interaction := newTerminalLoginInteraction(os.Stdin, os.Stderr, visibleInput)
+		// /login runs in-process from chat, so the reader goroutine must not
+		// outlive the flow and start eating the user's next lines of input.
+		defer interaction.Close()
 		if _, err := c.Login(ctx, providerID, interaction); err != nil {
 			return err
 		}
@@ -568,10 +647,90 @@ type terminalLoginInteraction struct {
 	reader       *bufio.Reader
 	out          io.Writer
 	visibleInput bool
+	// secretIn is the same stream as reader when it is a terminal, so that
+	// PromptSecret can turn echo off. Nil for piped input and in tests.
+	secretIn *os.File
+
+	// lines is served by a single reader goroutine, started only when a
+	// prompt is actually cancellable.
+	//
+	// Reading stdin in a goroutine per prompt leaked one goroutine for every
+	// prompt whose context won the race -- each still blocked in ReadString --
+	// and /login runs in-process from chat, so those orphans went on to
+	// swallow the user's next lines of input, one line each.
+	linesOnce sync.Once
+	lines     chan loginLineResult
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+type loginLineResult struct {
+	line string
+	err  error
 }
 
 func newTerminalLoginInteraction(in io.Reader, out io.Writer, visibleInput bool) *terminalLoginInteraction {
-	return &terminalLoginInteraction{reader: bufio.NewReader(in), out: out, visibleInput: visibleInput}
+	i := &terminalLoginInteraction{
+		reader: bufio.NewReader(in), out: out, visibleInput: visibleInput,
+		closed: make(chan struct{}),
+	}
+	if file, ok := in.(*os.File); ok && charmterm.IsTerminal(file.Fd()) {
+		i.secretIn = file
+	}
+	return i
+}
+
+// Close releases the reader goroutine, if one was started. A read already
+// blocked in the terminal driver still needs one more newline to return, which
+// is unavoidable without non-blocking I/O, but at most one such goroutine can
+// exist per login flow instead of one per cancelled prompt.
+func (i *terminalLoginInteraction) Close() {
+	i.closeOnce.Do(func() { close(i.closed) })
+}
+
+// readLine reads one line directly.
+func (i *terminalLoginInteraction) readLine() loginLineResult {
+	line, err := i.reader.ReadString('\n')
+	if err == io.EOF && line != "" {
+		err = nil
+	}
+	return loginLineResult{line: strings.TrimSpace(line), err: err}
+}
+
+// lineChannel starts the shared reader goroutine on first use.
+func (i *terminalLoginInteraction) lineChannel() <-chan loginLineResult {
+	i.linesOnce.Do(func() {
+		i.lines = make(chan loginLineResult)
+		go func() {
+			for {
+				result := i.readLine()
+				select {
+				case i.lines <- result:
+				case <-i.closed:
+					return
+				}
+				if result.err != nil {
+					return
+				}
+			}
+		}()
+	})
+	return i.lines
+}
+
+// readSecretPrompt reads a secret without echoing it, when it can.
+//
+// It bypasses the bufio.Reader, so it must only run while that reader holds
+// nothing: otherwise buffered bytes the user already typed would be skipped.
+// On a terminal in canonical mode a read returns at most one line, so the
+// buffer is empty at every prompt boundary; the check makes that explicit
+// rather than assumed.
+func (i *terminalLoginInteraction) readSecretPrompt() (string, bool, error) {
+	if i.secretIn == nil || i.reader.Buffered() > 0 {
+		return "", false, nil
+	}
+	secret, err := readSecretFrom(i.secretIn, i.out, "> ")
+	return secret, true, err
 }
 
 func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, error) {
@@ -589,34 +748,33 @@ func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, e
 		if prompt.Placeholder != "" {
 			fmt.Fprintf(i.out, "%s\n", dim("Example: "+prompt.Placeholder))
 		}
-		if prompt.Kind == catalog.PromptSecret && i.visibleInput {
-			fmt.Fprint(i.out, "(input is visible) ")
+		if prompt.Kind == catalog.PromptSecret {
+			if secret, handled, err := i.readSecretPrompt(); handled {
+				return secret, err
+			}
+			if i.visibleInput {
+				fmt.Fprint(i.out, "(input is visible) ")
+			} else {
+				fmt.Fprint(i.out, "> ")
+			}
 		} else {
 			fmt.Fprint(i.out, "> ")
 		}
 	}
 
-	type lineResult struct {
-		line string
-		err  error
-	}
-	result := make(chan lineResult, 1)
-	go func() {
-		line, err := i.reader.ReadString('\n')
-		if err == io.EOF && line != "" {
-			err = nil
+	// Only involve a goroutine when the prompt can actually be cancelled;
+	// otherwise read inline, where there is nothing to leak.
+	var read loginLineResult
+	if prompt.Ctx == nil || prompt.Ctx.Done() == nil {
+		read = i.readLine()
+	} else {
+		select {
+		case <-prompt.Ctx.Done():
+			return "", catalog.ErrLoginCancelled
+		case read = <-i.lineChannel():
 		}
-		result <- lineResult{line: strings.TrimSpace(line), err: err}
-	}()
-
-	ctx := prompt.Ctx
-	if ctx == nil {
-		ctx = context.Background()
 	}
-	select {
-	case <-ctx.Done():
-		return "", catalog.ErrLoginCancelled
-	case read := <-result:
+	{
 		if read.err != nil {
 			return "", read.err
 		}
@@ -649,19 +807,6 @@ func (i *terminalLoginInteraction) Notify(event catalog.LoginEvent) {
 			fmt.Fprintln(i.out, event.Message)
 		}
 	}
-}
-
-// readSecret prompts on stderr and reads one line from stdin. Terminal echo is
-// not suppressed, so the prompt says so when stdin is a terminal.
-func readSecret(prompt string) (string, error) {
-	if info, err := os.Stdin.Stat(); err == nil && (info.Mode()&os.ModeCharDevice) != 0 {
-		fmt.Fprint(os.Stderr, prompt+"(input is visible) ")
-	}
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
-	}
-	return strings.TrimSpace(line), nil
 }
 
 // ---------------------------------------------------------------------------

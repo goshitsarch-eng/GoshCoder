@@ -316,9 +316,7 @@ func parseQuote(trimmed string) (depth int, body string, ok bool) {
 	for strings.HasPrefix(rest, ">") {
 		depth++
 		rest = strings.TrimPrefix(rest, ">")
-		if strings.HasPrefix(rest, " ") {
-			rest = rest[1:]
-		}
+		rest = strings.TrimPrefix(rest, " ")
 	}
 	return depth, rest, depth > 0
 }

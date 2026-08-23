@@ -108,3 +108,34 @@ func TestSSEEmptyStream(t *testing.T) {
 		t.Fatalf("got %#v", events)
 	}
 }
+
+// TestSSECapCoversColonLessDataLines covers a bypass of the event-size cap. The
+// guard tested the raw line for a "data:" prefix, but accumulation keys off the
+// parsed field name -- and a colon-less "data" line is a valid SSE field with an
+// empty value, so it appended to the buffer while slipping past the check.
+func TestSSECapCoversColonLessDataLines(t *testing.T) {
+	// Each bare "data" line contributes a newline to the accumulator, so
+	// enough of them exceed the cap without any line carrying a colon.
+	var body strings.Builder
+	for range maxSSEEventBytes + 16 {
+		body.WriteString("data\n")
+	}
+
+	reader := NewSSEReader(strings.NewReader(body.String()))
+	_, err := reader.Next()
+	if !errors.Is(err, ErrSSEEventTooLarge) {
+		t.Fatalf("err = %v, want ErrSSEEventTooLarge", err)
+	}
+}
+
+// TestSSEStillReadsNormalEvents is the negative control for the moved check.
+func TestSSEStillReadsNormalEvents(t *testing.T) {
+	reader := NewSSEReader(strings.NewReader("event: ping\ndata: one\ndata: two\n\n"))
+	event, err := reader.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if event.Event != "ping" || event.Data != "one\ntwo" {
+		t.Fatalf("event = %#v", event)
+	}
+}

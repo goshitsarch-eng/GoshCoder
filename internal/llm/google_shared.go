@@ -500,6 +500,9 @@ func consumeGoogleStream(ctx context.Context, body io.Reader, model *Model, outp
 	// Only one of these is set at a time: the open text or thinking block.
 	var currentText *TextContent
 	var currentThinking *ThinkingContent
+	// Accumulators for the blocks above; see textAccumulator. Reset whenever a
+	// new block starts.
+	var textAccum, thinkingAccum textAccumulator
 
 	blockIndex := func() int { return len(output.Content) - 1 }
 	syncCurrent := func() {
@@ -564,22 +567,24 @@ func consumeGoogleStream(ctx context.Context, body io.Reader, model *Model, outp
 					if (isThinking && currentThinking == nil) || (!isThinking && currentText == nil) {
 						closeCurrent()
 						if isThinking {
+							thinkingAccum.reset()
 							currentThinking = &ThinkingContent{Type: "thinking"}
 							output.Content = append(output.Content, *currentThinking)
 							push(AssistantMessageEvent{Type: EventThinkingStart, ContentIndex: blockIndex()})
 						} else {
+							textAccum.reset()
 							currentText = &TextContent{Type: "text"}
 							output.Content = append(output.Content, *currentText)
 							push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: blockIndex()})
 						}
 					}
 					if isThinking {
-						currentThinking.Thinking += text
+						currentThinking.Thinking = thinkingAccum.add(text)
 						currentThinking.ThinkingSignature = retainThoughtSignature(currentThinking.ThinkingSignature, part.ThoughtSignature)
 						syncCurrent()
 						push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: blockIndex(), Delta: text})
 					} else {
-						currentText.Text += text
+						currentText.Text = textAccum.add(text)
 						currentText.TextSignature = retainThoughtSignature(currentText.TextSignature, part.ThoughtSignature)
 						syncCurrent()
 						push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: blockIndex(), Delta: text})
@@ -624,7 +629,12 @@ func consumeGoogleStream(ctx context.Context, body io.Reader, model *Model, outp
 			if candidate.FinishReason != "" {
 				output.RawStopReason = candidate.FinishReason
 				output.StopReason = mapGoogleStopReason(candidate.FinishReason)
-				if hasToolCallBlock(output.Content) {
+				// Promote to toolUse only from a clean stop. Overriding
+				// unconditionally masked MAX_TOKENS and safety stops, so the
+				// agent loop's guard against tool calls parsed out of a
+				// truncated response never fired and a call the model was cut
+				// off midway through writing was executed as if complete.
+				if output.StopReason == StopStop && hasToolCallBlock(output.Content) {
 					output.StopReason = StopToolUse
 				}
 			}

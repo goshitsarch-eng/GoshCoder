@@ -829,8 +829,13 @@ func mapAnthropicStopReason(reason, refusalExplanation string) (StopReason, stri
 		return StopStop, "", nil
 	case "sensitive": // Content flagged by safety filters
 		return StopError, "Provider stopped with: sensitive", nil
+	case "model_context_window_exceeded":
+		return StopLength, "", nil
 	default:
-		return "", "", fmt.Errorf("unhandled stop reason: %s", reason)
+		// A stop reason this port has not seen must not cost the user the
+		// response that came with it. Anthropic adds values over time, and
+		// erroring out here discarded a complete, already-paid-for turn.
+		return StopStop, "", nil
 	}
 }
 
@@ -883,6 +888,11 @@ func StreamAnthropicMessagesSimple(model *Model, conv *Context, options *SimpleS
 
 	maxTokens, thinkingBudget := adjustAnthropicMaxTokensForThinking(base.MaxTokens, model.MaxTokens, reasoning, options.ThinkingBudgets)
 	maxTokens = ClampMaxTokensToContext(model, conv, maxTokens)
+	// Send the adjusted budget, not the original. Extended thinking spends
+	// max_tokens on reasoning as well as on the answer, which is why the
+	// adjustment enlarges it; leaving base.MaxTokens in place meant the request
+	// carried the unenlarged value and the model ran out of room mid-answer.
+	base.MaxTokens = maxTokens
 	enabled := true
 	return StreamAnthropicMessages(model, conv, &AnthropicOptions{
 		StreamOptions:        base,
@@ -1103,6 +1113,15 @@ func (p *anthropicMessagesStreamer) consumeStream(ctx context.Context, body io.R
 	type indexedBlock struct {
 		index int
 		block streamingBlock
+		// accum accumulates this block's text or thinking deltas; see
+		// textAccumulator for why the field is not appended to directly.
+		//
+		// A pointer, not a value: indexedBlock lives in a slice that grows as
+		// blocks arrive, and appending relocates its elements. strings.Builder
+		// panics if it is used after being copied, so a by-value accumulator
+		// here would crash the stream as soon as a message carried enough
+		// content blocks to force a reallocation.
+		accum *textAccumulator
 	}
 	var blocks []indexedBlock
 	contentIndex := func(apiIndex int) int {
@@ -1182,12 +1201,16 @@ func (p *anthropicMessagesStreamer) consumeStream(ctx context.Context, body io.R
 			switch cb.Type {
 			case "text":
 				blocks = append(blocks, indexedBlock{index: event.Index, block: &TextContent{Type: "text", Text: cb.Text}})
+				blocks[len(blocks)-1].accum = &textAccumulator{}
+				blocks[len(blocks)-1].accum.add(cb.Text)
 				syncContent()
 				p.push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: len(blocks) - 1})
 			case "thinking":
 				blocks = append(blocks, indexedBlock{index: event.Index, block: &ThinkingContent{
 					Type: "thinking", Thinking: cb.Thinking, ThinkingSignature: cb.Signature,
 				}})
+				blocks[len(blocks)-1].accum = &textAccumulator{}
+				blocks[len(blocks)-1].accum.add(cb.Thinking)
 				syncContent()
 				p.push(AssistantMessageEvent{Type: EventThinkingStart, ContentIndex: len(blocks) - 1})
 			case "redacted_thinking":
@@ -1223,20 +1246,29 @@ func (p *anthropicMessagesStreamer) consumeStream(ctx context.Context, body io.R
 			switch d.Type {
 			case "text_delta":
 				if block, ok := blocks[idx].block.(*TextContent); ok {
-					block.Text += d.Text
+					if blocks[idx].accum == nil {
+						blocks[idx].accum = &textAccumulator{}
+					}
+					block.Text = blocks[idx].accum.add(d.Text)
 					syncContent()
 					p.push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: idx, Delta: d.Text})
 				}
 			case "thinking_delta":
 				if block, ok := blocks[idx].block.(*ThinkingContent); ok {
-					block.Thinking += d.Thinking
+					if blocks[idx].accum == nil {
+						blocks[idx].accum = &textAccumulator{}
+					}
+					block.Thinking = blocks[idx].accum.add(d.Thinking)
 					syncContent()
 					p.push(AssistantMessageEvent{Type: EventThinkingDelta, ContentIndex: idx, Delta: d.Thinking})
 				}
 			case "input_json_delta":
 				if block, ok := blocks[idx].block.(*streamingToolCall); ok {
-					block.partialArgs += d.PartialJSON
-					block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+					block.partialArgs.WriteString(d.PartialJSON)
+					if shouldReparseStreamingJSON(block.parsedArgsLen, block.partialArgs.Len()) {
+						block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
+						block.parsedArgsLen = block.partialArgs.Len()
+					}
 					syncContent()
 					p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: idx, Delta: d.PartialJSON})
 				}
@@ -1259,7 +1291,7 @@ func (p *anthropicMessagesStreamer) consumeStream(ctx context.Context, body io.R
 			case *ThinkingContent:
 				p.push(AssistantMessageEvent{Type: EventThinkingEnd, ContentIndex: idx, Content: block.Thinking})
 			case *streamingToolCall:
-				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs.String())
 				syncContent()
 				tc := block.ToolCall
 				p.push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: idx, ToolCall: &tc})

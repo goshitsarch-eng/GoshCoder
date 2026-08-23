@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testMistralModel(baseURL string) *Model {
@@ -683,5 +684,97 @@ func TestMistralRegisteredInRegistry(t *testing.T) {
 	}
 	if funcs.Stream == nil || funcs.StreamSimple == nil {
 		t.Fatalf("registration = %#v", funcs)
+	}
+}
+
+// TestMistralStreamOutlivesTheRequestTimeout covers a truncation bug. The
+// Mistral path was the only one to set http.Client.Timeout, which Go documents
+// as covering the whole exchange including reading the body -- so any answer
+// that took longer than the timeout to finish streaming was cut off, the
+// partial response discarded, and the request retried to die the same way.
+func TestMistralStreamOutlivesTheRequestTimeout(t *testing.T) {
+	const requestTimeout = 300 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		flush := func() {
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		// Keep streaming well past the request timeout, as a long answer does.
+		for range 4 {
+			fmt.Fprint(w, mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"content":"chunk "}}]}`))
+			flush()
+			time.Sleep(requestTimeout / 2)
+		}
+		fmt.Fprint(w, mistralSSE(mistralFinish))
+		flush()
+	}))
+	defer server.Close()
+
+	options := &MistralOptions{}
+	options.APIKey = "k"
+	options.TimeoutMs = int64(requestTimeout / time.Millisecond)
+
+	result, err := StreamMistral(testMistralModel(server.URL),
+		&Context{Messages: []Message{UserMessage{Role: "user", Content: "hi"}}},
+		options).Result(t.Context())
+	if err != nil {
+		t.Fatalf("a stream longer than the request timeout was aborted: %v", err)
+	}
+	if result.StopReason == StopError {
+		t.Fatalf("stream failed: %s", result.ErrorMessage)
+	}
+	var text string
+	for _, block := range result.Content {
+		if content, ok := block.(TextContent); ok {
+			text += content.Text
+		}
+	}
+	if strings.Count(text, "chunk") != 4 {
+		t.Fatalf("text = %q, want all four deltas", text)
+	}
+}
+
+// TestMistralToolCallContinuationDeltasStayOneCall covers a stream where the
+// tool call's id appears only on its first chunk, which is how Mistral sends
+// them. Deriving a synthetic id from the index for the later chunks produced a
+// different map key, so each continuation forked a second tool call: one block
+// carried the name and none of the arguments, the other the arguments and no
+// name, and the model's single request reached the agent as two broken ones.
+func TestMistralToolCallContinuationDeltasStayOneCall(t *testing.T) {
+	body := mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"abcdefghi","function":{"name":"read","arguments":"{\"path\":"}}]}}]}`) +
+		mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"main.go\""}}]}}]}`) +
+		mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}`) +
+		mistralSSE(mistralFinish)
+
+	model := mistralServer(t, body)
+	options := &MistralOptions{}
+	options.APIKey = "k"
+
+	result, err := StreamMistral(model,
+		&Context{Messages: []Message{UserMessage{Role: "user", Content: "read it"}}},
+		options).Result(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []ToolCall
+	for _, block := range result.Content {
+		if call, ok := block.(ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("got %d tool calls, want 1: %#v", len(calls), calls)
+	}
+	if calls[0].Name != "read" {
+		t.Fatalf("name = %q", calls[0].Name)
+	}
+	if got, _ := calls[0].Arguments["path"].(string); got != "main.go" {
+		t.Fatalf("path = %q, want the arguments assembled onto the named call", got)
 	}
 }

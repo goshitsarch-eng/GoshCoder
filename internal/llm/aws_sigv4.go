@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,6 +37,72 @@ type awsCredentials struct {
 	SessionToken    string
 	// Source describes where the credentials came from, for diagnostics.
 	Source string
+}
+
+// awsURIEncode percent-encodes s the way SigV4's UriEncode does: everything
+// outside the RFC 3986 unreserved set becomes %XX with uppercase hex. Path
+// separators are preserved when encodeSlash is false.
+func awsURIEncode(s string, encodeSlash bool) string {
+	const upperhex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '-', c == '.', c == '_', c == '~':
+			b.WriteByte(c)
+		case c == '/' && !encodeSlash:
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(upperhex[c>>4])
+			b.WriteByte(upperhex[c&0x0f])
+		}
+	}
+	return b.String()
+}
+
+// awsCanonicalURI builds the CanonicalURI element of the canonical request.
+//
+// It must be the request's path URI-encoded again -- what AWS calls encoding
+// twice for every service except S3, since the path on the wire is already
+// encoded once. Signing the raw path instead worked only while every character
+// in it happened to be unreserved. Go's url.PathEscape deliberately leaves ':'
+// alone, and every Bedrock model id ends in one (":0"), so the service
+// canonicalized the colon to %3A, computed a different signature, and rejected
+// every request with SignatureDoesNotMatch.
+func awsCanonicalURI(escapedPath string) string {
+	if escapedPath == "" {
+		return "/"
+	}
+	return awsURIEncode(escapedPath, false)
+}
+
+// awsCanonicalQuery builds the CanonicalQueryString element.
+//
+// net/url's Encode is close but not equivalent: it encodes a space as "+",
+// where SigV4 requires "%20", and it does not encode the same character set.
+func awsCanonicalQuery(values url.Values) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var parts []string
+	for _, key := range keys {
+		encodedKey := awsURIEncode(key, true)
+		entries := append([]string(nil), values[key]...)
+		sort.Strings(entries)
+		for _, value := range entries {
+			parts = append(parts, encodedKey+"="+awsURIEncode(value, true))
+		}
+	}
+	return strings.Join(parts, "&")
 }
 
 // resolveAWSCredentials resolves static credentials, preferring an explicitly
@@ -228,11 +295,8 @@ func signAWSRequest(req *http.Request, payload []byte, creds *awsCredentials, re
 	}
 
 	canonicalHeaders, signedHeaders := canonicalizeHeaders(req.Header, host)
-	canonicalURI := req.URL.EscapedPath()
-	if canonicalURI == "" {
-		canonicalURI = "/"
-	}
-	canonicalQuery := req.URL.Query().Encode()
+	canonicalURI := awsCanonicalURI(req.URL.EscapedPath())
+	canonicalQuery := awsCanonicalQuery(req.URL.Query())
 
 	canonicalRequest := strings.Join([]string{
 		req.Method,

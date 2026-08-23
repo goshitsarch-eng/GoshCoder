@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"fmt"
 	"goshcoder/internal/agent"
 	"goshcoder/internal/llm"
 )
@@ -63,5 +64,59 @@ func TestConversationCostSurvivesCompaction(t *testing.T) {
 func TestFullscreenCompactRunsAsynchronously(t *testing.T) {
 	if !fullscreenCommandRunsAsync("/compact focus on tests") || fullscreenCommandRunsAsync("/status") {
 		t.Fatal("async command classification is wrong")
+	}
+}
+
+// TestContextEstimateMatchesAFullMeasurement covers the cache behind the
+// sidebar's context readout. It must agree with measuring from scratch after
+// every append, and must start over when a compaction replaces the transcript.
+func TestContextEstimateMatchesAFullMeasurement(t *testing.T) {
+	var estimate contextEstimate
+
+	var messages []agent.Message
+	for i := range 40 {
+		messages = append(messages, llm.UserMessage{
+			Role: "user", Content: fmt.Sprintf("message number %d with some content", i),
+		})
+		if got, want := estimate.estimate(messages), estimateMessagesTokens(messages); got != want {
+			t.Fatalf("after %d messages: cached %d, full measurement %d", len(messages), got, want)
+		}
+	}
+
+	// A compaction replaces the transcript with a shorter one.
+	compacted := []agent.Message{
+		llm.UserMessage{Role: "user", Content: "a summary of everything above"},
+		llm.UserMessage{Role: "user", Content: "the most recent turn"},
+	}
+	if got, want := estimate.estimate(compacted), estimateMessagesTokens(compacted); got != want {
+		t.Fatalf("after compaction: cached %d, full measurement %d", got, want)
+	}
+
+	// Growing again from the compacted base must stay correct.
+	compacted = append(compacted, llm.UserMessage{Role: "user", Content: "a new turn after compaction"})
+	if got, want := estimate.estimate(compacted), estimateMessagesTokens(compacted); got != want {
+		t.Fatalf("after regrowth: cached %d, full measurement %d", got, want)
+	}
+}
+
+// TestContextEstimateTracksAMutatingFinalMessage covers the streaming case: the
+// last message is rewritten in place as deltas arrive, so it must not be cached.
+func TestContextEstimateTracksAMutatingFinalMessage(t *testing.T) {
+	var estimate contextEstimate
+	messages := []agent.Message{
+		llm.UserMessage{Role: "user", Content: "question"},
+		llm.AssistantMessage{Role: "assistant", Content: []llm.ContentBlock{llm.TextContent{Type: "text", Text: "par"}}},
+	}
+	first := estimate.estimate(messages)
+
+	messages[1] = llm.AssistantMessage{Role: "assistant", Content: []llm.ContentBlock{
+		llm.TextContent{Type: "text", Text: strings.Repeat("a much longer answer ", 50)},
+	}}
+	second := estimate.estimate(messages)
+	if second <= first {
+		t.Fatalf("estimate did not grow with the streaming message: %d then %d", first, second)
+	}
+	if want := estimateMessagesTokens(messages); second != want {
+		t.Fatalf("cached %d, full measurement %d", second, want)
 	}
 }

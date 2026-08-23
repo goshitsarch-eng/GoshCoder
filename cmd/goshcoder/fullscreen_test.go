@@ -13,6 +13,8 @@ import (
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
+	"os"
+	"sync"
 )
 
 func TestBTWViewDoesNotDuplicateAnsweredQuestion(t *testing.T) {
@@ -93,11 +95,11 @@ func TestOmniNetworkCommandsRunOffTheFullscreenUpdateLoop(t *testing.T) {
 
 func TestFullscreenSuggestionsIncludeNativeOmniAndBTWCommands(t *testing.T) {
 	session := &session{}
-	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil)
+	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil, nil)
 	if len(omni) != 3 || omni[0].label != "status" || omni[1].label != "sync" || omni[2].label != "setup" {
 		t.Fatalf("omni suggestions = %#v", omni)
 	}
-	side := fullscreenSuggestionsWithModels(session, "/btw r", nil)
+	side := fullscreenSuggestionsWithModels(session, "/btw r", nil, nil)
 	if len(side) != 1 || side[0].label != "resume" || side[0].execute {
 		t.Fatalf("btw suggestions = %#v", side)
 	}
@@ -138,11 +140,11 @@ func TestModelPickerFiltersAndMarksCurrentModel(t *testing.T) {
 		{ref: "vendor/alpha", name: "Alpha", provider: "vendor", current: true},
 		{ref: "vendor/beta-code", name: "Beta Coder", provider: "vendor", context: 200_000, reasoning: true},
 	}
-	items := fullscreenSuggestionsWithModels(session, "/model beta", choices)
+	items := fullscreenSuggestionsWithModels(session, "/model beta", choices, nil)
 	if len(items) != 1 || items[0].label != "Beta Coder" || items[0].value != "/model vendor/beta-code" {
 		t.Fatalf("model suggestions = %#v", items)
 	}
-	items = fullscreenSuggestionsWithModels(session, "/model ", choices)
+	items = fullscreenSuggestionsWithModels(session, "/model ", choices, nil)
 	if len(items) != 2 || !items[0].current {
 		t.Fatalf("unfiltered model suggestions = %#v", items)
 	}
@@ -319,6 +321,16 @@ func fullscreenTestSession(model *llm.Model, thinking llm.ModelThinkingLevel) *s
 	}
 }
 
+// newFullscreenTestSessionForKeys builds a minimal idle session for key-handler
+// tests.
+func newFullscreenTestSessionForKeys(t *testing.T) *session {
+	t.Helper()
+	return fullscreenTestSession(&llm.Model{
+		ID: "test-model", Name: "Test", Provider: "test", API: "test-api",
+		ContextWindow: 128000, MaxTokens: 4096,
+	}, llm.ThinkingOff)
+}
+
 func TestFullscreenEditorHistory(t *testing.T) {
 	editor := fullscreenEditor{history: []string{"first", "second"}, historyIndex: -1, input: []rune("draft")}
 	editor.cursor = len(editor.input)
@@ -330,4 +342,75 @@ func TestFullscreenEditorHistory(t *testing.T) {
 	if string(editor.input) != "draft" {
 		t.Fatalf("input = %q", editor.input)
 	}
+}
+
+// TestRunFullscreenCommandDoesNotCorruptStderr covers the os.Stderr swap.
+// runFullscreenCommand is reachable from both the Bubble Tea update loop and a
+// tea.Cmd goroutine, and two overlapping calls each restored what they found --
+// so the later one restored the earlier one's already-closed pipe and every
+// subsequent write to stderr failed for the rest of the process's life.
+func TestRunFullscreenCommandDoesNotCorruptStderr(t *testing.T) {
+	original := os.Stderr
+	t.Cleanup(func() { os.Stderr = original })
+
+	session := &session{}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = runFullscreenCommand(session, "/help")
+		}()
+	}
+	wg.Wait()
+
+	if os.Stderr != original {
+		t.Fatal("os.Stderr was left pointing at a capture pipe")
+	}
+	// Writing must still reach a live file descriptor.
+	if _, err := os.Stderr.Write(nil); err != nil {
+		t.Fatalf("stderr is no longer writable: %v", err)
+	}
+}
+
+// TestCtrlCRequiresConfirmationAtAnIdlePrompt covers accidental data loss. The
+// transcript lives only in memory, so a single mistyped Ctrl+C at an empty idle
+// prompt used to discard the whole conversation with no way back.
+func TestCtrlCRequiresConfirmationAtAnIdlePrompt(t *testing.T) {
+	model := newFullscreenModel(newFullscreenTestSessionForKeys(t), nil, nil)
+
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); isQuit(cmd) {
+		t.Fatal("a single Ctrl+C quit immediately, discarding the session")
+	}
+	if !strings.Contains(model.activity, "Ctrl+C again") {
+		t.Fatalf("no confirmation hint shown: %q", model.activity)
+	}
+
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); !isQuit(cmd) {
+		t.Fatal("a second Ctrl+C did not quit")
+	}
+}
+
+// TestCtrlCArmingIsClearedByOtherKeys keeps a stale first press from turning a
+// much later Ctrl+C into an immediate exit.
+func TestCtrlCArmingIsClearedByOtherKeys(t *testing.T) {
+	model := newFullscreenModel(newFullscreenTestSessionForKeys(t), nil, nil)
+
+	model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	model.handleTeaKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	model.clearInput()
+
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); isQuit(cmd) {
+		t.Fatal("Ctrl+C quit immediately after intervening input re-armed it")
+	}
+}
+
+// isQuit reports whether cmd is tea.Quit.
+func isQuit(cmd tea.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	_, ok := cmd().(tea.QuitMsg)
+	return ok
 }

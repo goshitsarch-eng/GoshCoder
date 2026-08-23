@@ -91,8 +91,37 @@ func (b BrowserReviewer) review(ctx context.Context, title, markdown, previous s
 	token := hex.EncodeToString(tokenBytes)
 	result := make(chan Decision, 1)
 	var once sync.Once
+	expectedHost := listener.Addr().String()
+	// A browser reaching this server through an attacker-controlled hostname
+	// that resolves to 127.0.0.1 would otherwise be served the plan and the
+	// CSRF token, and could then post a decision. Requiring the Host header to
+	// be the address actually bound closes that rebinding path.
+	allowedHost := func(r *http.Request) bool {
+		host := r.Host
+		if host == expectedHost {
+			return true
+		}
+		hostname, port, err := net.SplitHostPort(host)
+		if err != nil {
+			return false
+		}
+		_, expectedPort, err := net.SplitHostPort(expectedHost)
+		if err != nil || port != expectedPort {
+			return false
+		}
+		if hostname == "localhost" {
+			return true
+		}
+		ip := net.ParseIP(hostname)
+		return ip != nil && ip.IsLoopback()
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !allowedHost(r) {
+			http.Error(w, "unexpected Host header", http.StatusMisdirectedRequest)
+			return
+		}
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
 			return
@@ -164,14 +193,24 @@ func (b BrowserReviewer) review(ctx context.Context, title, markdown, previous s
 	}()
 
 	reviewURL := "http://" + listener.Addr().String() + "/"
-	if b.Notify != nil {
-		b.Notify("Planner review: " + reviewURL)
-	}
 	opener := b.OpenBrowser
 	if opener == nil {
 		opener = openBrowser
 	}
-	_ = opener(reviewURL)
+	// Open the browser first so the notice can say whether it worked. The port
+	// is ephemeral, so if the browser did not open and the URL is not shown,
+	// there is no way to reach the review and the tool blocks until the user
+	// aborts the turn -- which is what happens on a headless box with no
+	// xdg-open.
+	openErr := opener(reviewURL)
+	if b.Notify != nil {
+		if openErr != nil {
+			b.Notify("Planner review: could not open a browser (" + openErr.Error() +
+				"). Open this URL to continue:\n" + reviewURL)
+		} else {
+			b.Notify("Planner review: " + reviewURL)
+		}
+	}
 
 	select {
 	case decision := <-result:

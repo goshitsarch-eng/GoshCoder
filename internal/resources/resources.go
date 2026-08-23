@@ -60,11 +60,26 @@ func Discover(cwd, agentDir string) (*Set, error) {
 	}
 	result := &Set{}
 	result.ContextFiles = discoverContextFiles(root, agentDir, &result.Warnings)
-	result.CustomSystem = firstFile(
-		filepath.Join(root, ".pi", "SYSTEM.md"),
-		filepath.Join(root, ".goshcoder", "SYSTEM.md"),
-		filepath.Join(agentDir, "SYSTEM.md"),
-	)
+	// A SYSTEM.md replaces the entire system prompt rather than adding to it,
+	// so whoever supplies it controls the agent's instructions. The user's own
+	// agent directory is therefore consulted first: cloning a repository must
+	// not silently override the prompt its owner configured. A workspace copy
+	// still works -- that is the point of the feature -- but it is announced
+	// rather than applied invisibly.
+	result.CustomSystem = readText(filepath.Join(agentDir, "SYSTEM.md"))
+	if result.CustomSystem == "" {
+		for _, candidate := range []string{
+			filepath.Join(root, ".pi", "SYSTEM.md"),
+			filepath.Join(root, ".goshcoder", "SYSTEM.md"),
+		} {
+			if text := readText(candidate); text != "" {
+				result.CustomSystem = text
+				result.Warnings = append(result.Warnings, fmt.Sprintf(
+					"%s replaces the whole system prompt; review it if this repository is not yours", candidate))
+				break
+			}
+		}
+	}
 	var appendParts []string
 	for _, name := range []string{
 		filepath.Join(agentDir, "APPEND_SYSTEM.md"),
@@ -87,6 +102,13 @@ func discoverContextFiles(cwd, agentDir string, warnings *[]string) []ContextFil
 	add := func(path string) {
 		absolute, _ := filepath.Abs(path)
 		if seen[absolute] {
+			return
+		}
+		// Refuse a symlink: a repository can ship AGENTS.md pointing at the
+		// user's SSH key or auth.json, and the content of every context file
+		// is injected into the system prompt and sent to the model provider.
+		if info, lstatErr := os.Lstat(path); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			*warnings = append(*warnings, fmt.Sprintf("context %s: ignored because it is a symbolic link", path))
 			return
 		}
 		content, err := readLimited(path)
@@ -269,7 +291,8 @@ func (set *Set) BuildSystemPrompt(explicit, cwd string, toolNames []string) stri
 	if len(set.ContextFiles) > 0 {
 		base += "\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n"
 		for _, file := range set.ContextFiles {
-			base += fmt.Sprintf("<project_instructions path=%q>\n%s\n</project_instructions>\n\n", filepath.ToSlash(file.Path), file.Content)
+			base += fmt.Sprintf("<project_instructions path=%q>\n%s\n</project_instructions>\n\n",
+				filepath.ToSlash(file.Path), sealDelimiters(file.Content))
 		}
 		base += "</project_context>"
 	}
@@ -290,6 +313,26 @@ func (set *Set) BuildSystemPrompt(explicit, cwd string, toolNames []string) stri
 	}
 	absolute, _ := filepath.Abs(cwd)
 	return base + "\nCurrent working directory: " + filepath.ToSlash(absolute)
+}
+
+// sealDelimiters neutralises the framing tags inside untrusted context content.
+//
+// Project context is interpolated between <project_instructions> tags, and its
+// content comes from files in whatever repository the user happens to have
+// open. Without this an AGENTS.md that contains the closing tag can break out
+// of its container and address the model as if it were the harness itself.
+//
+// Only the delimiters are altered, not the whole text: escaping every angle
+// bracket would mangle ordinary Markdown and code samples that the file is
+// there to communicate.
+func sealDelimiters(content string) string {
+	replacer := strings.NewReplacer(
+		"</project_instructions>", "<\u200b/project_instructions>",
+		"<project_instructions", "<\u200bproject_instructions",
+		"</project_context>", "<\u200b/project_context>",
+		"<project_context>", "<\u200bproject_context>",
+	)
+	return replacer.Replace(content)
 }
 
 func toolSnippet(name string) string {
@@ -481,11 +524,19 @@ func ancestorDirectories(path string) []string {
 	return result
 }
 
+// ancestorDirectoriesUntilGit lists path and its ancestors, stopping at the
+// repository root.
+//
+// The stop condition used fileExists, which requires a *regular* file, but .git
+// is a directory in an ordinary clone -- it is only a file in a worktree or a
+// submodule. So the walk never stopped and ran all the way to the filesystem
+// root, reaching sibling checkouts and the user's home directory and offering
+// their skills to the model as if they belonged to this project.
 func ancestorDirectoriesUntilGit(path string) []string {
 	var result []string
 	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
 		result = append(result, current)
-		if fileExists(filepath.Join(current, ".git")) {
+		if isRepositoryRoot(current) {
 			break
 		}
 		parent := filepath.Dir(current)
@@ -494,6 +545,12 @@ func ancestorDirectoriesUntilGit(path string) []string {
 		}
 	}
 	return result
+}
+
+// isRepositoryRoot reports whether dir holds a .git entry, of either shape.
+func isRepositoryRoot(dir string) bool {
+	_, err := os.Lstat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 func readLimited(path string) (string, error) {
@@ -518,15 +575,6 @@ func readText(path string) string {
 		return ""
 	}
 	return text
-}
-
-func firstFile(paths ...string) string {
-	for _, path := range paths {
-		if text := readText(path); text != "" {
-			return text
-		}
-	}
-	return ""
 }
 
 func fileExists(path string) bool {

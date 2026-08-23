@@ -472,15 +472,21 @@ func (a *Agent) Continue() error {
 
 	last := messages[len(messages)-1]
 	if RoleOf(last) == "assistant" {
+		// Drain one queue at a time. Draining both up front discarded the
+		// follow-ups whenever steering also had messages, because only one
+		// drain result is ever run.
 		a.mu.Lock()
 		queuedSteering := a.steeringQueue.drain()
-		queuedFollowUps := a.followUpQueue.drain()
 		a.mu.Unlock()
 		if len(queuedSteering) > 0 {
 			// skipInitialSteeringPoll: the drained messages are the prompt, so
 			// the loop must not immediately re-poll the (now empty) queue.
 			return a.runPromptMessages(queuedSteering, true)
 		}
+
+		a.mu.Lock()
+		queuedFollowUps := a.followUpQueue.drain()
+		a.mu.Unlock()
 		if len(queuedFollowUps) > 0 {
 			return a.runPromptMessages(queuedFollowUps, false)
 		}

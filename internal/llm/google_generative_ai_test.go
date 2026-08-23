@@ -941,3 +941,63 @@ func TestGoogleImageToolResultNestsForGemini3(t *testing.T) {
 		}
 	})
 }
+
+// TestGoogleTruncationIsNotMaskedAsToolUse covers a stop reason that was being
+// overwritten. Any finishReason was promoted to toolUse whenever a tool call
+// was present, so a MAX_TOKENS truncation reported as toolUse -- and the agent
+// loop's guard against tool calls parsed out of a truncated response, which
+// keys off StopLength, never fired for this API.
+func TestGoogleTruncationIsNotMaskedAsToolUse(t *testing.T) {
+	body := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"path":"a.go"}}}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7,"totalTokenCount":12}}
+
+`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+
+	model := testGoogleModel(server.URL)
+	options := &GoogleOptions{}
+	options.APIKey = "k"
+	result, err := StreamGoogleGenerativeAI(model,
+		&Context{
+			Messages: []Message{UserMessage{Role: "user", Content: "read it"}},
+			Tools:    []Tool{{Name: "read", Description: "read", Parameters: []byte(`{"type":"object","properties":{"path":{"type":"string"}}}`)}},
+		}, options).Result(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != StopLength {
+		t.Fatalf("stop reason = %q, want StopLength so the truncation guard fires", result.StopReason)
+	}
+	if result.RawStopReason != "MAX_TOKENS" {
+		t.Fatalf("raw stop reason = %q", result.RawStopReason)
+	}
+}
+
+// TestGoogleCleanStopWithToolCallIsToolUse is the negative control.
+func TestGoogleCleanStopWithToolCallIsToolUse(t *testing.T) {
+	body := `data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"path":"a.go"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":7,"totalTokenCount":12}}
+
+`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+
+	options := &GoogleOptions{}
+	options.APIKey = "k"
+	result, err := StreamGoogleGenerativeAI(testGoogleModel(server.URL),
+		&Context{
+			Messages: []Message{UserMessage{Role: "user", Content: "read it"}},
+			Tools:    []Tool{{Name: "read", Description: "read", Parameters: []byte(`{"type":"object","properties":{"path":{"type":"string"}}}`)}},
+		}, options).Result(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != StopToolUse {
+		t.Fatalf("stop reason = %q, want StopToolUse", result.StopReason)
+	}
+}
