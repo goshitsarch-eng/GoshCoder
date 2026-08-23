@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -12,6 +13,7 @@ import (
 	"goshcoder/internal/llm"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
+	"goshcoder/internal/sessionlog"
 	"goshcoder/internal/tools"
 	"os"
 	"sync"
@@ -95,11 +97,11 @@ func TestOmniNetworkCommandsRunOffTheFullscreenUpdateLoop(t *testing.T) {
 
 func TestFullscreenSuggestionsIncludeNativeOmniAndBTWCommands(t *testing.T) {
 	session := &session{}
-	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil, nil)
+	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil, nil, nil)
 	if len(omni) != 3 || omni[0].label != "status" || omni[1].label != "sync" || omni[2].label != "setup" {
 		t.Fatalf("omni suggestions = %#v", omni)
 	}
-	side := fullscreenSuggestionsWithModels(session, "/btw r", nil, nil)
+	side := fullscreenSuggestionsWithModels(session, "/btw r", nil, nil, nil)
 	if len(side) != 1 || side[0].label != "resume" || side[0].execute {
 		t.Fatalf("btw suggestions = %#v", side)
 	}
@@ -140,11 +142,11 @@ func TestModelPickerFiltersAndMarksCurrentModel(t *testing.T) {
 		{ref: "vendor/alpha", name: "Alpha", provider: "vendor", current: true},
 		{ref: "vendor/beta-code", name: "Beta Coder", provider: "vendor", context: 200_000, reasoning: true},
 	}
-	items := fullscreenSuggestionsWithModels(session, "/model beta", choices, nil)
+	items := fullscreenSuggestionsWithModels(session, "/model beta", choices, nil, nil)
 	if len(items) != 1 || items[0].label != "Beta Coder" || items[0].value != "/model vendor/beta-code" {
 		t.Fatalf("model suggestions = %#v", items)
 	}
-	items = fullscreenSuggestionsWithModels(session, "/model ", choices, nil)
+	items = fullscreenSuggestionsWithModels(session, "/model ", choices, nil, nil)
 	if len(items) != 2 || !items[0].current {
 		t.Fatalf("unfiltered model suggestions = %#v", items)
 	}
@@ -288,7 +290,7 @@ func TestBubbleTeaCommandPaletteRunsPlanner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer workspace.Close()
-	manager, err := plannotator.New(workspace.Root, filepath.Join(t.TempDir(), "plan.json"), nil)
+	manager, err := plannotator.New(workspace.Root, nil, plannotator.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,14 +376,16 @@ func TestRunFullscreenCommandDoesNotCorruptStderr(t *testing.T) {
 	}
 }
 
-// TestCtrlCRequiresConfirmationAtAnIdlePrompt covers accidental data loss. The
-// transcript lives only in memory, so a single mistyped Ctrl+C at an empty idle
-// prompt used to discard the whole conversation with no way back.
-func TestCtrlCRequiresConfirmationAtAnIdlePrompt(t *testing.T) {
+// TestCtrlCStillConfirmsWhenNothingIsBeingSaved covers accidental data loss in
+// the states where the transcript really is only in memory: -no-session, a
+// session opened read-only because another window holds the claim, and a
+// recorder that stopped after a write failure. In those, one mistyped Ctrl+C at
+// an empty idle prompt discards the whole conversation with no way back.
+func TestCtrlCStillConfirmsWhenNothingIsBeingSaved(t *testing.T) {
 	model := newFullscreenModel(newFullscreenTestSessionForKeys(t), nil, nil)
 
 	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); isQuit(cmd) {
-		t.Fatal("a single Ctrl+C quit immediately, discarding the session")
+		t.Fatal("a single Ctrl+C quit immediately, discarding an unsaved session")
 	}
 	if !strings.Contains(model.activity, "Ctrl+C again") {
 		t.Fatalf("no confirmation hint shown: %q", model.activity)
@@ -390,6 +394,59 @@ func TestCtrlCRequiresConfirmationAtAnIdlePrompt(t *testing.T) {
 	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); !isQuit(cmd) {
 		t.Fatal("a second Ctrl+C did not quit")
 	}
+}
+
+// TestCtrlCQuitsImmediatelyWhenTheSessionIsRecorded is the other half: once the
+// conversation is durable, the confirmation is friction with nothing behind it.
+// This is the behaviour change persistence buys, and asserting it is what stops
+// the guard being reinstated by reflex later.
+func TestCtrlCQuitsImmediatelyWhenTheSessionIsRecorded(t *testing.T) {
+	s := newFullscreenTestSessionForKeys(t)
+	attachTestRecorder(t, s)
+	model := newFullscreenModel(s, nil, nil)
+
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); !isQuit(cmd) {
+		t.Fatal("Ctrl+C did not quit even though the session is on disk")
+	}
+}
+
+// TestCtrlCConfirmsAgainOnceRecordingStops covers the state the fail-soft
+// recorder creates: a write failure stops recording mid-session, and from that
+// point the transcript is memory-only again, so the guard has to come back.
+func TestCtrlCConfirmsAgainOnceRecordingStops(t *testing.T) {
+	s := newFullscreenTestSessionForKeys(t)
+	writer := attachTestRecorder(t, s)
+	model := newFullscreenModel(s, nil, nil)
+
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); !isQuit(cmd) {
+		t.Fatal("Ctrl+C did not quit while recording")
+	}
+	model.quitArmedAt = time.Time{}
+
+	// Closing the writer is what a failed write leaves behind: a recorder that
+	// is no longer reaching disk.
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if s.recordingActive() {
+		t.Fatal("the session still reports itself as recording")
+	}
+	if cmd := model.handleTeaKey(tea.KeyMsg{Type: tea.KeyCtrlC}); isQuit(cmd) {
+		t.Fatal("Ctrl+C quit immediately even though recording had stopped")
+	}
+}
+
+// attachTestRecorder gives a test session a real session file.
+func attachTestRecorder(t *testing.T, s *session) *sessionlog.Writer {
+	t.Helper()
+	store := sessionlog.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	writer, err := store.Create(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	s.log = newSessionRecorder(writer, nil)
+	t.Cleanup(func() { _ = s.log.close() })
+	return writer
 }
 
 // TestCtrlCArmingIsClearedByOtherKeys keeps a stale first press from turning a

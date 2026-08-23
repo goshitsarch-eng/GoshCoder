@@ -23,6 +23,7 @@ import (
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/sessionlog"
 	"goshcoder/internal/tui"
 )
 
@@ -107,9 +108,19 @@ type fullscreenModel struct {
 	// holding a key that triggered it forked one git process per repeat.
 	gitRefreshWanted   bool
 	gitRefreshInFlight bool
+	// sessionChoices caches the resume picker's candidates. suggestions() runs
+	// inside View(), so an uncached picker would re-read every file in the
+	// session shard on every keystroke and on every 120 ms tick -- the same
+	// mistake /login had to be rescued from.
+	sessionChoices      []sessionlog.Info
+	sessionChoicesValid bool
+	// sessionScanRunning / sessionScanResult move the scan off the render
+	// goroutine entirely: populating the cache parses every session file in the
+	// shard and can fork git, which must never happen inside View().
+	sessionScanRunning bool
+	sessionScanResult  chan []sessionlog.Info
 	// quitArmedAt is when Ctrl+C was last pressed at an idle empty prompt.
-	// A session holds the entire conversation in memory and nothing on disk,
-	// so one stray keystroke used to destroy work with no way back.
+	// It only arms when nothing is being saved: see handleTeaKey.
 	quitArmedAt time.Time
 }
 
@@ -124,6 +135,8 @@ func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAg
 		updates:   updates,
 		lifecycle: lifecycle,
 		models:    availableFullscreenModels(session),
+
+		sessionScanResult: make(chan []sessionlog.Info, 1),
 
 		renderCache: tui.NewMessageCache(),
 	}
@@ -140,6 +153,9 @@ func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAg
 }
 
 func runFullscreenChat(session *session) error {
+	fullscreenActive.Store(true)
+	defer fullscreenActive.Store(false)
+
 	// Streaming deltas are coalesced, while lifecycle/tool events use a
 	// separate queue so a delta flood can never hide activity changes.
 	updates := make(chan fullscreenAgentEvent, 1)
@@ -153,7 +169,25 @@ func runFullscreenChat(session *session) error {
 			}
 			return
 		}
-		lifecycle <- message
+		// Never block here. This listener runs inside the agent's emit, which
+		// holds the lock the state setters also take -- and the only drainer of
+		// this channel is the Bubble Tea update loop. A blocking send therefore
+		// self-deadlocks the moment the update loop calls SetModel with the
+		// channel full: it waits for a drain only it can perform.
+		//
+		// Dropping is safe because these events are cosmetic. applyAgentEvent
+		// sets activity strings; the transcript itself is rendered from the
+		// agent's own state, which refreshRealtimeInfo re-reads. The coalescing
+		// updates channel is used as the overflow path so a redraw still
+		// happens and the dropped status simply resolves one frame later.
+		select {
+		case lifecycle <- message:
+		default:
+			select {
+			case updates <- message:
+			default:
+			}
+		}
 	})
 	defer unsubscribe()
 
@@ -284,6 +318,7 @@ func (model *fullscreenModel) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		// immediately.
 		model.models = availableFullscreenModels(model.session)
 		model.invalidateLoginSuggestions()
+		model.invalidateSessionSuggestions()
 		model.notices = appendNotice(model.notices, "Login", "Added "+value.provider+". Use /model to switch providers.")
 		model.activity = "Logged in to " + value.provider
 
@@ -415,10 +450,11 @@ func (model *fullscreenModel) View() string {
 		planItems = model.session.plan.State().Items
 	}
 	frame := tui.Frame{
-		Cache:              model.renderCache,
-		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
-		Messages:           messages,
-		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool, planItems),
+		Cache:    model.renderCache,
+		Title:    fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
+		Messages: messages,
+		Sidebar: fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity,
+			len(state.PendingToolCalls), model.recentTool, planItems, model.session.sidebarStorageLine()),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,
 		Status:             status,
@@ -461,13 +497,23 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 			model.activity = "Aborting"
 			return nil
 		}
-		// Require confirmation. The transcript exists only in memory, so a
-		// single mistyped Ctrl+C threw away the whole conversation.
+		// Confirmation is only warranted when quitting would actually lose
+		// something. Once the conversation is on disk, a second keypress is
+		// friction with nothing behind it.
+		//
+		// The branch stays for the cases where the transcript really is only in
+		// memory: -no-session, a session opened read-only because another
+		// window holds the claim, and a recorder that stopped after a write
+		// failure. Those are exactly the states in which this guard earns its
+		// keep, so it is made conditional rather than deleted.
+		if model.session.recordingActive() {
+			return tea.Quit
+		}
 		if !model.quitArmedAt.IsZero() && time.Since(model.quitArmedAt) < quitConfirmWindow {
 			return tea.Quit
 		}
 		model.quitArmedAt = time.Now()
-		model.activity = "Press Ctrl+C again to exit (this session is not saved)"
+		model.activity = "Press Ctrl+C again to exit (this session is not being saved)"
 		// Keep the spinner loop alive long enough for the hint to expire on
 		// its own if the user does nothing.
 		return fullscreenTickCommand()
@@ -1005,6 +1051,9 @@ func fullscreenLoginCommand(providerID string) tea.Cmd {
 
 func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 	model.busyCommand = false
+	// Any command may have named, switched or removed a session, so the picker's
+	// cached candidates are stale from here.
+	model.invalidateSessionSuggestions()
 	if result.output != "" {
 		model.notices = appendNotice(model.notices, "Command", result.output)
 	}
@@ -1035,7 +1084,10 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 		return false
 	}
 	command := fields[0]
-	return command == "/compact" || (command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
+	return command == "/compact" || command == "/sessions" || command == "/resume" ||
+		command == "/tree" || command == "/fork" || command == "/clone" ||
+		command == "/export" || command == "/import" ||
+		(command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
 		command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
 		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
 		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
@@ -1043,7 +1095,7 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
 	return fullscreenSuggestionsWithModels(model.session, string(model.editor.input), model.models,
-		model.cachedLoginSuggestions)
+		model.cachedLoginSuggestions, model.cachedSessionSuggestions)
 }
 
 func (model *fullscreenModel) selectedSuggestion(count int) int {
@@ -1163,18 +1215,22 @@ func (model *fullscreenModel) deletePreviousWord() {
 }
 
 func fullscreenSuggestions(session *session, input string) []fullscreenSuggestion {
-	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session), nil)
+	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session), nil, nil)
 }
 
 // loginSuggestions is how the picker for "/login <query>" is produced. The
 // fullscreen model passes a cached implementation, because the uncached one
 // resolves credentials for every provider and must not run on the render path.
 func fullscreenSuggestionsWithModels(session *session, input string, models []fullscreenModelChoice,
-	loginSuggestions func(string) []fullscreenSuggestion) []fullscreenSuggestion {
+	loginSuggestions func(string) []fullscreenSuggestion,
+	sessionSuggestions func(string) []fullscreenSuggestion) []fullscreenSuggestion {
 	if loginSuggestions == nil {
 		loginSuggestions = fullscreenLoginSuggestions
 	}
 	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/resume ") && sessionSuggestions != nil {
+		return sessionSuggestions(strings.TrimSpace(strings.TrimPrefix(input[len("/resume "):], " ")))
+	}
 	if strings.HasPrefix(lower, "/model ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/model "))
 		terms := strings.Fields(query)
@@ -1489,6 +1545,9 @@ func containsString(values []string, target string) bool {
 
 func fullscreenSuggestionTitle(input string) string {
 	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/resume ") {
+		return "RESUME SESSION  ·  type to search names and transcripts"
+	}
 	if strings.HasPrefix(lower, "/model ") {
 		return "SELECT MODEL  ·  type to filter authenticated providers"
 	}

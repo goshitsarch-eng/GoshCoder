@@ -87,6 +87,7 @@ func chatCommand(args []string) error {
 	if err := validateSessionFlags(cfg); err != nil {
 		return err
 	}
+	markModelProvenance(flags, cfg)
 	// Planner commands are available in chat even when plan mode was not
 	// requested at startup.
 	cfg.LoadPlannotator = true
@@ -111,6 +112,9 @@ func chatCommand(args []string) error {
 	if cfg.Fullscreen {
 		return runFullscreenChat(s)
 	}
+	for _, notice := range s.drainStartupNotices() {
+		fmt.Fprintln(os.Stderr, dim("session: "+notice))
+	}
 
 	// Ctrl-C aborts a turn; when idle it closes stdin so the read loop ends.
 	stop := s.handleInterrupts(func() {
@@ -128,6 +132,13 @@ func chatCommand(args []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf(
 			"goshcoder %s · %s/%s · /help for commands", Version, s.model.Provider, s.model.ID)))
+	}
+
+	if banner := s.resumeBanner; banner != "" {
+		renderRestoredTranscript(s.restoredMessages, banner)
+	}
+	if hint := s.exitHint(); hint != "" {
+		fmt.Fprintln(os.Stderr, dim(hint))
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -287,20 +298,26 @@ func userMessage(text string) llm.UserMessage {
 	return llm.UserMessage{Role: "user", Content: text, Timestamp: time.Now().UnixMilli()}
 }
 
+// chatCommandAliases preserves the old upstream command names.
+//
+// A package-level table rather than an inline switch so the prompt-name
+// validator can read the real thing: a saved prompt called "plannotator" would
+// otherwise shadow an alias that still works, and a copied list would drift.
+var chatCommandAliases = map[string]string{
+	"/plannator":            "/planner",
+	"/plannotator":          "/planner",
+	"/plannotator-review":   "/planner-review",
+	"/plannotator-annotate": "/planner-annotate",
+	"/plannotator-last":     "/planner-last",
+}
+
 // handleSlashCommand runs one slash command. exit is true when chat should end.
 func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	command, rest, _ := strings.Cut(input, " ")
 	rest = strings.TrimSpace(rest)
 	// Preserve the old upstream command names as hidden compatibility aliases.
-	switch command {
-	case "/plannator", "/plannotator":
-		command = "/planner"
-	case "/plannotator-review":
-		command = "/planner-review"
-	case "/plannotator-annotate":
-		command = "/planner-annotate"
-	case "/plannotator-last":
-		command = "/planner-last"
+	if canonical, ok := chatCommandAliases[command]; ok {
+		command = canonical
 	}
 
 	switch command {
@@ -417,10 +434,103 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	case "/messages":
 		printTranscriptSummary(s.agent.State().Messages)
 
-	case "/status", "/session", "/sidebar":
+	case "/status", "/sidebar":
 		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
 			fmt.Fprintln(os.Stderr, line)
 		}
+
+	case "/session":
+		// Extended rather than replaced: the card is what people already reach
+		// for, and pi's /session means the same thing.
+		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		for _, line := range s.sessionStorageLines() {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/tree":
+		if s.log == nil {
+			return false, errors.New("this session is not being saved, so it has no tree")
+		}
+		for _, line := range treeLines(s.log.snapshot(), s.log.leaf()) {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/fork":
+		if err := s.forkTo(rest); err != nil {
+			return false, err
+		}
+
+	case "/label":
+		if err := s.labelPoint(rest); err != nil {
+			return false, err
+		}
+
+	case "/clone":
+		if err := s.cloneSession(); err != nil {
+			return false, err
+		}
+		for _, notice := range s.drainNotices() {
+			fmt.Fprintln(os.Stderr, dim(notice.Kind+": "+notice.Text))
+		}
+
+	case "/export":
+		if s.log == nil {
+			return false, errors.New("this session is not being saved, so there is nothing to export")
+		}
+		s.log.sync()
+		args := []string{s.log.id()}
+		if rest != "" {
+			args = append(args, strings.Fields(rest)...)
+		}
+		if err := sessionsExport(args); err != nil {
+			return false, err
+		}
+
+	case "/import":
+		if rest == "" {
+			return false, errors.New("/import needs a path to a .jsonl session file")
+		}
+		if err := sessionsImport(strings.Fields(rest)); err != nil {
+			return false, err
+		}
+
+	case "/prompt", "/prompts":
+		if err := s.handlePromptCommand(rest); err != nil {
+			return false, err
+		}
+
+	case "/sessions":
+		for _, line := range sessionListLines(s.workspaceRoot()) {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/resume":
+		if rest == "" {
+			return false, errors.New("/resume needs a session id, prefix, or path")
+		}
+		if err := s.switchSession(rest); err != nil {
+			return false, err
+		}
+		for _, notice := range s.drainNotices() {
+			fmt.Fprintln(os.Stderr, dim(notice.Kind+": "+notice.Text))
+		}
+		renderRestoredTranscript(s.restoredMessages, "resumed transcript")
+
+	case "/name":
+		if rest == "" {
+			if name := s.sessionName(); name != "" {
+				fmt.Fprintln(os.Stderr, name)
+			} else {
+				fmt.Fprintln(os.Stderr, dim("this session has no name; /name <text> sets one"))
+			}
+			return false, nil
+		}
+		if err := s.setSessionName(rest); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", dim("session named "+rest))
 
 	case "/hotkeys":
 		fmt.Fprintln(os.Stderr, `Enter       send or accept selection
@@ -457,9 +567,13 @@ Ctrl-D      quit when the editor is empty`)
 		}
 
 	case "/clear", "/new":
-		if err := s.agent.Reset(); err != nil {
+		// The pre-clear transcript stays in the session file behind a reset
+		// marker rather than being rotated into a new one, so an accidental
+		// /clear is recoverable with `sessions show --full`.
+		if err := s.agent.ResetWithReason(command); err != nil {
 			return false, err
 		}
+		s.contextEstimate.reset()
 		fmt.Fprintf(os.Stderr, "%s\n", dim("transcript cleared"))
 
 	case "/compact":

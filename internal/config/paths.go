@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"goshcoder/internal/atomicfile"
 )
 
 // DirName is the per-user configuration directory name.
@@ -64,6 +66,14 @@ func OmniRoutePath() string { return filepath.Join(AgentDir(), "omniroute.json")
 // BTWPath stores the native pi-btw model and thinking preferences.
 func BTWPath() string { return filepath.Join(AgentDir(), "pi-btw.json") }
 
+// SessionsDir returns the root holding persisted session logs. Sessions are
+// sharded beneath it by a cwd-derived directory name; see internal/sessionlog.
+func SessionsDir() string { return filepath.Join(AgentDir(), "sessions") }
+
+// PromptsDir returns the user-scoped prompt template directory. A project may
+// also carry its own under .goshcoder/prompts; see internal/resources.
+func PromptsDir() string { return filepath.Join(AgentDir(), "prompts") }
+
 // DefaultModelPath is the small text file used to remember the last model
 // selected for interactive chat.
 func DefaultModelPath() string { return filepath.Join(AgentDir(), "default-model") }
@@ -85,24 +95,7 @@ func ReadDefaultModel() string {
 
 // WriteDefaultModel atomically remembers the model used by interactive chat.
 func WriteDefaultModel(model string) error {
-	directory, err := EnsureAgentDir()
-	if err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(directory, ".default-model-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := temporary.Name()
-	defer os.Remove(name)
-	if _, err := temporary.WriteString(strings.TrimSpace(model) + "\n"); err != nil {
-		temporary.Close()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, DefaultModelPath())
+	return atomicfile.Write(DefaultModelPath(), []byte(strings.TrimSpace(model)+"\n"), 0o600)
 }
 
 // EnsureAgentDir creates the agent directory if it does not exist. The

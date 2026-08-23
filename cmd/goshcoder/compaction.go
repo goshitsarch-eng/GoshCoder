@@ -86,16 +86,33 @@ func (s *session) compactContext(instructions string) (int, int, error) {
 	if err != nil {
 		return len(state.Messages), len(state.Messages), err
 	}
-	compacted := make([]agent.Message, 0, len(recent)+1)
-	compacted = append(compacted, compactionSummaryMessage{
+	marker := compactionSummaryMessage{
 		Summary: summary, TokensBefore: estimateMessagesTokens(state.Messages),
 		CostBefore: conversationCost(state.Messages), RetainedMessages: len(recent), Timestamp: time.Now().UnixMilli(),
-	})
-	compacted = append(compacted, recent...)
-	s.agent.SetMessages(compacted)
+	}
+	// Compact rather than SetMessages: SetMessages emits nothing, so the
+	// session log would keep appending onto the pre-compaction prefix and the
+	// next resume would replay the whole uncompacted transcript.
+	if err := s.agent.Compact(marker, recent, agent.CompactionInfo{
+		Summary:          marker.Summary,
+		TokensBefore:     marker.TokensBefore,
+		CostBefore:       marker.CostBefore,
+		RetainedMessages: marker.RetainedMessages,
+		Timestamp:        marker.Timestamp,
+	}); err != nil {
+		return len(state.Messages), len(state.Messages), err
+	}
 	s.contextEstimate.reset()
+	// Queued steering and follow-up messages are dropped here because they were
+	// written against a transcript that no longer exists. That is real user
+	// input disappearing, so it is reported rather than done in silence.
+	dropped := s.agent.QueuedMessageCount()
 	s.agent.ClearAllQueues()
-	return len(state.Messages), len(compacted), nil
+	if dropped > 0 {
+		s.pushNotice("Compact", fmt.Sprintf(
+			"%d queued message(s) were discarded: they were written against the transcript that was just compacted", dropped))
+	}
+	return len(state.Messages), len(recent) + 1, nil
 }
 
 func (s *session) maybeAutoCompact() error {

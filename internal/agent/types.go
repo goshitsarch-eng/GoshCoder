@@ -145,6 +145,24 @@ const (
 	EventToolExecutionStart  EventType = "tool_execution_start"
 	EventToolExecutionUpdate EventType = "tool_execution_update"
 	EventToolExecutionEnd    EventType = "tool_execution_end"
+
+	// The four events below have no pi equivalent. They exist because
+	// Subscribe could not see most of what a session recorder has to persist:
+	// SetModel, SetThinkingLevel, Reset and the external SetMessages call that
+	// compaction used all mutated state and emitted nothing. A recorder built
+	// on Subscribe alone therefore kept appending post-compaction messages
+	// onto a pre-compaction prefix, and kept growing across a /clear, so every
+	// resume replayed a duplicated, uncompacted transcript.
+	//
+	// Routing them through the existing emit seam rather than adding a second
+	// recorder interface is what makes their ordering structural: emit holds
+	// emitMu for the whole call, so a SetModel from the interface goroutine
+	// and a message_end from the run goroutine are serialized, and the
+	// recorded order is the state's linearization order.
+	EventModelChange         EventType = "model_change"
+	EventThinkingLevelChange EventType = "thinking_level_change"
+	EventContextCompacted    EventType = "context_compacted"
+	EventTranscriptReset     EventType = "transcript_reset"
 )
 
 // Event is an agent lifecycle event (TS AgentEvent union flattened into one
@@ -179,6 +197,30 @@ type Event struct {
 	// Result is the final tool result on tool_execution_end.
 	Result  *ToolResult
 	IsError bool
+
+	// Provider and ModelID are set on model_change.
+	Provider llm.ProviderID
+	ModelID  string
+	// ThinkingLevel is set on thinking_level_change.
+	ThinkingLevel llm.ModelThinkingLevel
+	// Compaction and Kept are set on context_compacted: the summary marker
+	// that replaced the compacted prefix, and the messages retained after it.
+	Compaction *CompactionInfo
+	Kept       []Message
+	// Reason is set on transcript_reset, naming what cleared the transcript.
+	Reason string
+}
+
+// CompactionInfo describes a compaction for the session log. The cost and
+// retained-message count are carried because the interface derives spend and
+// context usage from the in-memory marker, and a resume that reconstructed the
+// marker without them would silently misreport both.
+type CompactionInfo struct {
+	Summary          string
+	TokensBefore     int
+	CostBefore       float64
+	RetainedMessages int
+	Timestamp        int64
 }
 
 // BeforeToolCallResult is returned from BeforeToolCall. Block prevents the

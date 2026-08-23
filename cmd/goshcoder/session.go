@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -39,6 +38,20 @@ type sessionConfig struct {
 	Fullscreen        bool
 	// Quiet suppresses the startup banner.
 	Quiet bool
+
+	// Session persistence. SessionRef is a path, an exact id, or an id prefix.
+	SessionRef  string
+	Continue    bool
+	Resume      bool
+	NoSession   bool
+	ReadOnly    bool
+	SessionName string
+	SessionsDir string
+	// ModelFromFlag records whether ModelRef came from -m or from the
+	// remembered default. Without it a resumed session cannot tell the user
+	// overriding its model from the CLI merely filling in a default, and would
+	// silently ignore the model the conversation was actually held on.
+	ModelFromFlag bool
 }
 
 // session bundles an agent with the pieces its tools and hooks need.
@@ -81,40 +94,79 @@ type session struct {
 	loopTools  []agent.Tool
 	claudeTUI  bool
 	fullscreen bool
+
+	// log records the conversation to disk. It is nil only when -no-session
+	// was given, and every call site tolerates that rather than branching.
+	log *sessionRecorder
+	// startupNotices are messages produced while opening the session, shown
+	// once by whichever interface starts.
+	startupNotices []string
+	// resumeBanner describes a reopened session, or is empty for a new one.
+	resumeBanner string
+	// restoredMessages is the transcript a resume folded back, retained so the
+	// line-oriented interfaces can print it after construction.
+	restoredMessages []agent.Message
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
 // agent. It returns a usage error when the model is missing or unsupported.
 func newSession(cfg sessionConfig) (*session, error) {
-	if cfg.ModelRef == "" {
-		return nil, errors.New("a model is required (-m provider/model); run 'goshcoder models' to see options")
-	}
-
-	model, _, err := newCatalog().ResolveModel(cfg.ModelRef)
-	if err != nil {
-		return nil, err
-	}
-	if _, ok := llm.GetStreamer(model.API); !ok {
-		return nil, fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
-	}
-
 	resourceRoot, err := filepath.Abs(cfg.Workdir)
 	if err != nil {
 		return nil, err
 	}
+
+	// The session is opened before the model is resolved so that a resumed
+	// conversation's own model can supply the default. Doing this the other way
+	// round -- as this function used to -- means chatCommand's remembered
+	// default is already in ModelRef, and the recorded model is silently
+	// ignored on every resume.
+	opened, err := openSession(cfg, resourceRoot)
+	if err != nil {
+		return nil, err
+	}
+	modelRef, modelNotices := resolveResumedModel(cfg, opened, cfg.ModelFromFlag)
+	if modelRef == "" {
+		if opened.writer != nil {
+			_ = opened.writer.Close()
+		}
+		return nil, errors.New("a model is required (-m provider/model); run 'goshcoder models' to see options")
+	}
+
+	model, _, err := newCatalog().ResolveModel(modelRef)
+	if err != nil {
+		if opened.writer != nil {
+			_ = opened.writer.Close()
+		}
+		return nil, err
+	}
+	if _, ok := llm.GetStreamer(model.API); !ok {
+		if opened.writer != nil {
+			_ = opened.writer.Close()
+		}
+		return nil, fmt.Errorf("model %s uses the %q protocol, which is not implemented yet", model.ID, model.API)
+	}
 	loadedResources, err := coderresources.Discover(resourceRoot, config.AgentDir())
 	if err != nil {
+		closeOpened(opened)
 		return nil, fmt.Errorf("discover local resources: %w", err)
 	}
 	s := &session{
 		model: model, btw: btw.NewManager(), explicitSystemPrompt: cfg.SystemPrompt,
 		resources: loadedResources, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen,
+		startupNotices:   append(append([]string(nil), opened.Notices...), modelNotices...),
+		restoredMessages: opened.restored.Messages,
 	}
+	if opened.writer != nil {
+		s.log = newSessionRecorder(opened.writer, s.pushNotice)
+	}
+	s.resumeBanner = resumeBanner(opened, s.log)
 
 	var agentTools []agent.Tool
 	if cfg.EnableTools || cfg.LoadPlannotator || cfg.EnablePlannotator {
 		workspace, err := tools.NewWorkspace(cfg.Workdir)
 		if err != nil {
+			closeOpened(opened)
 			return nil, err
 		}
 		s.workspace = workspace
@@ -147,7 +199,6 @@ func newSession(cfg sessionConfig) (*session, error) {
 	}
 	if cfg.LoadPlannotator || cfg.EnablePlannotator {
 		root := s.workspace.Root
-		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
 		reviewer := plannotator.BrowserReviewer{Notify: func(message string) {
 			if cfg.Fullscreen {
 				// The fullscreen UI owns the terminal, so this cannot go to
@@ -157,15 +208,30 @@ func newSession(cfg sessionConfig) (*session, error) {
 			}
 			fmt.Fprintln(os.Stderr, message)
 		}}
-		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
+		// Plan state now travels in the session log as a custom entry, which
+		// is what pi documents that entry type for: extension state that
+		// survives a reload and never participates in context.
+		initial := restoredPlannerState(opened, root, &s.startupNotices)
+		manager, err := plannotator.New(root, reviewer, plannotator.Options{
+			Initial: initial,
+			OnChange: func(state plannotator.State) {
+				s.log.recordCustom(plannerCustomType, state)
+				// The adopted per-workspace file is only retired once its
+				// contents have actually been written somewhere durable.
+				retireLegacyPlannerState(root)
+			},
+			Warn: func(message string) { s.pushNotice("Planner", message) },
+		})
 		if err != nil {
 			_ = s.workspace.Close()
+			closeOpened(opened)
 			return nil, err
 		}
 		s.plan = manager
 		if cfg.EnablePlannotator && manager.State().Phase == plannotator.PhaseIdle {
 			if err := manager.Enter(); err != nil {
 				_ = s.workspace.Close()
+				closeOpened(opened)
 				return nil, err
 			}
 		}
@@ -188,6 +254,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 			if s.workspace != nil {
 				_ = s.workspace.Close()
 			}
+			closeOpened(opened)
 			return nil, err
 		}
 		s.loops = ralph.NewStore(root, fmt.Sprintf("cli-%d", os.Getpid()))
@@ -206,10 +273,17 @@ func newSession(cfg sessionConfig) (*session, error) {
 
 	s.agent = agent.NewAgent(agent.AgentOptions{
 		InitialState: &agent.InitialState{
-			SystemPrompt:  systemPrompt,
-			Model:         *model,
-			ThinkingLevel: llm.ClampThinkingLevel(model, cfg.Thinking),
+			SystemPrompt: systemPrompt,
+			Model:        *model,
+			// A resumed session's own thinking level wins over the flag's
+			// default, and is re-clamped because the model it was recorded
+			// against may not be the model this process ended up on.
+			ThinkingLevel: llm.ClampThinkingLevel(model, resumedThinking(cfg.Thinking, opened)),
 			Tools:         agentTools,
+			// Seeded here rather than through SetMessages after construction:
+			// InitialState emits nothing, so the restored transcript is not
+			// re-recorded into the log it just came out of.
+			Messages: opened.restored.Messages,
 		},
 		// Resolve credentials for every provider call. Besides following /model,
 		// this refreshes OAuth during long-running sessions and observes a
@@ -231,10 +305,40 @@ func newSession(cfg sessionConfig) (*session, error) {
 			s.planPrepareNextTurn(),
 		),
 	})
+	// Subscribed unconditionally and before any renderer: one registration
+	// covers line mode, fullscreen, chat and run, and going first means an
+	// entry is durable before anything draws it.
+	if s.log != nil {
+		s.agent.Subscribe(s.log.listener())
+	}
 	if !cfg.Fullscreen {
 		s.agent.Subscribe(renderEvent)
 	}
+	if cfg.SessionName != "" && s.log != nil {
+		s.log.setName(cfg.SessionName)
+	}
 	return s, nil
+}
+
+// closeOpened releases a session opened before construction failed.
+//
+// Every error path after openSession has to do this. Returning without it left
+// the claim held for the stale threshold and a stub session file on disk, so a
+// mistyped -C directory made the next launch report the workspace as busy.
+func closeOpened(opened *openedSession) {
+	if opened != nil && opened.writer != nil {
+		_ = opened.writer.Close()
+	}
+}
+
+// resumedThinking prefers the level a resumed session recorded over the flag
+// default, since -thinking carries a default value on every invocation and
+// would otherwise silently reset a session that was running at "high".
+func resumedThinking(flagLevel string, opened *openedSession) string {
+	if opened != nil && opened.Resumed && opened.restored.ThinkingLevel != "" {
+		return opened.restored.ThinkingLevel
+	}
+	return flagLevel
 }
 
 // resolveOpenAIWebSearchAuth gives the native web search port the same
@@ -387,10 +491,38 @@ func (s *session) reloadResources() error {
 }
 
 func (s *session) close() error {
-	if s == nil || s.workspace == nil {
+	if s == nil {
 		return nil
 	}
-	return s.workspace.Close()
+	// The log closes first: it syncs, releases the claim, and deletes a session
+	// that never got a reply. Doing it after the workspace would leave the
+	// claim held for the stale threshold if closing the workspace failed.
+	var firstErr error
+	if err := s.log.close(); err != nil {
+		firstErr = err
+	}
+	if s.workspace != nil {
+		if err := s.workspace.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// recordingActive reports whether the conversation is reaching disk. The
+// Ctrl+C confirmation and the sidebar both ask.
+func (s *session) recordingActive() bool {
+	return s != nil && s.log != nil && s.log.active()
+}
+
+// drainStartupNotices returns the messages produced while opening the session.
+func (s *session) drainStartupNotices() []string {
+	if s == nil {
+		return nil
+	}
+	notices := s.startupNotices
+	s.startupNotices = nil
+	return notices
 }
 
 // handleInterrupts routes Ctrl-C to the agent so a run aborts and settles

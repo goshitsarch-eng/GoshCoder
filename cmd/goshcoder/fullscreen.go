@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
@@ -31,6 +32,10 @@ type fullscreenEditor struct {
 	suggestion   int
 }
 
+// fullscreenActive marks the window in which the alternate-screen program owns
+// the terminal, so command handlers know not to write to the console.
+var fullscreenActive atomic.Bool
+
 type slashCommand struct {
 	name        string
 	description string
@@ -43,7 +48,12 @@ var fullscreenSlashCommands = []slashCommand{
 	{"/thinking", "Choose reasoning effort for this model"}, {"/tools", "List active tools"},
 	{"/status", "Show session information"}, {"/session", "Show session information"},
 	{"/sidebar", "Show session information"}, {"/hotkeys", "Show keyboard shortcuts"},
-	{"/messages", "Show transcript summary"},
+	{"/messages", "Show transcript summary"}, {"/name", "Name this session"},
+	{"/resume", "Switch to a saved session"}, {"/sessions", "List saved sessions"},
+	{"/prompt", "Save, list, back up, or restore prompts"},
+	{"/tree", "Show rewind points in this session"}, {"/fork", "Rewind to an earlier point"},
+	{"/label", "Name a rewind point"}, {"/clone", "Duplicate this session"},
+	{"/export", "Export this session"}, {"/import", "Adopt a session file"},
 	{"/steer", "Guide the active response"}, {"/followup", "Queue the next message"},
 	{"/queue", "Show queued messages"}, {"/clear", "Clear the transcript"},
 	{"/new", "Start a fresh conversation"}, {"/compact", "Summarize older context"},
@@ -315,7 +325,10 @@ func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	return result
 }
 
-func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem) []string {
+// fullscreenSidebar renders the right-hand panel. storage carries the session's
+// recording state, which is the one thing the panel could not otherwise tell
+// the user: whether closing this window keeps the conversation.
+func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem, storage string) []string {
 	name := info.Name
 	if name == "" {
 		name = "New Session"
@@ -336,12 +349,17 @@ func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pending
 		"title\t" + name,
 		"accent\t" + info.Model,
 		"meta\t" + info.Thinking + " thinking · " + mode,
+	}
+	if storage != "" {
+		lines = append(lines, "meta\t"+storage)
+	}
+	lines = append(lines, []string{
 		"",
 		"section\tContext",
 		fmt.Sprintf("bar\t%d", percent),
 		"meta\t" + contextText,
 		fmt.Sprintf("meta\t%d%% used · $%.4f spent", percent, info.Cost),
-	}
+	}...)
 	if activity != "Ready" || pendingTools > 0 {
 		lines = append(lines, "", "section\tActivity", "active\t"+activity)
 		if pendingTools > 0 {

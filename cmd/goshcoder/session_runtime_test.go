@@ -22,7 +22,7 @@ func TestPlanPrepareNextTurnEnablesFullToolsImmediatelyAfterApproval(t *testing.
 		t.Fatal(err)
 	}
 	defer workspace.Close()
-	manager, err := plannotator.New(root, filepath.Join(t.TempDir(), "state.json"), nil)
+	manager, err := plannotator.New(root, nil, plannotator.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func hasTool(available []agent.Tool, name string) bool {
 }
 
 func TestPlanPrepareNextTurnDoesNotDuplicateModePrompt(t *testing.T) {
-	manager, err := plannotator.New(t.TempDir(), filepath.Join(t.TempDir(), "state.json"), nil)
+	manager, err := plannotator.New(t.TempDir(), nil, plannotator.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestPlanRuntimeToolsKeepRalphTools(t *testing.T) {
 	}
 	defer workspace.Close()
 
-	manager, err := plannotator.New(root, filepath.Join(t.TempDir(), "state.json"), nil)
+	manager, err := plannotator.New(root, nil, plannotator.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

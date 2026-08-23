@@ -1,0 +1,6 @@
+{"type":"session","id":"11111111-2222-3333-4444-555555555555","timestamp":"2025-12-09T00:53:29.825Z","cwd":"/Users/someone/project","provider":"anthropic","modelId":"claude-opus-4-5","thinkingLevel":"off"}
+{"type":"message","timestamp":"2025-12-09T00:53:30.000Z","message":{"role":"user","content":"summarized away","timestamp":1765241610000}}
+{"type":"message","timestamp":"2025-12-09T00:53:31.000Z","message":{"role":"assistant","content":[{"type":"text","text":"also summarized"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-4-5","usage":{"input":10,"output":5},"stopReason":"stop","timestamp":1765241611000}}
+{"type":"message","timestamp":"2025-12-09T00:53:32.000Z","message":{"role":"user","content":"the first kept entry","timestamp":1765241612000}}
+{"type":"compaction","timestamp":"2025-12-09T00:53:33.000Z","firstKeptEntryIndex":3,"tokensBefore":175004,"summary":"## Goal\nA prior conversation, summarized."}
+{"type":"message","timestamp":"2025-12-09T00:53:34.000Z","message":{"role":"assistant","content":[{"type":"text","text":"after the compaction"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-opus-4-5","usage":{"input":10,"output":5},"stopReason":"stop","timestamp":1765241614000}}
