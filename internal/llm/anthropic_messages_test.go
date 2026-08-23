@@ -732,3 +732,25 @@ data: {"type":"message_stop"}
 			sent, budget)
 	}
 }
+
+// TestAnthropicHeaderOnlyAuthSendsNoAPIKeyHeader covers an Anthropic-compatible
+// backend that authenticates with Authorization rather than x-api-key -- Meta's
+// Model API is one. The credential travels only in the header, so the request
+// must carry that header and no x-api-key alongside it: the point of leaving
+// APIKey empty is defeated if the protocol adds one anyway.
+func TestAnthropicHeaderOnlyAuthSendsNoAPIKeyHeader(t *testing.T) {
+	model := testAnthropicModel("")
+	conv := &Context{Messages: []Message{UserMessage{Role: "user", Content: "hi"}}}
+	bearer := "Bearer model-api-key"
+	opts := &AnthropicOptions{
+		StreamOptions: StreamOptions{Headers: ProviderHeaders{"Authorization": &bearer}},
+	}
+
+	_, headers := captureAnthropicRequest(t, model, conv, opts)
+	if headers.Get("Authorization") != bearer {
+		t.Fatalf("Authorization = %q", headers.Get("Authorization"))
+	}
+	if got := headers.Get("x-api-key"); got != "" {
+		t.Fatalf("x-api-key = %q, want it absent", got)
+	}
+}

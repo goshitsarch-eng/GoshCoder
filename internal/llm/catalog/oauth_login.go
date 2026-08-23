@@ -8,12 +8,16 @@ package catalog
 //
 // Two mechanisms cover the supported providers:
 //
-//   - PKCE + loopback redirect (Anthropic, OpenAI Codex): open a browser at the
-//     authorize URL, serve 127.0.0.1 for the callback, exchange the code and
-//     verifier for tokens. A manual-code prompt races the callback so a headless
-//     or remote session can paste the redirect URL by hand.
-//   - Device code (OpenAI Codex headless): request a user code, display it, poll
-//     until the user authorizes.
+//   - PKCE + loopback redirect (Anthropic, OpenAI Codex, xAI): open a browser
+//     at the authorize URL, serve 127.0.0.1 for the callback, exchange the code
+//     and verifier for tokens. A manual-code prompt races the callback so a
+//     headless or remote session can paste the redirect URL by hand.
+//   - Device code (Kimi, OpenAI Codex headless, xAI, Meta): request a user
+//     code, display it, poll until the user authorizes.
+//
+// The two providers with their own file are the ones that need more than this:
+// xAI discovers its endpoints (oauth_xai.go) and Meta exchanges the identity it
+// receives for a separately minted API key (oauth_meta.go).
 //
 // Refresh and request-auth derivation live in oauth.go.
 

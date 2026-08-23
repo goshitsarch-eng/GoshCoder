@@ -86,20 +86,22 @@ goshcoder prompts list
 goshcoder prompts backup
 goshcoder prompts restore goshcoder-prompts-2026-08-23.tar.gz
 
-# Or log in with an Anthropic, OpenAI Codex, or Kimi subscription
+# Or log in with a subscription or account you already have
 goshcoder auth login anthropic
 goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
+goshcoder auth login xai      # Grok subscription; device code or browser
+goshcoder auth login meta     # Meta account; mints a Model API key
 
-# xAI/Grok Code (API-key account)
-goshcoder auth set xai
-# Then select xai/grok-build-0.1 or its grok-code-fast-1 alias
+# The same providers by API key, for a developer account
+goshcoder auth set xai        # then select xai/grok-4.3 or grok-build-0.1
+goshcoder auth set meta       # then select meta/muse-spark-1.2
 ```
 
 Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
-providers are added to `auth.json` independently, so signing in to Anthropic,
-OpenAI Codex, or Kimi does not remove existing logins. Use `/model` immediately
-afterward to search models across every authenticated provider.
+providers are added to `auth.json` independently, so signing in to one does not
+remove existing logins. Use `/model` immediately afterward to search models
+across every authenticated provider.
 
 Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 
@@ -328,11 +330,26 @@ Documented at the top of each ported file. The notable ones:
   structs travel on the options struct.
 - **No SDKs.** Provider requests are hand-rolled `net/http` plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
-- **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, and Kimi
-  Code. Kimi also supports API-key authentication. xAI/Grok Code uses an xAI
-  API key (`XAI_API_KEY` or `goshcoder auth set xai`); a grok.com consumer
-  subscription is not an API credential and no unofficial browser-login flow
-  is used.
+- **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
+  Code, xAI, and Meta. Every one of them also accepts an API key, so a
+  developer account never has to go through a subscription login.
+  - **xAI (Grok)** uses xAI's own OIDC server at `auth.x.ai`: PKCE S256 over a
+    loopback callback, or RFC 8628 device code for a headless session, against
+    the public desktop client. Discovered endpoints are pinned to the issuer's
+    host, so a discovery document cannot move the token exchange elsewhere.
+    What this authenticates is a consumer Grok subscription, and xAI applies
+    its own entitlement checks afterwards: a login can succeed and inference
+    still answer 403 for an account without the plan the endpoint wants. That
+    is xAI's decision, not a client bug, and `XAI_API_KEY` is unaffected.
+  - **Meta** signs in by device code at `auth.meta.com` and then mints a Model
+    API key at `api.meta.ai/muse-code/key`; the key is what requests carry, and
+    Meta re-mints it about once a day, which the stored expiry accounts for.
+    Meta's Model API speaks the Anthropic Messages shape but authenticates with
+    `Authorization`, so the key travels as a header and never as `x-api-key`.
+  - The client ids both flows use are public desktop clients with no secret --
+    PKCE and the device flow replace one. `GOSHCODER_XAI_OAUTH_CLIENT_ID` and
+    `GOSHCODER_META_OAUTH_CLIENT_ID` override them for an account registered
+    against a different application.
 - **Interface.** Interactive chat uses a Bubble Tea alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.

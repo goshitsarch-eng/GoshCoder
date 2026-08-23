@@ -264,8 +264,8 @@ func TestCodexAccountID(t *testing.T) {
 
 func TestOAuthProviderRegistry(t *testing.T) {
 	ids := OAuthProviderIDs()
-	// The three providers ported so far, sorted.
-	want := []string{"anthropic", "kimi-coding", "openai-codex"}
+	// The providers ported so far, sorted.
+	want := []string{"anthropic", "kimi-coding", "meta", "openai-codex", "xai"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("OAuthProviderIDs = %v, want %v", ids, want)
 	}

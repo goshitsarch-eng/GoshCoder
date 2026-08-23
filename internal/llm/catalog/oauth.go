@@ -54,7 +54,9 @@ type OAuthProvider interface {
 var oauthProviders = map[string]OAuthProvider{
 	"anthropic":    anthropicOAuth{},
 	"kimi-coding":  kimiCodingOAuth{},
+	"meta":         metaOAuth{},
 	"openai-codex": openAICodexOAuth{},
+	"xai":          xaiOAuth{},
 }
 
 // OAuthProviderFor returns the OAuth implementation for a provider id.
@@ -137,6 +139,8 @@ func (c *Catalog) envMap() map[string]string {
 		"KIMI_OAUTH_HOST",
 		"PI_OAUTH_CALLBACK_HOST",
 		"GOSHCODER_OAUTH_CALLBACK_HOST",
+		"GOSHCODER_XAI_OAUTH_CLIENT_ID",
+		"GOSHCODER_META_OAUTH_CLIENT_ID",
 	} {
 		if value := c.env(name); value != "" {
 			env[name] = value

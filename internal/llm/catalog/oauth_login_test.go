@@ -378,7 +378,7 @@ func TestKimiLoginRejectsUntrustedVerificationURL(t *testing.T) {
 }
 
 func TestLoginProviderRegistry(t *testing.T) {
-	for _, id := range []string{"anthropic", "kimi-coding", "openai-codex"} {
+	for _, id := range []string{"anthropic", "kimi-coding", "meta", "openai-codex", "xai"} {
 		if _, ok := LoginProviderFor(id); !ok {
 			t.Errorf("%s should have a login flow", id)
 		}
