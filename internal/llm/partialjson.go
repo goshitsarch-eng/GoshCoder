@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // This file ports reference/pi/packages/ai/src/utils/json-parse.ts plus the
@@ -211,14 +213,30 @@ func (p *partialParser) parseString() (string, error) {
 			}
 			next := p.s[p.pos+1]
 			if next == 'u' {
-				if p.pos+6 <= len(p.s) {
+				r, size, status := decodeUnicodeEscape(p.s[p.pos:])
+				switch status {
+				case escapeIncomplete:
+					// The rest of the escape (or a surrogate's low half) has
+					// not streamed in yet. Dropping it is better than emitting
+					// a replacement character the next delta would contradict.
+					return b.String(), nil
+				case escapeInvalid:
+					// Not valid hex: keep the raw bytes rather than inventing
+					// a rune the strict parser would never produce.
 					b.WriteString(p.s[p.pos : p.pos+6])
 					p.pos += 6
-					continue
+				default:
+					b.WriteRune(r)
+					p.pos += size
 				}
-				// incomplete \u escape at EOF: drop it
-				return b.String(), nil
+				continue
 			}
+			if decoded, ok := simpleEscape(next); ok {
+				b.WriteByte(decoded)
+				p.pos += 2
+				continue
+			}
+			// Not an escape JSON defines; keep it verbatim.
 			b.WriteByte('\\')
 			b.WriteByte(next)
 			p.pos += 2
@@ -228,6 +246,91 @@ func (p *partialParser) parseString() (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+// Escape-decoding outcomes for decodeUnicodeEscape.
+const (
+	escapeOK = iota
+	// escapeIncomplete: the escape is cut off by the end of the buffer and
+	// will be completed by a later delta.
+	escapeIncomplete
+	// escapeInvalid: the six bytes are present but are not \uXXXX hex.
+	escapeInvalid
+)
+
+// simpleEscape maps a one-character JSON escape to the byte it denotes.
+func simpleEscape(c byte) (byte, bool) {
+	switch c {
+	case '"':
+		return '"', true
+	case '\\':
+		return '\\', true
+	case '/':
+		return '/', true
+	case 'b':
+		return '\b', true
+	case 'f':
+		return '\f', true
+	case 'n':
+		return '\n', true
+	case 'r':
+		return '\r', true
+	case 't':
+		return '\t', true
+	}
+	return 0, false
+}
+
+// decodeUnicodeEscape decodes the \uXXXX escape at the start of s, joining a
+// surrogate pair when its low half follows, and reports how many bytes of s it
+// consumed.
+func decodeUnicodeEscape(s string) (rune, int, int) {
+	high, ok := parseHex4(s)
+	if !ok {
+		if len(s) < 6 {
+			return 0, 0, escapeIncomplete
+		}
+		return 0, 0, escapeInvalid
+	}
+	if !utf16.IsSurrogate(rune(high)) {
+		return rune(high), 6, escapeOK
+	}
+	// A high surrogate alone is not a character. Wait for its partner rather
+	// than emitting U+FFFD, which a later delta would have to take back.
+	if len(s) < 12 {
+		return 0, 0, escapeIncomplete
+	}
+	low, ok := parseHex4(s[6:])
+	if !ok {
+		return utf8.RuneError, 6, escapeOK
+	}
+	if joined := utf16.DecodeRune(rune(high), rune(low)); joined != utf8.RuneError {
+		return joined, 12, escapeOK
+	}
+	return utf8.RuneError, 6, escapeOK
+}
+
+// parseHex4 reads the four hex digits of a \uXXXX escape at the start of s.
+func parseHex4(s string) (uint16, bool) {
+	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+		return 0, false
+	}
+	var value uint16
+	for i := 2; i < 6; i++ {
+		var digit uint16
+		switch c := s[i]; {
+		case c >= '0' && c <= '9':
+			digit = uint16(c - '0')
+		case c >= 'a' && c <= 'f':
+			digit = uint16(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			digit = uint16(c-'A') + 10
+		default:
+			return 0, false
+		}
+		value = value<<4 | digit
+	}
+	return value, true
 }
 
 // parseNumber scans a numeric token, trimming trailing characters that leave
@@ -374,4 +477,34 @@ func ParseStreamingJSON(partial string) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+// streamingParseFloor is the smallest buffer growth that justifies re-parsing
+// a tool call's arguments mid-stream. It is deliberately tiny: small tool calls
+// (a path, a shell command) must still show a live preview from their first few
+// deltas, and the quadratic cost this guards against only bites at sizes where
+// the geometric term below has already taken over.
+const streamingParseFloor = 8
+
+// shouldReparseStreamingJSON reports whether accumulated tool-call arguments
+// have grown enough to be worth re-parsing for the live preview.
+//
+// ParseStreamingJSON is O(n) in the whole accumulated buffer, so running it on
+// every delta makes assembling one tool call O(n^2). Measured: a 54 KB `write`
+// argument arriving in token-sized chunks cost 5.1 s of CPU and 2.5 GB of
+// allocation, stalling the UI for the entire call. Growing the interval
+// geometrically keeps the total parsing work linear in the argument size while
+// still refreshing the preview often enough to look live -- roughly thirty
+// times across a large call, while a small one still updates on nearly every
+// delta.
+//
+// This only affects the intermediate value published in event.Partial. Both
+// protocols re-parse authoritatively once the arguments are complete, so the
+// final Arguments map is never approximate.
+func shouldReparseStreamingJSON(parsedLen, currentLen int) bool {
+	next := parsedLen + streamingParseFloor
+	if geometric := parsedLen + parsedLen/4; geometric > next {
+		next = geometric
+	}
+	return currentLen >= next
 }

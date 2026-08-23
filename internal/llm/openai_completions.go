@@ -489,7 +489,10 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 			if tc.Function != nil && tc.Function.Arguments != "" {
 				deltaStr = tc.Function.Arguments
 				block.partialArgs += tc.Function.Arguments
-				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+				if shouldReparseStreamingJSON(block.parsedArgsLen, len(block.partialArgs)) {
+					block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+					block.parsedArgsLen = len(block.partialArgs)
+				}
 			} else if tc.Custom != nil && tc.Custom.Input != "" {
 				// Custom (grammar) tool input: constrained sampling is out of
 				// scope for this port slice, so the raw input accumulates into
@@ -497,7 +500,10 @@ func (p *completionsStreamer) consumeStream(ctx context.Context, body io.Reader,
 				// via appendGrammarToolInputJsonDelta).
 				deltaStr = tc.Custom.Input
 				block.partialArgs += tc.Custom.Input
-				block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+				if shouldReparseStreamingJSON(block.parsedArgsLen, len(block.partialArgs)) {
+					block.ToolCall.Arguments = ParseStreamingJSON(block.partialArgs)
+					block.parsedArgsLen = len(block.partialArgs)
+				}
 			}
 			syncContent()
 			p.push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: contentIndex(block), Delta: deltaStr})
@@ -566,6 +572,9 @@ type streamingBlock interface {
 type streamingToolCall struct {
 	ToolCall
 	partialArgs string
+	// parsedArgsLen is how much of partialArgs the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedArgsLen int
 }
 
 func (t *TextContent) content() ContentBlock       { return *t }

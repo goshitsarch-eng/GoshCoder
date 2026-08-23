@@ -529,7 +529,10 @@ type responsesStreamingToolCall struct {
 	ToolCall
 	// partialJSON accumulates function_call argument deltas. Nil for custom
 	// tool calls, which carry a customInput buffer instead.
-	partialJSON    *string
+	partialJSON *string
+	// parsedJSONLen is how much of partialJSON the Arguments map reflects.
+	// See shouldReparseStreamingJSON.
+	parsedJSONLen  int
 	customProperty string
 	customBuffer   *GrammarToolInputJSONBuffer
 }
@@ -897,7 +900,10 @@ func (p *responsesStreamProcessor) ProcessEvent(event *responsesStreamEvent) err
 			return nil
 		}
 		*slot.toolCall.partialJSON += event.Delta
-		slot.toolCall.Arguments = ParseStreamingJSON(*slot.toolCall.partialJSON)
+		if shouldReparseStreamingJSON(slot.toolCall.parsedJSONLen, len(*slot.toolCall.partialJSON)) {
+			slot.toolCall.Arguments = ParseStreamingJSON(*slot.toolCall.partialJSON)
+			slot.toolCall.parsedJSONLen = len(*slot.toolCall.partialJSON)
+		}
 		p.pushToolCallDelta(slot, event.Delta)
 
 	case "response.function_call_arguments.done":
