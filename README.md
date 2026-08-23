@@ -28,7 +28,9 @@ location, `--version <tag>` to pin a release, `--from-source` to always compile,
 **From a checkout**
 
 Requires Go 1.26.6 or newer; earlier 1.26 patch releases carry standard-library
-vulnerabilities that `govulncheck` reports as reachable from this tree.
+vulnerabilities that `govulncheck` reports as reachable from this tree. The
+installers fetch that toolchain through Go's own mechanism when the installed
+one is older, so `GOTOOLCHAIN=local` is the only setting that will stop them.
 
 ```sh
 make build      # stamped binary in bin/
