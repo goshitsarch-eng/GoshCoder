@@ -500,10 +500,6 @@ func executeToolCallsSequential(ctx context.Context, currentContext *Context, as
 		emitToolResultMessage(toolResultMessage, emit)
 		finalizedCalls = append(finalizedCalls, finalized)
 		messages = append(messages, toolResultMessage)
-
-		if ctx.Err() != nil {
-			break
-		}
 	}
 
 	return executedToolCallBatch{
@@ -534,17 +530,11 @@ func executeToolCallsParallel(ctx context.Context, currentContext *Context, assi
 			finalized := finalizedOutcome{toolCall: toolCall, result: immediate.result, isError: immediate.isError}
 			emitToolExecutionEnd(finalized, emit)
 			entries = append(entries, entry{finalized: &finalized, thunkIdx: -1})
-			if ctx.Err() != nil {
-				break
-			}
 			continue
 		}
 
 		thunks = append(thunks, *prepared)
 		entries = append(entries, entry{thunkIdx: len(thunks) - 1})
-		if ctx.Err() != nil {
-			break
-		}
 	}
 
 	// Execute prepared calls concurrently; each worker finalizes and emits
@@ -555,6 +545,19 @@ func executeToolCallsParallel(ctx context.Context, currentContext *Context, assi
 		wg.Add(1)
 		go func(i int, prepared preparedToolCall) {
 			defer wg.Done()
+			// Every other tool path recovers, and the run as a whole is
+			// wrapped, but neither covers a goroutine: a panic raised here --
+			// including one from a subscriber reached through emit -- unwinds
+			// past all of them and takes the process down with the transcript.
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = finalizedOutcome{
+						toolCall: prepared.toolCall,
+						result:   createErrorToolResult(fmt.Sprint(r)),
+						isError:  true,
+					}
+				}
+			}()
 			executed := executePreparedToolCall(ctx, &prepared, emit)
 			results[i] = finalizeExecutedToolCall(ctx, currentContext, assistantMessage, &prepared, executed, config)
 			emitToolExecutionEnd(results[i], emit)

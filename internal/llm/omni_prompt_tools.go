@@ -85,9 +85,9 @@ func streamOmniPromptTools(model *Model, request *Context, options *SimpleStream
 		if prose != "" {
 			index := len(output.Content)
 			output.Content = append(output.Content, TextContent{Type: "text", Text: prose})
-			stream.Push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: index, Partial: output})
-			stream.Push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: index, Delta: prose, Partial: output})
-			stream.Push(AssistantMessageEvent{Type: EventTextEnd, ContentIndex: index, Content: prose, Partial: output})
+			stream.Push(AssistantMessageEvent{Type: EventTextStart, ContentIndex: index, Partial: snapshotOmniMessage(output)})
+			stream.Push(AssistantMessageEvent{Type: EventTextDelta, ContentIndex: index, Delta: prose, Partial: snapshotOmniMessage(output)})
+			stream.Push(AssistantMessageEvent{Type: EventTextEnd, ContentIndex: index, Content: prose, Partial: snapshotOmniMessage(output)})
 		}
 		for _, call := range calls {
 			index := len(output.Content)
@@ -95,19 +95,42 @@ func streamOmniPromptTools(model *Model, request *Context, options *SimpleStream
 			toolCall := ToolCall{Type: "toolCall", ID: id, Name: call.Name, Arguments: call.Arguments}
 			output.Content = append(output.Content, toolCall)
 			encoded, _ := json.Marshal(call.Arguments)
-			stream.Push(AssistantMessageEvent{Type: EventToolCallStart, ContentIndex: index, Partial: output})
-			stream.Push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: index, Delta: string(encoded), Partial: output})
-			stream.Push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: index, ToolCall: &toolCall, Partial: output})
+			stream.Push(AssistantMessageEvent{Type: EventToolCallStart, ContentIndex: index, Partial: snapshotOmniMessage(output)})
+			stream.Push(AssistantMessageEvent{Type: EventToolCallDelta, ContentIndex: index, Delta: string(encoded), Partial: snapshotOmniMessage(output)})
+			stream.Push(AssistantMessageEvent{Type: EventToolCallEnd, ContentIndex: index, ToolCall: &toolCall, Partial: snapshotOmniMessage(output)})
 		}
-		output.StopReason = StopStop
-		if len(calls) > 0 {
+		// Keep the inner stream's stop reason. Overwriting StopLength here hid
+		// truncation from the agent loop's guard, so tool calls parsed out of
+		// a response that was cut off mid-generation were executed as if the
+		// model had finished asking for them.
+		output.StopReason = result.StopReason
+		output.RawStopReason = result.RawStopReason
+		switch {
+		case output.StopReason == StopLength:
+			// leave it: the response was truncated
+		case len(calls) > 0:
 			output.StopReason = StopToolUse
+		default:
+			output.StopReason = StopStop
 		}
 		CalculateCost(model, &output.Usage)
 		stream.Push(AssistantMessageEvent{Type: EventDone, Reason: output.StopReason, Message: output})
 		stream.End()
 	}()
 	return stream
+}
+
+// snapshotOmniMessage copies the in-flight message for publication in
+// event.Partial.
+//
+// The consumer reads event.Partial on its own goroutine (internal/agent's loop
+// pulls events while this producer is still running), so handing out the live
+// pointer races every subsequent append to Content and the final StopReason
+// write. Every other streamer in this package publishes a copy.
+func snapshotOmniMessage(message *AssistantMessage) *AssistantMessage {
+	copied := *message
+	copied.Content = append([]ContentBlock(nil), message.Content...)
+	return &copied
 }
 
 func finishOmniPromptError(stream *AssistantMessageEventStream, output *AssistantMessage, reason StopReason, message string) {
