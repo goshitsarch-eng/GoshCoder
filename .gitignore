@@ -3,6 +3,8 @@ reference/
 
 # Build artifacts
 bin/
+# A bare `go build ./cmd/goshcoder` drops the binary here rather than in bin/.
+/goshcoder
 *.exe
 *.test
 *.out
