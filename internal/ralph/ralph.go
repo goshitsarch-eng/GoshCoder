@@ -380,8 +380,18 @@ func (s *Store) Start(name, taskContent string, options Options) (*State, error)
 	if loopName == "" {
 		return nil, fmt.Errorf("a loop name is required")
 	}
-	if existing, ok := s.Load(loopName, false); ok && existing.Status == StatusActive {
-		return nil, fmt.Errorf("loop %q is already active", loopName)
+	// A paused loop holds real work -- its task file and its iteration count --
+	// and starting over the same name silently replaced the file and reset the
+	// count to 1. Only a completed loop's name is free to reuse.
+	if existing, ok := s.Load(loopName, false); ok {
+		switch existing.Status {
+		case StatusActive:
+			return nil, fmt.Errorf("loop %q is already active", loopName)
+		case StatusPaused:
+			return nil, fmt.Errorf(
+				"loop %q is paused at iteration %d; resume it with \"ralph resume %s\", or delete or archive it first",
+				loopName, existing.Iteration, loopName)
+		}
 	}
 
 	maxIterations := options.MaxIterations

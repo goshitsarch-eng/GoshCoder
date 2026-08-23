@@ -731,3 +731,67 @@ func TestToolsExposeBothTools(t *testing.T) {
 		t.Fatalf("tool names = %#v", names)
 	}
 }
+
+// TestStartRefusesToOverwriteAPausedLoop covers silent data loss. A paused loop
+// holds its task file and its iteration count, and starting a loop under the
+// same name replaced the file and reset the count to 1 with no warning -- so a
+// user resuming work after a break lost it by typing the name they had used
+// before.
+func TestStartRefusesToOverwriteAPausedLoop(t *testing.T) {
+	store := NewStore(t.TempDir(), "test-session")
+
+	if _, err := store.Start("refactor", "the original task description", Options{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	state, ok := store.Load("refactor", false)
+	if !ok {
+		t.Fatal("the loop was not stored")
+	}
+	state.Iteration = 7
+	state.Status = StatusPaused
+	if err := store.Save(state, false); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	_, err := store.Start("refactor", "a completely different task", Options{})
+	if err == nil {
+		t.Fatal("starting over a paused loop was allowed, discarding its task file and iteration count")
+	}
+	if !strings.Contains(err.Error(), "paused") {
+		t.Fatalf("error does not explain the conflict: %v", err)
+	}
+
+	// The original work must still be intact.
+	after, ok := store.Load("refactor", false)
+	if !ok {
+		t.Fatal("the paused loop disappeared")
+	}
+	if after.Iteration != 7 {
+		t.Fatalf("iteration = %d, want the paused value preserved", after.Iteration)
+	}
+	// TaskFile is relative to the store root.
+	content, err := os.ReadFile(filepath.Join(store.Root, after.TaskFile))
+	if err != nil {
+		t.Fatalf("read task file: %v", err)
+	}
+	if !strings.Contains(string(content), "the original task description") {
+		t.Fatalf("task file was overwritten: %q", content)
+	}
+}
+
+// TestStartReusesACompletedLoopName is the negative control: a finished loop's
+// name is free.
+func TestStartReusesACompletedLoopName(t *testing.T) {
+	store := NewStore(t.TempDir(), "test-session")
+	if _, err := store.Start("cleanup", "first run", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := store.Load("cleanup", false)
+	state.Status = StatusCompleted
+	if err := store.Save(state, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start("cleanup", "second run", Options{}); err != nil {
+		t.Fatalf("a completed loop's name should be reusable: %v", err)
+	}
+}
