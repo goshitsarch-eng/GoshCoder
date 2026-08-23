@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -556,13 +557,20 @@ func (w *Workspace) GrepTool() agent.Tool {
 			if contextLines < 0 {
 				contextLines = 0
 			}
+			var globbed *globPattern
+			if glob != "" {
+				globbed, err = compileGlob(glob)
+				if err != nil {
+					return agent.ToolResult{}, err
+				}
+			}
 			var output []string
 			matches := 0
 			for _, file := range files {
 				if ctx.Err() != nil {
 					return agent.ToolResult{}, ctx.Err()
 				}
-				if glob != "" && !globMatches(glob, filepath.ToSlash(file)) {
+				if globbed != nil && !globbed.match(file) {
 					continue
 				}
 				content, truncated, readErr := w.readLimited(file, 4*1024*1024)
@@ -637,6 +645,10 @@ func (w *Workspace) FindTool() agent.Tool {
 			if limit <= 0 {
 				limit = 1000
 			}
+			globbed, err := compileGlob(pattern)
+			if err != nil {
+				return agent.ToolResult{}, err
+			}
 			var matches []string
 			limited := false
 			for _, file := range files {
@@ -644,7 +656,7 @@ func (w *Workspace) FindTool() agent.Tool {
 				if resolved != "." {
 					relative = strings.TrimPrefix(relative, filepath.ToSlash(resolved)+"/")
 				}
-				if globMatches(pattern, relative) {
+				if globbed.match(relative) {
 					matches = append(matches, relative)
 					if len(matches) >= limit {
 						limited = true
@@ -739,17 +751,32 @@ func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]stri
 	return files, err
 }
 
-func globMatches(pattern, name string) bool {
+// globPattern is a glob compiled once for reuse across candidate files.
+//
+// Compiling per file is what the old shape did -- regexp.MatchString for the
+// full path and a second regexp.MustCompile for the basename fallback -- and
+// Go's regexp compiler is far more expensive than a match, so a find or grep
+// over a few thousand files spent most of its time compiling the same pattern
+// over and over.
+type globPattern struct {
+	re *regexp.Regexp
+	// basenameToo records that the pattern names no directory, so it applies
+	// at every depth the way fd and rg globs do.
+	basenameToo bool
+}
+
+// compileGlob translates a glob into an anchored regular expression.
+func compileGlob(pattern string) (*globPattern, error) {
 	pattern = filepath.ToSlash(pattern)
-	name = filepath.ToSlash(name)
 	var expression strings.Builder
 	expression.WriteByte('^')
-	for index := 0; index < len(pattern); index++ {
+	for index := 0; index < len(pattern); {
 		switch pattern[index] {
 		case '*':
-			if index+1 < len(pattern) && pattern[index+1] == '*' {
+			index++
+			if index < len(pattern) && pattern[index] == '*' {
 				index++
-				if index+1 < len(pattern) && pattern[index+1] == '/' {
+				if index < len(pattern) && pattern[index] == '/' {
 					index++
 					expression.WriteString("(?:.*/)?")
 				} else {
@@ -759,18 +786,33 @@ func globMatches(pattern, name string) bool {
 				expression.WriteString("[^/]*")
 			}
 		case '?':
+			index++
 			expression.WriteString("[^/]")
 		default:
-			expression.WriteString(regexp.QuoteMeta(string(pattern[index])))
+			// Decode a whole rune: quoting one byte at a time turned each
+			// byte of a multi-byte character into its own code point, so a
+			// pattern like "café*" could never match the file it named.
+			r, size := utf8.DecodeRuneInString(pattern[index:])
+			expression.WriteString(regexp.QuoteMeta(string(r)))
+			index += size
 		}
 	}
 	expression.WriteByte('$')
-	matched, _ := regexp.MatchString(expression.String(), name)
-	if matched {
+
+	compiled, err := regexp.Compile(expression.String())
+	if err != nil {
+		return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
+	}
+	return &globPattern{re: compiled, basenameToo: !strings.Contains(pattern, "/")}, nil
+}
+
+// match reports whether name satisfies the glob.
+func (g *globPattern) match(name string) bool {
+	name = filepath.ToSlash(name)
+	if g.re.MatchString(name) {
 		return true
 	}
-	// A basename-only pattern applies at every depth, matching fd/rg globs.
-	return !strings.Contains(pattern, "/") && regexp.MustCompile(expression.String()).MatchString(filepath.Base(name))
+	return g.basenameToo && g.re.MatchString(path.Base(name))
 }
 
 func skipSearchDir(name string) bool {

@@ -107,6 +107,10 @@ type fullscreenModel struct {
 	// holding a key that triggered it forked one git process per repeat.
 	gitRefreshWanted   bool
 	gitRefreshInFlight bool
+	// quitArmedAt is when Ctrl+C was last pressed at an idle empty prompt.
+	// A session holds the entire conversation in memory and nothing on disk,
+	// so one stray keystroke used to destroy work with no way back.
+	quitArmedAt time.Time
 }
 
 func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAgentEvent) *fullscreenModel {
@@ -179,6 +183,9 @@ func waitForFullscreenEvent(updates, lifecycle <-chan fullscreenAgentEvent) tea.
 		}
 	}
 }
+
+// quitConfirmWindow is how long a first Ctrl+C stays armed.
+const quitConfirmWindow = 3 * time.Second
 
 func fullscreenTickCommand() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(now time.Time) tea.Msg { return fullscreenTick(now) })
@@ -430,6 +437,13 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 		return model.handleBTWTeaKey(key)
 	}
 	streaming := model.session.agent.State().IsStreaming
+	if key.String() != "ctrl+c" && !model.quitArmedAt.IsZero() {
+		// Anything else means the user did not mean to quit.
+		model.quitArmedAt = time.Time{}
+		if strings.HasPrefix(model.activity, "Press Ctrl+C again") {
+			model.activity = "Ready"
+		}
+	}
 	switch key.String() {
 	case "ctrl+c":
 		if len(model.editor.input) > 0 {
@@ -441,7 +455,16 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 			model.activity = "Aborting"
 			return nil
 		}
-		return tea.Quit
+		// Require confirmation. The transcript exists only in memory, so a
+		// single mistyped Ctrl+C threw away the whole conversation.
+		if !model.quitArmedAt.IsZero() && time.Since(model.quitArmedAt) < quitConfirmWindow {
+			return tea.Quit
+		}
+		model.quitArmedAt = time.Now()
+		model.activity = "Press Ctrl+C again to exit (this session is not saved)"
+		// Keep the spinner loop alive long enough for the hint to expire on
+		// its own if the user does nothing.
+		return fullscreenTickCommand()
 
 	case "ctrl+d":
 		if len(model.editor.input) == 0 {

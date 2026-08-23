@@ -236,3 +236,55 @@ func TestGrepFindsNonASCIIFilenames(t *testing.T) {
 		t.Fatalf("grep missed a file with a non-ASCII name: %q", text)
 	}
 }
+
+// TestGlobMatchesNonASCIIPatterns covers a pattern that names a non-ASCII file.
+// The translator quoted the pattern one byte at a time, and a byte-to-string
+// conversion turns each byte of a multi-byte character into its own code point
+// -- so "café*" was compiled as a pattern matching the mojibake "cafÃ©" and
+// could never match the file it named.
+func TestGlobMatchesNonASCIIPatterns(t *testing.T) {
+	cases := []struct {
+		pattern, name string
+		want          bool
+	}{
+		{"café*.go", "café-utils.go", true},
+		{"日本*.txt", "日本語.txt", true},
+		{"café*.go", "cafe-utils.go", false},
+		{"*.go", "main.go", true},
+		{"**/*.go", "a/b/main.go", true},
+		{"src/*.go", "src/main.go", true},
+		{"src/*.go", "other/main.go", false},
+		// A basename-only pattern applies at any depth.
+		{"*.go", "a/b/main.go", true},
+		{"a?c.go", "abc.go", true},
+	}
+	for _, tc := range cases {
+		compiled, err := compileGlob(tc.pattern)
+		if err != nil {
+			t.Fatalf("compileGlob(%q): %v", tc.pattern, err)
+		}
+		if got := compiled.match(tc.name); got != tc.want {
+			t.Errorf("compileGlob(%q).match(%q) = %v, want %v", tc.pattern, tc.name, got, tc.want)
+		}
+	}
+}
+
+// BenchmarkGlobMatchOverManyFiles measures the cost the find and grep tools pay
+// per candidate. Compiling the pattern for every file -- twice, for the
+// basename fallback -- made a search over a few thousand files spend most of its
+// time in Go's regexp compiler rather than matching.
+func BenchmarkGlobMatchOverManyFiles(b *testing.B) {
+	names := make([]string, 5000)
+	for i := range names {
+		names[i] = fmt.Sprintf("internal/pkg%d/file%d.go", i%40, i)
+	}
+	compiled, err := compileGlob("**/*.go")
+	if err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		for _, name := range names {
+			_ = compiled.match(name)
+		}
+	}
+}

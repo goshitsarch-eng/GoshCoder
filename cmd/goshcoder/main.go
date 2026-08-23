@@ -74,6 +74,20 @@ func main() {
 	}
 
 	command, args := os.Args[1], os.Args[2:]
+
+	// The flag forms must be handled before the dash branch below hands
+	// anything starting with "-" to chatCommand: routing them there made the
+	// switch cases for them dead code, so `goshcoder --version` started a chat
+	// session and `goshcoder -h` printed the chat flag list and exited 1.
+	switch command {
+	case "--version", "-v":
+		fmt.Print(versionInfo())
+		return
+	case "--help", "-h":
+		fmt.Print(usage)
+		return
+	}
+
 	if strings.HasPrefix(command, "-") {
 		if err := chatCommand(os.Args[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
@@ -97,9 +111,9 @@ func main() {
 		err = omniCommand(args)
 	case "ralph":
 		err = ralphCommand(args)
-	case "version", "--version", "-v":
+	case "version":
 		fmt.Print(versionInfo())
-	case "help", "--help", "-h":
+	case "help":
 		fmt.Print(usage)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", command, usage)
@@ -128,6 +142,9 @@ func runCommand(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if err := validateSessionFlags(cfg); err != nil {
+		return err
+	}
 
 	prompt := strings.TrimSpace(strings.Join(flags.Args(), " "))
 	if prompt == "" {
@@ -146,6 +163,26 @@ func runCommand(args []string) error {
 }
 
 // bindSessionFlags registers the flags shared by run and chat.
+// validateSessionFlags rejects values the session would otherwise accept and
+// then quietly reinterpret.
+//
+// -thinking took any string: ClampThinkingLevel falls back to the model's
+// lowest supported level for anything it does not recognise, so `-thinking
+// hihg` ran with thinking off and said nothing, and the user only found out
+// from the bill or the answer quality.
+func validateSessionFlags(cfg *sessionConfig) error {
+	if cfg.Thinking == "" {
+		return nil
+	}
+	for _, level := range llm.ThinkingLevels() {
+		if cfg.Thinking == level {
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown -thinking level %q; use one of: %s",
+		cfg.Thinking, strings.Join(llm.ThinkingLevels(), ", "))
+}
+
 func bindSessionFlags(flags *flag.FlagSet) *sessionConfig {
 	cfg := &sessionConfig{}
 	flags.StringVar(&cfg.ModelRef, "m", "", "model reference")
@@ -412,8 +449,8 @@ func providersCommand() error {
 			if auth.IsAmbient() {
 				detail += " (ambient)"
 			}
-		} else if names := providerEnvNames(provider); names != "" {
-			detail = "set " + names
+		} else {
+			detail = providerSetupHint(provider)
 		}
 		fmt.Printf("%s %-24s %-22s %s\n", status, provider.ID, provider.Name, dim(detail))
 	}
@@ -425,6 +462,32 @@ func providerEnvNames(provider *catalog.Provider) string {
 		return ""
 	}
 	return strings.Join(provider.EnvKeys, " or ")
+}
+
+// providerSetupHint says how to configure an unconfigured provider.
+//
+// Listing only the environment variables left every OAuth provider, and the
+// ones authenticated by cloud credentials, with a blank column -- so the
+// providers most users start with looked unsupported rather than unconfigured.
+func providerSetupHint(provider *catalog.Provider) string {
+	if _, ok := catalog.LoginProviderFor(provider.ID); ok {
+		if names := providerEnvNames(provider); names != "" {
+			return "run: goshcoder auth login " + provider.ID + " (or set " + names + ")"
+		}
+		return "run: goshcoder auth login " + provider.ID
+	}
+	if names := providerEnvNames(provider); names != "" {
+		return "set " + names + ", or run: goshcoder auth set " + provider.ID
+	}
+	switch provider.ID {
+	case "amazon-bedrock":
+		return "set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, AWS_PROFILE, or AWS_BEARER_TOKEN_BEDROCK"
+	case "google-vertex", "google-vertex-anthropic":
+		return "set GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_PROJECT"
+	case "azure":
+		return "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT"
+	}
+	return "run: goshcoder auth set " + provider.ID
 }
 
 func modelsCommand(args []string) error {

@@ -64,6 +64,8 @@ type session struct {
 	explicitSystemPrompt string
 	resources            *coderresources.Set
 	normalTools          []agent.Tool
+	// contextEstimate caches the transcript's token estimate; see its type.
+	contextEstimate contextEstimate
 	// loopTools are the Ralph tools. They are kept separately from
 	// normalTools because planRuntimeTools rebuilds the agent's tool list from
 	// normalTools before every turn, and anything not merged back in there is

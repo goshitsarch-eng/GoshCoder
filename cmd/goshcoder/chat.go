@@ -84,6 +84,9 @@ func chatCommand(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if err := validateSessionFlags(cfg); err != nil {
+		return err
+	}
 	// Planner commands are available in chat even when plan mode was not
 	// requested at startup.
 	cfg.LoadPlannotator = true
@@ -674,7 +677,7 @@ func (s *session) sessionInfoRealtime() claudetui.SessionInfo {
 	}
 	info.Cost = conversationCost(state.Messages)
 	if hasCompaction {
-		info.ContextUsed = estimateMessagesTokens(state.Messages)
+		info.ContextUsed = s.contextEstimate.estimate(state.Messages)
 	}
 	return info
 }

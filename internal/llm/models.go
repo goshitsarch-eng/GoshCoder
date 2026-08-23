@@ -36,6 +36,15 @@ var extendedThinkingLevels = []ModelThinkingLevel{
 	ThinkingOff, ThinkingMinimal, ThinkingLow, ThinkingMedium, ThinkingHigh, ThinkingXHigh, ThinkingMax,
 }
 
+// ThinkingLevels returns every thinking level the CLI accepts, weakest first.
+func ThinkingLevels() []string {
+	levels := make([]string, 0, len(extendedThinkingLevels))
+	for _, level := range extendedThinkingLevels {
+		levels = append(levels, string(level))
+	}
+	return levels
+}
+
 // GetSupportedThinkingLevels returns the thinking levels a model supports,
 // honoring ThinkingLevelMap nil (unsupported) entries. Port of
 // getSupportedThinkingLevels in models.ts.
