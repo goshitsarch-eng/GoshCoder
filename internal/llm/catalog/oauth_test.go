@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"goshcoder/internal/lockfile"
 )
 
 // ---------------------------------------------------------------------------
@@ -509,7 +511,7 @@ func TestCredentialStoreRecoversStaleLock(t *testing.T) {
 	if err := os.WriteFile(lockPath, []byte("stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * defaultLockTiming().stale)
+	old := time.Now().Add(-2 * lockfile.DefaultTiming().Stale)
 	if err := os.Chtimes(lockPath, old, old); err != nil {
 		t.Fatal(err)
 	}

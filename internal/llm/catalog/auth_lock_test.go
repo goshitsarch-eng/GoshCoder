@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"goshcoder/internal/lockfile"
 )
 
 // readAuthFile returns the raw provider->credential map on disk.
@@ -27,12 +29,12 @@ func readAuthFile(t *testing.T, path string) map[string]*Credential {
 // fastLockTiming scales the lock's timings down so the tests below finish
 // quickly while keeping their ratios -- a heartbeat well inside the stale
 // threshold, and a wait well beyond it.
-func fastLockTiming() lockTiming {
-	return lockTiming{
-		heartbeat: 20 * time.Millisecond,
-		stale:     200 * time.Millisecond,
-		wait:      30 * time.Second,
-		retry:     5 * time.Millisecond,
+func fastLockTiming() lockfile.Timing {
+	return lockfile.Timing{
+		Heartbeat: 20 * time.Millisecond,
+		Stale:     200 * time.Millisecond,
+		Wait:      30 * time.Second,
+		Retry:     5 * time.Millisecond,
 	}
 }
 
@@ -105,7 +107,7 @@ func TestSlowModifyKeepsItsLock(t *testing.T) {
 	select {
 	case err := <-fastDone:
 		t.Fatalf("the waiter took the lock from a live holder (err=%v)", err)
-	case <-time.After(10 * fastLockTiming().stale):
+	case <-time.After(10 * fastLockTiming().Stale):
 		// Still blocked, which is correct: the holder heartbeats its lock.
 	}
 

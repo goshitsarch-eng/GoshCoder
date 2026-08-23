@@ -1,0 +1,219 @@
+package lockfile
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fast scales the protocol's timings down so the tests finish quickly while
+// keeping their ratios -- a heartbeat well inside the stale threshold, and a
+// wait well beyond it. Production constants are never slept on.
+func fast() Timing {
+	return Timing{
+		Heartbeat: 20 * time.Millisecond,
+		Stale:     200 * time.Millisecond,
+		Wait:      30 * time.Second,
+		Retry:     5 * time.Millisecond,
+	}
+}
+
+// TestAcquireCreatesAndReleaseRemoves is the baseline both hazard tests below
+// are contrasted against: without it, a test asserting "the lock file is still
+// there" cannot distinguish correct retention from a lock that was never
+// removed under any circumstances.
+func TestAcquireCreatesAndReleaseRemoves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+
+	release, err := Acquire(path, fast())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("lock file missing while held: %v", err)
+	}
+
+	release()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lock file survived release: %v", err)
+	}
+}
+
+// TestReleaseIsIdempotent covers the deferred-release path: callers defer the
+// release and may also call it explicitly on a success path, and a second call
+// must not remove a lock a later acquisition has since taken.
+func TestReleaseIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+
+	release, err := Acquire(path, fast())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	release()
+
+	second, err := Acquire(path, fast())
+	if err != nil {
+		t.Fatalf("re-acquire: %v", err)
+	}
+	defer second()
+
+	release() // the stale first release
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a repeated release removed the second holder's lock: %v", err)
+	}
+}
+
+// TestTryAcquireReportsTheLiveOwnerInsteadOfWaiting covers the session claim:
+// a second window cannot win by waiting, because the holder keeps the lock for
+// the lifetime of its process, so the caller needs the owner's identity to put
+// in an error message rather than a timeout minutes later.
+func TestTryAcquireReportsTheLiveOwnerInsteadOfWaiting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.lock")
+
+	release, err := Acquire(path, fast())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer release()
+
+	start := time.Now()
+	_, owner, ok, err := TryAcquire(path, fast())
+	if err != nil {
+		t.Fatalf("TryAcquire returned an I/O error for a busy lock: %v", err)
+	}
+	if ok {
+		t.Fatal("TryAcquire took a lock that was already held")
+	}
+	if owner.PID != os.Getpid() {
+		t.Fatalf("owner.PID = %d, want this process %d", owner.PID, os.Getpid())
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("TryAcquire waited %v; it must not wait at all", elapsed)
+	}
+}
+
+// TestStaleLockIsReclaimed covers recovery from a crashed holder: nothing
+// refreshes the mtime after a SIGKILL, so a waiter must eventually take over
+// or the state file is locked out forever.
+func TestStaleLockIsReclaimed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+	timing := fast()
+
+	// A lock file with no live holder behind it, as a crash would leave.
+	if err := os.WriteFile(path, []byte("999999 deadbeef\n"), 0o600); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	old := time.Now().Add(-2 * timing.Stale)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("age lock: %v", err)
+	}
+
+	release, err := Acquire(path, timing)
+	if err != nil {
+		t.Fatalf("Acquire did not reclaim a stale lock: %v", err)
+	}
+	release()
+}
+
+// TestLiveHolderIsNotReclaimed is the negative control for the test above: the
+// heartbeat must keep a legitimately long hold alive. Without it, a waiter
+// declares a working holder dead, both processes write from stale snapshots,
+// and one of the two writes is silently destroyed.
+func TestLiveHolderIsNotReclaimed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+	timing := fast()
+
+	release, err := Acquire(path, timing)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer release()
+
+	// Hold well past the stale threshold; the heartbeat should keep it fresh.
+	time.Sleep(3 * timing.Stale)
+
+	timing.Wait = 0
+	_, owner, ok, err := TryAcquire(path, timing)
+	if err != nil {
+		t.Fatalf("TryAcquire: %v", err)
+	}
+	if ok {
+		t.Fatal("a live holder's lock was reclaimed as stale")
+	}
+	if owner.PID != os.Getpid() {
+		t.Fatalf("owner.PID = %d, want %d", owner.PID, os.Getpid())
+	}
+}
+
+// TestReleaseDoesNotRemoveAnotherHoldersLock covers the release path when this
+// holder was declared stale and the lock re-taken: deleting the successor's
+// file would admit a third writer.
+func TestReleaseDoesNotRemoveAnotherHoldersLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+
+	release, err := Acquire(path, fast())
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("4242 a-different-holder\n"), 0o600); err != nil {
+		t.Fatalf("overwrite lock: %v", err)
+	}
+	release()
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("release removed another holder's lock file: %v", err)
+	}
+	if !strings.Contains(string(content), "a-different-holder") {
+		t.Fatalf("lock content = %q, want the other holder's token", content)
+	}
+}
+
+// TestAcquireTimesOutWithErrTimeout covers the waiting path's failure mode.
+// Callers distinguish a busy lock from an I/O failure with errors.Is, and
+// report them very differently, so the sentinel has to survive wrapping.
+func TestAcquireTimesOutWithErrTimeout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+	timing := fast()
+
+	release, err := Acquire(path, timing)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer release()
+
+	timing.Wait = 30 * time.Millisecond
+	if _, err := Acquire(path, timing); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("second Acquire error = %v, want ErrTimeout", err)
+	}
+}
+
+// TestOwnerOfAMalformedLockDoesNotFail covers a lock file read between another
+// process's O_EXCL create and its token write. Reporting who holds a lock must
+// never itself fail, or a busy-lock message becomes an I/O error.
+func TestOwnerOfAMalformedLockDoesNotFail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	timing := fast()
+	timing.Stale = time.Hour // keep it from being reclaimed
+	_, owner, ok, err := TryAcquire(path, timing)
+	if err != nil {
+		t.Fatalf("TryAcquire: %v", err)
+	}
+	if ok {
+		t.Fatal("took a lock that exists")
+	}
+	if owner.PID != 0 {
+		t.Fatalf("owner.PID = %d, want 0 for an unreadable token", owner.PID)
+	}
+	if got := owner.String(); got != "another process" {
+		t.Fatalf("owner.String() = %q, want a usable fallback", got)
+	}
+}
