@@ -10,10 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/btw"
@@ -495,20 +493,6 @@ func (s *session) close() error {
 	return firstErr
 }
 
-// recordUserMessage writes the user's own prompt to the session log.
-//
-// A prompt reaches the agent through Prompt rather than through an event, so
-// the message_end subscription sees only the model's half of the conversation.
-// Without this a resumed session replays answers with no questions.
-func (s *session) recordUserMessage(prompt string) {
-	if s == nil || s.log == nil || strings.TrimSpace(prompt) == "" {
-		return
-	}
-	s.log.appendMessage(llm.UserMessage{
-		Role: "user", Content: prompt, Timestamp: time.Now().UnixMilli(),
-	})
-}
-
 // recordingActive reports whether the conversation is reaching disk. The
 // Ctrl+C confirmation and the sidebar both ask.
 func (s *session) recordingActive() bool {
@@ -569,7 +553,6 @@ func (s *session) runTurn(prompt string) error {
 	if err := s.maybeAutoCompact(); err != nil {
 		return fmt.Errorf("automatic context compaction: %w", err)
 	}
-	s.recordUserMessage(prompt)
 	if err := s.agent.Prompt(prompt); err != nil {
 		return err
 	}

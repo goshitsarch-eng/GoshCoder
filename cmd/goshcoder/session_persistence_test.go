@@ -69,6 +69,12 @@ func newTestSessionWithModel(model *llm.Model) *session {
 	}
 }
 
+// userMsg builds a user message for tests that seed a log directly rather than
+// driving a turn through the agent loop.
+func userMsg(text string) llm.UserMessage {
+	return llm.UserMessage{Role: "user", Content: text, Timestamp: 1}
+}
+
 // assistant builds an assistant message with a cost, since cost accounting is
 // what several of the tests below turn on.
 func assistant(text string, cost float64) llm.AssistantMessage {
@@ -87,9 +93,9 @@ func assistant(text string, cost float64) llm.AssistantMessage {
 func TestConversationSurvivesAResume(t *testing.T) {
 	f := newRecordingFixture(t)
 
-	f.session.recordUserMessage("add a -continue flag")
+	f.session.log.appendMessage(userMsg("add a -continue flag"))
 	f.session.log.appendMessage(assistant("here is the flag", 0.01))
-	f.session.recordUserMessage("now add tests")
+	f.session.log.appendMessage(userMsg("now add tests"))
 	f.session.log.appendMessage(assistant("here are the tests", 0.02))
 
 	got := f.reopen(t)
@@ -114,7 +120,7 @@ func TestConversationSurvivesAResume(t *testing.T) {
 func TestUserPromptsAreRecorded(t *testing.T) {
 	f := newRecordingFixture(t)
 
-	f.session.recordUserMessage("the question")
+	f.session.log.appendMessage(userMsg("the question"))
 	f.session.log.appendMessage(assistant("the answer", 0))
 
 	got := f.reopen(t)
@@ -189,7 +195,7 @@ func TestExplicitModelChangeBeatsTheAssistantFallback(t *testing.T) {
 func TestCompactionSurvivesAResume(t *testing.T) {
 	f := newRecordingFixture(t)
 
-	f.session.recordUserMessage("old question")
+	f.session.log.appendMessage(userMsg("old question"))
 	f.session.log.appendMessage(assistant("old answer", 5.00))
 
 	kept := []agent.Message{assistant("kept answer", 0.25)}
@@ -280,12 +286,12 @@ func TestCompactionDetailsRideInPiSCompatibleSlot(t *testing.T) {
 func TestClearIsRecordedAndCutsTheRestoredContext(t *testing.T) {
 	f := newRecordingFixture(t)
 
-	f.session.recordUserMessage("discarded question")
+	f.session.log.appendMessage(userMsg("discarded question"))
 	f.session.log.appendMessage(assistant("discarded answer", 0))
 	if err := f.session.agent.ResetWithReason("/clear"); err != nil {
 		t.Fatalf("ResetWithReason: %v", err)
 	}
-	f.session.recordUserMessage("fresh question")
+	f.session.log.appendMessage(userMsg("fresh question"))
 	f.session.log.appendMessage(assistant("fresh answer", 0))
 
 	got := f.reopen(t)
@@ -329,14 +335,14 @@ func TestNoSessionWritesNothing(t *testing.T) {
 // stops, one notice is raised, and the conversation stays in memory.
 func TestRecordingStopsButTheTranscriptSurvivesAWriteFailure(t *testing.T) {
 	f := newRecordingFixture(t)
-	f.session.recordUserMessage("before the failure")
+	f.session.log.appendMessage(userMsg("before the failure"))
 
 	// Closing the underlying writer is what a failed write leaves behind.
 	if err := f.session.log.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	f.session.recordUserMessage("after the failure")
+	f.session.log.appendMessage(userMsg("after the failure"))
 	f.session.log.appendMessage(assistant("still answering", 0))
 
 	if f.session.recordingActive() {
@@ -353,7 +359,7 @@ func TestRecordingStopsButTheTranscriptSurvivesAWriteFailure(t *testing.T) {
 // the wrong place for it.
 func TestSessionFilesAreNeverWrittenIntoTheWorkspace(t *testing.T) {
 	f := newRecordingFixture(t)
-	f.session.recordUserMessage("question")
+	f.session.log.appendMessage(userMsg("question"))
 	f.session.log.appendMessage(assistant("answer", 0))
 	f.session.log.sync()
 

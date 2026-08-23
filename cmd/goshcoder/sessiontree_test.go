@@ -12,7 +12,7 @@ import (
 // seedConversation records n question/answer pairs.
 func seedConversation(f *recordingFixture, pairs int) {
 	for i := 1; i <= pairs; i++ {
-		f.session.recordUserMessage(question(i))
+		f.session.log.appendMessage(userMsg(question(i)))
 		f.session.log.appendMessage(assistant(answer(i), 0.01))
 	}
 	f.session.log.sync()
@@ -91,7 +91,7 @@ func TestNewTurnAfterAForkAttachesToTheRewindPoint(t *testing.T) {
 		t.Fatalf("forkTo: %v", err)
 	}
 
-	f.session.recordUserMessage("a different direction")
+	f.session.log.appendMessage(userMsg("a different direction"))
 	f.session.log.appendMessage(assistant("a different answer", 0))
 
 	got := f.reopen(t)
@@ -208,7 +208,7 @@ func TestCloneLeavesTheOriginalUntouched(t *testing.T) {
 	if got := len(f.session.agent.State().Messages); got != 4 {
 		t.Fatalf("the clone has %d messages, want the original's 4", got)
 	}
-	f.session.recordUserMessage("only in the clone")
+	f.session.log.appendMessage(userMsg("only in the clone"))
 	f.session.log.sync()
 	stillOriginal, _ := os.ReadFile(originalPath)
 	if strings.Contains(string(stillOriginal), "only in the clone") {
@@ -241,7 +241,7 @@ func TestTreeLinesMarkTheCurrentPointAndBranchCounts(t *testing.T) {
 	if err := f.session.forkTo("1"); err != nil {
 		t.Fatalf("forkTo: %v", err)
 	}
-	f.session.recordUserMessage("second branch")
+	f.session.log.appendMessage(userMsg("second branch"))
 	f.session.log.appendMessage(assistant("second answer", 0))
 
 	lines := treeLines(f.session.log.snapshot(), f.session.log.leaf())

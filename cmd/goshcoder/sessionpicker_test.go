@@ -99,7 +99,7 @@ func TestSwitchingSessionsReplacesTheTranscriptAndReleasesTheClaim(t *testing.T)
 
 	// A session to switch away from, and one to switch to.
 	first := newRecordingFixtureIn(t, store, cwd)
-	first.session.recordUserMessage("the first conversation")
+	first.session.log.appendMessage(userMsg("the first conversation"))
 	first.session.log.appendMessage(assistant("first answer", 0))
 	firstPath := first.session.log.path()
 
