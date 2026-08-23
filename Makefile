@@ -19,6 +19,11 @@ GO_MIN_VERSION := 1.26.6
 VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
 	|| printf '0.2.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
+
+# Release archives are named without the tag's leading "v", which is what both
+# installers derive from the release tag. Naming them with it made every
+# published archive undownloadable by install.sh and install.ps1.
+DIST_VERSION := $(VERSION:v%=%)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 LDFLAGS := -s -w \
@@ -35,7 +40,7 @@ PLATFORMS := \
 INSTALL_DIR ?= $(if $(GOBIN),$(GOBIN),$(shell $(GO) env GOPATH)/bin)
 
 .PHONY: all build install uninstall run clean check fmt fmt-check vet test test-race \
-        test-hermetic cover lint vuln tools dist checksums help
+        test-hermetic cover lint vuln tools dist dist-name checksums help
 
 all: build
 
@@ -136,7 +141,7 @@ dist: clean-dist
 	@for platform in $(PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
 		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
-		out="dist/$(BINARY)_$(VERSION)_$${os}_$${arch}"; \
+		out="dist/$(BINARY)_$(DIST_VERSION)_$${os}_$${arch}"; \
 		echo "building $$out$$ext"; \
 		mkdir -p "$$out"; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
@@ -150,6 +155,10 @@ dist: clean-dist
 		rm -rf "$$out"; \
 	done
 	@$(MAKE) --no-print-directory checksums
+
+## dist-name: print the archive basename the installers expect (used by CI)
+dist-name:
+	@printf '%s_%s_%s_%s\n' '$(BINARY)' '$(DIST_VERSION)' "$${OS:-linux}" "$${ARCH:-amd64}"
 
 ## checksums: write SHA-256 sums for the built archives
 checksums:

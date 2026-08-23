@@ -7,7 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"context"
+	"errors"
 	"goshcoder/internal/llm/catalog"
+	"io"
+	"runtime"
 )
 
 // TestReadSecretFromPipedInputReadsALine covers scripted use
@@ -86,5 +90,55 @@ func TestLoginInteractionDoesNotAnnounceVisibleInputForPipedSecrets(t *testing.T
 	}
 	if strings.Contains(out.String(), "input is visible") {
 		t.Fatalf("warned about visible input on a non-terminal: %q", out.String())
+	}
+}
+
+// TestLoginPromptDoesNotLeakAReaderPerCancellation covers a goroutine leak that
+// stole the user's keystrokes. Each cancellable prompt spawned its own
+// goroutine blocked on stdin; when the context won the race the goroutine
+// stayed blocked forever, and because /login runs in-process from chat, every
+// orphan went on to swallow one line of the user's later input.
+func TestLoginPromptDoesNotLeakAReaderPerCancellation(t *testing.T) {
+	// A reader that never returns, standing in for a terminal awaiting input.
+	blocked, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
+
+	interaction := newTerminalLoginInteraction(blocked, io.Discard, false)
+	t.Cleanup(interaction.Close)
+
+	before := runtime.NumGoroutine()
+	for range 20 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // the callback server won the race
+		_, err := interaction.Prompt(catalog.LoginPrompt{
+			Kind: catalog.PromptText, Message: "paste the code", Ctx: ctx,
+		})
+		if !errors.Is(err, catalog.ErrLoginCancelled) {
+			t.Fatalf("Prompt error = %v, want ErrLoginCancelled", err)
+		}
+	}
+
+	// One shared reader is expected; twenty are the bug.
+	if grew := runtime.NumGoroutine() - before; grew > 3 {
+		t.Fatalf("twenty cancelled prompts left %d extra goroutines blocked on stdin", grew)
+	}
+}
+
+// TestLoginPromptWithoutCancellationUsesNoGoroutine keeps the common prompts --
+// which cannot be cancelled -- off the goroutine path entirely.
+func TestLoginPromptWithoutCancellationUsesNoGoroutine(t *testing.T) {
+	interaction := newTerminalLoginInteraction(strings.NewReader("typed answer\n"), io.Discard, false)
+	t.Cleanup(interaction.Close)
+
+	before := runtime.NumGoroutine()
+	got, err := interaction.Prompt(catalog.LoginPrompt{Kind: catalog.PromptText, Message: "name?"})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if got != "typed answer" {
+		t.Fatalf("answer = %q", got)
+	}
+	if grew := runtime.NumGoroutine() - before; grew > 0 {
+		t.Fatalf("a non-cancellable prompt started %d goroutines", grew)
 	}
 }

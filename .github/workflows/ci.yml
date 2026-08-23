@@ -150,3 +150,10 @@ jobs:
         run: |
           sh install.sh --from-source --dir "$RUNNER_TEMP/bin" --no-modify-path
           "$RUNNER_TEMP/bin/goshcoder" version
+
+      # The Makefile and the installers derive the release archive's name
+      # independently, so a mismatch is invisible until a published release
+      # 404s for every user. This serves real artifacts and drives the real
+      # download path.
+      - name: release archives match what the installers request
+        run: sh scripts/release-roundtrip.sh v9.9.9

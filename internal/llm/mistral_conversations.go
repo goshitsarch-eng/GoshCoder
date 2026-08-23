@@ -828,7 +828,20 @@ func doMistralRequest(ctx context.Context, model *Model, options *MistralOptions
 	if options.TimeoutMs > 0 {
 		timeout = time.Duration(options.TimeoutMs) * time.Millisecond
 	}
-	client := &http.Client{Timeout: timeout}
+	// The bound goes on the transport, not on the client.
+	//
+	// http.Client.Timeout covers the whole exchange including reading the
+	// response body, and this is a streaming request: a model that took longer
+	// than the timeout to finish answering had its stream cut off mid-response
+	// with "context deadline exceeded (Client.Timeout ... while reading body)",
+	// the partial answer discarded, and the identical request retried -- each
+	// attempt paying for the input again and dying at the same point.
+	// ResponseHeaderTimeout bounds time-to-first-byte instead, so a slow or
+	// unreachable endpoint still fails fast while a long answer streams to
+	// completion. Cancellation remains the request context's job.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	client := &http.Client{Transport: transport}
 
 	resp, err := client.Do(req)
 	if err != nil {

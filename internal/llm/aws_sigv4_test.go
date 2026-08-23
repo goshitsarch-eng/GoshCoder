@@ -2,6 +2,7 @@ package llm
 
 import (
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -393,5 +394,67 @@ func TestExplicitProfileOptionWins(t *testing.T) {
 	}
 	if profile := resolveBedrockProfile(options); profile != "chosen" {
 		t.Fatalf("profile = %q", profile)
+	}
+}
+
+// TestCanonicalURIEncodesReservedCharacters covers the SigV4 CanonicalURI rule.
+// Signing the raw request path worked only while every character in it was
+// unreserved; Go's url.PathEscape deliberately leaves ':' alone and every
+// Bedrock model id ends in ":0", so the service canonicalised the colon to %3A,
+// computed a different signature, and rejected the request.
+func TestCanonicalURIEncodesReservedCharacters(t *testing.T) {
+	cases := []struct{ path, want string }{
+		{"", "/"},
+		{"/", "/"},
+		{"/model/us.anthropic.claude-sonnet-4-5-20250929-v1:0/converse-stream",
+			"/model/us.anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse-stream"},
+		{"/a/b-c_d.e~f", "/a/b-c_d.e~f"},
+		// A path that already carries a percent-escape is encoded again, which
+		// is what "twice for every service except S3" means: the service does
+		// the same to what it received.
+		{"/model/x%2Fy/converse-stream", "/model/x%252Fy/converse-stream"},
+		{"/with space", "/with%20space"},
+	}
+	for _, tc := range cases {
+		if got := awsCanonicalURI(tc.path); got != tc.want {
+			t.Errorf("awsCanonicalURI(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestBedrockModelIDPathIsSignedConsistently is the end-to-end version: the
+// canonical URI the signature covers must be the encoding of exactly the path
+// that goes on the wire.
+func TestBedrockModelIDPathIsSignedConsistently(t *testing.T) {
+	modelID := "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	raw := "https://bedrock-runtime.us-east-1.amazonaws.com/model/" + url.PathEscape(modelID) + "/converse-stream"
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical := awsCanonicalURI(parsed.EscapedPath())
+	if strings.Contains(canonical, ":") {
+		t.Fatalf("canonical URI still carries an unencoded colon: %q", canonical)
+	}
+	if !strings.Contains(canonical, "%3A0") {
+		t.Fatalf("canonical URI = %q, want the model id's colon encoded", canonical)
+	}
+}
+
+// TestCanonicalQueryUsesSigV4Encoding covers the query rule: net/url's Encode
+// writes a space as "+", where SigV4 requires "%20", and sorts only by key.
+func TestCanonicalQueryUsesSigV4Encoding(t *testing.T) {
+	values := url.Values{
+		"b":     []string{"two"},
+		"a":     []string{"one 1", "one 2"},
+		"c:key": []string{"v/v"},
+	}
+	want := "a=one%201&a=one%202&b=two&c%3Akey=v%2Fv"
+	if got := awsCanonicalQuery(values); got != want {
+		t.Fatalf("awsCanonicalQuery = %q, want %q", got, want)
+	}
+	if got := awsCanonicalQuery(nil); got != "" {
+		t.Fatalf("empty query = %q", got)
 	}
 }

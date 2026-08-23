@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	charmterm "github.com/charmbracelet/x/term"
 
@@ -541,6 +542,9 @@ func authCommand(args []string) error {
 			visibleInput = (info.Mode() & os.ModeCharDevice) != 0
 		}
 		interaction := newTerminalLoginInteraction(os.Stdin, os.Stderr, visibleInput)
+		// /login runs in-process from chat, so the reader goroutine must not
+		// outlive the flow and start eating the user's next lines of input.
+		defer interaction.Close()
 		if _, err := c.Login(ctx, providerID, interaction); err != nil {
 			return err
 		}
@@ -570,14 +574,72 @@ type terminalLoginInteraction struct {
 	// secretIn is the same stream as reader when it is a terminal, so that
 	// PromptSecret can turn echo off. Nil for piped input and in tests.
 	secretIn *os.File
+
+	// lines is served by a single reader goroutine, started only when a
+	// prompt is actually cancellable.
+	//
+	// Reading stdin in a goroutine per prompt leaked one goroutine for every
+	// prompt whose context won the race -- each still blocked in ReadString --
+	// and /login runs in-process from chat, so those orphans went on to
+	// swallow the user's next lines of input, one line each.
+	linesOnce sync.Once
+	lines     chan loginLineResult
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+type loginLineResult struct {
+	line string
+	err  error
 }
 
 func newTerminalLoginInteraction(in io.Reader, out io.Writer, visibleInput bool) *terminalLoginInteraction {
-	i := &terminalLoginInteraction{reader: bufio.NewReader(in), out: out, visibleInput: visibleInput}
+	i := &terminalLoginInteraction{
+		reader: bufio.NewReader(in), out: out, visibleInput: visibleInput,
+		closed: make(chan struct{}),
+	}
 	if file, ok := in.(*os.File); ok && charmterm.IsTerminal(file.Fd()) {
 		i.secretIn = file
 	}
 	return i
+}
+
+// Close releases the reader goroutine, if one was started. A read already
+// blocked in the terminal driver still needs one more newline to return, which
+// is unavoidable without non-blocking I/O, but at most one such goroutine can
+// exist per login flow instead of one per cancelled prompt.
+func (i *terminalLoginInteraction) Close() {
+	i.closeOnce.Do(func() { close(i.closed) })
+}
+
+// readLine reads one line directly.
+func (i *terminalLoginInteraction) readLine() loginLineResult {
+	line, err := i.reader.ReadString('\n')
+	if err == io.EOF && line != "" {
+		err = nil
+	}
+	return loginLineResult{line: strings.TrimSpace(line), err: err}
+}
+
+// lineChannel starts the shared reader goroutine on first use.
+func (i *terminalLoginInteraction) lineChannel() <-chan loginLineResult {
+	i.linesOnce.Do(func() {
+		i.lines = make(chan loginLineResult)
+		go func() {
+			for {
+				result := i.readLine()
+				select {
+				case i.lines <- result:
+				case <-i.closed:
+					return
+				}
+				if result.err != nil {
+					return
+				}
+			}
+		}()
+	})
+	return i.lines
 }
 
 // readSecretPrompt reads a secret without echoing it, when it can.
@@ -624,27 +686,19 @@ func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, e
 		}
 	}
 
-	type lineResult struct {
-		line string
-		err  error
-	}
-	result := make(chan lineResult, 1)
-	go func() {
-		line, err := i.reader.ReadString('\n')
-		if err == io.EOF && line != "" {
-			err = nil
+	// Only involve a goroutine when the prompt can actually be cancelled;
+	// otherwise read inline, where there is nothing to leak.
+	var read loginLineResult
+	if prompt.Ctx == nil || prompt.Ctx.Done() == nil {
+		read = i.readLine()
+	} else {
+		select {
+		case <-prompt.Ctx.Done():
+			return "", catalog.ErrLoginCancelled
+		case read = <-i.lineChannel():
 		}
-		result <- lineResult{line: strings.TrimSpace(line), err: err}
-	}()
-
-	ctx := prompt.Ctx
-	if ctx == nil {
-		ctx = context.Background()
 	}
-	select {
-	case <-ctx.Done():
-		return "", catalog.ErrLoginCancelled
-	case read := <-result:
+	{
 		if read.err != nil {
 			return "", read.err
 		}
