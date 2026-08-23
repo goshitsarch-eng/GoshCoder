@@ -466,8 +466,18 @@ func expandPlaceholder(text string, args []string, all string) (consumed int, re
 		}
 		end := len(args)
 		if match[2] != "" {
-			length, _ := strconv.Atoi(match[2])
-			end = min(len(args), start+length)
+			// Clamp before adding. A template body is untrusted -- discovery
+			// loads it out of a repository checkout, and a restore writes one
+			// from a third-party archive -- so ${@:2:9223372036854775807}
+			// overflowed start+length to a negative bound and panicked the
+			// process on the input path, before the slash dispatcher ran.
+			length, convErr := strconv.Atoi(match[2])
+			switch {
+			case convErr != nil || length < 0:
+				end = start
+			case length < len(args)-start:
+				end = start + length
+			}
 		}
 		return len(match[0]), strings.Join(args[start:end], " "), true
 	}

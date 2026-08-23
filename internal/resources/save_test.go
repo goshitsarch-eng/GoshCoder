@@ -621,3 +621,105 @@ func writeTarWithSymlink(t *testing.T, out *bytes.Buffer) {
 		t.Fatalf("close gzip: %v", err)
 	}
 }
+
+// TestHostileSliceLengthDoesNotPanic covers an untrusted template body. Bodies
+// are loaded straight out of a repository checkout and written by a restore
+// from someone else's archive, and expansion runs on the input path before the
+// slash dispatcher -- so a panic here takes down the whole session.
+func TestHostileSliceLengthDoesNotPanic(t *testing.T) {
+	bodies := []string{
+		"${@:2:9223372036854775807}",
+		"${@:1:9223372036854775807}",
+		"${@:9223372036854775807}",
+		"${@:2:-1}",
+		"${@:0:99999999999999999999}",
+		"$999999999999999999999",
+	}
+	for _, body := range bodies {
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("expandTemplate(%q) panicked: %v", body, recovered)
+				}
+			}()
+			expandTemplate(body, []string{"a", "b", "c"})
+			expandTemplate(body, nil)
+		}()
+	}
+}
+
+// TestSliceStillWorksForHonestLengths is the negative control: the clamp must
+// not break the feature it is guarding.
+func TestSliceStillWorksForHonestLengths(t *testing.T) {
+	args := []string{"one", "two", "three", "four"}
+	for body, want := range map[string]string{
+		"${@:2}":   "two three four",
+		"${@:2:2}": "two three",
+		"${@:1:1}": "one",
+		"${@:3:9}": "three four",
+	} {
+		if got := expandTemplate(body, args); got != want {
+			t.Fatalf("expandTemplate(%q) = %q, want %q", body, got, want)
+		}
+	}
+}
+
+// TestSaveRefusesASymlinkedPromptDirectory covers the escape that a per-file
+// guard could not see: a repository commits `.goshcoder/prompts` as a symlink,
+// the .md inside it does not exist so nothing is refused, and the write lands
+// wherever the link points. A file called CLAUDE.md placed in the agent
+// directory that way is loaded into the system prompt of every future session.
+func TestSaveRefusesASymlinkedPromptDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symbolic links need elevation on Windows")
+	}
+	cwd, agentDir := t.TempDir(), t.TempDir()
+	outside := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(cwd, ".goshcoder"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cwd, ".goshcoder", "prompts")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	_, _, err := SaveTemplate(cwd, agentDir, "CLAUDE", "injected instructions", SaveOptions{Target: SaveProject})
+	if !errors.Is(err, ErrPromptDirEscapes) {
+		t.Fatalf("SaveTemplate error = %v, want ErrPromptDirEscapes", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "CLAUDE.md")); !os.IsNotExist(statErr) {
+		t.Fatal("a prompt was written outside the workspace through a directory symlink")
+	}
+
+	// A restore must be refused for the same reason.
+	outcomes, err := RestorePrompts(cwd, agentDir,
+		[]ArchivedPrompt{{Name: "AGENTS", Target: SaveProject, Body: "injected"}}, RestoreOptions{})
+	if err != nil {
+		t.Fatalf("RestorePrompts: %v", err)
+	}
+	if len(outcomes) != 1 || !outcomes[0].Skipped {
+		t.Fatalf("outcomes = %+v, want the restore refused", outcomes)
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "AGENTS.md")); !os.IsNotExist(statErr) {
+		t.Fatal("a restore wrote outside the workspace through a directory symlink")
+	}
+
+	// And a backup must not read through it either.
+	if _, warnings, err := CollectPrompts(cwd, agentDir, []SaveTarget{SaveProject}); err != nil {
+		t.Fatalf("CollectPrompts: %v", err)
+	} else if len(warnings) == 0 {
+		t.Fatal("a backup read through the redirected directory without saying so")
+	}
+}
+
+// TestOrdinaryProjectPromptDirectoryStillWorks is the negative control for the
+// guard above.
+func TestOrdinaryProjectPromptDirectoryStillWorks(t *testing.T) {
+	cwd, agentDir := t.TempDir(), t.TempDir()
+	if _, _, err := SaveTemplate(cwd, agentDir, "ship", "ship it", SaveOptions{Target: SaveProject}); err != nil {
+		t.Fatalf("SaveTemplate into a normal project directory: %v", err)
+	}
+	if got := loadOne(t, cwd, agentDir, "ship"); !strings.Contains(got.Body, "ship it") {
+		t.Fatalf("body = %q", got.Body)
+	}
+}

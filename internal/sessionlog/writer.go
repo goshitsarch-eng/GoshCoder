@@ -49,6 +49,19 @@ type Writer struct {
 	degraded error
 	closed   bool
 	readOnly bool
+	// keep suppresses the delete-if-empty rule. A fork or an import is a file
+	// the caller explicitly asked for, and its copied path may legitimately
+	// contain no assistant reply -- rewinding to a question is exactly that.
+	// Deleting it would destroy the copy the moment it was closed.
+	keep bool
+}
+
+// Keep marks this session as one the caller created deliberately, so Close
+// will not apply the delete-if-empty rule to it.
+func (w *Writer) Keep() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.keep = true
 }
 
 // Path returns the session file's location.
@@ -239,7 +252,7 @@ func (w *Writer) Close() error {
 		w.file = nil
 	}
 
-	discard := !w.readOnly && !w.tree.HasAssistantMessage()
+	discard := !w.readOnly && !w.keep && !w.tree.HasAssistantMessage()
 	if discard {
 		if err := os.Remove(w.path); err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
 			firstErr = fmt.Errorf("sessionlog: remove empty session %s: %w", w.path, err)
@@ -260,7 +273,7 @@ func (w *Writer) Discarded() bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.closed && !w.readOnly && !w.tree.HasAssistantMessage()
+	return w.closed && !w.readOnly && !w.keep && !w.tree.HasAssistantMessage()
 }
 
 // messageRole reads the role out of a raw message payload without decoding the

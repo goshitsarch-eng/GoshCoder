@@ -177,3 +177,59 @@ func TestMemberLargerThanTheLimitIsSkippedNotFatal(t *testing.T) {
 		t.Fatalf("warnings = %v, want one naming the skipped member", warnings)
 	}
 }
+
+// TestManyHonestlySizedSparseMembersCannotExhaustMemory is the aggregate half.
+// Every per-member check passes when each member honestly declares exactly the
+// per-prompt limit; ten thousand of them still retain twenty gigabytes. The
+// gzip-stream counter cannot see it, because sparse holes are synthesized after
+// decompression and are never read from that stream.
+func TestManyHonestlySizedSparseMembersCannotExhaustMemory(t *testing.T) {
+	const members = 200
+	archive := buildSparseSwarm(members, maxResourceBytes)
+
+	if len(archive) > 64<<10 {
+		t.Fatalf("the swarm is %d bytes; it is meant to be small", len(archive))
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, _, _, err := ReadArchive(bytes.NewReader(archive))
+	runtime.ReadMemStats(&after)
+
+	allocated := (after.TotalAlloc - before.TotalAlloc) >> 20
+	if allocated > 256 {
+		t.Fatalf("reading a %d-byte archive allocated %d MiB (err=%v)", len(archive), allocated, err)
+	}
+	if err == nil {
+		t.Fatal("an archive claiming 400 MiB of prompts was accepted")
+	}
+}
+
+// buildSparseSwarm produces an archive of count sparse members, each declaring
+// logical bytes while carrying one real byte.
+func buildSparseSwarm(count int, logical int64) []byte {
+	var archive bytes.Buffer
+	for i := 0; i < count; i++ {
+		name := fmt.Sprintf("user/m%04d.md", i)
+		records := paxRecord("GNU.sparse.major", "0") +
+			paxRecord("GNU.sparse.minor", "1") +
+			paxRecord("GNU.sparse.name", name) +
+			paxRecord("GNU.sparse.size", fmt.Sprint(logical)) +
+			paxRecord("GNU.sparse.numblocks", "1") +
+			paxRecord("GNU.sparse.map", "0,1")
+		archive.Write(ustarHeader("PaxHeaders/m", int64(len(records)), 'x'))
+		archive.WriteString(records)
+		padToBlock(&archive)
+		archive.Write(ustarHeader("m", 1, '0'))
+		archive.WriteByte('A')
+		padToBlock(&archive)
+	}
+	archive.Write(make([]byte, 1024))
+
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	writer.Write(archive.Bytes())
+	writer.Close()
+	return compressed.Bytes()
+}

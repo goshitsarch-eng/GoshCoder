@@ -89,6 +89,58 @@ func TemplateDir(cwd, agentDir string, target SaveTarget) string {
 	return filepath.Join(agentDir, "prompts")
 }
 
+// ErrPromptDirEscapes is returned when the prompt directory, or a component of
+// it, resolves outside the tree it is supposed to live in.
+var ErrPromptDirEscapes = errors.New("resources: the prompt directory resolves outside its workspace")
+
+// checkTemplateDir refuses a prompt directory that a symbolic link has
+// redirected out of its own tree.
+//
+// Guarding only the final `<name>.md` component was not enough, and the gap was
+// serious: a checked-out repository can commit `.goshcoder/prompts` as a
+// symlink to any directory the user can write. The .md file inside it does not
+// exist, so the per-file Lstat found nothing to refuse, and the write went
+// through the link. Landing a file called CLAUDE.md or AGENTS.md in the agent
+// directory that way is persistent prompt injection: it is loaded into the
+// system prompt of every future session, in every workspace.
+//
+// The whole resolved path is compared against the resolved root instead. Only
+// the deepest existing ancestor can be resolved, since the directory itself may
+// not exist yet, which is exactly the case a first save has to handle.
+func checkTemplateDir(dir, root string) error {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		// A root that does not resolve cannot be reasoned about; the agent
+		// directory always exists by the time anything is saved.
+		resolvedRoot = filepath.Clean(root)
+	}
+
+	probe := filepath.Clean(dir)
+	for {
+		resolved, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			relative, relErr := filepath.Rel(resolvedRoot, resolved)
+			if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("%w: %s points outside %s", ErrPromptDirEscapes, dir, root)
+			}
+			return nil
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return nil
+		}
+		probe = parent
+	}
+}
+
+// templateRoot is the tree a target's prompt directory must stay inside.
+func templateRoot(cwd, agentDir string, target SaveTarget) string {
+	if target == SaveProject {
+		return cwd
+	}
+	return agentDir
+}
+
 // placeholderPattern matches every form expandTemplate rewrites.
 var placeholderPattern = regexp.MustCompile(`\$\{(?:\d+|@|ARGUMENTS):-[^}]*\}|\$\{@:\d+(?::\d+)?\}|\$(?:ARGUMENTS|@|\d+)`)
 
@@ -140,6 +192,9 @@ func SaveTemplate(cwd, agentDir, name, body string, options SaveOptions) (path s
 	}
 
 	directory := TemplateDir(cwd, agentDir, options.Target)
+	if err := checkTemplateDir(directory, templateRoot(cwd, agentDir, options.Target)); err != nil {
+		return "", "", err
+	}
 	path = filepath.Join(directory, name+".md")
 
 	// Never write through a discovered path. A prompt directory can contain a
@@ -216,7 +271,11 @@ func RemoveTemplate(cwd, agentDir, name string, target SaveTarget) (string, erro
 	if err := ValidTemplateName(name, nil); err != nil {
 		return "", err
 	}
-	path := filepath.Join(TemplateDir(cwd, agentDir, target), name+".md")
+	directory := TemplateDir(cwd, agentDir, target)
+	if err := checkTemplateDir(directory, templateRoot(cwd, agentDir, target)); err != nil {
+		return "", err
+	}
+	path := filepath.Join(directory, name+".md")
 	info, err := os.Lstat(path)
 	if err != nil {
 		return "", fmt.Errorf("no prompt named %q in %s", name, TemplateDir(cwd, agentDir, target))

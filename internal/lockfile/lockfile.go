@@ -112,6 +112,11 @@ func token() (string, error) {
 	return fmt.Sprintf("%d %s\n", os.Getpid(), hex.EncodeToString(random[:])), nil
 }
 
+// ReadOwner reports who holds the lock at path, without attempting to take it.
+// Callers that only need to display whether a resource is busy use this rather
+// than TryAcquire, which competes for the lock it is asking about.
+func ReadOwner(path string) Owner { return readOwner(path) }
+
 // readOwner parses a lock file's token. A malformed or unreadable file yields
 // the zero Owner rather than an error: the caller is reporting who holds a
 // lock it failed to take, and that report must not itself fail.
@@ -188,8 +193,18 @@ func acquire(path string, t Timing) (func(), Owner, bool, error) {
 		// race another waiter doing the same, which is why the winner is
 		// decided by the O_EXCL create on the next iteration rather than by
 		// who removed the file.
+		//
+		// The removal's error is not ignored. A lock path that looks stale but
+		// cannot be unlinked -- another user's file in a sticky directory, a
+		// read-only mount, a directory left where the lock should be -- used to
+		// send this loop straight back to the top, skipping both the deadline
+		// check and the sleep below: an unkillable 100% CPU spin, reachable
+		// from a session listing and therefore from the render path.
 		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > t.Stale {
-			_ = os.Remove(path)
+			if removeErr := os.Remove(path); removeErr != nil {
+				return nil, readOwner(path), false, fmt.Errorf(
+					"lockfile: %s is stale but cannot be removed: %w", path, removeErr)
+			}
 			continue
 		}
 		if !time.Now().Before(deadline) {

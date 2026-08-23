@@ -64,6 +64,9 @@ type LoadReport struct {
 	// RepairedTail is set when an unterminated final line was removed so the
 	// next append would not concatenate onto it.
 	RepairedTail bool
+	// UnterminatedTail is set when the final entry parsed cleanly but its
+	// newline never landed. It is retained; the caller terminates it.
+	UnterminatedTail bool
 	// Migrated is set when the file was read as a pre-v3 pi session. Such a
 	// file cannot be appended to -- see ErrLegacyFormat.
 	Migrated bool
@@ -248,34 +251,54 @@ func (s *Store) Load(path string) (*Tree, Header, LoadReport, error) {
 // readInto folds a session file. It returns the byte offset of the end of the
 // last complete line, so a caller with write access can cut off an
 // unterminated tail before appending to it.
+// readInto folds a session file. It returns keepBytes: the offset up to which
+// the file is known-good, so a caller with write access can cut off a torn
+// append without touching anything real.
+//
+// The accounting is the delicate part, and two shapes broke it before:
+//
+//   - An oversized line is skipped, but its bytes are still in the file. If the
+//     offset does not advance past them, a later repair truncates in the middle
+//     of a subsequent entry and destroys everything after the oversized one.
+//     Consumption is therefore tracked from what the reader actually consumed,
+//     not from whether a line was retained.
+//   - A final line that is valid JSON but missing its newline is a completed
+//     write whose terminator did not land. Deleting it while keeping it in the
+//     fold leaves the next append pointing at a parent that is no longer on
+//     disk. It is kept, and the caller terminates it instead.
 func readInto(file *os.File, path string) (*Tree, Header, LoadReport, int64, error) {
 	var report LoadReport
 	reader := bufio.NewReaderSize(file, 64<<10)
 
-	// readLine returns a whole line including its terminator, or the trailing
-	// bytes with io.EOF when the file does not end in a newline. Reading
+	// readLine returns one line including its terminator, plus how many bytes
+	// were consumed from the file to produce it -- which differs from len(line)
+	// for an oversized line, whose tail is drained and discarded. Reading
 	// through ErrBufferFull rather than using bufio.Scanner is what lets one
 	// oversized line be reported and skipped instead of ending the scan.
-	readLine := func() ([]byte, error) {
+	readLine := func() ([]byte, int64, error) {
 		var line []byte
+		var consumed int64
 		for {
 			chunk, err := reader.ReadSlice('\n')
-			line = append(line, chunk...)
+			consumed += int64(len(chunk))
+			if len(line) <= MaxEntryBytes {
+				line = append(line, chunk...)
+			}
 			if len(line) > MaxEntryBytes {
-				// Drain the rest of this line so the next call starts on the
-				// next one.
-				for err == bufio.ErrBufferFull {
-					_, err = reader.ReadSlice('\n')
+				for errors.Is(err, bufio.ErrBufferFull) {
+					var drained []byte
+					drained, err = reader.ReadSlice('\n')
+					consumed += int64(len(drained))
 				}
-				return line, ErrTooLarge
+				return line, consumed, ErrTooLarge
 			}
 			if err == nil || !errors.Is(err, bufio.ErrBufferFull) {
-				return line, err
+				return line, consumed, err
 			}
 		}
 	}
 
-	first, err := readLine()
+	first, consumed, err := readLine()
 	if len(first) == 0 {
 		return nil, Header{}, report, 0, fmt.Errorf("sessionlog: %s is empty", path)
 	}
@@ -300,31 +323,39 @@ func readInto(file *os.File, path string) (*Tree, Header, LoadReport, int64, err
 			fmt.Sprintf("session is format v%d; it was read as v%d without being rewritten", header.Version, FormatVersion))
 	}
 
-	// offset tracks complete lines only. A skipped-but-complete line still
-	// counts: it is pi-compatible content that a repair must not delete.
-	var offset int64
-	if complete(first) {
-		offset = int64(len(first))
+	if info, statErr := file.Stat(); statErr == nil && info.Size() > MaxSessionBytes {
+		return nil, Header{}, report, 0, fmt.Errorf(
+			"sessionlog: %s is %d bytes, over the %d-byte limit; export it or start a new session",
+			path, info.Size(), MaxSessionBytes)
 	}
 
+	total := consumed
+	keepBytes := consumed
 	tree := NewTree()
 	lineNumber := 1
+	// lastAdded anchors an entry whose recorded parent was skipped, so one bad
+	// line costs that line rather than every entry before it: walking the
+	// parent chain stops dead at a gap, which would silently drop the whole
+	// conversation preceding it from the next request.
+	var lastAdded string
+
 	for {
-		raw, readErr := readLine()
+		raw, used, readErr := readLine()
+		lineStart := total
+		total += used
 		if len(raw) > 0 {
 			lineNumber++
 			whole := complete(raw)
-			if whole {
-				offset += int64(len(raw))
-			}
 			body := trimLine(raw)
 			switch {
 			case errors.Is(readErr, ErrTooLarge):
 				report.SkippedLines++
 				report.Warnings = append(report.Warnings,
 					fmt.Sprintf("line %d exceeds the %d-byte entry limit and was skipped", lineNumber, MaxEntryBytes))
+				keepBytes = total
 			case len(body) == 0:
 				// Blank lines are not entries; pi ignores them too.
+				keepBytes = total
 			default:
 				entry, decodeErr := decodeEntry(body, !migration.needed())
 				if decodeErr == nil && migration.needed() {
@@ -332,19 +363,40 @@ func readInto(file *os.File, path string) (*Tree, Header, LoadReport, int64, err
 				}
 				switch {
 				case decodeErr != nil && !whole:
-					// An unterminated final line is a torn append: the process
-					// died between issuing the write and its completion.
+					// An unterminated final line that does not parse is a torn
+					// append: the process died between issuing the write and
+					// its completion. Drop exactly those bytes.
 					report.RepairedTail = true
+					keepBytes = lineStart
 				case decodeErr != nil:
 					report.SkippedLines++
 					report.Warnings = append(report.Warnings,
 						fmt.Sprintf("line %d %s and was skipped", lineNumber, decodeErr))
+					keepBytes = total
 				default:
+					if entry.ParentID != nil && !tree.Has(*entry.ParentID) {
+						if lastAdded == "" {
+							entry.ParentID = nil
+						} else {
+							anchor := lastAdded
+							entry.ParentID = &anchor
+						}
+						report.Warnings = append(report.Warnings, fmt.Sprintf(
+							"line %d referenced an entry that is not in the file; it was reattached so the earlier conversation stays reachable",
+							lineNumber))
+					}
 					if addErr := tree.Add(entry, raw); addErr != nil {
 						report.SkippedLines++
 						report.Warnings = append(report.Warnings,
 							fmt.Sprintf("line %d %s and was skipped", lineNumber, addErr))
+					} else {
+						lastAdded = entry.ID
+						if !whole {
+							// Kept, but its terminator never landed.
+							report.UnterminatedTail = true
+						}
 					}
+					keepBytes = total
 				}
 			}
 		}
@@ -358,11 +410,12 @@ func readInto(file *os.File, path string) (*Tree, Header, LoadReport, int64, err
 			return nil, Header{}, report, 0, fmt.Errorf("sessionlog: read %s: %w", path, readErr)
 		}
 	}
+
 	if migration.needed() {
 		migration.finish(tree)
 		header.Version = FormatVersion
 	}
-	return tree, header, report, offset, nil
+	return tree, header, report, keepBytes, nil
 }
 
 func complete(raw []byte) bool { return len(raw) > 0 && raw[len(raw)-1] == '\n' }
@@ -405,9 +458,12 @@ func (s *Store) Attach(path string) (*Writer, LoadReport, error) {
 		release()
 		return nil, report, fmt.Errorf("%w: %s is format v%d", ErrLegacyFormat, path, report.SourceVersion)
 	}
-	// Cut the file back to the last complete line. Without this, the next
+	// Cut the file back to the last known-good byte. Without this, the next
 	// append concatenates onto a partial entry and corrupts both.
-	if info, statErr := file.Stat(); statErr == nil && info.Size() != offset {
+	//
+	// keepBytes already accounts for skipped-but-present lines, so this only
+	// ever removes a torn append -- never a line the fold retained.
+	if info, statErr := file.Stat(); statErr == nil && info.Size() > offset {
 		if truncErr := file.Truncate(offset); truncErr != nil {
 			file.Close()
 			release()
@@ -419,6 +475,18 @@ func (s *Store) Attach(path string) (*Writer, LoadReport, error) {
 		file.Close()
 		release()
 		return nil, report, fmt.Errorf("sessionlog: seek %s: %w", path, err)
+	}
+	// A final entry that parsed but never got its newline is real conversation.
+	// Terminating it keeps it, where truncating would delete an entry the fold
+	// is already treating as the parent of everything appended next.
+	if report.UnterminatedTail {
+		written, writeErr := file.Write([]byte{'\n'})
+		offset += int64(written)
+		if writeErr != nil {
+			file.Close()
+			release()
+			return nil, report, fmt.Errorf("sessionlog: terminate %s: %w", path, writeErr)
+		}
 	}
 	return &Writer{file: file, path: path, header: header, tree: tree, release: release, size: offset}, report, nil
 }
@@ -569,18 +637,28 @@ func (s *Store) describe(path string, withText bool) (Info, error) {
 	}
 	info.SearchText = text.String()
 
-	// Probing the claim is advisory display only, so a probe that wins must
-	// release immediately -- otherwise merely listing sessions would leave a
-	// lock file behind for every one of them.
-	if release, owner, ok, lockErr := lockfile.TryAcquire(path+".lock", lockfile.SessionTiming()); lockErr == nil {
-		if ok {
-			release()
-		} else {
-			info.Locked = true
-			info.Owner = owner
-		}
-	}
+	info.Locked, info.Owner = probeClaim(path)
 	return info, nil
+}
+
+// probeClaim reports whether a session is open elsewhere WITHOUT taking the
+// claim.
+//
+// Acquiring it to find out was a real hazard: claim() has no retry, so a
+// concurrent process starting a session while a listing ran could lose the race
+// against the listing's own momentary hold and fail to open its own file. A
+// listing must observe, not compete.
+func probeClaim(path string) (bool, lockfile.Owner) {
+	lockPath := path + ".lock"
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		return false, lockfile.Owner{}
+	}
+	// A lock whose heartbeat stopped belongs to a process that is gone.
+	if time.Since(info.ModTime()) > lockfile.SessionTiming().Stale {
+		return false, lockfile.Owner{}
+	}
+	return true, lockfile.ReadOwner(lockPath)
 }
 
 // messageText extracts a plain-text preview from a message payload. It reads
@@ -734,8 +812,15 @@ func (s *Store) Fork(src Info, at *string, targetCwd string) (*Writer, error) {
 		onPath[entry.ID] = true
 	}
 	for _, entry := range tree.All() {
-		if !onPath[entry.ID] && !(entry.Type == TypeLabel && onPath[entry.TargetID]) {
-			continue
+		// A label is copied only when both its target and its own parent are on
+		// the copied path; otherwise the copy carries a dangling reference.
+		if !onPath[entry.ID] {
+			if entry.Type != TypeLabel || !onPath[entry.TargetID] {
+				continue
+			}
+			if entry.ParentID != nil && !onPath[*entry.ParentID] {
+				continue
+			}
 		}
 		raw, ok := tree.Raw(entry.ID)
 		if !ok {
@@ -755,11 +840,38 @@ func (s *Store) Fork(src Info, at *string, targetCwd string) (*Writer, error) {
 			return nil, err
 		}
 	}
+	// The write head must land on the last conversation entry, not on a label
+	// or another annotation that happened to be copied last: a label's own
+	// parent may not be on the copied path, and projecting from it yields an
+	// empty transcript.
+	if anchor := lastConversationEntry(writer.tree); anchor != "" {
+		if err := writer.SetLeaf(anchor); err != nil {
+			writer.Close()
+			return nil, err
+		}
+	}
+	// A fork is deliberate, so it survives Close even when the copied path
+	// holds no assistant reply -- rewinding to a question produces exactly that.
+	writer.Keep()
 	if err := writer.Sync(); err != nil {
 		writer.Close()
 		return nil, err
 	}
 	return writer, nil
+}
+
+// lastConversationEntry returns the id of the last entry that carries actual
+// conversation, ignoring annotations that are not valid write-head positions.
+func lastConversationEntry(tree *Tree) string {
+	var found string
+	for _, entry := range tree.All() {
+		switch entry.Type {
+		case TypeLabel, TypeSessionInfo:
+			continue
+		}
+		found = entry.ID
+	}
+	return found
 }
 
 // appendRaw writes a line verbatim, preserving its ids and timestamps. Used

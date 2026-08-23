@@ -217,3 +217,41 @@ func TestOwnerOfAMalformedLockDoesNotFail(t *testing.T) {
 		t.Fatalf("owner.String() = %q, want a usable fallback", got)
 	}
 }
+
+// TestUnremovableStaleLockFailsInsteadOfSpinning covers a lock path that looks
+// stale but cannot be unlinked: another user's file in a sticky directory, a
+// read-only mount, or a directory left where the lock belongs.
+//
+// The reclaim branch used to `continue` on a failed removal, skipping both the
+// deadline check and the retry sleep -- an unkillable 100% CPU spin. It is
+// reachable from a session listing, and a listing runs inside the render loop,
+// so one such path would hang the whole interface.
+func TestUnremovableStaleLockFailsInsteadOfSpinning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+
+	// A non-empty directory where the lock file should be: os.Remove refuses it.
+	if err := os.MkdirAll(filepath.Join(path, "occupied"), 0o700); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("age: %v", err)
+	}
+
+	timing := fast()
+	done := make(chan error, 1)
+	go func() {
+		_, _, _, err := TryAcquire(path, timing)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("TryAcquire reported success against an unusable lock path")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("TryAcquire never returned; it is spinning on an unremovable stale lock")
+	}
+}

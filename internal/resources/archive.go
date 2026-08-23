@@ -78,6 +78,13 @@ func CollectPrompts(cwd, agentDir string, targets []SaveTarget) ([]ArchivedPromp
 	var warnings []string
 	for _, target := range targets {
 		directory := TemplateDir(cwd, agentDir, target)
+		// A backup reads through the same redirected directory a save would
+		// write through, so an archive the user may share could otherwise carry
+		// files from wherever a repository pointed the link.
+		if err := checkTemplateDir(directory, templateRoot(cwd, agentDir, target)); err != nil {
+			warnings = append(warnings, err.Error())
+			continue
+		}
 		entries, err := os.ReadDir(directory)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -188,8 +195,16 @@ func ReadArchive(in io.Reader) ([]ArchivedPrompt, ArchiveManifest, []string, err
 	defer gzipReader.Close()
 
 	// Bound the decompressed stream: a small archive can expand to gigabytes.
+	//
+	// This counter alone is not sufficient, and cannot be. It sits on the gzip
+	// stream, but a GNU sparse member's holes are synthesized by archive/tar
+	// after decompression, so those bytes are never read from here at all. The
+	// running total below is what actually bounds the result -- ten thousand
+	// members each honestly reporting two megabytes would otherwise retain
+	// twenty gigabytes while every individual check passed.
 	limited := &countingReader{reader: io.LimitReader(gzipReader, maxArchiveBytes+1), limit: maxArchiveBytes}
 	tarReader := tar.NewReader(limited)
+	var retained int64
 
 	for entries := 0; ; entries++ {
 		if entries > maxArchiveEntries {
@@ -269,6 +284,11 @@ func ReadArchive(in io.Reader) ([]ArchivedPrompt, ArchiveManifest, []string, err
 			warnings = append(warnings, fmt.Sprintf("%s was skipped: %v", clean, err))
 			continue
 		}
+		retained += int64(len(content))
+		if retained > maxArchiveBytes {
+			return nil, manifest, warnings, fmt.Errorf(
+				"this archive expands to more than %d bytes of prompts", maxArchiveBytes)
+		}
 		prompts = append(prompts, ArchivedPrompt{Name: name, Target: target, Body: string(content)})
 	}
 
@@ -338,7 +358,13 @@ func RestorePrompts(cwd, agentDir string, prompts []ArchivedPrompt, options Rest
 			continue
 		}
 
-		path := filepath.Join(TemplateDir(cwd, agentDir, prompt.Target), prompt.Name+".md")
+		directory := TemplateDir(cwd, agentDir, prompt.Target)
+		if err := checkTemplateDir(directory, templateRoot(cwd, agentDir, prompt.Target)); err != nil {
+			outcome.Skipped, outcome.Reason = true, err.Error()
+			outcomes = append(outcomes, outcome)
+			continue
+		}
+		path := filepath.Join(directory, prompt.Name+".md")
 		outcome.Path = path
 		if info, err := os.Lstat(path); err == nil {
 			if info.Mode()&os.ModeSymlink != 0 {
