@@ -274,6 +274,10 @@ func TestEndToEndToolUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The workspace holds an open os.Root handle for path confinement. Unix
+	// lets t.TempDir unlink the directory out from under it; Windows refuses
+	// while the handle is open, and the cleanup failure fails the test.
+	defer workspace.Close()
 
 	c := catalog.NewCatalog(nil)
 	c.SetGetenv(func(name string) string {
@@ -359,6 +363,7 @@ func TestEndToEndToolErrorIsReportedToModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer workspace.Close()
 
 	model := provider.testModel()
 	a := agent.NewAgent(agent.AgentOptions{
@@ -408,6 +413,7 @@ func TestEndToEndPathConfinementThroughAgent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	defer workspace.Close()
 
 	model := provider.testModel()
 	a := agent.NewAgent(agent.AgentOptions{

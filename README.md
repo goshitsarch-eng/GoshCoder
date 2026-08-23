@@ -280,7 +280,9 @@ boundary matters:
   planning mode removes it and independently blocks shell execution.
 - **Credentials** live in `auth.json` (mode 0600) and are never echoed to the
   terminal. Concurrent sessions coordinate through a heartbeat lock file so a
-  refreshed token cannot be lost to a racing writer.
+  refreshed token cannot be lost to a racing writer. The 0600 here and below is
+  a Unix guarantee: Windows has no permission bits, so those files are
+  protected by whatever ACLs they inherit from your user profile instead.
 - **Local servers** (OAuth callback, Planner review) bind loopback only, validate
   state/CSRF tokens and the `Host` header, and set no-store and CSP headers.
 - **Session transcripts** contain every file the agent read and every command's

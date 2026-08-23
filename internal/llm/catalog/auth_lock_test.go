@@ -32,9 +32,13 @@ func readAuthFile(t *testing.T, path string) map[string]*Credential {
 func fastLockTiming() lockfile.Timing {
 	return lockfile.Timing{
 		Heartbeat: 20 * time.Millisecond,
-		Stale:     200 * time.Millisecond,
-		Wait:      30 * time.Second,
-		Retry:     5 * time.Millisecond,
+		// A second, not the 200ms this started as: a heartbeat goroutine
+		// starved for longer than the stale window makes a live holder look
+		// dead, and a 200ms stall is ordinary on a loaded CI runner. See
+		// lockfile.fast in internal/lockfile.
+		Stale: time.Second,
+		Wait:  30 * time.Second,
+		Retry: 5 * time.Millisecond,
 	}
 }
 
@@ -107,7 +111,7 @@ func TestSlowModifyKeepsItsLock(t *testing.T) {
 	select {
 	case err := <-fastDone:
 		t.Fatalf("the waiter took the lock from a live holder (err=%v)", err)
-	case <-time.After(10 * fastLockTiming().Stale):
+	case <-time.After(2 * fastLockTiming().Stale):
 		// Still blocked, which is correct: the holder heartbeats its lock.
 	}
 

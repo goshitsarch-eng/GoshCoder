@@ -360,7 +360,7 @@ func (m *Manager) IsPlanPathAllowed(inputPath string) bool {
 		return false
 	}
 	target := inputPath
-	if !filepath.IsAbs(target) {
+	if !isRootedPath(target) {
 		target = filepath.Join(m.root, target)
 	}
 	target = filepath.Clean(target)
@@ -370,6 +370,37 @@ func (m *Manager) IsPlanPathAllowed(inputPath string) bool {
 	}
 	ext := strings.ToLower(filepath.Ext(target))
 	return ext == ".md" || ext == ".mdx"
+}
+
+// isRootedPath reports whether a path names a location from a filesystem root
+// rather than from inside the workspace, in any platform's spelling.
+//
+// filepath.IsAbs alone is not enough. On Windows "/plans/a.md" is not absolute
+// -- it is relative to the current drive -- so the gate joined it onto the
+// workspace root and accepted it, where the same path on Unix was rejected for
+// pointing outside. A write gate that means different things on different
+// platforms is worse than one that is merely strict, so every rooted spelling
+// is recognised everywhere: a leading slash or backslash, a drive letter, and
+// the UNC prefix that a leading backslash already covers.
+//
+// The cost is that a Unix file literally named "C:\\x.md" is now refused as
+// well. That is a pathological name, and refusing it is what keeps the rule
+// identical on every platform.
+func isRootedPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	if filepath.IsAbs(path) {
+		return true
+	}
+	if path[0] == '/' || path[0] == '\\' {
+		return true
+	}
+	if len(path) >= 2 && path[1] == ':' &&
+		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+		return true
+	}
+	return false
 }
 
 var checklistPattern = regexp.MustCompile(`(?m)^(?:[-*+]|\d+[.)])\s*\[([ xX])\]\s+(.+)$`)

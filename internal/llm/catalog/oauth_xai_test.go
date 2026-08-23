@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"goshcoder/internal/llm"
 )
 
 // xaiServer is a fake xAI issuer: discovery, device authorization, and token,
@@ -338,5 +340,48 @@ func TestXAIAPIKeyPathIsUnaffectedByTheOAuthFlow(t *testing.T) {
 	auth, ok := c.ResolveAuth("xai")
 	if !ok || auth.APIKey != "xai-key" || auth.Source != "XAI_API_KEY" {
 		t.Fatalf("auth = %#v, ok = %v", auth, ok)
+	}
+}
+
+// TestGrokFlagshipModelsAreListed covers the gap catalog_extra.json exists to
+// close. catalog.json is generated from the pi reference, so it carries
+// whatever xAI had shipped when pi last regenerated it -- which left the
+// current flagship missing from `goshcoder models xai` entirely. A login the
+// user cannot point at this quarter's model is not much of a login.
+func TestGrokFlagshipModelsAreListed(t *testing.T) {
+	c, _ := oauthCatalog(t, nil)
+	provider := c.Provider("xai")
+	if provider == nil {
+		t.Fatal("xai is not a known provider")
+	}
+
+	for _, id := range []string{
+		"grok-4.6",
+		"grok-4.20-0309-reasoning",
+		"grok-4.20-0309-non-reasoning",
+		"grok-4.20-multi-agent-0309",
+	} {
+		model := provider.Model(id)
+		if model == nil {
+			t.Errorf("xai has no %s", id)
+			continue
+		}
+		if _, ok := llm.GetStreamer(model.API); !ok {
+			t.Errorf("%s speaks %q, which no streamer implements", id, model.API)
+		}
+		if model.BaseURL != "https://api.x.ai/v1" {
+			t.Errorf("%s baseUrl = %q", id, model.BaseURL)
+		}
+		if model.ContextWindow <= 0 || model.MaxTokens <= 0 || model.Cost.Input <= 0 {
+			t.Errorf("%s carries unusable metadata: %#v", id, model)
+		}
+		// xAI prices a request whose input passes 200K at a higher rate for
+		// the whole request. Without the tier the cost readout understates a
+		// long-context turn by half.
+		if len(model.Cost.Tiers) == 0 {
+			t.Errorf("%s has no long-context pricing tier", id)
+		} else if got := model.Cost.Tiers[0].InputTokensAbove; got != 200000 {
+			t.Errorf("%s tier starts above %d tokens, want 200000", id, got)
+		}
 	}
 }
