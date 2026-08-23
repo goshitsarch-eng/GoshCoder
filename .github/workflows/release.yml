@@ -39,13 +39,16 @@ jobs:
       # ${{ }} interpolation: a manual run is the one path where the tag
       # arrives as free text, and expanding free text into a script is how a
       # workflow with contents: write gets turned into someone else's.
+      # Inputs reach the shell through the environment rather than through
+      # ${{ }} interpolation: a manual run is the one path where they arrive as
+      # free text, and expanding free text into a script is how a workflow with
+      # contents: write gets turned into someone else's.
       - name: resolve the release tag
         id: release
         env:
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_REF: ${{ inputs.ref }}
-          REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
@@ -54,38 +57,73 @@ jobs:
             checkout="${INPUT_REF:-$REF_NAME}"
           else
             tag="$REF_NAME"
-            checkout="$REF"
+            checkout="$REF_NAME"
           fi
-          # The tag becomes a git ref, an archive filename, and the version the
-          # binary reports, so it is validated rather than trusted.
+
+          # Reject anything that is not a single line before any pattern test.
+          # grep is line-oriented, so "v1.2.3\ntag=evil" satisfies a ^...$
+          # pattern on its first line -- and then the second line writes another
+          # "tag=" assignment into $GITHUB_OUTPUT, where the last assignment is
+          # the one that wins. Validating the pattern first would authorise a
+          # value that never reaches the later steps.
+          for value in "$tag" "$checkout"; do
+            if [ "$(printf '%s' "$value" | head -n 1)" != "$value" ]; then
+              echo "::error::release inputs must each be a single line"
+              exit 1
+            fi
+          done
+
+          # The tag becomes a git ref, the archive filenames, and the version
+          # the binary reports.
           if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
             echo "::error::release tag must look like v1.2.3 or v1.2.3-rc.1, got '$tag'"
             exit 1
           fi
+          # The source ref is a branch, tag, or commit; anything outside this
+          # set is not one, and it lands in $GITHUB_OUTPUT just as the tag does.
+          if ! printf '%s' "$checkout" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._/-]*$'; then
+            echo "::error::source ref must be a branch, tag, or commit, got '$checkout'"
+            exit 1
+          fi
+
           printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
           printf 'checkout=%s\n' "$checkout" >>"$GITHUB_OUTPUT"
           echo "releasing $tag from $checkout"
 
+      # Checked out without a ref: whatever triggered the run always resolves,
+      # where the source ref named by a manual run might not. Which commit gets
+      # built is decided in the next step, once the tags are on disk and an
+      # existing tag can be told from one still to be created.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.release.outputs.checkout }}
-          # Tags are needed to tell "this release already exists" from "create
-          # it", and `git describe` in the Makefile needs the history.
+          # All refs, so an existing tag is visible and `git describe` in the
+          # Makefile has the history it needs.
           fetch-depth: 0
 
-      - name: create the tag if the manual run named a new one
-        if: github.event_name == 'workflow_dispatch'
+      - name: check out the commit to release
         env:
+          EVENT: ${{ github.event_name }}
           TAG: ${{ steps.release.outputs.tag }}
+          CHECKOUT: ${{ steps.release.outputs.checkout }}
         run: |
           set -eu
+          git fetch --tags --prune --force origin
+
+          # An existing tag is built as it stands rather than as the branch has
+          # since become -- and the source ref is genuinely ignored here, which
+          # is what the input promises.
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            # Re-running an existing tag must build that tag, not whatever the
-            # branch has moved on to since.
             echo "tag $TAG already exists; building it as it stands"
-            git checkout -q "refs/tags/$TAG"
+            git checkout -q --detach "refs/tags/$TAG"
             exit 0
           fi
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            echo "::error::$TAG triggered this run but no longer exists"
+            exit 1
+          fi
+
+          git checkout -q --detach "origin/$CHECKOUT" 2>/dev/null \
+            || git checkout -q --detach "$CHECKOUT"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "GoshCoder $TAG"
