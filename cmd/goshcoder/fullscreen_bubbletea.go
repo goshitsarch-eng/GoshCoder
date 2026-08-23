@@ -114,6 +114,11 @@ type fullscreenModel struct {
 	// mistake /login had to be rescued from.
 	sessionChoices      []sessionlog.Info
 	sessionChoicesValid bool
+	// sessionScanRunning / sessionScanResult move the scan off the render
+	// goroutine entirely: populating the cache parses every session file in the
+	// shard and can fork git, which must never happen inside View().
+	sessionScanRunning bool
+	sessionScanResult  chan []sessionlog.Info
 	// quitArmedAt is when Ctrl+C was last pressed at an idle empty prompt.
 	// It only arms when nothing is being saved: see handleTeaKey.
 	quitArmedAt time.Time
@@ -131,6 +136,8 @@ func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAg
 		lifecycle: lifecycle,
 		models:    availableFullscreenModels(session),
 
+		sessionScanResult: make(chan []sessionlog.Info, 1),
+
 		renderCache: tui.NewMessageCache(),
 	}
 	for _, tool := range session.agent.State().Tools {
@@ -146,6 +153,9 @@ func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAg
 }
 
 func runFullscreenChat(session *session) error {
+	fullscreenActive.Store(true)
+	defer fullscreenActive.Store(false)
+
 	// Streaming deltas are coalesced, while lifecycle/tool events use a
 	// separate queue so a delta flood can never hide activity changes.
 	updates := make(chan fullscreenAgentEvent, 1)
@@ -159,7 +169,25 @@ func runFullscreenChat(session *session) error {
 			}
 			return
 		}
-		lifecycle <- message
+		// Never block here. This listener runs inside the agent's emit, which
+		// holds the lock the state setters also take -- and the only drainer of
+		// this channel is the Bubble Tea update loop. A blocking send therefore
+		// self-deadlocks the moment the update loop calls SetModel with the
+		// channel full: it waits for a drain only it can perform.
+		//
+		// Dropping is safe because these events are cosmetic. applyAgentEvent
+		// sets activity strings; the transcript itself is rendered from the
+		// agent's own state, which refreshRealtimeInfo re-reads. The coalescing
+		// updates channel is used as the overflow path so a redraw still
+		// happens and the dropped status simply resolves one frame later.
+		select {
+		case lifecycle <- message:
+		default:
+			select {
+			case updates <- message:
+			default:
+			}
+		}
 	})
 	defer unsubscribe()
 

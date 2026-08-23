@@ -30,7 +30,7 @@ const pickerLimit = 50
 // from October". sessionlog bounds the text it keeps per session so this stays
 // affordable.
 func listSessionsForPicker(workdir string, allWorkspaces bool) ([]sessionlog.Info, error) {
-	store := defaultStore()
+	store := activeStore()
 	sessions, err := store.List(workdir, sessionlog.ListOptions{
 		AllWorkspaces: allWorkspaces,
 		Limit:         pickerLimit,
@@ -157,26 +157,33 @@ func chooseSessionInteractively(workdir string) (sessionlog.Info, bool, error) {
 
 // switchSession swaps the live session for another one mid-conversation.
 //
-// The current session is closed first, releasing its claim, so switching back
-// and forth between two sessions in one window works.
+// The target is attached BEFORE the current file is closed. Closing first left
+// every failure path -- a claim held elsewhere, a pre-v3 file, an I/O error --
+// with no recorder at all: the window kept running and silently recorded
+// nothing for the rest of its life.
+//
+// The recorder object is reused rather than replaced. Agent.Subscribe binds its
+// listener to the recorder it was given, so installing a new one would leave
+// every event going to the old, closed recorder.
 func (s *session) switchSession(ref string) error {
 	if s == nil {
 		return errors.New("no session")
 	}
-	store := defaultStore()
+	if s.log == nil {
+		return errors.New("this session is not being saved, so it cannot be switched")
+	}
+	if s.agent.State().IsStreaming {
+		return errors.New("wait for the current response to finish before switching sessions")
+	}
+	store := s.sessionStore()
 	workdir := s.workspaceRoot()
 	info, err := store.Resolve(workdir, ref)
 	if err != nil {
 		return err
 	}
-	if s.log != nil && info.Path == s.log.path() {
+	if info.Path == s.log.path() {
 		return errors.New("that is already the current session")
 	}
-
-	if err := s.log.close(); err != nil {
-		return fmt.Errorf("close the current session: %w", err)
-	}
-	s.log = nil
 
 	writer, report, err := store.Attach(info.Path)
 	if err != nil {
@@ -189,13 +196,19 @@ func (s *session) switchSession(ref string) error {
 		}
 		return err
 	}
-	s.log = newSessionRecorder(writer, s.pushNotice)
-	s.sessionReadOnly = false
 
 	projected := projectSession(writer.Snapshot(), writer.Leaf())
+	// Seeding the transcript before the swap keeps the agent and the log
+	// describing the same conversation at every instant.
 	s.agent.SetMessages(projected.Messages)
 	s.contextEstimate.reset()
-	s.restoredMessages = projected.Messages
+
+	if previous := s.log.swap(writer); previous != nil {
+		if closeErr := previous.Close(); closeErr != nil {
+			s.pushNotice("Session", "the previous session did not close cleanly: "+closeErr.Error())
+		}
+	}
+
 	for _, notice := range reportNotices(report) {
 		s.pushNotice("Session", notice)
 	}
@@ -270,17 +283,41 @@ func fullscreenResumeSuggestions(sessions []sessionlog.Info, query string, curre
 // cachedSessionSuggestions keeps the picker off the render path.
 //
 // suggestions() runs inside View(), on every keystroke and on a 120 ms tick.
-// Listing sessions reads every file in the shard, so an uncached picker would
-// re-read the whole session directory dozens of times a second -- the same
-// mistake the /login picker already had to be rescued from.
+// Caching alone was not enough: the very first "/resume " keystroke still
+// populated the cache inline, and populating it parses every session file in
+// the shard and can fork git for the repository root. On a large history that
+// is seconds of frozen interface, and on a network filesystem it can hang.
+//
+// The scan therefore runs on its own goroutine. Until it lands the picker
+// simply reports that it is still loading, and invalidation clears the flag so
+// the next miss starts a fresh scan.
 func (model *fullscreenModel) cachedSessionSuggestions(query string) []fullscreenSuggestion {
 	if !model.sessionChoicesValid {
-		sessions, err := listSessionsForPicker(model.session.workspaceRoot(), false)
-		if err != nil {
-			sessions = nil
+		if !model.sessionScanRunning {
+			model.sessionScanRunning = true
+			root := model.session.workspaceRoot()
+			target := model.sessionScanResult
+			go func() {
+				sessions, err := listSessionsForPicker(root, false)
+				if err != nil {
+					sessions = nil
+				}
+				select {
+				case target <- sessions:
+				default:
+				}
+			}()
 		}
-		model.sessionChoices = sessions
-		model.sessionChoicesValid = true
+		select {
+		case sessions := <-model.sessionScanResult:
+			model.sessionChoices = sessions
+			model.sessionChoicesValid = true
+			model.sessionScanRunning = false
+		default:
+			return []fullscreenSuggestion{{
+				label: "…", description: "reading saved sessions", value: "", execute: false,
+			}}
+		}
 	}
 	current := ""
 	if model.session != nil && model.session.log != nil {

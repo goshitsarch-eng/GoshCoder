@@ -380,3 +380,107 @@ func newRecordingFixtureIn(t *testing.T, store *sessionlog.Store, cwd string) *r
 	t.Cleanup(func() { _ = s.log.close() })
 	return &recordingFixture{session: s, store: store, cwd: cwd, path: writer.Path()}
 }
+
+// TestSwitchedSessionKeepsRecording covers a silent failure: Agent.Subscribe
+// binds its listener to the recorder it was given, so replacing session.log
+// with a freshly constructed recorder left every event going to the old, closed
+// one. /resume and /clone appeared to work and recorded nothing from that
+// moment on, for the rest of the window's life.
+func TestSwitchedSessionKeepsRecording(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	cwd := t.TempDir()
+	store := defaultStore()
+
+	f := newRecordingFixtureIn(t, store, cwd)
+	f.session.log.appendMessage(userMsg("in the first session"))
+	f.session.log.appendMessage(assistant("first answer", 0))
+
+	target, err := store.Create(cwd, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	targetRecorder := newSessionRecorder(target, nil)
+	targetRecorder.appendMessage(assistant("target answer", 0))
+	targetID := target.ID()
+	targetPath := target.Path()
+	if err := targetRecorder.close(); err != nil {
+		t.Fatalf("close target: %v", err)
+	}
+
+	if err := f.session.switchSession(targetID); err != nil {
+		t.Fatalf("switchSession: %v", err)
+	}
+
+	// The recorder object is the one the listener was bound to before the
+	// switch, so writing through it is exactly what an agent event does.
+	f.session.log.appendMessage(userMsg("after the switch"))
+	f.session.log.sync()
+
+	tree, _, _, err := store.Load(targetPath)
+	if err != nil {
+		t.Fatalf("reload target: %v", err)
+	}
+	var found bool
+	for _, entry := range tree.All() {
+		if strings.Contains(entryText(entry), "after the switch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("writes after switchSession did not reach the new session file")
+	}
+	if !f.session.recordingActive() {
+		t.Fatal("the session stopped recording after switching")
+	}
+}
+
+// TestFailedSwitchKeepsTheCurrentSessionRecording covers the ordering that
+// makes a failure survivable: closing the current file before knowing the
+// target could be attached left the window with no recorder at all, silently,
+// for the rest of its life.
+func TestFailedSwitchKeepsTheCurrentSessionRecording(t *testing.T) {
+	t.Setenv("GOSHCODER_AGENT_DIR", t.TempDir())
+	cwd := t.TempDir()
+	store := defaultStore()
+
+	f := newRecordingFixtureIn(t, store, cwd)
+	f.session.log.appendMessage(assistant("current answer", 0))
+	originalPath := f.session.log.path()
+
+	// A target another process is driving: Attach must fail.
+	held, err := store.Create(cwd, "")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	heldRecorder := newSessionRecorder(held, nil)
+	heldRecorder.appendMessage(assistant("held answer", 0))
+	heldRecorder.sync()
+	defer heldRecorder.close()
+
+	if err := f.session.switchSession(held.ID()); err == nil {
+		t.Fatal("switching to a session held elsewhere succeeded")
+	}
+
+	if !f.session.recordingActive() {
+		t.Fatal("a failed switch left the session not recording")
+	}
+	if f.session.log.path() != originalPath {
+		t.Fatalf("a failed switch changed the session file to %s", f.session.log.path())
+	}
+	f.session.log.appendMessage(userMsg("still working"))
+	f.session.log.sync()
+
+	tree, _, _, err := store.Load(originalPath)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	var found bool
+	for _, entry := range tree.All() {
+		if strings.Contains(entryText(entry), "still working") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("writes after a failed switch did not reach the original file")
+	}
+}

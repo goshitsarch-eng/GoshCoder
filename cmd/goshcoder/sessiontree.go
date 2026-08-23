@@ -130,6 +130,12 @@ func (s *session) forkTo(argument string) error {
 	if s == nil || s.log == nil || !s.log.active() {
 		return errors.New("this session is not being saved, so it cannot branch")
 	}
+	// Reset and Compact refuse while a run is active; SetMessages does not, so
+	// rewinding mid-turn would strand the run's own message list against a
+	// transcript it no longer describes.
+	if s.agent.State().IsStreaming {
+		return errors.New("wait for the current response to finish before rewinding")
+	}
 	tree := s.log.snapshot()
 	points := branchPoints(tree, s.log.leaf())
 	if len(points) == 0 {
@@ -206,6 +212,9 @@ func (s *session) labelPoint(argument string) error {
 func (s *session) cloneSession() error {
 	if s == nil || s.log == nil || !s.log.active() {
 		return errors.New("this session is not being saved, so it cannot be cloned")
+	}
+	if s.agent.State().IsStreaming {
+		return errors.New("wait for the current response to finish before cloning")
 	}
 	store := defaultStore()
 	info, err := store.Resolve(s.workspaceRoot(), s.log.id())

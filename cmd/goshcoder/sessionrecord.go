@@ -49,6 +49,33 @@ func newSessionRecorder(writer *sessionlog.Writer, notify func(kind, text string
 	return &sessionRecorder{writer: writer, notify: notify}
 }
 
+// swap replaces the file this recorder writes to and returns the previous
+// writer for the caller to close.
+//
+// The recorder object itself must outlive every swap. Agent.Subscribe binds a
+// listener to the receiver it was created from, so replacing session.log with a
+// freshly constructed recorder left every event going to the old, closed one --
+// /resume and /clone silently recorded nothing from the moment they ran.
+func (r *sessionRecorder) swap(writer *sessionlog.Writer) *sessionlog.Writer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := r.writer
+	r.writer = writer
+	// A new file gets a fresh chance to report a failure of its own.
+	r.reported = false
+	return previous
+}
+
+// readOnly reports whether the current file was opened without a claim.
+func (r *sessionRecorder) readOnly() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.writer != nil && r.writer.ReadOnly()
+}
+
 // active reports whether appends are reaching disk.
 func (r *sessionRecorder) active() bool {
 	if r == nil {

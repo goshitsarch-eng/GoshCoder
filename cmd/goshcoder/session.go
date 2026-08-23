@@ -98,8 +98,6 @@ type session struct {
 	// log records the conversation to disk. It is nil only when -no-session
 	// was given, and every call site tolerates that rather than branching.
 	log *sessionRecorder
-	// sessionReadOnly is set when the session was opened without a claim.
-	sessionReadOnly bool
 	// startupNotices are messages produced while opening the session, shown
 	// once by whichever interface starts.
 	startupNotices []string
@@ -155,7 +153,6 @@ func newSession(cfg sessionConfig) (*session, error) {
 	s := &session{
 		model: model, btw: btw.NewManager(), explicitSystemPrompt: cfg.SystemPrompt,
 		resources: loadedResources, claudeTUI: cfg.ClaudeTUI, fullscreen: cfg.Fullscreen,
-		sessionReadOnly:  opened.writer != nil && opened.writer.ReadOnly(),
 		startupNotices:   append(append([]string(nil), opened.Notices...), modelNotices...),
 		restoredMessages: opened.restored.Messages,
 	}

@@ -24,11 +24,8 @@ import (
 
 // sessionStore returns the store the flags select.
 func sessionStore(cfg sessionConfig) *sessionlog.Store {
-	root := cfg.SessionsDir
-	if root == "" {
-		root = config.SessionsDir()
-	}
-	return sessionlog.NewStore(config.ExpandTilde(root))
+	setActiveSessionsRoot(cfg.SessionsDir)
+	return activeStore()
 }
 
 // openedSession is the result of resolving the session flags.
@@ -302,9 +299,36 @@ func currentWorkdir() string {
 	return dir
 }
 
-func defaultStore() *sessionlog.Store {
+// activeSessionsRoot is the session store root this process is using. It is
+// set once from -sessions-dir before any session is opened.
+//
+// Without it the flag was honoured only when opening the session: every in-app
+// command -- /resume, /sessions, /tree, /clone, /export -- and the whole
+// `sessions` subcommand went to the default directory instead, so pointing at
+// ~/.pi/agent/sessions opened a pi session and then listed none of them.
+var activeSessionsRoot string
+
+// setActiveSessionsRoot records the store root for the rest of the process.
+func setActiveSessionsRoot(root string) {
+	if root == "" {
+		activeSessionsRoot = ""
+		return
+	}
+	activeSessionsRoot = config.ExpandTilde(root)
+}
+
+// activeStore returns the store every session command should use.
+func activeStore() *sessionlog.Store {
+	if activeSessionsRoot != "" {
+		return sessionlog.NewStore(activeSessionsRoot)
+	}
 	return sessionlog.NewStore(config.SessionsDir())
 }
+
+// sessionStore returns the store this session belongs to.
+func (s *session) sessionStore() *sessionlog.Store { return activeStore() }
+
+func defaultStore() *sessionlog.Store { return activeStore() }
 
 func sessionsList(args []string) error {
 	all := false
@@ -513,6 +537,14 @@ func sessionsExport(args []string) error {
 	}
 
 	if out == "" || out == "-" {
+		// Only the line-oriented interface has a stdout to write to. Under the
+		// fullscreen TUI, stdout is the alternate screen the program is drawing
+		// on and command output is captured into a message card, so dumping a
+		// session's raw JSONL there corrupts the display and is unreadable
+		// besides.
+		if !stdoutIsAvailable() {
+			return errors.New("give /export a destination path; the fullscreen interface has no console to print to")
+		}
 		_, err = os.Stdout.Write(content)
 		return err
 	}
@@ -522,6 +554,10 @@ func sessionsExport(args []string) error {
 	fmt.Fprintf(os.Stderr, "%s\n", dim("exported "+info.ShortID()+" to "+out))
 	return nil
 }
+
+// stdoutIsAvailable reports whether writing to the console is safe. The
+// fullscreen program owns the terminal for its lifetime.
+func stdoutIsAvailable() bool { return !fullscreenActive.Load() }
 
 // exportMarkdown renders a readable transcript. It deliberately produces plain
 // Markdown rather than pi's HTML export: that export inlines ~165 KB of
@@ -755,7 +791,7 @@ func (s *session) sessionStorageLines() []string {
 		return []string{"session   not being saved (-no-session)"}
 	}
 	lines := []string{
-		"session   " + shortSessionID(s.log.id()) + " · " + sessionRuntimeNotice(s.log, s.sessionReadOnly),
+		"session   " + shortSessionID(s.log.id()) + " · " + sessionRuntimeNotice(s.log, s.log.readOnly()),
 		"file      " + sessionRelativePath(s.log.path()),
 	}
 	if name := s.sessionName(); name != "" {
@@ -769,7 +805,7 @@ func (s *session) sidebarStorageLine() string {
 	if s == nil || s.log == nil || s.log.path() == "" {
 		return "not recording"
 	}
-	return "session " + shortSessionID(s.log.id()) + " · " + sessionRuntimeNotice(s.log, s.sessionReadOnly)
+	return "session " + shortSessionID(s.log.id()) + " · " + sessionRuntimeNotice(s.log, s.log.readOnly())
 }
 
 // sessionName returns the display name recorded for this session.

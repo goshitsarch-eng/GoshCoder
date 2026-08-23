@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
@@ -30,6 +31,10 @@ type fullscreenEditor struct {
 	scroll       int
 	suggestion   int
 }
+
+// fullscreenActive marks the window in which the alternate-screen program owns
+// the terminal, so command handlers know not to write to the console.
+var fullscreenActive atomic.Bool
 
 type slashCommand struct {
 	name        string

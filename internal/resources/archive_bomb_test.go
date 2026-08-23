@@ -191,18 +191,26 @@ func TestManyHonestlySizedSparseMembersCannotExhaustMemory(t *testing.T) {
 		t.Fatalf("the swarm is %d bytes; it is meant to be small", len(archive))
 	}
 
+	// Retention is the hazard, so measure the live heap after a collection
+	// rather than cumulative allocation -- which the race detector inflates and
+	// which counts transient buffers the reader has already released.
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	_, _, _, err := ReadArchive(bytes.NewReader(archive))
+	prompts, _, _, err := ReadArchive(bytes.NewReader(archive))
+	runtime.GC()
 	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(prompts)
 
-	allocated := (after.TotalAlloc - before.TotalAlloc) >> 20
-	if allocated > 256 {
-		t.Fatalf("reading a %d-byte archive allocated %d MiB (err=%v)", len(archive), allocated, err)
+	var retained uint64
+	if after.HeapAlloc > before.HeapAlloc {
+		retained = (after.HeapAlloc - before.HeapAlloc) >> 20
+	}
+	if retained > 128 {
+		t.Fatalf("reading a %d-byte archive retained %d MiB (err=%v)", len(archive), retained, err)
 	}
 	if err == nil {
-		t.Fatal("an archive claiming 400 MiB of prompts was accepted")
+		t.Fatalf("an archive claiming %d MiB of prompts was accepted", (members*maxResourceBytes)>>20)
 	}
 }
 
