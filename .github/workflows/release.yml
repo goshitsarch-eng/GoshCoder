@@ -1,13 +1,28 @@
 name: Release
 
+# Two ways in, one code path:
+#
+#   * pushing a v* tag, the ordinary route;
+#   * a manual run, which names the tag and creates it if it does not exist.
+#
+# The second exists because pushing a tag needs credentials that not every
+# environment has -- an automation session's token is often scoped to branches
+# only, and then there is no way to cut a release at all. The workflow's own
+# GITHUB_TOKEN has contents: write, so it can create the tag itself. A push
+# made with that token deliberately does not trigger another workflow run, so
+# creating the tag here cannot start a second release of the same version.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (must already exist)"
+        description: "Release tag, e.g. v0.2.0. Created if it does not exist."
         required: true
+      ref:
+        description: "Branch or commit to tag. Defaults to the branch this run was started from. Ignored when the tag already exists."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -20,10 +35,62 @@ jobs:
     name: build and publish release archives
     runs-on: ubuntu-latest
     steps:
+      # Inputs reach the shell through the environment rather than through
+      # ${{ }} interpolation: a manual run is the one path where the tag
+      # arrives as free text, and expanding free text into a script is how a
+      # workflow with contents: write gets turned into someone else's.
+      - name: resolve the release tag
+        id: release
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_REF: ${{ inputs.ref }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+            checkout="${INPUT_REF:-$REF_NAME}"
+          else
+            tag="$REF_NAME"
+            checkout="$REF"
+          fi
+          # The tag becomes a git ref, an archive filename, and the version the
+          # binary reports, so it is validated rather than trusted.
+          if ! printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::release tag must look like v1.2.3 or v1.2.3-rc.1, got '$tag'"
+            exit 1
+          fi
+          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
+          printf 'checkout=%s\n' "$checkout" >>"$GITHUB_OUTPUT"
+          echo "releasing $tag from $checkout"
+
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ steps.release.outputs.checkout }}
+          # Tags are needed to tell "this release already exists" from "create
+          # it", and `git describe` in the Makefile needs the history.
           fetch-depth: 0
+
+      - name: create the tag if the manual run named a new one
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -eu
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            # Re-running an existing tag must build that tag, not whatever the
+            # branch has moved on to since.
+            echo "tag $TAG already exists; building it as it stands"
+            git checkout -q "refs/tags/$TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "GoshCoder $TAG"
+          git push origin "refs/tags/$TAG"
+          echo "created and pushed $TAG at $(git rev-parse --short HEAD)"
 
       - uses: actions/setup-go@v5
         with:
@@ -39,7 +106,7 @@ jobs:
 
       - name: build archives
         env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq zip
           make dist VERSION="$RELEASE_TAG"
@@ -47,8 +114,12 @@ jobs:
       - name: list artifacts
         run: ls -la dist && cat dist/checksums.txt
 
+      # tag_name is explicit because on a manual run github.ref is the branch
+      # the run started from; without it the release would be published against
+      # that branch instead of the tag the archives were built for.
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.zip
