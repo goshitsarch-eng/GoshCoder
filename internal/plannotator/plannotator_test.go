@@ -45,7 +45,7 @@ func (r reviewerStub) Review(context.Context, string, string) (Decision, error) 
 
 func newTestManager(t *testing.T, reviewer Reviewer) *Manager {
 	t.Helper()
-	manager, err := New(t.TempDir(), filepath.Join(t.TempDir(), "state.json"), reviewer)
+	manager, err := New(t.TempDir(), reviewer, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestSubmitDeniedThenApproved(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte(plan), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	manager, _ := New(root, "", reviewerStub{decision: Decision{Approved: false, Feedback: "add rollback"}})
+	manager, _ := New(root, reviewerStub{decision: Decision{Approved: false, Feedback: "add rollback"}}, Options{})
 	_ = manager.Enter()
 	result, err := manager.Submit(t.Context(), "PLAN.md")
 	if err != nil {
@@ -169,7 +169,7 @@ func TestSubmitRequiresChecklist(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte("# Plan\nJust do it."), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	manager, err := New(root, "", nil)
+	manager, err := New(root, nil, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestSubmitRejectsSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, "PLAN.md")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	manager, err := New(root, "", nil)
+	manager, err := New(root, nil, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,28 +211,231 @@ func TestSubmitRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
-func TestCorruptStateIsReported(t *testing.T) {
-	stateFile := filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(stateFile, []byte("not json"), 0o600); err != nil {
-		t.Fatal(err)
+// TestUnrecognizedPhaseStartsIdleWithAWarning covers what used to be a hard
+// error. Plan state now travels in the session log, so refusing to parse it
+// would make a corrupt Planner entry a reason the whole session will not open --
+// a much worse failure than starting idle and saying so.
+func TestUnrecognizedPhaseStartsIdleWithAWarning(t *testing.T) {
+	var warnings []string
+	manager, err := New(t.TempDir(), nil, Options{
+		Initial: &State{Phase: Phase("nonsense")},
+		Warn:    func(message string) { warnings = append(warnings, message) },
+	})
+	if err != nil {
+		t.Fatalf("an unrecognized phase failed the whole construction: %v", err)
 	}
-	if _, err := New(t.TempDir(), stateFile, nil); err == nil {
-		t.Fatal("corrupt state was silently ignored")
+	if manager.State().Phase != PhaseIdle {
+		t.Fatalf("phase = %q, want idle", manager.State().Phase)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want one explaining the state was ignored", warnings)
 	}
 }
 
-func TestStatePersists(t *testing.T) {
-	root, config := t.TempDir(), filepath.Join(t.TempDir(), "state.json")
-	manager, _ := New(root, config, nil)
-	if err := manager.Enter(); err != nil {
-		t.Fatal(err)
-	}
-	reloaded, err := New(root, config, nil)
+// TestStateIsHandedToTheHostOnEveryTransition replaces the old
+// TestStatePersists. The promise moved: it used to be "a fresh process in the
+// same workspace resumes the plan", and is now "the host is told, so -continue
+// resumes the plan". The Manager owns no file.
+func TestStateIsHandedToTheHostOnEveryTransition(t *testing.T) {
+	var published []State
+	manager, err := New(t.TempDir(), nil, Options{
+		OnChange: func(state State) { published = append(published, state) },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.State().Phase != PhasePlanning {
-		t.Fatalf("state = %#v", reloaded.State())
+
+	if err := manager.Enter(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Exit(); err != nil {
+		t.Fatal(err)
+	}
+	if len(published) != 2 {
+		t.Fatalf("published %d states, want one per transition", len(published))
+	}
+	if published[0].Phase != PhasePlanning || published[1].Phase != PhaseIdle {
+		t.Fatalf("published = %v", published)
+	}
+
+	// And a restored state seeds a fresh Manager, which is how -continue works.
+	resumed, err := New(t.TempDir(), nil, Options{Initial: &State{Phase: PhasePlanning}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.State().Phase != PhasePlanning {
+		t.Fatalf("restored phase = %q, want planning", resumed.State().Phase)
+	}
+}
+
+// TestCompletingTheLastStepKeepsThePlanRecord covers the fourth site that
+// assigned a bare State{} literal, and the one easiest to miss: fixing Enter,
+// Exit and Toggle still leaves finishing a plan wiping the record of it.
+func TestCompletingTheLastStepKeepsThePlanRecord(t *testing.T) {
+	root := t.TempDir()
+	plan := "- [ ] first\n- [ ] second\n"
+	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var published []State
+	manager, err := New(root, nil, Options{
+		Initial: &State{
+			Phase: PhaseExecuting, PlanPath: "PLAN.md", PlanHash: hashPlan([]byte(plan)),
+			Items: []ChecklistItem{{Step: 1, Text: "first"}, {Step: 2, Text: "second"}},
+		},
+		OnChange: func(state State) { published = append(published, state) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager.TrackAssistant(llm.AssistantMessage{Content: []llm.ContentBlock{
+		llm.TextContent{Type: "text", Text: "done with [DONE:1] and [DONE:2]"}}})
+
+	state := manager.State()
+	if state.Phase != PhaseIdle {
+		t.Fatalf("phase = %q, want idle once every step is done", state.Phase)
+	}
+	if state.PlanPath != "PLAN.md" || len(state.Items) != 2 {
+		t.Fatalf("finishing the plan wiped its record: %#v", state)
+	}
+	// The transition itself has to be persisted. It used to be gated on the
+	// marker count, so a plan could finish without the change being saved.
+	if len(published) == 0 {
+		t.Fatal("completing the plan was not published to the host")
+	}
+	if published[len(published)-1].Phase != PhaseIdle {
+		t.Fatalf("last published phase = %q, want idle", published[len(published)-1].Phase)
+	}
+}
+
+// TestEditedPlanDropsStaleCompletionInsteadOfMisattributingIt covers the
+// positional-step hazard: checklist steps are numbered by position, so merging
+// saved completion into an edited plan silently marks whatever task now sits at
+// that position as done.
+func TestEditedPlanDropsStaleCompletionInsteadOfMisattributingIt(t *testing.T) {
+	root := t.TempDir()
+	original := "- [ ] set up the database\n- [ ] delete the staging data\n"
+	edited := "- [ ] delete the staging data\n- [ ] set up the database\n"
+	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var warnings []string
+	manager, err := New(root, nil, Options{
+		Initial: &State{
+			Phase: PhaseExecuting, PlanPath: "PLAN.md", PlanHash: hashPlan([]byte(original)),
+			Items: []ChecklistItem{{Step: 1, Text: "set up the database", Completed: true}, {Step: 2, Text: "delete the staging data"}},
+		},
+		Warn: func(message string) { warnings = append(warnings, message) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	items := manager.State().Items
+	if len(items) != 2 {
+		t.Fatalf("items = %#v", items)
+	}
+	// Step 1 is now "delete the staging data". Carrying the old completion
+	// across would mark it done without it ever having run.
+	if items[0].Completed {
+		t.Fatalf("stale completion was carried onto %q after the plan was edited", items[0].Text)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want one saying progress was reset", warnings)
+	}
+}
+
+// TestUneditedPlanKeepsItsCompletion is the negative control: the guard above
+// must not throw away progress every time a plan is merely reopened.
+func TestUneditedPlanKeepsItsCompletion(t *testing.T) {
+	root := t.TempDir()
+	plan := "- [ ] first\n- [ ] second\n"
+	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(root, nil, Options{Initial: &State{
+		Phase: PhaseExecuting, PlanPath: "PLAN.md", PlanHash: hashPlan([]byte(plan)),
+		Items: []ChecklistItem{{Step: 1, Text: "first", Completed: true}, {Step: 2, Text: "second"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := manager.State().Items
+	if len(items) != 2 || !items[0].Completed {
+		t.Fatalf("completion was dropped for an unedited plan: %#v", items)
+	}
+}
+
+// TestTwoManagersDoNotShareAPhase is the regression the README documented and
+// that no test covered: two sessions in one workspace shared one state file, so
+// window B pressing /planner turned window A's mode off. Nothing in this
+// package ever built two Managers before.
+func TestTwoManagersDoNotShareAPhase(t *testing.T) {
+	root := t.TempDir()
+
+	first, err := New(root, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(root, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := first.Enter(); err != nil {
+		t.Fatal(err)
+	}
+	if got := second.State().Phase; got != PhaseIdle {
+		t.Fatalf("the second session's phase became %q when the first entered planning", got)
+	}
+	if _, err := second.Toggle(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Toggle(); err != nil {
+		t.Fatal(err)
+	}
+	if got := first.State().Phase; got != PhasePlanning {
+		t.Fatalf("the first session's phase became %q when the second toggled its own", got)
+	}
+}
+
+// TestTogglingKeepsPlanPathAndItems covers a live data-loss bug that has
+// nothing to do with scoping: Enter, Exit and Toggle assigned a fresh State{}
+// literal, so one /planner keypress wiped the checklist of an approved plan
+// with no way to get it back.
+func TestTogglingKeepsPlanPathAndItems(t *testing.T) {
+	root := t.TempDir()
+	plan := "- [x] first\n- [ ] second\n"
+	if err := os.WriteFile(filepath.Join(root, "PLAN.md"), []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(root, nil, Options{Initial: &State{
+		Phase:    PhaseExecuting,
+		PlanPath: "PLAN.md",
+		Items:    []ChecklistItem{{Step: 1, Text: "first", Completed: true}, {Step: 2, Text: "second"}},
+		PlanHash: hashPlan([]byte(plan)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, transition := range []func() error{
+		manager.Enter,
+		func() error { _, err := manager.Toggle(); return err },
+		manager.Exit,
+	} {
+		if err := transition(); err != nil {
+			t.Fatal(err)
+		}
+		state := manager.State()
+		if state.PlanPath != "PLAN.md" {
+			t.Fatalf("PlanPath was lost by a phase change: %#v", state)
+		}
+		if len(state.Items) != 2 || !state.Items[0].Completed {
+			t.Fatalf("checklist was lost by a phase change: %#v", state.Items)
+		}
 	}
 }
 
@@ -348,7 +551,7 @@ func TestSubmitPassesDeniedPlanToNextVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	reviewer := &versionedReviewerStub{decisions: []Decision{{Feedback: "revise"}, {Approved: true}}}
-	manager, err := New(root, filepath.Join(t.TempDir(), "state.json"), reviewer)
+	manager, err := New(root, reviewer, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +576,7 @@ func TestSubmitPassesDeniedPlanToNextVersion(t *testing.T) {
 func TestSubmitCancellationIsRecoverable(t *testing.T) {
 	root := t.TempDir()
 	_ = os.WriteFile(filepath.Join(root, "PLAN.md"), []byte("- [ ] Work"), 0o644)
-	manager, _ := New(root, "", reviewerStub{err: context.Canceled})
+	manager, _ := New(root, reviewerStub{err: context.Canceled}, Options{})
 	_ = manager.Enter()
 	result, err := manager.Submit(t.Context(), "PLAN.md")
 	if err != nil || !strings.Contains(result.Content[0].(llm.TextContent).Text, "cancelled") {

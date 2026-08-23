@@ -443,6 +443,23 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 			fmt.Fprintln(os.Stderr, dim(line))
 		}
 
+	case "/sessions":
+		for _, line := range sessionListLines(s.workspaceRoot()) {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/resume":
+		if rest == "" {
+			return false, errors.New("/resume needs a session id, prefix, or path")
+		}
+		if err := s.switchSession(rest); err != nil {
+			return false, err
+		}
+		for _, notice := range s.drainNotices() {
+			fmt.Fprintln(os.Stderr, dim(notice.Kind+": "+notice.Text))
+		}
+		renderRestoredTranscript(s.restoredMessages, "resumed transcript")
+
 	case "/name":
 		if rest == "" {
 			if name := s.sessionName(); name != "" {

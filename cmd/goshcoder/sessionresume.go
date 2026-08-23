@@ -5,6 +5,8 @@ package main
 // the user in every interface.
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"goshcoder/internal/agent"
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
+	"goshcoder/internal/plannotator"
 	"goshcoder/internal/sessionlog"
 )
 
@@ -53,6 +56,15 @@ func openSession(cfg sessionConfig, workdir string) (*openedSession, error) {
 	var target sessionlog.Info
 	var haveTarget bool
 	switch {
+	case cfg.Resume:
+		info, chosen, err := chooseSessionInteractively(workdir)
+		if err != nil {
+			return nil, err
+		}
+		if !chosen {
+			break
+		}
+		target, haveTarget = info, true
 	case cfg.SessionRef != "":
 		info, err := store.Resolve(workdir, cfg.SessionRef)
 		if err != nil {
@@ -104,6 +116,9 @@ func openSession(cfg sessionConfig, workdir string) (*openedSession, error) {
 	result.restored = projectSession(writer.Snapshot(), writer.Leaf())
 	result.Notices = append(result.Notices, reportNotices(report)...)
 	result.Notices = append(result.Notices, result.restored.Warnings...)
+	if notice := missingWorkspaceNotice(target, workdir); notice != "" {
+		result.Notices = append(result.Notices, notice)
+	}
 	return result, nil
 }
 
@@ -316,12 +331,13 @@ func sessionsList(args []string) error {
 		}
 		return nil
 	}
-	for _, info := range sessions {
+	labels := sessionlog.ShortIDs(sessions)
+	for index, info := range sessions {
 		marker := " "
 		if info.Locked {
 			marker = "*"
 		}
-		line := fmt.Sprintf("%s %s  %s  %3d msg", marker, info.ShortID(),
+		line := fmt.Sprintf("%s %s  %s  %3d msg", marker, labels[index],
 			info.Modified.Local().Format("2006-01-02 15:04"), info.Messages)
 		if info.Cleared > 0 {
 			line += fmt.Sprintf(" (+%d cleared)", info.Cleared)
@@ -680,6 +696,55 @@ func (s *session) exitHint() string {
 		return ""
 	}
 	return "session " + shortSessionID(s.log.id()) + " · resume with: goshcoder chat -continue"
+}
+
+// plannerCustomType names the Planner's custom entry in the session log.
+const plannerCustomType = "goshcoder.planner"
+
+// restoredPlannerState reads the Planner's phase out of a resumed session, and
+// otherwise adopts the old per-workspace file once before removing it.
+//
+// A payload that does not decode yields nil plus a warning rather than an
+// error: once phase lives in the session log, refusing to parse it would make
+// a corrupt Planner entry a reason the whole session will not open.
+func restoredPlannerState(opened *openedSession, workspaceRoot string, notices *[]string) *plannotator.State {
+	if opened != nil && opened.Resumed {
+		if raw, ok := opened.restored.Custom[plannerCustomType]; ok && len(raw) > 0 {
+			var state plannotator.State
+			if err := json.Unmarshal(raw, &state); err != nil {
+				*notices = append(*notices,
+					"the saved Planner state could not be read and was ignored: "+err.Error())
+				return nil
+			}
+			return &state
+		}
+		return nil
+	}
+	return adoptLegacyPlannerState(workspaceRoot, notices)
+}
+
+// adoptLegacyPlannerState migrates the per-workspace file this build no longer
+// writes. It runs once, for a new session in a workspace that was mid-plan, so
+// the change of scoping does not silently drop an in-flight plan.
+func adoptLegacyPlannerState(workspaceRoot string, notices *[]string) *plannotator.State {
+	stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(workspaceRoot)))[:16]
+	path := filepath.Join(config.AgentDir(), "plannotator", stateID+".json")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var state plannotator.State
+	if err := json.Unmarshal(content, &state); err != nil || state.Phase == "" || state.Phase == plannotator.PhaseIdle {
+		_ = os.Remove(path)
+		return nil
+	}
+	// Two sessions racing this removal is benign: whoever loses simply finds
+	// nothing to adopt, and the state is already in the winner's session log.
+	_ = os.Remove(path)
+	*notices = append(*notices, fmt.Sprintf(
+		"adopted the workspace's saved Planner state (%s); plan state now belongs to a session, so use -continue to come back to it",
+		state.Phase))
+	return &state
 }
 
 // sessionStorageLines describe where the conversation is being kept, for

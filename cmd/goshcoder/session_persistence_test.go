@@ -33,12 +33,7 @@ func newRecordingFixture(t *testing.T) *recordingFixture {
 	}
 
 	model := &llm.Model{ID: "test-model", Name: "Test", Provider: "test", API: "test-api", ContextWindow: 128000}
-	s := &session{
-		model: model,
-		agent: agent.NewAgent(agent.AgentOptions{InitialState: &agent.InitialState{
-			Model: *model, ThinkingLevel: llm.ThinkingOff,
-		}}),
-	}
+	s := newTestSessionWithModel(model)
 	s.log = newSessionRecorder(writer, s.pushNotice)
 	s.agent.Subscribe(s.log.listener())
 
@@ -61,6 +56,17 @@ func (f *recordingFixture) reopen(t *testing.T) restored {
 		t.Fatalf("reload skipped %d lines: %v", report.SkippedLines, report.Warnings)
 	}
 	return projectSession(tree, tree.Leaf())
+}
+
+// newTestSessionWithModel builds a bare session for the persistence tests,
+// without the catalog, credentials or workspace newSession would demand.
+func newTestSessionWithModel(model *llm.Model) *session {
+	return &session{
+		model: model,
+		agent: agent.NewAgent(agent.AgentOptions{InitialState: &agent.InitialState{
+			Model: *model, ThinkingLevel: llm.ThinkingOff,
+		}}),
+	}
 }
 
 // assistant builds an assistant message with a cost, since cost accounting is

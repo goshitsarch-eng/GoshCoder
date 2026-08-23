@@ -44,6 +44,7 @@ var fullscreenSlashCommands = []slashCommand{
 	{"/status", "Show session information"}, {"/session", "Show session information"},
 	{"/sidebar", "Show session information"}, {"/hotkeys", "Show keyboard shortcuts"},
 	{"/messages", "Show transcript summary"}, {"/name", "Name this session"},
+	{"/resume", "Switch to a saved session"}, {"/sessions", "List saved sessions"},
 	{"/steer", "Guide the active response"}, {"/followup", "Queue the next message"},
 	{"/queue", "Show queued messages"}, {"/clear", "Clear the transcript"},
 	{"/new", "Start a fresh conversation"}, {"/compact", "Summarize older context"},

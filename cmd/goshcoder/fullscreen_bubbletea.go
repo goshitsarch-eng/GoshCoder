@@ -23,6 +23,7 @@ import (
 	"goshcoder/internal/llm"
 	"goshcoder/internal/llm/catalog"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/sessionlog"
 	"goshcoder/internal/tui"
 )
 
@@ -107,9 +108,14 @@ type fullscreenModel struct {
 	// holding a key that triggered it forked one git process per repeat.
 	gitRefreshWanted   bool
 	gitRefreshInFlight bool
+	// sessionChoices caches the resume picker's candidates. suggestions() runs
+	// inside View(), so an uncached picker would re-read every file in the
+	// session shard on every keystroke and on every 120 ms tick -- the same
+	// mistake /login had to be rescued from.
+	sessionChoices      []sessionlog.Info
+	sessionChoicesValid bool
 	// quitArmedAt is when Ctrl+C was last pressed at an idle empty prompt.
-	// A session holds the entire conversation in memory and nothing on disk,
-	// so one stray keystroke used to destroy work with no way back.
+	// It only arms when nothing is being saved: see handleTeaKey.
 	quitArmedAt time.Time
 }
 
@@ -284,6 +290,7 @@ func (model *fullscreenModel) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		// immediately.
 		model.models = availableFullscreenModels(model.session)
 		model.invalidateLoginSuggestions()
+		model.invalidateSessionSuggestions()
 		model.notices = appendNotice(model.notices, "Login", "Added "+value.provider+". Use /model to switch providers.")
 		model.activity = "Logged in to " + value.provider
 
@@ -1016,6 +1023,9 @@ func fullscreenLoginCommand(providerID string) tea.Cmd {
 
 func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 	model.busyCommand = false
+	// Any command may have named, switched or removed a session, so the picker's
+	// cached candidates are stale from here.
+	model.invalidateSessionSuggestions()
 	if result.output != "" {
 		model.notices = appendNotice(model.notices, "Command", result.output)
 	}
@@ -1046,7 +1056,8 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 		return false
 	}
 	command := fields[0]
-	return command == "/compact" || (command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
+	return command == "/compact" || command == "/sessions" || command == "/resume" ||
+		(command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
 		command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
 		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
 		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
@@ -1054,7 +1065,7 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
 	return fullscreenSuggestionsWithModels(model.session, string(model.editor.input), model.models,
-		model.cachedLoginSuggestions)
+		model.cachedLoginSuggestions, model.cachedSessionSuggestions)
 }
 
 func (model *fullscreenModel) selectedSuggestion(count int) int {
@@ -1174,18 +1185,22 @@ func (model *fullscreenModel) deletePreviousWord() {
 }
 
 func fullscreenSuggestions(session *session, input string) []fullscreenSuggestion {
-	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session), nil)
+	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session), nil, nil)
 }
 
 // loginSuggestions is how the picker for "/login <query>" is produced. The
 // fullscreen model passes a cached implementation, because the uncached one
 // resolves credentials for every provider and must not run on the render path.
 func fullscreenSuggestionsWithModels(session *session, input string, models []fullscreenModelChoice,
-	loginSuggestions func(string) []fullscreenSuggestion) []fullscreenSuggestion {
+	loginSuggestions func(string) []fullscreenSuggestion,
+	sessionSuggestions func(string) []fullscreenSuggestion) []fullscreenSuggestion {
 	if loginSuggestions == nil {
 		loginSuggestions = fullscreenLoginSuggestions
 	}
 	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/resume ") && sessionSuggestions != nil {
+		return sessionSuggestions(strings.TrimSpace(strings.TrimPrefix(input[len("/resume "):], " ")))
+	}
 	if strings.HasPrefix(lower, "/model ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/model "))
 		terms := strings.Fields(query)
@@ -1500,6 +1515,9 @@ func containsString(values []string, target string) bool {
 
 func fullscreenSuggestionTitle(input string) string {
 	lower := strings.ToLower(input)
+	if strings.HasPrefix(lower, "/resume ") {
+		return "RESUME SESSION  ·  type to search names and transcripts"
+	}
 	if strings.HasPrefix(lower, "/model ") {
 		return "SELECT MODEL  ·  type to filter authenticated providers"
 	}

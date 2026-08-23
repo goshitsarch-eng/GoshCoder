@@ -97,11 +97,11 @@ func TestOmniNetworkCommandsRunOffTheFullscreenUpdateLoop(t *testing.T) {
 
 func TestFullscreenSuggestionsIncludeNativeOmniAndBTWCommands(t *testing.T) {
 	session := &session{}
-	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil, nil)
+	omni := fullscreenSuggestionsWithModels(session, "/omni s", nil, nil, nil)
 	if len(omni) != 3 || omni[0].label != "status" || omni[1].label != "sync" || omni[2].label != "setup" {
 		t.Fatalf("omni suggestions = %#v", omni)
 	}
-	side := fullscreenSuggestionsWithModels(session, "/btw r", nil, nil)
+	side := fullscreenSuggestionsWithModels(session, "/btw r", nil, nil, nil)
 	if len(side) != 1 || side[0].label != "resume" || side[0].execute {
 		t.Fatalf("btw suggestions = %#v", side)
 	}
@@ -142,11 +142,11 @@ func TestModelPickerFiltersAndMarksCurrentModel(t *testing.T) {
 		{ref: "vendor/alpha", name: "Alpha", provider: "vendor", current: true},
 		{ref: "vendor/beta-code", name: "Beta Coder", provider: "vendor", context: 200_000, reasoning: true},
 	}
-	items := fullscreenSuggestionsWithModels(session, "/model beta", choices, nil)
+	items := fullscreenSuggestionsWithModels(session, "/model beta", choices, nil, nil)
 	if len(items) != 1 || items[0].label != "Beta Coder" || items[0].value != "/model vendor/beta-code" {
 		t.Fatalf("model suggestions = %#v", items)
 	}
-	items = fullscreenSuggestionsWithModels(session, "/model ", choices, nil)
+	items = fullscreenSuggestionsWithModels(session, "/model ", choices, nil, nil)
 	if len(items) != 2 || !items[0].current {
 		t.Fatalf("unfiltered model suggestions = %#v", items)
 	}
@@ -290,7 +290,7 @@ func TestBubbleTeaCommandPaletteRunsPlanner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer workspace.Close()
-	manager, err := plannotator.New(workspace.Root, filepath.Join(t.TempDir(), "plan.json"), nil)
+	manager, err := plannotator.New(workspace.Root, nil, plannotator.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}

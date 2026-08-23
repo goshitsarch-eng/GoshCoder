@@ -104,12 +104,60 @@ func (i Info) Title() string {
 	return i.ID
 }
 
+// shortIDLength is the shortest id prefix ever displayed.
+const shortIDLength = 8
+
 // ShortID returns the id prefix used in listings and messages.
+//
+// Eight characters is only a floor. uuidv7 puts the millisecond timestamp
+// first, so two sessions created in the same second share their first eight
+// characters exactly -- displaying that prefix would offer the user an
+// identifier that cannot select what it names. Use ShortIDs when rendering a
+// list, which widens the prefix until it distinguishes the sessions on screen.
 func (i Info) ShortID() string {
-	if len(i.ID) >= 8 {
-		return i.ID[:8]
+	if len(i.ID) >= shortIDLength {
+		return i.ID[:shortIDLength]
 	}
 	return i.ID
+}
+
+// ShortIDs returns a display prefix for each session, widened as needed so no
+// two collide. Same idea as an abbreviated git hash: short enough to read,
+// long enough to be an identifier.
+func ShortIDs(sessions []Info) []string {
+	length := shortIDLength
+	for {
+		seen := make(map[string]bool, len(sessions))
+		collision := false
+		longest := 0
+		for _, info := range sessions {
+			if len(info.ID) > longest {
+				longest = len(info.ID)
+			}
+			prefix := info.ID
+			if len(prefix) > length {
+				prefix = prefix[:length]
+			}
+			if seen[prefix] {
+				collision = true
+				break
+			}
+			seen[prefix] = true
+		}
+		if !collision || length >= longest {
+			break
+		}
+		length += 4
+	}
+	out := make([]string, len(sessions))
+	for index, info := range sessions {
+		if len(info.ID) > length {
+			out[index] = info.ID[:length]
+			continue
+		}
+		out[index] = info.ID
+	}
+	return out
 }
 
 // Create starts a new session for cwd. parent names the session this one was

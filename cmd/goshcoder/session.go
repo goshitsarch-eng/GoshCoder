@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -203,7 +202,6 @@ func newSession(cfg sessionConfig) (*session, error) {
 	}
 	if cfg.LoadPlannotator || cfg.EnablePlannotator {
 		root := s.workspace.Root
-		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
 		reviewer := plannotator.BrowserReviewer{Notify: func(message string) {
 			if cfg.Fullscreen {
 				// The fullscreen UI owns the terminal, so this cannot go to
@@ -213,7 +211,17 @@ func newSession(cfg sessionConfig) (*session, error) {
 			}
 			fmt.Fprintln(os.Stderr, message)
 		}}
-		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
+		// Plan state now travels in the session log as a custom entry, which
+		// is what pi documents that entry type for: extension state that
+		// survives a reload and never participates in context.
+		initial := restoredPlannerState(opened, root, &s.startupNotices)
+		manager, err := plannotator.New(root, reviewer, plannotator.Options{
+			Initial: initial,
+			OnChange: func(state plannotator.State) {
+				s.log.recordCustom(plannerCustomType, state)
+			},
+			Warn: func(message string) { s.pushNotice("Planner", message) },
+		})
 		if err != nil {
 			_ = s.workspace.Close()
 			return nil, err
