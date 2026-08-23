@@ -82,8 +82,7 @@ func runOmniCommand(ctx context.Context, args []string, interactive bool) (strin
 		if err != nil {
 			return "", err
 		}
-		fmt.Fprint(os.Stderr, "OmniRoute API key (blank for local/public): ")
-		key, err := readTerminalLine(os.Stdin)
+		key, err := readSecret("OmniRoute API key (blank for local/public): ")
 		if err != nil {
 			return "", err
 		}

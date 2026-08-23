@@ -788,6 +788,7 @@ func TestBedrockThinkingFields(t *testing.T) {
 }
 
 func TestBedrockRegionResolution(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	// An empty AWS config keeps the host machine's profile out of the result.
 	emptyFiles := func(t *testing.T) map[string]string {
 		return map[string]string{

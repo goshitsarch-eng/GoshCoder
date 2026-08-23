@@ -337,3 +337,61 @@ aws_access_key_id = OTHER
 		t.Fatal("section boundaries were not respected")
 	}
 }
+
+// TestExplicitBedrockKeysBeatAmbientProfile covers the case where a user has
+// AWS_PROFILE exported for an unrelated project while GoshCoder's Bedrock
+// provider carries its own configured keys. Consulting the ambient profile
+// first made resolveAWSCredentials short-circuit to it, so the configured keys
+// were ignored and the request either failed outright or signed against the
+// wrong AWS account.
+func TestExplicitBedrockKeysBeatAmbientProfile(t *testing.T) {
+	clearAmbientAWSEnv(t)
+	t.Setenv("AWS_PROFILE", "some-other-project")
+
+	options := &BedrockOptions{StreamOptions: StreamOptions{Env: map[string]string{
+		"AWS_ACCESS_KEY_ID":     "AKIDCONFIGURED",
+		"AWS_SECRET_ACCESS_KEY": "secret-configured",
+		"AWS_REGION":            "us-east-1",
+	}}}
+
+	if profile := resolveBedrockProfile(options); profile != "" {
+		t.Fatalf("profile = %q, want configured keys to win over the ambient profile", profile)
+	}
+	creds, err := resolveAWSCredentials(resolveBedrockProfile(options), options.Env)
+	if err != nil {
+		t.Fatalf("resolveAWSCredentials: %v", err)
+	}
+	if creds.AccessKeyID != "AKIDCONFIGURED" {
+		t.Fatalf("access key = %q", creds.AccessKeyID)
+	}
+}
+
+// TestAmbientProfileStillAppliesWithoutConfiguredKeys is the negative control:
+// a user who relies on AWS_PROFILE alone must keep working.
+func TestAmbientProfileStillAppliesWithoutConfiguredKeys(t *testing.T) {
+	clearAmbientAWSEnv(t)
+	t.Setenv("AWS_PROFILE", "work")
+
+	options := &BedrockOptions{StreamOptions: StreamOptions{Env: map[string]string{
+		"AWS_REGION": "us-east-1",
+	}}}
+	if profile := resolveBedrockProfile(options); profile != "work" {
+		t.Fatalf("profile = %q, want the ambient profile to apply", profile)
+	}
+}
+
+// TestExplicitProfileOptionWins keeps an explicitly requested profile ahead of
+// configured static keys, which is what an option is for.
+func TestExplicitProfileOptionWins(t *testing.T) {
+	clearAmbientAWSEnv(t)
+	options := &BedrockOptions{
+		Profile: "chosen",
+		StreamOptions: StreamOptions{Env: map[string]string{
+			"AWS_ACCESS_KEY_ID":     "AKIDCONFIGURED",
+			"AWS_SECRET_ACCESS_KEY": "secret-configured",
+		}},
+	}
+	if profile := resolveBedrockProfile(options); profile != "chosen" {
+		t.Fatalf("profile = %q", profile)
+	}
+}

@@ -508,7 +508,7 @@ func TestCredentialStoreRecoversStaleLock(t *testing.T) {
 	if err := os.WriteFile(lockPath, []byte("stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	old := time.Now().Add(-2 * lockFileTimeout)
+	old := time.Now().Add(-2 * defaultLockTiming().stale)
 	if err := os.Chtimes(lockPath, old, old); err != nil {
 		t.Fatal(err)
 	}

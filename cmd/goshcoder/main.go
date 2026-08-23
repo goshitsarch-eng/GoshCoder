@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 
+	charmterm "github.com/charmbracelet/x/term"
+
 	"goshcoder/internal/agent"
 	"goshcoder/internal/config"
 	"goshcoder/internal/llm"
@@ -565,10 +567,32 @@ type terminalLoginInteraction struct {
 	reader       *bufio.Reader
 	out          io.Writer
 	visibleInput bool
+	// secretIn is the same stream as reader when it is a terminal, so that
+	// PromptSecret can turn echo off. Nil for piped input and in tests.
+	secretIn *os.File
 }
 
 func newTerminalLoginInteraction(in io.Reader, out io.Writer, visibleInput bool) *terminalLoginInteraction {
-	return &terminalLoginInteraction{reader: bufio.NewReader(in), out: out, visibleInput: visibleInput}
+	i := &terminalLoginInteraction{reader: bufio.NewReader(in), out: out, visibleInput: visibleInput}
+	if file, ok := in.(*os.File); ok && charmterm.IsTerminal(file.Fd()) {
+		i.secretIn = file
+	}
+	return i
+}
+
+// readSecretPrompt reads a secret without echoing it, when it can.
+//
+// It bypasses the bufio.Reader, so it must only run while that reader holds
+// nothing: otherwise buffered bytes the user already typed would be skipped.
+// On a terminal in canonical mode a read returns at most one line, so the
+// buffer is empty at every prompt boundary; the check makes that explicit
+// rather than assumed.
+func (i *terminalLoginInteraction) readSecretPrompt() (string, bool, error) {
+	if i.secretIn == nil || i.reader.Buffered() > 0 {
+		return "", false, nil
+	}
+	secret, err := readSecretFrom(i.secretIn, i.out, "> ")
+	return secret, true, err
 }
 
 func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, error) {
@@ -586,8 +610,15 @@ func (i *terminalLoginInteraction) Prompt(prompt catalog.LoginPrompt) (string, e
 		if prompt.Placeholder != "" {
 			fmt.Fprintf(i.out, "%s\n", dim("Example: "+prompt.Placeholder))
 		}
-		if prompt.Kind == catalog.PromptSecret && i.visibleInput {
-			fmt.Fprint(i.out, "(input is visible) ")
+		if prompt.Kind == catalog.PromptSecret {
+			if secret, handled, err := i.readSecretPrompt(); handled {
+				return secret, err
+			}
+			if i.visibleInput {
+				fmt.Fprint(i.out, "(input is visible) ")
+			} else {
+				fmt.Fprint(i.out, "> ")
+			}
 		} else {
 			fmt.Fprint(i.out, "> ")
 		}
@@ -646,19 +677,6 @@ func (i *terminalLoginInteraction) Notify(event catalog.LoginEvent) {
 			fmt.Fprintln(i.out, event.Message)
 		}
 	}
-}
-
-// readSecret prompts on stderr and reads one line from stdin. Terminal echo is
-// not suppressed, so the prompt says so when stdin is a terminal.
-func readSecret(prompt string) (string, error) {
-	if info, err := os.Stdin.Stat(); err == nil && (info.Mode()&os.ModeCharDevice) != 0 {
-		fmt.Fprint(os.Stderr, prompt+"(input is visible) ")
-	}
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
-	}
-	return strings.TrimSpace(line), nil
 }
 
 // ---------------------------------------------------------------------------

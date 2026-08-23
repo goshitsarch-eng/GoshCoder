@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -280,16 +281,43 @@ func configuredBedrockRegion(options *BedrockOptions) string {
 	return getProviderEnvValue("AWS_DEFAULT_REGION", options.Env)
 }
 
+// resolveBedrockProfile picks the AWS profile to sign with.
+//
+// An ambient AWS_PROFILE must not override credentials the user configured for
+// this provider. resolveAWSCredentials short-circuits to the profile whenever
+// one is named, so consulting the process environment unconditionally means a
+// user who happens to export AWS_PROFILE for an unrelated project has their
+// configured Bedrock keys silently ignored -- and either fails with "no
+// credentials for AWS profile" or signs against the wrong AWS account.
+//
+// Precedence therefore is: an explicit option, then an explicitly configured
+// AWS_PROFILE, then the ambient one but only when no static key pair was
+// configured to be overridden.
+func resolveBedrockProfile(options *BedrockOptions) string {
+	if options == nil {
+		return ""
+	}
+	if options.Profile != "" {
+		return options.Profile
+	}
+	if options.Env != nil {
+		if profile := options.Env["AWS_PROFILE"]; profile != "" {
+			return profile
+		}
+		if options.Env["AWS_ACCESS_KEY_ID"] != "" && options.Env["AWS_SECRET_ACCESS_KEY"] != "" {
+			return ""
+		}
+	}
+	return os.Getenv("AWS_PROFILE")
+}
+
 // resolveBedrockTarget resolves the region and endpoint for a request.
 //
 // Region precedence matches the TS: an ARN-embedded region, then an explicit
 // option or env var, then a standard endpoint's region, then the profile's
 // configured region, then us-east-1.
 func resolveBedrockTarget(model *Model, options *BedrockOptions) (region string, endpoint string) {
-	profile := options.Profile
-	if profile == "" {
-		profile = getProviderEnvValue("AWS_PROFILE", options.Env)
-	}
+	profile := resolveBedrockProfile(options)
 	configured := configuredBedrockRegion(options)
 	endpointRegion := standardBedrockEndpointRegion(model.BaseURL)
 
@@ -1211,11 +1239,7 @@ func doBedrockRequest(ctx context.Context, model *Model, options *BedrockOptions
 	case bearerToken != "":
 		req.Header.Set("Authorization", "Bearer "+bearerToken)
 	default:
-		profile := options.Profile
-		if profile == "" {
-			profile = getProviderEnvValue("AWS_PROFILE", options.Env)
-		}
-		creds, err := resolveAWSCredentials(profile, options.Env)
+		creds, err := resolveAWSCredentials(resolveBedrockProfile(options), options.Env)
 		if err != nil {
 			return nil, err
 		}

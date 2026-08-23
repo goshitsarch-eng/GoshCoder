@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -178,18 +180,20 @@ type CredentialStore struct {
 	data map[string]*Credential
 	// getenv feeds config-value resolution on Read; defaults to os.Getenv.
 	getenv func(string) string
+	// lockTiming is set once at construction and never mutated afterwards.
+	lockTiming lockTiming
 }
 
 // NewInMemoryCredentialStore returns a store that keeps credentials in
 // memory only (pi's InMemoryCredentialStore).
 func NewInMemoryCredentialStore() *CredentialStore {
-	return &CredentialStore{data: map[string]*Credential{}, getenv: os.Getenv}
+	return &CredentialStore{data: map[string]*Credential{}, getenv: os.Getenv, lockTiming: defaultLockTiming()}
 }
 
 // NewFileCredentialStore returns a store backed by the auth.json file at
 // path. A missing file reads as empty.
 func NewFileCredentialStore(path string) *CredentialStore {
-	return &CredentialStore{path: path, getenv: os.Getenv}
+	return &CredentialStore{path: path, getenv: os.Getenv, lockTiming: defaultLockTiming()}
 }
 
 // SetGetenv overrides the environment lookup used for config-value
@@ -270,9 +274,53 @@ func (s *CredentialStore) writeLocked() error {
 	return nil
 }
 
-// lockFileTimeout bounds how long lock waits for a sibling process's lock.
-const lockFileTimeout = 30 * time.Second
-const lockFileRetry = 20 * time.Millisecond
+// Lock file timings.
+//
+// A holder proves it is alive by touching the lock file on a heartbeat, and a
+// waiter only reclaims a lock whose heartbeat has stopped. Separating the two
+// matters because Modify runs the caller's function while holding the lock,
+// and for OAuth that function is a token exchange: Kimi alone retries three
+// times behind a 30 s HTTP timeout with 1+2+4 s of backoff, so a legitimate
+// hold can approach two minutes. When the stale threshold is not comfortably
+// longer than the longest hold -- as it was when both were 30 s and nothing
+// refreshed the mtime -- a waiter declares a live holder dead, both processes
+// write auth.json from snapshots taken before the other's write, and one
+// rotated refresh token is silently destroyed.
+// lockTiming groups the lock file's timings. It lives on the store rather than
+// in package variables so that tests can shrink it without a data race against
+// a running heartbeat.
+type lockTiming struct {
+	heartbeat time.Duration
+	// stale is how long a lock may go untouched before a waiter treats its
+	// owner as dead. Only reached if the owner crashed or was SIGKILLed,
+	// since a live owner refreshes the file every heartbeat.
+	stale time.Duration
+	// wait bounds how long lock() waits for a sibling process. It must
+	// exceed the worst-case legitimate hold or a concurrent session fails to
+	// save a freshly refreshed token.
+	wait  time.Duration
+	retry time.Duration
+}
+
+func defaultLockTiming() lockTiming {
+	return lockTiming{
+		heartbeat: 2 * time.Second,
+		stale:     20 * time.Second,
+		wait:      5 * time.Minute,
+		retry:     20 * time.Millisecond,
+	}
+}
+
+// lockToken returns a value unique to this acquisition. The pid alone is not
+// enough: pids are recycled, and two containers sharing a mounted agent
+// directory can hold the same one simultaneously.
+func lockToken() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d %s\n", os.Getpid(), hex.EncodeToString(random[:])), nil
+}
 
 // lock acquires the cross-process lock file. In-memory stores skip it.
 func (s *CredentialStore) lock() (func(), error) {
@@ -280,12 +328,19 @@ func (s *CredentialStore) lock() (func(), error) {
 		return func() {}, nil
 	}
 	lockPath := s.path + ".lock"
-	deadline := time.Now().Add(lockFileTimeout)
-	recoveredStaleLock := false
+	token, err := lockToken()
+	if err != nil {
+		return nil, fmt.Errorf("catalog: failed to generate an auth.json lock token: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return nil, fmt.Errorf("catalog: failed to create the agent directory: %w", err)
+	}
+	timing := s.lockTiming
+	deadline := time.Now().Add(timing.wait)
 	for {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			if _, writeErr := fmt.Fprintf(f, "%d\n", os.Getpid()); writeErr != nil {
+		f, openErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			if _, writeErr := f.WriteString(token); writeErr != nil {
 				f.Close()
 				os.Remove(lockPath)
 				return nil, fmt.Errorf("catalog: failed to initialize auth.json lock: %w", writeErr)
@@ -294,23 +349,57 @@ func (s *CredentialStore) lock() (func(), error) {
 				os.Remove(lockPath)
 				return nil, fmt.Errorf("catalog: failed to initialize auth.json lock: %w", closeErr)
 			}
-			return func() { _ = os.Remove(lockPath) }, nil
+			return holdLock(lockPath, token, timing.heartbeat), nil
 		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("catalog: failed to acquire auth.json lock: %w", err)
+		if !errors.Is(openErr, os.ErrExist) {
+			return nil, fmt.Errorf("catalog: failed to acquire auth.json lock: %w", openErr)
 		}
-		info, statErr := os.Stat(lockPath)
-		if !recoveredStaleLock && statErr == nil && time.Since(info.ModTime()) > lockFileTimeout {
-			if removeErr := os.Remove(lockPath); removeErr == nil {
-				recoveredStaleLock = true
-				deadline = time.Now().Add(lockFileTimeout)
-				continue
-			}
+		// Reclaim a lock whose owner stopped heartbeating. Removing it can
+		// race another waiter doing the same, which is why the winner is
+		// decided by the O_EXCL create on the next iteration rather than by
+		// who removed the file.
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > timing.stale {
+			_ = os.Remove(lockPath)
+			continue
 		}
 		if time.Now().After(deadline) {
 			return nil, errors.New("catalog: timed out acquiring auth.json lock")
 		}
-		time.Sleep(lockFileRetry)
+		time.Sleep(timing.retry)
+	}
+}
+
+// holdLock keeps lockPath's mtime fresh for as long as the lock is held and
+// returns the release function.
+func holdLock(lockPath, token string, heartbeat time.Duration) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				// Best effort: a failure here only risks the lock being
+				// reclaimed, which the ownership check below still contains.
+				_ = os.Chtimes(lockPath, now, now)
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(done)
+			// Remove the lock only while it is still ours. If a waiter
+			// declared us stale and took it, deleting its file would admit a
+			// third writer.
+			if content, err := os.ReadFile(lockPath); err != nil || string(content) != token {
+				return
+			}
+			_ = os.Remove(lockPath)
+		})
 	}
 }
 
@@ -370,6 +459,12 @@ func (s *CredentialStore) Modify(providerID string, fn func(current *Credential)
 	}
 	if next == nil {
 		return current, nil
+	}
+	// writeLocked marshals the whole map, so re-read first: fn can run for
+	// minutes (an OAuth token exchange) and this write must not roll back
+	// another provider's entry that changed on disk in the meantime.
+	if err := s.loadLocked(); err != nil {
+		return nil, err
 	}
 	s.data[providerID] = next.clone()
 	if err := s.writeLocked(); err != nil {
