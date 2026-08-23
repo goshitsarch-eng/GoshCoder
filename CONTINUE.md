@@ -247,6 +247,33 @@ Gloss; dependency checksums are committed in `go.sum`.
   keeps original tool call ids and thinking signatures. This tripped up test
   expectations three separate times.
 
+## Cutting a release
+
+`.github/workflows/release.yml` publishes the cross-compiled archives and the
+`checksums.txt` both installers verify against. Two ways in, one code path:
+
+- **Push a `v*` tag.** The ordinary route.
+- **Run the workflow manually** (Actions → Release → Run workflow), naming the
+  tag and optionally the branch or commit to cut it from. If the tag does not
+  exist the workflow creates and pushes it from that ref before building.
+
+The manual route exists because pushing a tag needs credentials scoped to
+`refs/tags/*`, and an automation session's token is often scoped to branches
+only -- which leaves no way to cut a release at all. The workflow's own
+`GITHUB_TOKEN` has `contents: write`, so it can create the tag itself. A push
+made with that token deliberately does not trigger another workflow run, so
+this cannot start a second release of the same version.
+
+The tag is validated against `v1.2.3` / `v1.2.3-rc.1` before it reaches a
+shell. It becomes a git ref, the archive filenames, and the version the binary
+reports (`make dist VERSION=<tag>`, which strips the leading `v` because that
+is the name `install.sh` derives from the release tag).
+
+The in-tree version (`cmd/goshcoder/version.go`, and the Makefile's `VERSION`
+fallback) stays at the `-dev` value for the release being prepared: the release
+build stamps the real one with `-ldflags`, so an untagged build never claims to
+be a release it is not.
+
 ## xAI and Meta OAuth — done
 
 Both providers accept an API key *and* a subscription/account login; adding the
