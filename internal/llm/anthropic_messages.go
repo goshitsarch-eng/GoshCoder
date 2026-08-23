@@ -829,8 +829,13 @@ func mapAnthropicStopReason(reason, refusalExplanation string) (StopReason, stri
 		return StopStop, "", nil
 	case "sensitive": // Content flagged by safety filters
 		return StopError, "Provider stopped with: sensitive", nil
+	case "model_context_window_exceeded":
+		return StopLength, "", nil
 	default:
-		return "", "", fmt.Errorf("unhandled stop reason: %s", reason)
+		// A stop reason this port has not seen must not cost the user the
+		// response that came with it. Anthropic adds values over time, and
+		// erroring out here discarded a complete, already-paid-for turn.
+		return StopStop, "", nil
 	}
 }
 
@@ -883,6 +888,11 @@ func StreamAnthropicMessagesSimple(model *Model, conv *Context, options *SimpleS
 
 	maxTokens, thinkingBudget := adjustAnthropicMaxTokensForThinking(base.MaxTokens, model.MaxTokens, reasoning, options.ThinkingBudgets)
 	maxTokens = ClampMaxTokensToContext(model, conv, maxTokens)
+	// Send the adjusted budget, not the original. Extended thinking spends
+	// max_tokens on reasoning as well as on the answer, which is why the
+	// adjustment enlarges it; leaving base.MaxTokens in place meant the request
+	// carried the unenlarged value and the model ran out of room mid-answer.
+	base.MaxTokens = maxTokens
 	enabled := true
 	return StreamAnthropicMessages(model, conv, &AnthropicOptions{
 		StreamOptions:        base,

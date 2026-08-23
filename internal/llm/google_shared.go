@@ -629,7 +629,12 @@ func consumeGoogleStream(ctx context.Context, body io.Reader, model *Model, outp
 			if candidate.FinishReason != "" {
 				output.RawStopReason = candidate.FinishReason
 				output.StopReason = mapGoogleStopReason(candidate.FinishReason)
-				if hasToolCallBlock(output.Content) {
+				// Promote to toolUse only from a clean stop. Overriding
+				// unconditionally masked MAX_TOKENS and safety stops, so the
+				// agent loop's guard against tool calls parsed out of a
+				// truncated response never fired and a call the model was cut
+				// off midway through writing was executed as if complete.
+				if output.StopReason == StopStop && hasToolCallBlock(output.Content) {
 					output.StopReason = StopToolUse
 				}
 			}

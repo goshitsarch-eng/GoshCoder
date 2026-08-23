@@ -738,3 +738,43 @@ func TestMistralStreamOutlivesTheRequestTimeout(t *testing.T) {
 		t.Fatalf("text = %q, want all four deltas", text)
 	}
 }
+
+// TestMistralToolCallContinuationDeltasStayOneCall covers a stream where the
+// tool call's id appears only on its first chunk, which is how Mistral sends
+// them. Deriving a synthetic id from the index for the later chunks produced a
+// different map key, so each continuation forked a second tool call: one block
+// carried the name and none of the arguments, the other the arguments and no
+// name, and the model's single request reached the agent as two broken ones.
+func TestMistralToolCallContinuationDeltasStayOneCall(t *testing.T) {
+	body := mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"abcdefghi","function":{"name":"read","arguments":"{\"path\":"}}]}}]}`) +
+		mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"main.go\""}}]}}]}`) +
+		mistralSSE(`{"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}`) +
+		mistralSSE(mistralFinish)
+
+	model := mistralServer(t, body)
+	options := &MistralOptions{}
+	options.APIKey = "k"
+
+	result, err := StreamMistral(model,
+		&Context{Messages: []Message{UserMessage{Role: "user", Content: "read it"}}},
+		options).Result(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []ToolCall
+	for _, block := range result.Content {
+		if call, ok := block.(ToolCall); ok {
+			calls = append(calls, call)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("got %d tool calls, want 1: %#v", len(calls), calls)
+	}
+	if calls[0].Name != "read" {
+		t.Fatalf("name = %q", calls[0].Name)
+	}
+	if got, _ := calls[0].Arguments["path"].(string); got != "main.go" {
+		t.Fatalf("path = %q, want the arguments assembled onto the named call", got)
+	}
+}

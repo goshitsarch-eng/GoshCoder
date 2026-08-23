@@ -578,6 +578,9 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 	// new block starts.
 	var textAccum, thinkingAccum textAccumulator
 	toolCallsByKey := map[string]*mistralStreamingToolCall{}
+	// Wire index -> key, so a continuation delta that omits the id still finds
+	// the block its first chunk created.
+	toolCallKeyByIndex := map[int]string{}
 	var toolCallOrder []string
 
 	blockIndex := func() int { return len(output.Content) - 1 }
@@ -730,11 +733,21 @@ func (p *mistralStreamer) consumeStream(ctx context.Context, body io.Reader) err
 			if raw.Index != nil {
 				index = *raw.Index
 			}
+			// Continuation deltas carry only the index; the id appears once, on
+			// the first chunk. Deriving a synthetic id from the index produced
+			// a different key from the id-bearing block, so every subsequent
+			// chunk forked a second tool call that carried the arguments while
+			// the original kept the name -- and the model's single request
+			// reached the agent as two broken ones.
+			key, known := toolCallKeyByIndex[index]
 			callID := raw.ID
-			if callID == "" || callID == "null" {
-				callID = deriveMistralToolCallID(fmt.Sprintf("toolcall:%d", index), 0)
+			if !known {
+				if callID == "" || callID == "null" {
+					callID = deriveMistralToolCallID(fmt.Sprintf("toolcall:%d", index), 0)
+				}
+				key = fmt.Sprintf("%s:%d", callID, index)
+				toolCallKeyByIndex[index] = key
 			}
-			key := fmt.Sprintf("%s:%d", callID, index)
 
 			block, exists := toolCallsByKey[key]
 			if !exists {

@@ -53,20 +53,25 @@ func (s *SSEReader) Next() (SSEEvent, error) {
 
 	for {
 		line, err := s.readLine()
-		if strings.HasPrefix(line, "data:") && data.Len()+len(line)+1 > maxSSEEventBytes {
-			return SSEEvent{}, ErrSSEEventTooLarge
-		}
 		if err != nil {
 			if err == io.EOF && line != "" {
 				// Process a final unterminated line, then report EOF on the
 				// next call unless it dispatches an event.
-				if ev, ok := s.processLine(line, &event, &data, &haveData); ok {
+				ev, ok, lineErr := s.processLine(line, &event, &data, &haveData)
+				if lineErr != nil {
+					return SSEEvent{}, lineErr
+				}
+				if ok {
 					return ev, nil
 				}
 			}
 			return SSEEvent{}, err
 		}
-		if ev, ok := s.processLine(line, &event, &data, &haveData); ok {
+		ev, ok, lineErr := s.processLine(line, &event, &data, &haveData)
+		if lineErr != nil {
+			return SSEEvent{}, lineErr
+		}
+		if ok {
 			return ev, nil
 		}
 	}
@@ -89,22 +94,23 @@ func (s *SSEReader) readLine() (string, error) {
 	}
 }
 
-// processLine handles one line; ok is true when a blank line dispatched an event.
-func (s *SSEReader) processLine(line string, event *SSEEvent, data *strings.Builder, haveData *bool) (SSEEvent, bool) {
+// processLine handles one line; ok is true when a blank line dispatched an
+// event, and err is non-nil when the accumulated event exceeds its size cap.
+func (s *SSEReader) processLine(line string, event *SSEEvent, data *strings.Builder, haveData *bool) (SSEEvent, bool, error) {
 	if line == "" {
 		if !*haveData {
 			*event = SSEEvent{}
-			return SSEEvent{}, false
+			return SSEEvent{}, false, nil
 		}
 		event.Data = data.String()
 		ev := *event
 		*event = SSEEvent{}
 		data.Reset()
 		*haveData = false
-		return ev, true
+		return ev, true, nil
 	}
 	if strings.HasPrefix(line, ":") {
-		return SSEEvent{}, false // comment
+		return SSEEvent{}, false, nil // comment
 	}
 	field, value, found := strings.Cut(line, ":")
 	if found {
@@ -114,6 +120,14 @@ func (s *SSEReader) processLine(line string, event *SSEEvent, data *strings.Buil
 	}
 	switch field {
 	case "data":
+		// The cap is enforced here rather than on the raw line, because
+		// accumulation keys off the parsed field name: a colon-less "data"
+		// line is a valid SSE field with an empty value, so it appended a
+		// newline while slipping past a check that looked for the "data:"
+		// prefix, and the accumulator could grow without bound.
+		if data.Len()+len(value)+1 > maxSSEEventBytes {
+			return SSEEvent{}, false, ErrSSEEventTooLarge
+		}
 		if *haveData {
 			data.WriteByte('\n')
 		}
@@ -126,5 +140,5 @@ func (s *SSEReader) processLine(line string, event *SSEEvent, data *strings.Buil
 	case "retry":
 		// reconnection delay: not used for LLM streams
 	}
-	return SSEEvent{}, false
+	return SSEEvent{}, false, nil
 }

@@ -102,6 +102,15 @@ func runLoop(ctx context.Context, currentContext *Context, newMessages *[]Messag
 
 		// Inner loop: process tool calls and steering messages.
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
+			// A batch cut short by an abort still leaves hasMoreToolCalls set,
+			// so without this the loop opened another turn and issued another
+			// provider request with an already-cancelled context -- a wasted
+			// round trip on every abort, plus a spurious empty assistant
+			// message appended to the transcript.
+			if ctx.Err() != nil {
+				emit(Event{Type: EventAgentEnd, Messages: append([]Message(nil), (*newMessages)...)})
+				return
+			}
 			if !firstTurn {
 				emit(Event{Type: EventTurnStart})
 			} else {
