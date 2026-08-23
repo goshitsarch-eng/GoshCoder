@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"goshcoder/internal/agent"
@@ -49,6 +50,15 @@ type session struct {
 	btw       *btw.Manager
 	workspace *tools.Workspace
 	plan      *plannotator.Manager
+	// promptMu guards baseSystemPrompt, explicitSystemPrompt and resources.
+	//
+	// /reload and /system rewrite all three from whichever goroutine runs the
+	// slash command -- the Bubble Tea update loop in the fullscreen UI -- while
+	// the agent's PrepareNextTurn hook reads baseSystemPrompt between tool
+	// turns on the run goroutine. A Go string is a two-word value with no
+	// atomicity, so an unsynchronized overlap can hand the agent one string's
+	// pointer with another's length.
+	promptMu sync.RWMutex
 	// baseSystemPrompt is the prompt without extension suffixes.
 	baseSystemPrompt     string
 	explicitSystemPrompt string
@@ -119,7 +129,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 	for _, tool := range promptTools {
 		toolNames = append(toolNames, tool.Name)
 	}
-	s.baseSystemPrompt = s.resources.BuildSystemPrompt(cfg.SystemPrompt, resourceRoot, toolNames)
+	s.setSystemPromptBase(s.resources.BuildSystemPrompt(cfg.SystemPrompt, resourceRoot, toolNames))
 	if !cfg.Quiet {
 		for _, warning := range s.resources.Warnings {
 			fmt.Fprintln(os.Stderr, dim("resource warning: "+warning))
@@ -203,7 +213,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 		},
 		// Compose native extension hooks in load order.
 		PrepareNextTurn: composePrepareNextTurn(
-			ralphPrepareNextTurn(s.loops, func() string { return s.baseSystemPrompt }),
+			ralphPrepareNextTurn(s.loops, s.systemPromptBase),
 			s.planPrepareNextTurn(),
 		),
 	})
@@ -268,11 +278,43 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 	return authStreamFn(auth)(model, request, options)
 }
 
+// systemPromptBase returns the prompt without extension suffixes.
+func (s *session) systemPromptBase() string {
+	s.promptMu.RLock()
+	defer s.promptMu.RUnlock()
+	return s.baseSystemPrompt
+}
+
+// setSystemPromptBase replaces the prompt without extension suffixes.
+func (s *session) setSystemPromptBase(prompt string) {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	s.baseSystemPrompt = prompt
+}
+
+// setExplicitSystemPrompt records a user-supplied /system override.
+func (s *session) setExplicitSystemPrompt(prompt string) {
+	s.promptMu.Lock()
+	defer s.promptMu.Unlock()
+	s.explicitSystemPrompt = prompt
+}
+
+// currentResources returns the loaded resource set, which /reload replaces.
+func (s *session) currentResources() *coderresources.Set {
+	if s == nil {
+		return nil
+	}
+	s.promptMu.RLock()
+	defer s.promptMu.RUnlock()
+	return s.resources
+}
+
 func (s *session) expandResourceInput(input string) (string, bool, error) {
-	if s == nil || s.resources == nil {
+	loaded := s.currentResources()
+	if loaded == nil {
 		return "", false, nil
 	}
-	return s.resources.Expand(input)
+	return loaded.Expand(input)
 }
 
 func (s *session) reloadResources() error {
@@ -288,8 +330,12 @@ func (s *session) reloadResources() error {
 	for _, tool := range promptTools {
 		toolNames = append(toolNames, tool.Name)
 	}
+
+	s.promptMu.Lock()
 	s.resources = loaded
 	s.baseSystemPrompt = loaded.BuildSystemPrompt(s.explicitSystemPrompt, s.workspaceRoot(), toolNames)
+	s.promptMu.Unlock()
+
 	s.syncPlanRuntime()
 	return nil
 }
@@ -397,7 +443,7 @@ func composePrepareNextTurn(hooks ...agent.PrepareNextTurnFunc) agent.PrepareNex
 }
 
 func (s *session) runtimeSystemPrompt() string {
-	prompt := s.baseSystemPrompt
+	prompt := s.systemPromptBase()
 	if s.loops != nil {
 		if state, ok := s.loops.Current(); ok && state.Status == ralph.StatusActive {
 			prompt += ralph.SystemPromptSuffix(state)

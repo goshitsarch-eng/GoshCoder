@@ -93,9 +93,53 @@ func TestRuneWidthHandlesCJKAndCombiningMarks(t *testing.T) {
 }
 
 func TestRenderMessagesKeepsLeadingIndentedCode(t *testing.T) {
-	lines := renderMessages([]Message{{Role: "assistant", Text: "    func main() {}"}}, 80, false, false)
+	lines := renderMessages([]Message{{Role: "assistant", Text: "    func main() {}"}}, 80, false, false, nil)
 	plain := stripANSI(strings.Join(lines, "\n"))
 	if !strings.Contains(plain, "func main() {}") || !strings.Contains(plain, "│") {
 		t.Fatalf("indented assistant code lost: %q", plain)
+	}
+}
+
+// TestMessageCacheReusesRenderedMessages covers the memoization the fullscreen
+// UI relies on: the whole transcript is re-rendered on every frame -- every
+// keystroke and every stream delta -- and markdown-parsing hundreds of
+// unchanged messages each time is what makes typing lag in a long session.
+func TestMessageCacheReusesRenderedMessages(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Text: "first question"},
+		{Role: "assistant", Text: "# Heading\n\nSome **bold** text and `code`."},
+		{Role: "assistant", Text: "second answer"},
+	}
+	cache := NewMessageCache()
+
+	first := renderMessages(messages, 80, false, false, cache)
+	second := renderMessages(messages, 80, false, false, cache)
+	if strings.Join(first, "\n") != strings.Join(second, "\n") {
+		t.Fatal("cached render differs from the first render")
+	}
+	if len(cache.entries) != len(messages) {
+		t.Fatalf("cache holds %d entries for %d messages", len(cache.entries), len(messages))
+	}
+
+	// An uncached render must produce exactly the same output.
+	uncached := renderMessages(messages, 80, false, false, nil)
+	if strings.Join(uncached, "\n") != strings.Join(first, "\n") {
+		t.Fatal("cached and uncached renders disagree")
+	}
+}
+
+// TestMessageCacheInvalidatesOnLayoutChange keeps a resize or a toggle from
+// showing lines rendered for the previous layout.
+func TestMessageCacheInvalidatesOnLayoutChange(t *testing.T) {
+	messages := []Message{{Role: "assistant", Text: strings.Repeat("word ", 40)}}
+	cache := NewMessageCache()
+
+	wide := renderMessages(messages, 100, false, false, cache)
+	narrow := renderMessages(messages, 40, false, false, cache)
+	if strings.Join(wide, "\n") == strings.Join(narrow, "\n") {
+		t.Fatal("a width change reused lines wrapped for the old width")
+	}
+	if want := renderMessages(messages, 40, false, false, nil); strings.Join(narrow, "\n") != strings.Join(want, "\n") {
+		t.Fatal("post-resize render does not match an uncached render at the new width")
 	}
 }

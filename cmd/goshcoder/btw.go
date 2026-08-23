@@ -127,17 +127,20 @@ func (s *session) handleBTWCommand(rest string) error {
 		if thread == nil {
 			return fmt.Errorf("unknown BTW thread %q", fields[1])
 		}
-		segments := btw.LatestSegments(thread)
+		// Snapshot under the manager's lock; a thread can still be receiving
+		// turns from the goroutine answering its question.
+		snapshot := s.btw.Snapshot(thread)
+		segments := btw.LatestSegments(&snapshot)
 		if len(fields) > 2 {
 			scope := strings.ToLower(fields[2])
 			if scope == "all" {
-				segments = btw.AnsweredSegments(thread, 0)
+				segments = btw.AnsweredSegments(&snapshot, 0)
 			} else if strings.HasPrefix(scope, "from:") {
 				index, err := strconv.Atoi(strings.TrimPrefix(scope, "from:"))
 				if err != nil || index < 1 {
 					return errors.New("from scope must be from:N with N >= 1")
 				}
-				segments = btw.AnsweredSegments(thread, index-1)
+				segments = btw.AnsweredSegments(&snapshot, index-1)
 			}
 		}
 		if len(segments) == 0 {

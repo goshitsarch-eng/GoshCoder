@@ -85,6 +85,28 @@ type fullscreenModel struct {
 	toolsExpanded bool
 	hideThinking  bool
 	btw           *fullscreenBTWState
+	// renderCache memoizes per-message rendering so a long transcript is not
+	// markdown-parsed from scratch on every keystroke.
+	renderCache *tui.MessageCache
+	// ticking records whether a spinner tick is already scheduled. The tick
+	// only animates the spinner and the elapsed-time readout, so it is armed
+	// while the agent is working and left off otherwise; re-arming it
+	// unconditionally kept the process re-rendering eight times a second at a
+	// fully idle prompt.
+	ticking bool
+	// loginChoices caches the /login picker. Building it resolves credentials
+	// for every provider, which reads auth.json once per provider and can
+	// trigger an OAuth refresh over the network -- work that must never happen
+	// on the render path.
+	loginChoices      []fullscreenSuggestion
+	loginChoicesQuery string
+	loginChoicesValid bool
+	// gitRefreshWanted / gitRefreshInFlight schedule the git enrichment of the
+	// sidebar off the update loop. sessionInfo forks `git status`, which in a
+	// large repository takes seconds; running it inline froze the UI, and
+	// holding a key that triggered it forked one git process per repeat.
+	gitRefreshWanted   bool
+	gitRefreshInFlight bool
 }
 
 func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAgentEvent) *fullscreenModel {
@@ -98,6 +120,8 @@ func newFullscreenModel(session *session, updates, lifecycle <-chan fullscreenAg
 		updates:   updates,
 		lifecycle: lifecycle,
 		models:    availableFullscreenModels(session),
+
+		renderCache: tui.NewMessageCache(),
 	}
 	for _, tool := range session.agent.State().Tools {
 		if tool.Name == "bash" {
@@ -141,6 +165,7 @@ func runFullscreenChat(session *session) error {
 }
 
 func (model *fullscreenModel) Init() tea.Cmd {
+	model.ticking = true
 	return tea.Batch(tea.HideCursor, waitForFullscreenEvent(model.updates, model.lifecycle), fullscreenTickCommand())
 }
 
@@ -159,11 +184,53 @@ func fullscreenTickCommand() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(now time.Time) tea.Msg { return fullscreenTick(now) })
 }
 
+// tickIfBusy schedules the next spinner frame only while the agent or a
+// command is working. An idle prompt has nothing to animate, and re-arming
+// regardless kept View -- which re-renders the whole transcript -- running
+// eight times a second forever.
+func (model *fullscreenModel) tickIfBusy() tea.Cmd {
+	if !model.session.agent.State().IsStreaming && !model.busyCommand {
+		model.ticking = false
+		return nil
+	}
+	model.ticking = true
+	return fullscreenTickCommand()
+}
+
+// resumeTicking restarts the spinner when work begins after an idle period.
+func (model *fullscreenModel) resumeTicking() tea.Cmd {
+	if model.ticking {
+		return nil
+	}
+	return model.tickIfBusy()
+}
+
 func refreshFullscreenInfo(session *session) tea.Cmd {
 	return func() tea.Msg { return fullscreenInfoRefreshed{info: session.sessionInfo()} }
 }
 
+// Update handles one Bubble Tea message.
+//
+// The spinner tick is re-armed here rather than at each site that starts work:
+// the tick is only scheduled while the agent or a command is busy, so every
+// transition into that state needs to restart it, and doing it centrally means
+// a new transition cannot forget to.
 func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := model.update(message)
+	cmds := []tea.Cmd{cmd}
+	if resume := model.resumeTicking(); resume != nil {
+		cmds = append(cmds, resume)
+	}
+	if git := model.pendingGitRefresh(); git != nil {
+		cmds = append(cmds, git)
+	}
+	if len(cmds) == 1 {
+		return next, cmd
+	}
+	return next, tea.Batch(cmds...)
+}
+
+func (model *fullscreenModel) update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := message.(type) {
 	case tea.WindowSizeMsg:
 		model.width, model.height = value.Width, value.Height
@@ -181,7 +248,7 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err != nil {
 			model.notices = appendNotice(model.notices, "Error", value.err.Error())
 		}
-		model.info = model.session.sessionInfo()
+		model.refreshInfoAsync()
 		model.activity = "Ready"
 		model.activityAt = time.Time{}
 
@@ -203,10 +270,12 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		// others. Rebuild the picker so every authenticated provider is visible
 		// immediately.
 		model.models = availableFullscreenModels(model.session)
+		model.invalidateLoginSuggestions()
 		model.notices = appendNotice(model.notices, "Login", "Added "+value.provider+". Use /model to switch providers.")
 		model.activity = "Logged in to " + value.provider
 
 	case fullscreenInfoRefreshed:
+		model.gitRefreshInFlight = false
 		model.info = value.info
 
 	case fullscreenBTWFinished:
@@ -230,7 +299,7 @@ func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fullscreenTick:
 		model.spin = (model.spin + 1) % 8
-		return model, fullscreenTickCommand()
+		return model, model.tickIfBusy()
 
 	case tea.KeyMsg:
 		return model, model.handleTeaKey(value)
@@ -278,6 +347,24 @@ func (model *fullscreenModel) refreshRealtimeInfo() {
 	model.info = fresh
 }
 
+// refreshInfoAsync updates everything the sidebar can show without blocking,
+// and asks for the git-derived fields to be filled in on a background command.
+func (model *fullscreenModel) refreshInfoAsync() {
+	model.refreshRealtimeInfo()
+	model.gitRefreshWanted = true
+}
+
+// pendingGitRefresh returns the command that enriches the sidebar with git
+// state, at most one at a time.
+func (model *fullscreenModel) pendingGitRefresh() tea.Cmd {
+	if !model.gitRefreshWanted || model.gitRefreshInFlight {
+		return nil
+	}
+	model.gitRefreshWanted = false
+	model.gitRefreshInFlight = true
+	return refreshFullscreenInfo(model.session)
+}
+
 func (model *fullscreenModel) View() string {
 	if model.btw != nil {
 		return model.viewBTW()
@@ -315,6 +402,7 @@ func (model *fullscreenModel) View() string {
 		planItems = model.session.plan.State().Items
 	}
 	frame := tui.Frame{
+		Cache:              model.renderCache,
 		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
 		Messages:           messages,
 		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool, planItems),
@@ -376,7 +464,7 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 
 	case "shift+tab":
 		cycleFullscreenThinking(model.session)
-		model.info = model.session.sessionInfo()
+		model.refreshInfoAsync()
 		model.activity = "Thinking set to " + model.session.agent.State().ThinkingLevel
 
 	case "ctrl+l":
@@ -517,7 +605,7 @@ func (model *fullscreenModel) cycleModel(direction int) {
 	for index := range model.models {
 		model.models[index].current = index == next
 	}
-	model.info = model.session.sessionInfo()
+	model.refreshInfoAsync()
 	model.activity = "Model set to " + model.models[next].ref
 }
 
@@ -704,7 +792,12 @@ func (model *fullscreenModel) handleBTWTeaKey(key tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "ctrl+r":
-		segments := btw.LatestSegments(state.thread)
+		// Read through the manager's lock: the answer for an in-flight question
+		// is appended to thread.Turns from a tea.Cmd goroutine, so iterating
+		// the live slice here races the append and can pair a new length with
+		// the old backing array.
+		snapshot := model.session.btw.Snapshot(state.thread)
+		segments := btw.LatestSegments(&snapshot)
 		if len(segments) == 0 {
 			model.activity = "No successful BTW answer to bring"
 			return nil
@@ -889,7 +982,7 @@ func (model *fullscreenModel) applyCommandResult(result fullscreenResult) bool {
 	if result.err != nil {
 		model.notices = appendNotice(model.notices, "Error", result.err.Error())
 	}
-	model.info = model.session.sessionInfo()
+	model.refreshInfoAsync()
 	state := model.session.agent.State()
 	currentRef := state.Model.Provider + "/" + state.Model.ID
 	for index := range model.models {
@@ -920,7 +1013,8 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 }
 
 func (model *fullscreenModel) suggestions() []fullscreenSuggestion {
-	return fullscreenSuggestionsWithModels(model.session, string(model.editor.input), model.models)
+	return fullscreenSuggestionsWithModels(model.session, string(model.editor.input), model.models,
+		model.cachedLoginSuggestions)
 }
 
 func (model *fullscreenModel) selectedSuggestion(count int) int {
@@ -1040,10 +1134,17 @@ func (model *fullscreenModel) deletePreviousWord() {
 }
 
 func fullscreenSuggestions(session *session, input string) []fullscreenSuggestion {
-	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session))
+	return fullscreenSuggestionsWithModels(session, input, availableFullscreenModels(session), nil)
 }
 
-func fullscreenSuggestionsWithModels(session *session, input string, models []fullscreenModelChoice) []fullscreenSuggestion {
+// loginSuggestions is how the picker for "/login <query>" is produced. The
+// fullscreen model passes a cached implementation, because the uncached one
+// resolves credentials for every provider and must not run on the render path.
+func fullscreenSuggestionsWithModels(session *session, input string, models []fullscreenModelChoice,
+	loginSuggestions func(string) []fullscreenSuggestion) []fullscreenSuggestion {
+	if loginSuggestions == nil {
+		loginSuggestions = fullscreenLoginSuggestions
+	}
 	lower := strings.ToLower(input)
 	if strings.HasPrefix(lower, "/model ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/model "))
@@ -1073,7 +1174,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		if strings.ContainsAny(query, " \t\n") {
 			return nil
 		}
-		return fullscreenLoginSuggestions(query)
+		return loginSuggestions(query)
 	}
 	if strings.HasPrefix(lower, "/omni ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/omni "))
@@ -1192,6 +1293,30 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		}
 	}
 	return suggestions
+}
+
+// cachedLoginSuggestions returns the /login picker without touching the
+// credential store on the render path.
+//
+// fullscreenLoginSuggestions resolves auth for every provider, which re-reads
+// auth.json once each and, for an expired OAuth credential, performs a token
+// refresh over the network. View() runs on the render goroutine, so behind a
+// captive portal a single "/login " in the composer froze the whole UI for the
+// HTTP timeout on every frame.
+func (model *fullscreenModel) cachedLoginSuggestions(query string) []fullscreenSuggestion {
+	if model.loginChoicesValid && model.loginChoicesQuery == query {
+		return model.loginChoices
+	}
+	model.loginChoices = fullscreenLoginSuggestions(query)
+	model.loginChoicesQuery = query
+	model.loginChoicesValid = true
+	return model.loginChoices
+}
+
+// invalidateLoginSuggestions forces the picker to be rebuilt after the set of
+// stored credentials may have changed.
+func (model *fullscreenModel) invalidateLoginSuggestions() {
+	model.loginChoicesValid = false
 }
 
 func fullscreenLoginSuggestions(query string) []fullscreenSuggestion {

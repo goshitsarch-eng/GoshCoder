@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/claudetui"
@@ -95,7 +97,26 @@ func editorHistory(editor *fullscreenEditor, direction int) {
 	editor.cursor = len(editor.input)
 }
 
+// commandCapture serializes the os.Stderr redirection below.
+//
+// Slash-command output is captured by swapping the process-global os.Stderr,
+// and runFullscreenCommand is reachable from two goroutines: directly on the
+// Bubble Tea update loop for synchronous commands, and from a tea.Cmd goroutine
+// for asynchronous ones. Two overlapping calls each save what they find and
+// restore it on the way out, so the later one restores the earlier one's pipe --
+// whose reader is already closed -- and every subsequent write to stderr fails
+// for the life of the process.
+var commandCapture sync.Mutex
+
 func runFullscreenCommand(session *session, input string) fullscreenResult {
+	// Refuse rather than block: a command can wait on a human (the planner's
+	// browser review), and the synchronous path runs on the update loop, where
+	// waiting would freeze the interface.
+	if !commandCapture.TryLock() {
+		return fullscreenResult{err: errors.New("another command is still running; wait for it to finish")}
+	}
+	defer commandCapture.Unlock()
+
 	oldStderr := os.Stderr
 	reader, writer, err := os.Pipe()
 	if err != nil {

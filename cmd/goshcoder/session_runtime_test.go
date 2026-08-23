@@ -11,6 +11,7 @@ import (
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
+	"sync"
 )
 
 func TestPlanPrepareNextTurnEnablesFullToolsImmediatelyAfterApproval(t *testing.T) {
@@ -125,4 +126,55 @@ func TestPlanRuntimeToolsKeepRalphTools(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestSystemPromptAccessIsSynchronized covers a data race between /reload or
+// /system -- which run on whichever goroutine handles the slash command, the
+// Bubble Tea update loop in the fullscreen UI -- and the agent's PrepareNextTurn
+// hook, which reads the base prompt between tool turns on the run goroutine.
+// A Go string is a two-word value with no atomicity, so an unsynchronized
+// overlap can pair one string's pointer with another's length.
+//
+// Both sides run the same fixed number of iterations behind a start barrier so
+// they genuinely overlap; without that the reader can finish before the writer
+// is scheduled and the race detector never sees the conflicting pair.
+func TestSystemPromptAccessIsSynchronized(t *testing.T) {
+	const iterations = 5000
+
+	session := &session{}
+	session.setSystemPromptBase("initial prompt")
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := range iterations {
+			session.setSystemPromptBase(strings.Repeat("x", i%64+1))
+			session.setExplicitSystemPrompt(strings.Repeat("y", i%32+1))
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			_ = session.systemPromptBase()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for range iterations {
+			_ = session.currentResources()
+		}
+	}()
+
+	close(start)
+	wg.Wait()
 }
