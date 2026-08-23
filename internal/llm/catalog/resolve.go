@@ -44,6 +44,8 @@ type Catalog struct {
 	fileExists func(string) bool
 	// oauthCtx bounds implicit OAuth refreshes triggered by auth resolution.
 	oauthCtx context.Context
+	// oauthTimeout caps one implicit refresh; see SetOAuthTimeout.
+	oauthTimeout time.Duration
 	// oauthErrors records the last refresh failure per provider, so callers can
 	// distinguish "no credential" from "your login expired".
 	oauthMu     sync.Mutex
@@ -63,6 +65,18 @@ func NewCatalog(credentials *CredentialStore) *Catalog {
 // SetOAuthContext bounds implicit OAuth refreshes, so a cancelled run does not
 // leave a token exchange in flight.
 func (c *Catalog) SetOAuthContext(ctx context.Context) { c.oauthCtx = ctx }
+
+// SetOAuthTimeout caps a single implicit refresh.
+//
+// Resolution can trigger a token exchange, which is network I/O, and several
+// paths that merely enumerate providers -- the startup model default, the model
+// and login pickers, `goshcoder providers` -- resolve every one of them. With
+// no deadline that runs on context.Background(), and a provider that retries
+// (Kimi retries three times behind a 30 s timeout, plus backoff) can block the
+// caller for over two minutes with nothing on screen. A caller that has a real
+// context of its own -- a model request, an interactive login -- installs it
+// with SetOAuthContext and is bounded by that instead.
+func (c *Catalog) SetOAuthTimeout(d time.Duration) { c.oauthTimeout = d }
 
 // Credentials returns the backing credential store, which login flows write to.
 func (c *Catalog) Credentials() *CredentialStore { return c.credentials }
@@ -418,6 +432,17 @@ func (c *Catalog) resolveOAuth(providerID string, stored *Credential) (*Auth, bo
 	}
 
 	ctx := c.oauthContext()
+	// Do not re-spend the full retry budget on a provider that just failed:
+	// these paths run on every picker rebuild, and a dead auth host would
+	// otherwise stall each one all over again.
+	if previous := c.OAuthError(providerID); previous != nil {
+		return nil, false
+	}
+	if c.oauthTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.oauthTimeout)
+		defer cancel()
+	}
 	refreshed, err := c.refreshOAuthCredential(ctx, providerID, provider)
 	if err != nil {
 		c.recordOAuthError(providerID, err)

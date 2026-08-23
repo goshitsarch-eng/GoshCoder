@@ -224,6 +224,12 @@ func refreshFullscreenInfo(session *session) tea.Cmd {
 // a new transition cannot forget to.
 func (model *fullscreenModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := model.update(message)
+	// Messages raised from agent-goroutine work (the Planner's review URL, for
+	// one) are queued on the session because that goroutine must not touch the
+	// screen. Drain them here so they appear like any other notice.
+	for _, notice := range model.session.drainNotices() {
+		model.notices = appendNotice(model.notices, notice.Kind, notice.Text)
+	}
 	cmds := []tea.Cmd{cmd}
 	if resume := model.resumeTicking(); resume != nil {
 		cmds = append(cmds, resume)

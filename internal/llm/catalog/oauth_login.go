@@ -342,11 +342,23 @@ func runLoopbackLogin(
 	authURL, redirectURI, expectedState string,
 	host string, port int, path string,
 ) (code string, err error) {
+	// The callback ports are fixed and shared with the vendors' own CLIs
+	// (Codex binds 1455 too), so a busy port is ordinary rather than fatal.
+	// Aborting here made the manual-paste path this function exists to offer
+	// unreachable: the auth URL was never shown and there was no way to log in
+	// until the user found and killed the other process.
+	var callbacks <-chan callbackResult
 	server, err := startCallbackServer(host, port, path, expectedState)
 	if err != nil {
-		return "", err
+		interaction.Notify(LoginEvent{
+			Kind: "info",
+			Message: fmt.Sprintf("Could not listen on %s:%d for the browser callback (%v). "+
+				"Complete login in the browser and paste the redirect URL below.", host, port, err),
+		})
+	} else {
+		defer server.close()
+		callbacks = server.results
 	}
-	defer server.close()
 
 	interaction.Notify(LoginEvent{
 		Kind: "auth_url",
@@ -378,7 +390,7 @@ func runLoopbackLogin(
 	}()
 
 	select {
-	case result, ok := <-server.results:
+	case result, ok := <-callbacks:
 		if !ok {
 			return "", ErrLoginCancelled
 		}

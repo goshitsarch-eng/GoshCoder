@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	charmterm "github.com/charmbracelet/x/term"
 
@@ -127,9 +128,21 @@ func main() {
 }
 
 // newCatalog builds a catalog backed by the on-disk credential store.
+// newCatalog builds a catalog backed by the on-disk credential store.
+//
+// The refresh cap keeps the paths that merely enumerate providers responsive.
+// Callers that have a real context of their own -- a model request, an
+// interactive login -- install it with SetOAuthContext and get the full
+// allowance; see Catalog.SetOAuthTimeout.
 func newCatalog() *catalog.Catalog {
-	return catalog.NewCatalog(catalog.NewFileCredentialStore(config.AuthPath()))
+	c := catalog.NewCatalog(catalog.NewFileCredentialStore(config.AuthPath()))
+	c.SetOAuthTimeout(implicitOAuthRefreshTimeout)
+	return c
 }
+
+// implicitOAuthRefreshTimeout caps a token refresh triggered incidentally, by
+// listing providers or rebuilding a picker rather than by an actual request.
+const implicitOAuthRefreshTimeout = 15 * time.Second
 
 // ---------------------------------------------------------------------------
 // run

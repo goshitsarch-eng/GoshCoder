@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"fmt"
 	"goshcoder/internal/agent"
 	"goshcoder/internal/plannotator"
 	"goshcoder/internal/ralph"
@@ -175,6 +176,72 @@ func TestSystemPromptAccessIsSynchronized(t *testing.T) {
 		}
 	}()
 
+	close(start)
+	wg.Wait()
+}
+
+// TestPlannerNoticesReachTheInterface covers how a message raised from the
+// agent goroutine gets to the user. The Planner's browser review runs inside a
+// tool call and its notice was written to stderr only in line mode, so in the
+// fullscreen UI -- the default on any terminal -- the review URL was dropped.
+// The port is ephemeral, so with no browser to open (a headless box with no
+// xdg-open) the tool then blocked on a review the user had no way to reach.
+func TestPlannerNoticesReachTheInterface(t *testing.T) {
+	s := &session{}
+
+	if got := s.drainNotices(); got != nil {
+		t.Fatalf("a fresh session had notices: %#v", got)
+	}
+
+	s.pushNotice("Planner", "Planner review: http://127.0.0.1:54321/")
+	drained := s.drainNotices()
+	if len(drained) != 1 || !strings.Contains(drained[0].Text, "127.0.0.1:54321") {
+		t.Fatalf("drained = %#v", drained)
+	}
+	if got := s.drainNotices(); got != nil {
+		t.Fatalf("notices were delivered twice: %#v", got)
+	}
+}
+
+// TestSessionNoticesAreBounded keeps a runaway producer from growing the queue
+// without limit.
+func TestSessionNoticesAreBounded(t *testing.T) {
+	s := &session{}
+	for i := range 500 {
+		s.pushNotice("Planner", fmt.Sprintf("notice %d", i))
+	}
+	drained := s.drainNotices()
+	if len(drained) > 64 {
+		t.Fatalf("queue grew to %d entries", len(drained))
+	}
+	// The most recent must survive; it is the one that matters.
+	if !strings.Contains(drained[len(drained)-1].Text, "notice 499") {
+		t.Fatalf("newest notice lost: %q", drained[len(drained)-1].Text)
+	}
+}
+
+// TestSessionNoticesAreConcurrencySafe: notices are pushed from the agent
+// goroutine and drained from the UI goroutine.
+func TestSessionNoticesAreConcurrencySafe(t *testing.T) {
+	s := &session{}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := range 1000 {
+			s.pushNotice("Planner", fmt.Sprintf("n%d", i))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		for range 1000 {
+			_ = s.drainNotices()
+		}
+	}()
 	close(start)
 	wg.Wait()
 }

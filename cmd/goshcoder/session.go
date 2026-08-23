@@ -66,6 +66,14 @@ type session struct {
 	normalTools          []agent.Tool
 	// contextEstimate caches the transcript's token estimate; see its type.
 	contextEstimate contextEstimate
+	// noticeMu guards pendingNotices.
+	noticeMu sync.Mutex
+	// pendingNotices carries messages raised from agent-goroutine work -- the
+	// Planner's review URL, for instance -- to whichever interface is running.
+	// The fullscreen UI owns the screen, so such work cannot write to stderr;
+	// dropping the message instead left the Planner blocking on a review the
+	// user had no way to reach.
+	pendingNotices []sessionNotice
 	// loopTools are the Ralph tools. They are kept separately from
 	// normalTools because planRuntimeTools rebuilds the agent's tool list from
 	// normalTools before every turn, and anything not merged back in there is
@@ -141,9 +149,13 @@ func newSession(cfg sessionConfig) (*session, error) {
 		root := s.workspace.Root
 		stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(root)))[:16]
 		reviewer := plannotator.BrowserReviewer{Notify: func(message string) {
-			if !cfg.Fullscreen {
-				fmt.Fprintln(os.Stderr, message)
+			if cfg.Fullscreen {
+				// The fullscreen UI owns the terminal, so this cannot go to
+				// stderr; it is queued for the interface to render instead.
+				s.pushNotice("Planner", message)
+				return
 			}
+			fmt.Fprintln(os.Stderr, message)
 		}}
 		manager, err := plannotator.New(root, filepath.Join(config.AgentDir(), "plannotator", stateID+".json"), reviewer)
 		if err != nil {
@@ -269,6 +281,9 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 		ctx = options.Ctx
 	}
 	models := newCatalog()
+	// A real request carries its own cancellation, so the incidental cap must
+	// not cut a legitimate refresh short.
+	models.SetOAuthTimeout(0)
 	models.SetOAuthContext(ctx)
 	auth, ok := models.ResolveAuth(model.Provider)
 	if !ok {
@@ -278,6 +293,35 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 		return errorStream(model, fmt.Sprintf("provider %q has no credentials configured", model.Provider))
 	}
 	return authStreamFn(auth)(model, request, options)
+}
+
+// sessionNotice is one message raised for the user from background work.
+type sessionNotice struct {
+	Kind string
+	Text string
+}
+
+// pushNotice queues a message for the interface to display.
+func (s *session) pushNotice(kind, text string) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	// Bounded: a runaway producer must not grow this without limit.
+	if len(s.pendingNotices) >= 64 {
+		s.pendingNotices = s.pendingNotices[1:]
+	}
+	s.pendingNotices = append(s.pendingNotices, sessionNotice{Kind: kind, Text: text})
+}
+
+// drainNotices removes and returns the queued messages.
+func (s *session) drainNotices() []sessionNotice {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	if len(s.pendingNotices) == 0 {
+		return nil
+	}
+	drained := s.pendingNotices
+	s.pendingNotices = nil
+	return drained
 }
 
 // systemPromptBase returns the prompt without extension suffixes.
