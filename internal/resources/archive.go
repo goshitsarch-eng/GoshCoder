@@ -210,9 +210,29 @@ func ReadArchive(in io.Reader) ([]ArchivedPrompt, ArchiveManifest, []string, err
 				"%s is not a regular file and was skipped", path.Clean(header.Name)))
 			continue
 		}
-		content, err := io.ReadAll(tarReader)
+		// Bound the member read itself rather than checking its length
+		// afterwards. A GNU sparse member declares a logical size while
+		// carrying almost no data, and archive/tar materializes the holes on
+		// read -- so a 217-byte archive could allocate gigabytes before any
+		// size check downstream ever ran. The counter on the gzip stream does
+		// not see this: the expansion happens after it.
+		//
+		// header.Size is checked first as a cheap rejection, but it is not
+		// trusted: a sparse header's size field is exactly what lies.
+		if header.Size > maxResourceBytes {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s declares %d bytes, over the %d-byte limit, and was skipped",
+				path.Clean(header.Name), header.Size, maxResourceBytes))
+			continue
+		}
+		content, err := io.ReadAll(io.LimitReader(tarReader, maxResourceBytes+1))
 		if err != nil {
 			return nil, manifest, warnings, fmt.Errorf("read %s from the archive: %w", header.Name, err)
+		}
+		if int64(len(content)) > maxResourceBytes {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s expands past the %d-byte limit and was skipped", path.Clean(header.Name), maxResourceBytes))
+			continue
 		}
 		if limited.exceeded {
 			return nil, manifest, warnings, fmt.Errorf("this archive expands beyond %d bytes", maxArchiveBytes)
@@ -247,10 +267,6 @@ func ReadArchive(in io.Reader) ([]ArchivedPrompt, ArchiveManifest, []string, err
 		name := strings.TrimSuffix(base, path.Ext(base))
 		if err := ValidTemplateName(name, nil); err != nil {
 			warnings = append(warnings, fmt.Sprintf("%s was skipped: %v", clean, err))
-			continue
-		}
-		if len(content) > maxResourceBytes {
-			warnings = append(warnings, fmt.Sprintf("%s is larger than the %d-byte limit and was skipped", clean, maxResourceBytes))
 			continue
 		}
 		prompts = append(prompts, ArchivedPrompt{Name: name, Target: target, Body: string(content)})
