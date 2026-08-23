@@ -138,7 +138,33 @@ func TestCanonicalizeHeadersExcludesUnsignedHeaders(t *testing.T) {
 	}
 }
 
+// clearAmbientAWSEnv blanks the AWS variables that may be set in the
+// developer's shell or on a CI runner.
+//
+// resolveAWSCredentials layers its explicit env map over the process
+// environment by design (getProviderEnvValue falls back to os.Getenv), so a
+// test that supplies only some keys silently inherits the rest. Without this,
+// a machine with real AWS credentials exported makes the unconfigured-
+// environment assertions below fail even though the code is correct.
+func clearAmbientAWSEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_SESSION_TOKEN",
+		"AWS_PROFILE",
+		"AWS_REGION",
+		"AWS_DEFAULT_REGION",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"AWS_SHARED_CREDENTIALS_FILE",
+		"AWS_CONFIG_FILE",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
 func TestResolveAWSCredentialsFromEnv(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	env := map[string]string{
 		"AWS_ACCESS_KEY_ID":     "AKIDENV",
 		"AWS_SECRET_ACCESS_KEY": "secret-env",
@@ -159,6 +185,7 @@ func TestResolveAWSCredentialsFromEnv(t *testing.T) {
 // TestResolveAWSCredentialsRequiresBothKeys covers a half-configured
 // environment, which must not resolve.
 func TestResolveAWSCredentialsRequiresBothKeys(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	// An empty shared-credentials path keeps the host machine's files out.
 	env := map[string]string{
 		"AWS_ACCESS_KEY_ID":           "AKIDENV",
@@ -189,6 +216,7 @@ func writeAWSFiles(t *testing.T, credentials, config string) map[string]string {
 }
 
 func TestResolveAWSCredentialsFromProfile(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	env := writeAWSFiles(t, `
 # a comment
 [default]
@@ -216,6 +244,7 @@ aws_session_token = token-work
 // TestProfileBeatsAmbientEnvKeys covers the precedence pi relies on: an
 // explicitly configured profile wins over ambient environment keys.
 func TestProfileBeatsAmbientEnvKeys(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	env := writeAWSFiles(t, `
 [work]
 aws_access_key_id = AKIDWORK
@@ -234,6 +263,7 @@ aws_secret_access_key = secret-work
 }
 
 func TestResolveAWSCredentialsFallsBackToDefaultProfile(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	env := writeAWSFiles(t, `
 [default]
 aws_access_key_id = AKIDDEFAULT
@@ -250,6 +280,7 @@ aws_secret_access_key = secret-default
 }
 
 func TestResolveAWSCredentialsMissingProfileErrors(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	env := writeAWSFiles(t, "[default]\naws_access_key_id = A\naws_secret_access_key = B\n", "")
 	if _, err := resolveAWSCredentials("nonexistent", env); err == nil {
 		t.Fatal("a missing profile must error")
@@ -257,6 +288,7 @@ func TestResolveAWSCredentialsMissingProfileErrors(t *testing.T) {
 }
 
 func TestRegionFromProfile(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	// The config file names non-default profiles as "[profile name]".
 	env := writeAWSFiles(t, "", `
 [default]

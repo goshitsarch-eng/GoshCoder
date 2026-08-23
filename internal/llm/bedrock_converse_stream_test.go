@@ -951,6 +951,7 @@ func TestBedrockSkipAuthStillSigns(t *testing.T) {
 }
 
 func TestBedrockMissingCredentialsErrors(t *testing.T) {
+	clearAmbientAWSEnv(t)
 	server := newBedrockServer(t, bedrockTextTurn("ok"))
 	conv := &Context{Messages: []Message{UserMessage{Role: "user", Content: "hi"}}}
 	// Empty file paths shadow any ambient credentials on the host.

@@ -33,9 +33,6 @@ jobs:
 
       # A release must never ship code that does not pass the gate.
       - name: verify
-        env:
-          AWS_ACCESS_KEY_ID: ""
-          AWS_SECRET_ACCESS_KEY: ""
         run: |
           go vet -all ./...
           go test -count=1 ./...

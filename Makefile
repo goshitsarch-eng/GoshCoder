@@ -35,7 +35,7 @@ PLATFORMS := \
 INSTALL_DIR ?= $(if $(GOBIN),$(GOBIN),$(shell $(GO) env GOPATH)/bin)
 
 .PHONY: all build install uninstall run clean check fmt fmt-check vet test test-race \
-        cover lint vuln tools dist checksums help
+        test-hermetic cover lint vuln tools dist checksums help
 
 all: build
 
@@ -63,7 +63,7 @@ run: build
 	@$(BIN_DIR)/$(BINARY)
 
 ## check: the full gate - format, vet, lint, tests with the race detector, vulns
-check: fmt-check vet lint test-race vuln
+check: fmt-check vet lint test-race test-hermetic vuln
 	@echo "all checks passed"
 
 ## fmt: rewrite sources with gofmt
@@ -82,25 +82,27 @@ vet:
 	$(GO) vet -all ./...
 
 ## test: run the test suite
-#
-# AWS_* is cleared because the Bedrock credential-resolution tests assert the
-# behaviour of an unconfigured environment; ambient credentials from a CI
-# runner or a developer shell would otherwise make them fail spuriously.
 test:
-	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-		-u AWS_PROFILE -u AWS_REGION -u AWS_DEFAULT_REGION \
-		$(GO) test -count=1 ./...
+	$(GO) test -count=1 ./...
 
 ## test-race: run the test suite under the race detector
 test-race:
-	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-		-u AWS_PROFILE -u AWS_REGION -u AWS_DEFAULT_REGION \
-		$(GO) test -race -count=1 ./...
+	$(GO) test -race -count=1 ./...
+
+## test-hermetic: prove the suite ignores ambient provider credentials
+#
+# The tests must not read the developer's real AWS credentials. Running with
+# obviously-wrong values set catches any test that silently inherits them.
+test-hermetic:
+	AWS_ACCESS_KEY_ID=hermeticity-probe \
+	AWS_SECRET_ACCESS_KEY=hermeticity-probe \
+	AWS_REGION=hermeticity-probe \
+	AWS_PROFILE=hermeticity-probe \
+		$(GO) test -count=1 ./...
 
 ## cover: write a coverage profile and print the per-package summary
 cover:
-	env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-		$(GO) test -count=1 -coverprofile=coverage.out ./...
+	$(GO) test -count=1 -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -1
 
 ## tools: install the optional external analysers into GOPATH/bin

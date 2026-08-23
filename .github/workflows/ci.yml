@@ -41,18 +41,20 @@ jobs:
       - name: go vet
         run: go vet -all ./...
 
-      # The Bedrock credential-resolution tests assert the behaviour of an
-      # unconfigured environment, so ambient AWS_* variables from a runner
-      # would make them fail spuriously.
       - name: go test
         shell: bash
+        run: go test -count=1 ./...
+
+      # The suite must ignore ambient provider credentials rather than reading
+      # whatever the runner or a developer shell happens to export. Setting
+      # obviously-wrong values catches any test that silently inherits them.
+      - name: go test (hermeticity probe)
+        shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ""
-          AWS_SECRET_ACCESS_KEY: ""
-          AWS_SESSION_TOKEN: ""
-          AWS_PROFILE: ""
-          AWS_REGION: ""
-          AWS_DEFAULT_REGION: ""
+          AWS_ACCESS_KEY_ID: hermeticity-probe
+          AWS_SECRET_ACCESS_KEY: hermeticity-probe
+          AWS_REGION: hermeticity-probe
+          AWS_PROFILE: hermeticity-probe
         run: go test -count=1 ./...
 
   race:
@@ -66,10 +68,6 @@ jobs:
           check-latest: true
           cache: true
       - name: go test -race
-        env:
-          AWS_ACCESS_KEY_ID: ""
-          AWS_SECRET_ACCESS_KEY: ""
-          AWS_SESSION_TOKEN: ""
         run: go test -race -count=1 ./...
 
   lint:
