@@ -161,6 +161,15 @@ func discoverTemplates(cwd, agentDir string, warnings *[]string) []Template {
 				continue
 			}
 			path := filepath.Join(directory, entry.Name())
+			// Skip symbolic links, as discoverContextFiles already does. A
+			// prompt directory in a repository is attacker-controlled content:
+			// without this, a checkout can point a template at the user's SSH
+			// key and have its contents expanded into a prompt and sent to the
+			// model provider.
+			if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+				*warnings = append(*warnings, fmt.Sprintf("prompt %s skipped: it is a symbolic link", path))
+				continue
+			}
 			body, err := readLimited(path)
 			if err != nil {
 				*warnings = append(*warnings, fmt.Sprintf("prompt %s: %v", path, err))
@@ -388,43 +397,94 @@ func (set *Set) Expand(input string) (expanded string, ok bool, err error) {
 	return "", false, nil
 }
 
+// expandTemplate substitutes a template's argument placeholders.
+//
+// Supported: $1..$n, $@ and $ARGUMENTS for all arguments, ${N:-default},
+// ${@:-default}, ${@:N} and ${@:N:L} for bash-style slicing. $$ is a literal
+// dollar sign.
+//
+// Two deviations from the earlier implementation, both correctness fixes that
+// /prompt save depends on:
+//
+// It is a single left-to-right pass rather than a sequence of regexp replaces.
+// The sequential version re-scanned its own output, so an argument whose value
+// contained "$ARGUMENTS" or "$@" was substituted a second time -- pi documents
+// replacement as explicitly non-recursive.
+//
+// $$ escapes a dollar sign, which the sequential version had no way to express.
+// Without it there is no way to store a prompt containing shell or code: "run
+// $1 through make check" silently loses the "$1" at use time, in a file the
+// user never opened. The cost is that a template containing a literal "$$" --
+// the shell's process id -- now renders as a single "$"; it must be written
+// "$$$$" to survive.
 func expandTemplate(body string, args []string) string {
 	all := strings.Join(args, " ")
-	defaultPattern := regexp.MustCompile(`\$\{(\d+|@|ARGUMENTS):-([^}]*)\}`)
-	body = defaultPattern.ReplaceAllStringFunc(body, func(match string) string {
-		parts := defaultPattern.FindStringSubmatch(match)
-		value := argumentValue(parts[1], args, all)
-		if value == "" {
-			return parts[2]
+	var out strings.Builder
+	out.Grow(len(body))
+
+	for index := 0; index < len(body); {
+		if body[index] != '$' {
+			out.WriteByte(body[index])
+			index++
+			continue
 		}
-		return value
-	})
-	slicePattern := regexp.MustCompile(`\$\{@:(\d+)(?::(\d+))?\}`)
-	body = slicePattern.ReplaceAllStringFunc(body, func(match string) string {
-		parts := slicePattern.FindStringSubmatch(match)
-		start, _ := strconv.Atoi(parts[1])
+		if consumed, replacement, ok := expandPlaceholder(body[index:], args, all); ok {
+			out.WriteString(replacement)
+			index += consumed
+			continue
+		}
+		out.WriteByte('$')
+		index++
+	}
+	return strings.TrimSpace(out.String())
+}
+
+var (
+	defaultPattern    = regexp.MustCompile(`^\$\{(\d+|@|ARGUMENTS):-([^}]*)\}`)
+	slicePattern      = regexp.MustCompile(`^\$\{@:(\d+)(?::(\d+))?\}`)
+	positionalPattern = regexp.MustCompile(`^\$(\d+)`)
+)
+
+// expandPlaceholder matches one placeholder at the start of text. ok is false
+// when the "$" begins nothing recognizable, in which case it stays literal.
+func expandPlaceholder(text string, args []string, all string) (consumed int, replacement string, ok bool) {
+	if strings.HasPrefix(text, "$$") {
+		return 2, "$", true
+	}
+	if match := defaultPattern.FindStringSubmatch(text); match != nil {
+		value := argumentValue(match[1], args, all)
+		if value == "" {
+			value = match[2]
+		}
+		return len(match[0]), value, true
+	}
+	if match := slicePattern.FindStringSubmatch(text); match != nil {
+		start, _ := strconv.Atoi(match[1])
 		start--
 		if start < 0 || start >= len(args) {
-			return ""
+			return len(match[0]), "", true
 		}
 		end := len(args)
-		if parts[2] != "" {
-			length, _ := strconv.Atoi(parts[2])
+		if match[2] != "" {
+			length, _ := strconv.Atoi(match[2])
 			end = min(len(args), start+length)
 		}
-		return strings.Join(args[start:end], " ")
-	})
-	positional := regexp.MustCompile(`\$(\d+)`)
-	body = positional.ReplaceAllStringFunc(body, func(match string) string {
-		index, _ := strconv.Atoi(strings.TrimPrefix(match, "$"))
+		return len(match[0]), strings.Join(args[start:end], " "), true
+	}
+	if match := positionalPattern.FindStringSubmatch(text); match != nil {
+		index, _ := strconv.Atoi(match[1])
 		if index < 1 || index > len(args) {
-			return ""
+			return len(match[0]), "", true
 		}
-		return args[index-1]
-	})
-	body = strings.ReplaceAll(body, "$ARGUMENTS", all)
-	body = strings.ReplaceAll(body, "$@", all)
-	return strings.TrimSpace(body)
+		return len(match[0]), args[index-1], true
+	}
+	if strings.HasPrefix(text, "$ARGUMENTS") {
+		return len("$ARGUMENTS"), all, true
+	}
+	if strings.HasPrefix(text, "$@") {
+		return len("$@"), all, true
+	}
+	return 0, "", false
 }
 
 func argumentValue(key string, args []string, all string) string {

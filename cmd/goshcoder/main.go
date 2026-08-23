@@ -54,6 +54,10 @@ Usage:
   goshcoder sessions export <id> [--md|--jsonl] [out]
                                      Export a session
   goshcoder sessions import <path>   Adopt a session file into this workspace
+  goshcoder prompts list             List saved prompt templates
+  goshcoder prompts backup [out]     Write a portable prompt archive
+  goshcoder prompts restore <file> [--overwrite] [--dry-run]
+                                     Restore prompts from an archive
   goshcoder version                  Print the version
 
 Chat/run flags:
@@ -132,6 +136,8 @@ func main() {
 		err = ralphCommand(args)
 	case "sessions":
 		err = sessionsCommand(args)
+	case "prompts":
+		err = promptsCommand(args)
 	case "version":
 		fmt.Print(versionInfo())
 	case "help":

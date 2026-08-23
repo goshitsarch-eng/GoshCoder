@@ -298,20 +298,26 @@ func userMessage(text string) llm.UserMessage {
 	return llm.UserMessage{Role: "user", Content: text, Timestamp: time.Now().UnixMilli()}
 }
 
+// chatCommandAliases preserves the old upstream command names.
+//
+// A package-level table rather than an inline switch so the prompt-name
+// validator can read the real thing: a saved prompt called "plannotator" would
+// otherwise shadow an alias that still works, and a copied list would drift.
+var chatCommandAliases = map[string]string{
+	"/plannator":            "/planner",
+	"/plannotator":          "/planner",
+	"/plannotator-review":   "/planner-review",
+	"/plannotator-annotate": "/planner-annotate",
+	"/plannotator-last":     "/planner-last",
+}
+
 // handleSlashCommand runs one slash command. exit is true when chat should end.
 func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	command, rest, _ := strings.Cut(input, " ")
 	rest = strings.TrimSpace(rest)
 	// Preserve the old upstream command names as hidden compatibility aliases.
-	switch command {
-	case "/plannator", "/plannotator":
-		command = "/planner"
-	case "/plannotator-review":
-		command = "/planner-review"
-	case "/plannotator-annotate":
-		command = "/planner-annotate"
-	case "/plannotator-last":
-		command = "/planner-last"
+	if canonical, ok := chatCommandAliases[command]; ok {
+		command = canonical
 	}
 
 	switch command {
@@ -441,6 +447,11 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 		}
 		for _, line := range s.sessionStorageLines() {
 			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/prompt", "/prompts":
+		if err := s.handlePromptCommand(rest); err != nil {
+			return false, err
 		}
 
 	case "/sessions":
