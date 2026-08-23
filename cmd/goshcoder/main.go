@@ -192,6 +192,12 @@ func runCommand(args []string) error {
 		return errors.New("a prompt is required")
 	}
 
+	// -resume needs a terminal to present a picker on, which `run` does not
+	// have. Silently folding it into -no-session produced exactly the
+	// combination validateSessionFlags rejects as contradictory.
+	if cfg.Resume {
+		return errors.New("-resume needs an interactive session; use `goshcoder chat -resume`, or -session <id> with run")
+	}
 	// `run` is the scripting entry point, so recording is opt-in: on by
 	// default it would turn every cron invocation into a permanent file.
 	if !cfg.Continue && cfg.SessionRef == "" && cfg.SessionName == "" {

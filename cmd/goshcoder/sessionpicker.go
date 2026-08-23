@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"goshcoder/internal/sessionlog"
@@ -346,10 +347,25 @@ func missingWorkspaceNotice(info sessionlog.Info, workdir string) string {
 		info.Cwd, workdir)
 }
 
+// stdinReader is shared by every prompt that reads a line before the
+// interactive interface starts.
+//
+// A fresh bufio.Reader per prompt discards whatever it buffered past the line
+// it returned, so a second prompt -- or the chat loop itself -- silently lost
+// input the user had already typed.
+var (
+	stdinOnce   sync.Once
+	stdinShared *bufio.Reader
+)
+
+func sharedStdin() *bufio.Reader {
+	stdinOnce.Do(func() { stdinShared = bufio.NewReader(os.Stdin) })
+	return stdinShared
+}
+
 // readLineFromStdin reads one line for the startup picker.
 func readLineFromStdin() (string, error) {
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
+	line, err := sharedStdin().ReadString('\n')
 	if err != nil && line == "" {
 		return "", err
 	}

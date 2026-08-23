@@ -148,6 +148,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 	}
 	loadedResources, err := coderresources.Discover(resourceRoot, config.AgentDir())
 	if err != nil {
+		closeOpened(opened)
 		return nil, fmt.Errorf("discover local resources: %w", err)
 	}
 	s := &session{
@@ -165,6 +166,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 	if cfg.EnableTools || cfg.LoadPlannotator || cfg.EnablePlannotator {
 		workspace, err := tools.NewWorkspace(cfg.Workdir)
 		if err != nil {
+			closeOpened(opened)
 			return nil, err
 		}
 		s.workspace = workspace
@@ -214,17 +216,22 @@ func newSession(cfg sessionConfig) (*session, error) {
 			Initial: initial,
 			OnChange: func(state plannotator.State) {
 				s.log.recordCustom(plannerCustomType, state)
+				// The adopted per-workspace file is only retired once its
+				// contents have actually been written somewhere durable.
+				retireLegacyPlannerState(root)
 			},
 			Warn: func(message string) { s.pushNotice("Planner", message) },
 		})
 		if err != nil {
 			_ = s.workspace.Close()
+			closeOpened(opened)
 			return nil, err
 		}
 		s.plan = manager
 		if cfg.EnablePlannotator && manager.State().Phase == plannotator.PhaseIdle {
 			if err := manager.Enter(); err != nil {
 				_ = s.workspace.Close()
+				closeOpened(opened)
 				return nil, err
 			}
 		}
@@ -247,6 +254,7 @@ func newSession(cfg sessionConfig) (*session, error) {
 			if s.workspace != nil {
 				_ = s.workspace.Close()
 			}
+			closeOpened(opened)
 			return nil, err
 		}
 		s.loops = ralph.NewStore(root, fmt.Sprintf("cli-%d", os.Getpid()))
@@ -310,6 +318,17 @@ func newSession(cfg sessionConfig) (*session, error) {
 		s.log.setName(cfg.SessionName)
 	}
 	return s, nil
+}
+
+// closeOpened releases a session opened before construction failed.
+//
+// Every error path after openSession has to do this. Returning without it left
+// the claim held for the stale threshold and a stub session file on disk, so a
+// mistyped -C directory made the next launch report the workspace as busy.
+func closeOpened(opened *openedSession) {
+	if opened != nil && opened.writer != nil {
+		_ = opened.writer.Close()
+	}
 }
 
 // resumedThinking prefers the level a resumed session recorded over the flag

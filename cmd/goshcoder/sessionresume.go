@@ -772,13 +772,24 @@ func adoptLegacyPlannerState(workspaceRoot string, notices *[]string) *plannotat
 		_ = os.Remove(path)
 		return nil
 	}
-	// Two sessions racing this removal is benign: whoever loses simply finds
-	// nothing to adopt, and the state is already in the winner's session log.
-	_ = os.Remove(path)
+	// The file is deliberately NOT removed here. Nothing has persisted this
+	// state yet -- the Planner is constructed after this returns, and its first
+	// OnChange is what writes the state into the session log. Deleting now and
+	// then failing to construct, or exiting before any phase change, would lose
+	// an in-flight plan outright. It is removed once it has been recorded; see
+	// retireLegacyPlannerState.
 	*notices = append(*notices, fmt.Sprintf(
 		"adopted the workspace's saved Planner state (%s); plan state now belongs to a session, so use -continue to come back to it",
 		state.Phase))
 	return &state
+}
+
+// retireLegacyPlannerState removes the per-workspace file once its contents are
+// safely in a session log. Two sessions racing the removal is benign: whoever
+// loses simply finds nothing to adopt.
+func retireLegacyPlannerState(workspaceRoot string) {
+	stateID := fmt.Sprintf("%x", sha256.Sum256([]byte(workspaceRoot)))[:16]
+	_ = os.Remove(filepath.Join(config.AgentDir(), "plannotator", stateID+".json"))
 }
 
 // sessionStorageLines describe where the conversation is being kept, for

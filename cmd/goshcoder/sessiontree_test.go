@@ -324,3 +324,31 @@ func TestImportAdoptsASessionIntoThisWorkspace(t *testing.T) {
 		t.Fatalf("List: %v (%d sessions)", err, len(listed))
 	}
 }
+
+// TestRewindSurvivesAResume covers the ordering inside forkTo. Appending the
+// branch summary before moving the write head attached it to the abandoned tip,
+// which then became the leaf again -- so the rewind looked right in the running
+// session and was silently undone the next time the session was opened, because
+// the leaf is what a resume continues from.
+func TestRewindSurvivesAResume(t *testing.T) {
+	f := newRecordingFixture(t)
+	seedConversation(f, 3)
+
+	if err := f.session.forkTo("2"); err != nil {
+		t.Fatalf("forkTo: %v", err)
+	}
+	inSession := len(f.session.agent.State().Messages)
+
+	got := f.reopen(t)
+	if len(got.Messages) != inSession {
+		t.Fatalf("resume restored %d messages but the rewind left %d in context; the rewind did not survive",
+			len(got.Messages), inSession)
+	}
+	for _, message := range got.Messages {
+		if user, ok := message.(llm.UserMessage); ok {
+			if text, _ := user.StringContent(); text == question(3) {
+				t.Fatal("the abandoned branch came back on resume")
+			}
+		}
+	}
+}

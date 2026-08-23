@@ -148,18 +148,23 @@ func (s *session) forkTo(argument string) error {
 	}
 	target := points[index-1]
 
-	// A branch summary records what is being left behind, so the abandoned
-	// path is identifiable in /tree rather than being an unlabelled fork.
 	abandoned := len(tree.Path(s.log.leaf())) - len(tree.Path(&target.ID))
+
+	// The write head moves FIRST. Appending the summary before the rewind
+	// attached it to the abandoned tip, which then became the leaf again --
+	// silently undoing the rewind on the next resume, since the leaf is what a
+	// reopened session continues from.
+	if err := s.log.setLeaf(target.ID); err != nil {
+		return err
+	}
+	// A branch summary records what was left behind, so an old branch is
+	// identifiable in /tree rather than being an unlabelled fork.
 	if abandoned > 0 {
 		s.log.append(sessionlog.Entry{
 			Type:    sessionlog.TypeBranchSummary,
 			FromID:  target.ID,
 			Summary: fmt.Sprintf("branched from %q, leaving %d entries on the previous path", target.Text, abandoned),
 		})
-	}
-	if err := s.log.setLeaf(target.ID); err != nil {
-		return err
 	}
 
 	// The transcript has to follow the write head, or the next turn is sent

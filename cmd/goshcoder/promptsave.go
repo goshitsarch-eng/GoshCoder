@@ -40,6 +40,12 @@ func reservedCommandNames(set *resources.Set) []string {
 	for _, command := range fullscreenSlashCommands {
 		add(command.name)
 	}
+	// The line-oriented dispatcher handles names the fullscreen palette does
+	// not list, and a template shadows a command in BOTH interfaces because
+	// expansion runs before either dispatcher.
+	for _, name := range lineModeSlashCommands {
+		add(name)
+	}
 	for alias, canonical := range chatCommandAliases {
 		add(alias)
 		add(canonical)
@@ -54,6 +60,17 @@ func reservedCommandNames(set *resources.Set) []string {
 		}
 	}
 	return names
+}
+
+// lineModeSlashCommands are the commands handleSlashCommand accepts that the
+// fullscreen palette does not advertise.
+var lineModeSlashCommands = []string{
+	"exit", "quit", "help", "?", "system", "steer", "followup", "queue",
+	"clear", "new", "compact", "reload", "resources", "messages", "tools",
+	"status", "sidebar", "session", "sessions", "resume", "name", "model",
+	"thinking", "login", "logout", "btw", "omni", "ralph", "planner",
+	"planner-review", "planner-annotate", "planner-last", "prompt", "prompts",
+	"tree", "fork", "label", "clone", "export", "import", "hotkeys",
 }
 
 // promptTargets returns the scopes a backup covers.
