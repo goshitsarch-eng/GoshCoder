@@ -412,6 +412,18 @@ func (a *Agent) HasQueuedMessages() bool {
 	return a.steeringQueue.hasItems() || a.followUpQueue.hasItems()
 }
 
+// QueuedMessageCount reports how many messages are waiting in both queues.
+//
+// Callers that are about to clear the queues use it to say how much user input
+// they are discarding: compaction drops queued messages because they were
+// written against a transcript that no longer exists, and doing that silently
+// loses something the user typed.
+func (a *Agent) QueuedMessageCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.steeringQueue.messages) + len(a.followUpQueue.messages)
+}
+
 // RunContext returns the active run's context, or nil when idle (TS
 // Agent.signal).
 func (a *Agent) RunContext() context.Context {

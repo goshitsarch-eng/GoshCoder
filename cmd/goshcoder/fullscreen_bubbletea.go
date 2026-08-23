@@ -415,10 +415,11 @@ func (model *fullscreenModel) View() string {
 		planItems = model.session.plan.State().Items
 	}
 	frame := tui.Frame{
-		Cache:              model.renderCache,
-		Title:              fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
-		Messages:           messages,
-		Sidebar:            fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity, len(state.PendingToolCalls), model.recentTool, planItems),
+		Cache:    model.renderCache,
+		Title:    fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
+		Messages: messages,
+		Sidebar: fullscreenSidebarWithStorage(model.info, model.session.workspaceRoot(), model.activity,
+			len(state.PendingToolCalls), model.recentTool, planItems, model.session.sidebarStorageLine()),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,
 		Status:             status,
@@ -461,13 +462,23 @@ func (model *fullscreenModel) handleTeaKey(key tea.KeyMsg) tea.Cmd {
 			model.activity = "Aborting"
 			return nil
 		}
-		// Require confirmation. The transcript exists only in memory, so a
-		// single mistyped Ctrl+C threw away the whole conversation.
+		// Confirmation is only warranted when quitting would actually lose
+		// something. Once the conversation is on disk, a second keypress is
+		// friction with nothing behind it.
+		//
+		// The branch stays for the cases where the transcript really is only in
+		// memory: -no-session, a session opened read-only because another
+		// window holds the claim, and a recorder that stopped after a write
+		// failure. Those are exactly the states in which this guard earns its
+		// keep, so it is made conditional rather than deleted.
+		if model.session.recordingActive() {
+			return tea.Quit
+		}
 		if !model.quitArmedAt.IsZero() && time.Since(model.quitArmedAt) < quitConfirmWindow {
 			return tea.Quit
 		}
 		model.quitArmedAt = time.Now()
-		model.activity = "Press Ctrl+C again to exit (this session is not saved)"
+		model.activity = "Press Ctrl+C again to exit (this session is not being saved)"
 		// Keep the spinner loop alive long enough for the hint to expire on
 		// its own if the user does nothing.
 		return fullscreenTickCommand()

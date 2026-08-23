@@ -46,6 +46,14 @@ Usage:
   goshcoder ralph stop <name>        Mark a loop completed
   goshcoder ralph archive <name>     Move a loop to .ralph/archive
   goshcoder ralph delete <name>      Delete a loop and its task file
+  goshcoder sessions list [--all]     List saved sessions
+  goshcoder sessions show <id>       Show one session
+  goshcoder sessions rm <id>...      Delete sessions
+  goshcoder sessions gc --older-than 30d [--yes]
+                                     Remove old sessions (lists them first)
+  goshcoder sessions export <id> [--md|--jsonl] [out]
+                                     Export a session
+  goshcoder sessions import <path>   Adopt a session file into this workspace
   goshcoder version                  Print the version
 
 Chat/run flags:
@@ -58,6 +66,16 @@ Chat/run flags:
   -claude-tui         Use the native pi-claude-code-tui look in line mode (default true)
   -fullscreen         Use the native fullscreen TUI in chat (default true on terminals)
   -C <dir>            Workspace directory for tools (default: current directory)
+
+Session flags:
+  -continue           Reopen the most recent session for this workspace
+  -resume             Choose a session to resume (chat only)
+  -session <ref>      Session id, id prefix, or path
+  -name <text>        Display name for the session
+  -no-session         Do not record this session
+  -read-only          Open a session without claiming it
+  -sessions-dir <dir> Session storage root (default ~/.goshcoder/agent/sessions)
+  Note: chat records by default; run records only with -continue, -session or -name.
 
 Environment:
   GOSHCODER_AGENT_DIR   Override the config directory (default ~/.goshcoder/agent)
@@ -112,6 +130,8 @@ func main() {
 		err = omniCommand(args)
 	case "ralph":
 		err = ralphCommand(args)
+	case "sessions":
+		err = sessionsCommand(args)
 	case "version":
 		fmt.Print(versionInfo())
 	case "help":
@@ -159,9 +179,23 @@ func runCommand(args []string) error {
 		return err
 	}
 
+	markModelProvenance(flags, cfg)
+
 	prompt := strings.TrimSpace(strings.Join(flags.Args(), " "))
 	if prompt == "" {
 		return errors.New("a prompt is required")
+	}
+
+	// `run` is the scripting entry point, so recording is opt-in: on by
+	// default it would turn every cron invocation into a permanent file.
+	if !cfg.Continue && cfg.SessionRef == "" && cfg.SessionName == "" {
+		cfg.NoSession = true
+	}
+	// Only chatCommand filled in a remembered model, so `run -continue` used to
+	// fail the empty-ModelRef guard before it could read the model out of the
+	// session it was asked to continue.
+	if cfg.ModelRef == "" {
+		cfg.ModelRef = config.ReadDefaultModel()
 	}
 
 	s, err := newSession(*cfg)
@@ -169,6 +203,12 @@ func runCommand(args []string) error {
 		return err
 	}
 	defer s.close()
+	for _, notice := range s.drainStartupNotices() {
+		fmt.Fprintln(os.Stderr, dim("session: "+notice))
+	}
+	if banner := s.resumeBanner; banner != "" {
+		renderRestoredTranscript(s.restoredMessages, banner)
+	}
 	stop := s.handleInterrupts(nil)
 	defer stop()
 
@@ -184,6 +224,27 @@ func runCommand(args []string) error {
 // hihg` ran with thinking off and said nothing, and the user only found out
 // from the bill or the answer quality.
 func validateSessionFlags(cfg *sessionConfig) error {
+	if cfg.NoSession {
+		switch {
+		case cfg.Continue:
+			return errors.New("-no-session and -continue ask for opposite things; drop one")
+		case cfg.Resume:
+			return errors.New("-no-session and -resume ask for opposite things; drop one")
+		case cfg.SessionRef != "":
+			return errors.New("-no-session and -session ask for opposite things; drop one")
+		case cfg.SessionName != "":
+			return errors.New("-name has nothing to name when -no-session is given")
+		}
+	}
+	if cfg.Continue && cfg.SessionRef != "" {
+		return errors.New("-continue and -session both choose a session; use one")
+	}
+	if cfg.Resume && cfg.SessionRef != "" {
+		return errors.New("-resume and -session both choose a session; use one")
+	}
+	if cfg.Resume && cfg.Continue {
+		return errors.New("-resume and -continue both choose a session; use one")
+	}
 	if cfg.Thinking == "" {
 		return nil
 	}
@@ -209,7 +270,31 @@ func bindSessionFlags(flags *flag.FlagSet) *sessionConfig {
 	flags.BoolVar(&cfg.EnablePlannotator, "plan", false, "alias for -planner")
 	flags.BoolVar(&cfg.ClaudeTUI, "claude-tui", true, "use the pi-claude-code-tui look")
 	flags.StringVar(&cfg.Workdir, "C", ".", "workspace directory")
+
+	// Session persistence.
+	//
+	// There is deliberately no -c short form for -continue: -C <dir> already
+	// means "workspace directory", the two are one Shift apart, and -continue
+	// takes no value -- so `goshcoder run -c ./sub "prompt"` would silently
+	// fold ./sub into the prompt, since positionals are joined.
+	flags.BoolVar(&cfg.Continue, "continue", false, "reopen the most recent session for this workspace")
+	flags.BoolVar(&cfg.Resume, "resume", false, "choose a session to resume")
+	flags.StringVar(&cfg.SessionRef, "session", "", "session id, id prefix, or path")
+	flags.BoolVar(&cfg.NoSession, "no-session", false, "do not record this session")
+	flags.BoolVar(&cfg.ReadOnly, "read-only", false, "open the session without claiming it")
+	flags.StringVar(&cfg.SessionName, "name", "", "display name for the session")
+	flags.StringVar(&cfg.SessionsDir, "sessions-dir", "", "session storage root (default ~/.goshcoder/agent/sessions)")
 	return cfg
+}
+
+// markModelProvenance records whether -m was actually given, which resume
+// needs in order to tell an explicit override from a filled-in default.
+func markModelProvenance(flags *flag.FlagSet, cfg *sessionConfig) {
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "m" || f.Name == "model" {
+			cfg.ModelFromFlag = true
+		}
+	})
 }
 
 // agentQueue adapts the agent to ralph.Queue. It holds a pointer to the agent

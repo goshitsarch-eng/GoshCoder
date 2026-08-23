@@ -87,6 +87,7 @@ func chatCommand(args []string) error {
 	if err := validateSessionFlags(cfg); err != nil {
 		return err
 	}
+	markModelProvenance(flags, cfg)
 	// Planner commands are available in chat even when plan mode was not
 	// requested at startup.
 	cfg.LoadPlannotator = true
@@ -111,6 +112,9 @@ func chatCommand(args []string) error {
 	if cfg.Fullscreen {
 		return runFullscreenChat(s)
 	}
+	for _, notice := range s.drainStartupNotices() {
+		fmt.Fprintln(os.Stderr, dim("session: "+notice))
+	}
 
 	// Ctrl-C aborts a turn; when idle it closes stdin so the read loop ends.
 	stop := s.handleInterrupts(func() {
@@ -128,6 +132,13 @@ func chatCommand(args []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "%s\n", dim(fmt.Sprintf(
 			"goshcoder %s · %s/%s · /help for commands", Version, s.model.Provider, s.model.ID)))
+	}
+
+	if banner := s.resumeBanner; banner != "" {
+		renderRestoredTranscript(s.restoredMessages, banner)
+	}
+	if hint := s.exitHint(); hint != "" {
+		fmt.Fprintln(os.Stderr, dim(hint))
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -417,10 +428,34 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	case "/messages":
 		printTranscriptSummary(s.agent.State().Messages)
 
-	case "/status", "/session", "/sidebar":
+	case "/status", "/sidebar":
 		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
 			fmt.Fprintln(os.Stderr, line)
 		}
+
+	case "/session":
+		// Extended rather than replaced: the card is what people already reach
+		// for, and pi's /session means the same thing.
+		for _, line := range claudetui.Sidebar(min(terminalWidth(), 42), s.sessionInfo(), colorEnabled()) {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		for _, line := range s.sessionStorageLines() {
+			fmt.Fprintln(os.Stderr, dim(line))
+		}
+
+	case "/name":
+		if rest == "" {
+			if name := s.sessionName(); name != "" {
+				fmt.Fprintln(os.Stderr, name)
+			} else {
+				fmt.Fprintln(os.Stderr, dim("this session has no name; /name <text> sets one"))
+			}
+			return false, nil
+		}
+		if err := s.setSessionName(rest); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(os.Stderr, "%s\n", dim("session named "+rest))
 
 	case "/hotkeys":
 		fmt.Fprintln(os.Stderr, `Enter       send or accept selection
@@ -457,9 +492,13 @@ Ctrl-D      quit when the editor is empty`)
 		}
 
 	case "/clear", "/new":
-		if err := s.agent.Reset(); err != nil {
+		// The pre-clear transcript stays in the session file behind a reset
+		// marker rather than being rotated into a new one, so an accidental
+		// /clear is recoverable with `sessions show --full`.
+		if err := s.agent.ResetWithReason(command); err != nil {
 			return false, err
 		}
+		s.contextEstimate.reset()
 		fmt.Fprintf(os.Stderr, "%s\n", dim("transcript cleared"))
 
 	case "/compact":

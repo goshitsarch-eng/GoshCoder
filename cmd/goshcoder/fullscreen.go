@@ -43,7 +43,7 @@ var fullscreenSlashCommands = []slashCommand{
 	{"/thinking", "Choose reasoning effort for this model"}, {"/tools", "List active tools"},
 	{"/status", "Show session information"}, {"/session", "Show session information"},
 	{"/sidebar", "Show session information"}, {"/hotkeys", "Show keyboard shortcuts"},
-	{"/messages", "Show transcript summary"},
+	{"/messages", "Show transcript summary"}, {"/name", "Name this session"},
 	{"/steer", "Guide the active response"}, {"/followup", "Queue the next message"},
 	{"/queue", "Show queued messages"}, {"/clear", "Clear the transcript"},
 	{"/new", "Start a fresh conversation"}, {"/compact", "Summarize older context"},
@@ -316,6 +316,13 @@ func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 }
 
 func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem) []string {
+	return fullscreenSidebarWithStorage(info, cwd, activity, pendingTools, recentTool, items, "")
+}
+
+// fullscreenSidebarWithStorage is fullscreenSidebar plus the session's
+// recording state, which is the one thing the panel could not otherwise tell
+// the user: whether closing this window keeps the conversation.
+func fullscreenSidebarWithStorage(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem, storage string) []string {
 	name := info.Name
 	if name == "" {
 		name = "New Session"
@@ -336,12 +343,17 @@ func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pending
 		"title\t" + name,
 		"accent\t" + info.Model,
 		"meta\t" + info.Thinking + " thinking · " + mode,
+	}
+	if storage != "" {
+		lines = append(lines, "meta\t"+storage)
+	}
+	lines = append(lines, []string{
 		"",
 		"section\tContext",
 		fmt.Sprintf("bar\t%d", percent),
 		"meta\t" + contextText,
 		fmt.Sprintf("meta\t%d%% used · $%.4f spent", percent, info.Cost),
-	}
+	}...)
 	if activity != "Ready" || pendingTools > 0 {
 		lines = append(lines, "", "section\tActivity", "active\t"+activity)
 		if pendingTools > 0 {
