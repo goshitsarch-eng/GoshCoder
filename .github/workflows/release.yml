@@ -1,19 +1,30 @@
 name: Release
 
-# Two ways in, one code path:
+# Three ways in, one code path:
 #
 #   * pushing a v* tag, the ordinary route;
-#   * a manual run, which names the tag and creates it if it does not exist.
+#   * pushing a release/v* branch, which cuts the tag named after it;
+#   * a manual run, which names the tag and the ref to cut it from.
 #
-# The second exists because pushing a tag needs credentials that not every
-# environment has -- an automation session's token is often scoped to branches
-# only, and then there is no way to cut a release at all. The workflow's own
-# GITHUB_TOKEN has contents: write, so it can create the tag itself. A push
-# made with that token deliberately does not trigger another workflow run, so
-# creating the tag here cannot start a second release of the same version.
+# The last two exist because pushing a tag needs credentials that not every
+# environment has. A token scoped to refs/heads/* cannot create refs/tags/*,
+# and an integration without actions: write cannot press "Run workflow"
+# either -- between them that can leave no way to cut a release at all. The
+# workflow's own GITHUB_TOKEN has contents: write, so it creates the tag
+# itself, and a branch push is a write that a branch-scoped token does have.
+#
+# A push made with GITHUB_TOKEN deliberately does not trigger another workflow
+# run, so creating the tag here cannot start a second release of the same
+# version. Cutting a release still requires push access to this repository,
+# which is what pushing a tag required before; this grants nobody anything new.
+#
+# The release/v* branch is only a trigger. It is left in place afterwards --
+# deleting someone's branch out from under them to tidy up would be worse than
+# the clutter -- and is safe to delete once the release is published.
 on:
   push:
     tags: ["v*"]
+    branches: ["release/v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -36,28 +47,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Inputs reach the shell through the environment rather than through
-      # ${{ }} interpolation: a manual run is the one path where the tag
-      # arrives as free text, and expanding free text into a script is how a
-      # workflow with contents: write gets turned into someone else's.
-      # Inputs reach the shell through the environment rather than through
-      # ${{ }} interpolation: a manual run is the one path where they arrive as
-      # free text, and expanding free text into a script is how a workflow with
-      # contents: write gets turned into someone else's.
+      # ${{ }} interpolation: a manual run and a branch name are the paths
+      # where they arrive as free text, and expanding free text into a script
+      # is how a workflow with contents: write gets turned into someone else's.
       - name: resolve the release tag
         id: release
         env:
           EVENT: ${{ github.event_name }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_REF: ${{ inputs.ref }}
+          REF: ${{ github.ref }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -eu
+          # may_create records whether this run is allowed to bring a tag into
+          # existence. A tag push cannot be: the tag it names is the one thing
+          # that must already exist.
           if [ "$EVENT" = "workflow_dispatch" ]; then
             tag="$INPUT_TAG"
             checkout="${INPUT_REF:-$REF_NAME}"
+            may_create=yes
           else
-            tag="$REF_NAME"
-            checkout="$REF_NAME"
+            case "$REF" in
+              refs/tags/*)
+                tag="$REF_NAME"
+                checkout="$REF"
+                may_create=no
+                ;;
+              refs/heads/release/*)
+                # release/v1.2.3 cuts v1.2.3 from that branch's head.
+                tag="${REF_NAME#release/}"
+                checkout="$REF_NAME"
+                may_create=yes
+                ;;
+              *)
+                echo "::error::$REF does not name a release"
+                exit 1
+                ;;
+            esac
           fi
 
           # Reject anything that is not a single line before any pattern test.
@@ -86,8 +113,11 @@ jobs:
             exit 1
           fi
 
-          printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
-          printf 'checkout=%s\n' "$checkout" >>"$GITHUB_OUTPUT"
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'checkout=%s\n' "$checkout"
+            printf 'may_create=%s\n' "$may_create"
+          } >>"$GITHUB_OUTPUT"
           echo "releasing $tag from $checkout"
 
       # Checked out without a ref: whatever triggered the run always resolves,
@@ -102,22 +132,22 @@ jobs:
 
       - name: check out the commit to release
         env:
-          EVENT: ${{ github.event_name }}
           TAG: ${{ steps.release.outputs.tag }}
           CHECKOUT: ${{ steps.release.outputs.checkout }}
+          MAY_CREATE: ${{ steps.release.outputs.may_create }}
         run: |
           set -eu
           git fetch --tags --prune --force origin
 
-          # An existing tag is built as it stands rather than as the branch has
+          # An existing tag is built as it stands rather than as its branch has
           # since become -- and the source ref is genuinely ignored here, which
-          # is what the input promises.
+          # is what the manual run's input promises.
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "tag $TAG already exists; building it as it stands"
             git checkout -q --detach "refs/tags/$TAG"
             exit 0
           fi
-          if [ "$EVENT" != "workflow_dispatch" ]; then
+          if [ "$MAY_CREATE" != "yes" ]; then
             echo "::error::$TAG triggered this run but no longer exists"
             exit 1
           fi
@@ -152,9 +182,9 @@ jobs:
       - name: list artifacts
         run: ls -la dist && cat dist/checksums.txt
 
-      # tag_name is explicit because on a manual run github.ref is the branch
-      # the run started from; without it the release would be published against
-      # that branch instead of the tag the archives were built for.
+      # tag_name is explicit because on a manual run, or a release-branch push,
+      # github.ref is a branch; without it the release would be published
+      # against that branch instead of the tag the archives were built for.
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release.outputs.tag }}

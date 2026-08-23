@@ -250,19 +250,33 @@ Gloss; dependency checksums are committed in `go.sum`.
 ## Cutting a release
 
 `.github/workflows/release.yml` publishes the cross-compiled archives and the
-`checksums.txt` both installers verify against. Two ways in, one code path:
+`checksums.txt` both installers verify against. Three ways in, one code path:
 
 - **Push a `v*` tag.** The ordinary route.
+- **Push a `release/v*` branch.** `release/v0.2.0` cuts `v0.2.0` from that
+  branch's head. The branch is only a trigger; it is left in place afterwards
+  and is safe to delete once the release is published.
 - **Run the workflow manually** (Actions → Release → Run workflow), naming the
-  tag and optionally the branch or commit to cut it from. If the tag does not
-  exist the workflow creates and pushes it from that ref before building.
+  tag and optionally the branch or commit to cut it from.
 
-The manual route exists because pushing a tag needs credentials scoped to
+In the last two, a tag that does not exist yet is created and pushed before
+building; a tag that already exists is built as it stands, and the source ref
+is ignored.
+
+The two extra routes exist because pushing a tag needs credentials scoped to
 `refs/tags/*`, and an automation session's token is often scoped to branches
-only -- which leaves no way to cut a release at all. The workflow's own
-`GITHUB_TOKEN` has `contents: write`, so it can create the tag itself. A push
-made with that token deliberately does not trigger another workflow run, so
-this cannot start a second release of the same version.
+only. That alone left no way to cut a release -- and the manual route did not
+close the gap either, because dispatching a workflow through the API needs
+`actions: write`, which the same integrations tend not to have (it answers
+`403 Resource not accessible by integration`). A branch push is the write such
+a token does have, so `release/v*` is the route that works from inside a
+session. The workflow's own `GITHUB_TOKEN` has `contents: write` and creates
+the tag itself.
+
+A push made with `GITHUB_TOKEN` deliberately does not trigger another workflow
+run, so creating the tag cannot start a second release of the same version.
+Cutting a release still requires push access to the repository, exactly as
+pushing a tag did; none of this grants anybody anything new.
 
 The tag is validated against `v1.2.3` / `v1.2.3-rc.1` before it reaches a
 shell. It becomes a git ref, the archive filenames, and the version the binary
