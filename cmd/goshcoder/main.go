@@ -21,9 +21,6 @@ import (
 	"goshcoder/internal/ralph"
 )
 
-// Version is the CLI version.
-const Version = "0.2.0-dev"
-
 const usage = `GoshCoder - a Go coding agent
 
 Usage:
@@ -98,7 +95,7 @@ func main() {
 	case "ralph":
 		err = ralphCommand(args)
 	case "version", "--version", "-v":
-		fmt.Println("goshcoder", Version)
+		fmt.Print(versionInfo())
 	case "help", "--help", "-h":
 		fmt.Print(usage)
 	default:
