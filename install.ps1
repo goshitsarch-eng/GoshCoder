@@ -152,12 +152,6 @@ function Install-FromSource {
     }
 
     $goVersionRaw = (& go env GOVERSION) -replace '^go', '' -replace '[^0-9.].*$', ''
-    try {
-        if ([version] $goVersionRaw -lt $GoMin) {
-            Write-Warn "Go $goVersionRaw is older than the recommended $GoMin"
-            Write-Warn 'earlier releases carry standard-library vulnerabilities reachable from this tree'
-        }
-    } catch { }
 
     $srcDir = $null
     if ((Test-Path './go.mod') -and ((Get-Content './go.mod' -First 1) -match '^module goshcoder')) {
@@ -171,6 +165,25 @@ function Install-FromSource {
         Write-Step "cloning $Repo"
         & git clone --depth 1 "https://github.com/$Repo.git" $srcDir 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { Stop-WithError "could not clone https://github.com/$Repo.git" }
+    }
+
+    # The requirement is whatever go.mod actually states, read from the tree
+    # being built rather than from a constant here that can drift away from it.
+    $required = $GoMin
+    $goModLine = Select-String -Path (Join-Path $srcDir 'go.mod') -Pattern '^go\s+([0-9][0-9.]*)' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($goModLine) { $required = $goModLine.Matches[0].Groups[1].Value }
+
+    $needsToolchain = $false
+    try { $needsToolchain = ([version] $goVersionRaw -lt [version] $required) } catch { }
+    if ($needsToolchain) {
+        # go.mod states a hard minimum, not a preference: an older toolchain
+        # refuses the build outright. Go resolves this itself when it is allowed
+        # to, so ask it to -- this also overrides a GOTOOLCHAIN pinned to
+        # "local" by whatever installed Go.
+        Write-Step "Go $goVersionRaw is older than the $required this project requires"
+        Write-Step "fetching the Go $required toolchain"
+        $env:GOTOOLCHAIN = "go$required+auto"
     }
 
     Write-Step 'compiling (this takes a minute)'
@@ -191,7 +204,12 @@ function Install-FromSource {
         & go build -trimpath `
             -ldflags "-s -w -X main.Version=$ver -X main.Commit=$commit -X main.BuildDate=$date" `
             -o $out ./cmd/goshcoder
-        if ($LASTEXITCODE -ne 0) { Stop-WithError 'build failed' }
+        if ($LASTEXITCODE -ne 0) {
+            if ($needsToolchain) {
+                Stop-WithError "build failed: this needs Go $required and $goVersionRaw is installed. Either install Go $required from https://go.dev/dl/, or allow Go to fetch it by clearing GOTOOLCHAIN=local from your environment."
+            }
+            Stop-WithError 'build failed'
+        }
         return $out
     } finally {
         Pop-Location

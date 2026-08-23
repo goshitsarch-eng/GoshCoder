@@ -216,11 +216,6 @@ version_ge() { # version_ge <have> <want>
 
 install_from_source() {
 	have go || die "building from source needs Go $GO_MIN or newer; install it from https://go.dev/dl/"
-	gover=$(go env GOVERSION 2>/dev/null | sed 's/^go//; s/[^0-9.].*$//')
-	if [ -n "$gover" ] && ! version_ge "$gover" "$GO_MIN"; then
-		warn "Go $gover is older than the recommended $GO_MIN"
-		warn "earlier releases carry standard-library vulnerabilities reachable from this tree"
-	fi
 
 	srcdir=""
 	if [ -f "./go.mod" ] && grep -q '^module goshcoder' ./go.mod 2>/dev/null; then
@@ -234,14 +229,38 @@ install_from_source() {
 			die "could not clone https://github.com/$REPO.git"
 	fi
 
+	# The requirement is whatever go.mod actually states, read from the tree
+	# being built rather than from a constant here that can drift away from it.
+	required=$(sed -n 's/^go \([0-9][0-9.]*\).*/\1/p' "$srcdir/go.mod" 2>/dev/null | head -1)
+	[ -n "$required" ] || required="$GO_MIN"
+	gover=$(go env GOVERSION 2>/dev/null | sed 's/^go//; s/[^0-9.].*$//')
+
+	if [ -n "$gover" ] && ! version_ge "$gover" "$required"; then
+		# go.mod states a hard minimum, not a preference: an older toolchain
+		# refuses the build outright. Go resolves this itself when it is allowed
+		# to, so ask it to -- GOTOOLCHAIN is exported for this build only, which
+		# also overrides a distribution that pinned it to "local".
+		info "Go $gover is older than the $required this project requires"
+		info "fetching the Go $required toolchain (set GOTOOLCHAIN=local to refuse)"
+		GOTOOLCHAIN="go${required}+auto"
+		export GOTOOLCHAIN
+	fi
+
 	info "compiling (this takes a minute)"
 	ver=$(cd "$srcdir" && git describe --tags --dirty --match 'v*' 2>/dev/null ||
 		printf '0.2.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 	commit=$(cd "$srcdir" && git rev-parse HEAD 2>/dev/null || echo '')
 	date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	( cd "$srcdir" && CGO_ENABLED=0 go build -trimpath \
+	if ! ( cd "$srcdir" && CGO_ENABLED=0 go build -trimpath \
 		-ldflags "-s -w -X main.Version=$ver -X main.Commit=$commit -X main.BuildDate=$date" \
-		-o "$TMPDIR_CREATED/$BINARY" ./cmd/goshcoder ) || die "build failed"
+		-o "$TMPDIR_CREATED/$BINARY" ./cmd/goshcoder ); then
+		if [ -n "$gover" ] && ! version_ge "$gover" "$required"; then
+			die "build failed: this needs Go $required and $gover is installed.
+  Either install Go $required from https://go.dev/dl/, or allow Go to fetch it
+  by running this installer without GOTOOLCHAIN=local in the environment."
+		fi
+		die "build failed"
+	fi
 	SOURCE_BINARY="$TMPDIR_CREATED/$BINARY"
 }
 
