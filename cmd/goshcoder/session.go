@@ -54,8 +54,13 @@ type session struct {
 	explicitSystemPrompt string
 	resources            *coderresources.Set
 	normalTools          []agent.Tool
-	claudeTUI            bool
-	fullscreen           bool
+	// loopTools are the Ralph tools. They are kept separately from
+	// normalTools because planRuntimeTools rebuilds the agent's tool list from
+	// normalTools before every turn, and anything not merged back in there is
+	// silently dropped from the running agent.
+	loopTools  []agent.Tool
+	claudeTUI  bool
+	fullscreen bool
 }
 
 // newSession resolves credentials, builds the tool set, and constructs the
@@ -164,7 +169,8 @@ func newSession(cfg sessionConfig) (*session, error) {
 		s.loops = ralph.NewStore(root, fmt.Sprintf("cli-%d", os.Getpid()))
 		// The ralph tools queue follow-ups on the agent, so they are registered
 		// against a pointer the agent is assigned to below.
-		agentTools = append(agentTools, s.loops.Tools(agentQueue{&s.agent})...)
+		s.loopTools = s.loops.Tools(agentQueue{&s.agent})
+		agentTools = append(agentTools, s.loopTools...)
 	}
 
 	systemPrompt := s.runtimeSystemPrompt()
@@ -414,16 +420,20 @@ func (s *session) syncPlanRuntime() {
 }
 
 func (s *session) planRuntimeTools() []agent.Tool {
+	// loopTools is merged into every branch: this list replaces the agent's
+	// tools wholesale before each turn, so anything omitted here is
+	// unregistered for the rest of the session even though the system prompt
+	// still instructs the model to call it.
 	if s.plan == nil || s.workspace == nil {
-		return append([]agent.Tool(nil), s.normalTools...)
+		return mergeTools(s.normalTools, s.loopTools)
 	}
 	switch s.plan.State().Phase {
 	case plannotator.PhasePlanning:
-		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()})
+		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}, s.loopTools)
 	case plannotator.PhaseExecuting:
-		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()})
+		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}, s.loopTools)
 	default:
-		return append([]agent.Tool(nil), s.normalTools...)
+		return mergeTools(s.normalTools, s.loopTools)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"goshcoder/internal/agent"
 	"goshcoder/internal/plannotator"
+	"goshcoder/internal/ralph"
 	"goshcoder/internal/tools"
 )
 
@@ -71,5 +72,57 @@ func TestPlanPrepareNextTurnDoesNotDuplicateModePrompt(t *testing.T) {
 	}
 	if count := strings.Count(update.Context.SystemPrompt, "[PLANNER - PLANNING PHASE]"); count != 1 {
 		t.Fatalf("planning prompt count = %d\n%s", count, update.Context.SystemPrompt)
+	}
+}
+
+// TestPlanRuntimeToolsKeepRalphTools covers a regression that silently disabled
+// Ralph in the default chat mode. The Ralph tools were appended to the agent's
+// initial tool list, but every rebuild in planRuntimeTools started from
+// normalTools -- a snapshot taken before that append -- and runTurn applies a
+// rebuild before every prompt. The model kept being told to call ralph_done by
+// the system prompt suffix while the tool itself was no longer registered.
+func TestPlanRuntimeToolsKeepRalphTools(t *testing.T) {
+	root := t.TempDir()
+	workspace, err := tools.NewWorkspace(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+
+	manager, err := plannotator.New(root, filepath.Join(t.TempDir(), "state.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := ralph.NewStore(root, "test-session")
+	session := &session{
+		baseSystemPrompt: "base",
+		plan:             manager,
+		workspace:        workspace,
+		normalTools:      workspace.All(),
+		loops:            store,
+	}
+	session.loopTools = store.Tools(agentQueue{&session.agent})
+
+	for _, phase := range []string{"idle", "planning", "executing"} {
+		switch phase {
+		case "planning":
+			if err := manager.Enter(); err != nil {
+				t.Fatal(err)
+			}
+		case "executing":
+			if err := os.WriteFile(filepath.Join(root, "plan.md"), []byte("- [ ] do it\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Submit(t.Context(), "plan.md"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runtime := session.planRuntimeTools()
+		for _, name := range []string{"ralph_start", "ralph_done"} {
+			if !hasTool(runtime, name) {
+				t.Fatalf("%s phase: %s is missing from the runtime tools", phase, name)
+			}
+		}
 	}
 }

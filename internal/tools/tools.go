@@ -7,10 +7,13 @@ package tools
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -214,16 +217,27 @@ func (w *Workspace) ReadTool() agent.Tool {
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
-			content, _, err := w.readLimited(resolved, maxReadBytes*40)
+			content, capped, err := w.readLimited(resolved, maxReadBytes*40)
 			if err != nil {
 				return agent.ToolResult{}, err
 			}
 			lines := strings.Split(strings.ReplaceAll(string(content), "\r\n", "\n"), "\n")
+			if capped && len(lines) > 1 {
+				// The byte cap almost certainly landed mid-line. Presenting
+				// that fragment as a complete line is wrong, and counting it
+				// makes every "of N lines" figure below a fabrication.
+				lines = lines[:len(lines)-1]
+			}
 			offset := numericParam(params["offset"], 1)
 			if offset < 1 {
 				offset = 1
 			}
 			if offset > len(lines) {
+				if capped {
+					return agent.ToolResult{}, fmt.Errorf(
+						"offset %d is beyond the first %d lines, which is all of %s this tool can read (the file exceeds %d bytes)",
+						offset, len(lines), w.display(resolved), maxReadBytes*40)
+				}
 				return agent.ToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", offset, len(lines))
 			}
 			end := len(lines)
@@ -241,10 +255,20 @@ func (w *Workspace) ReadTool() agent.Tool {
 			}
 			shownLines := strings.Count(selected, "\n") + 1
 			lastLine := offset + shownLines - 1
-			if truncated {
+			switch {
+			case truncated:
 				selected += fmt.Sprintf("\n\n[truncated: showing at most %d bytes from line %d]", maxReadBytes, offset)
-			} else if lastLine < len(lines) {
-				selected += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", offset, lastLine, len(lines), lastLine+1)
+			case lastLine < len(lines):
+				total := fmt.Sprint(len(lines))
+				if capped {
+					// len(lines) counts only what fitted under the byte cap,
+					// so it is a floor rather than the file's line count.
+					total = fmt.Sprintf("at least %d", len(lines))
+				}
+				selected += fmt.Sprintf("\n\n[Showing lines %d-%d of %s. Use offset=%d to continue.]", offset, lastLine, total, lastLine+1)
+			case capped:
+				selected += fmt.Sprintf("\n\n[%s exceeds %d bytes; only its first %d lines are readable with this tool]",
+					w.display(resolved), maxReadBytes*40, len(lines))
 			}
 			return textResult(selected), nil
 		},
@@ -275,12 +299,64 @@ func (w *Workspace) WriteTool() agent.Tool {
 			if err := w.root.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 				return agent.ToolResult{}, err
 			}
-			if err := w.root.WriteFile(resolved, []byte(content), 0o644); err != nil {
+			if err := w.writeFileAtomic(resolved, []byte(content)); err != nil {
 				return agent.ToolResult{}, err
 			}
 			return textResult(fmt.Sprintf("Wrote %d bytes to %s", len(content), w.display(resolved))), nil
 		},
 	}
+}
+
+// writeFileAtomic replaces path's contents without ever leaving it truncated.
+//
+// os.Root.WriteFile opens with O_TRUNC, so a write that fails partway -- ENOSPC,
+// EIO, a SIGKILL, a power loss -- destroys the original and leaves nothing to
+// recover from. The edit tool in particular has the whole original in memory
+// and discards it, so the user's file is simply gone. Writing a sibling
+// temporary file and renaming it into place means the destination is either the
+// old contents or the new ones, never a fragment.
+//
+// The temporary file is created inside the same os.Root, so confinement still
+// holds, and in the same directory, so the rename stays on one filesystem.
+func (w *Workspace) writeFileAtomic(resolved string, content []byte) (err error) {
+	perm := fs.FileMode(0o644)
+	if info, statErr := w.root.Stat(resolved); statErr == nil {
+		perm = info.Mode().Perm()
+	}
+
+	dir := filepath.Dir(resolved)
+	var random [8]byte
+	if _, randErr := rand.Read(random[:]); randErr != nil {
+		return randErr
+	}
+	tmp := filepath.Join(dir, "."+filepath.Base(resolved)+".goshcoder-"+hex.EncodeToString(random[:])+".tmp")
+
+	file, err := w.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			file.Close()
+			_ = w.root.Remove(tmp)
+		}
+	}()
+	if _, err = file.Write(content); err != nil {
+		return err
+	}
+	// Without this the rename can be durable while the contents are not, which
+	// on a crash yields a file that exists and is empty.
+	if err = file.Sync(); err != nil {
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	if err = w.root.Rename(tmp, resolved); err != nil {
+		_ = w.root.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // EditTool replaces an exact, unique substring in a file.
@@ -327,7 +403,7 @@ func (w *Workspace) EditTool() agent.Tool {
 					occurrences, w.display(resolved))
 			}
 			updated := strings.Replace(text, oldText, newText, 1)
-			if err := w.root.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+			if err := w.writeFileAtomic(resolved, []byte(updated)); err != nil {
 				return agent.ToolResult{}, err
 			}
 			return textResult("Edited " + w.display(resolved)), nil
@@ -604,7 +680,11 @@ func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]stri
 	// repository's complete ignore stack. Fall back to a conservative walk.
 	gitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	command := exec.CommandContext(gitCtx, "git", "-C", w.Root, "ls-files", "-co", "--exclude-standard", "--", resolved)
+	// -z emits NUL-delimited, unquoted paths. Without it git applies
+	// core.quotePath (on by default) and returns C-quoted, octal-escaped names
+	// for anything non-ASCII, so every file with an accented or CJK name was
+	// looked up under a path that does not exist and silently skipped.
+	command := exec.CommandContext(gitCtx, "git", "-C", w.Root, "ls-files", "-z", "-co", "--exclude-standard", "--", resolved)
 	command.Dir = w.Root
 	command.Env = withoutGitOverrideEnv(os.Environ())
 	command.WaitDelay = time.Second
@@ -615,10 +695,13 @@ func (w *Workspace) candidateFiles(ctx context.Context, resolved string) ([]stri
 			return nil, fmt.Errorf("candidate file list exceeds %d bytes", maxCandidateBytes)
 		}
 		var files []string
-		for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
-			line = filepath.Clean(line)
-			if line != "." && line != "" {
-				files = append(files, line)
+		for _, entry := range strings.Split(output.String(), "\x00") {
+			if entry == "" {
+				continue
+			}
+			entry = filepath.Clean(entry)
+			if entry != "." && entry != "" {
+				files = append(files, entry)
 				if len(files) > maxCandidateFiles {
 					return nil, fmt.Errorf("candidate file list exceeds %d files", maxCandidateFiles)
 				}
@@ -769,6 +852,7 @@ func (w *Workspace) BashTool() agent.Tool {
 			}
 
 			cmd := exec.CommandContext(runCtx, shell, append(args, command)...)
+			isolateProcessGroup(cmd)
 			cmd.WaitDelay = 2 * time.Second
 			cmd.Dir = w.Root
 			output := cappedOutput{limit: maxOutputBytes}
@@ -779,6 +863,16 @@ func (w *Workspace) BashTool() agent.Tool {
 			text := output.String()
 			if runCtx.Err() == context.DeadlineExceeded {
 				return agent.ToolResult{}, fmt.Errorf("command timed out after %s\n%s", timeout, text)
+			}
+			if errors.Is(runErr, exec.ErrWaitDelay) {
+				// The shell exited successfully but something it backgrounded
+				// still holds the output pipe. Reporting that as a failure
+				// makes the model retry a command that worked, so say what
+				// actually happened instead.
+				if strings.TrimSpace(text) == "" {
+					return textResult("(no output; a background process is still running)"), nil
+				}
+				return textResult(text + "\n\n[a background process started by this command is still running]"), nil
 			}
 			if runErr != nil {
 				// A non-zero exit is reported as an error result so the model
