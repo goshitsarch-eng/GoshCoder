@@ -12,6 +12,18 @@ import (
 // fast scales the protocol's timings down so the tests finish quickly while
 // keeping their ratios -- a heartbeat well inside the stale threshold, and a
 // wait well beyond it. Production constants are never slept on.
+// fast is the production timing compressed so the hazards below are reachable
+// in a test. The ratio is what matters -- a heartbeat an order of magnitude
+// shorter than the stale threshold -- not the absolute values.
+//
+// The stale window is a whole second rather than the 200ms it started as. A
+// live holder is declared dead if its heartbeat goroutine is starved for
+// longer than that window, and on a two-core CI runner executing every package
+// in parallel, a 200ms stall is ordinary: these tests passed by luck and began
+// failing on Windows the moment unrelated fixes changed the load profile. One
+// second still exercises the same behaviour and needs a stall two orders of
+// magnitude past the heartbeat to produce a false failure. Production is
+// 2s/20s, where the equivalent stall would have to last twenty seconds.
 func fast() Timing {
 	return Timing{
 		Heartbeat: 20 * time.Millisecond,
@@ -132,8 +144,8 @@ func TestLiveHolderIsNotReclaimed(t *testing.T) {
 	}
 	defer release()
 
-	// Hold well past the stale threshold; the heartbeat should keep it fresh.
-	time.Sleep(3 * timing.Stale)
+	// Hold past the stale threshold; the heartbeat should keep it fresh.
+	time.Sleep(2 * timing.Stale)
 
 	timing.Wait = 0
 	_, owner, ok, err := TryAcquire(path, timing)
