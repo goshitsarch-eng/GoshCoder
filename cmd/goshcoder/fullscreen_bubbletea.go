@@ -425,7 +425,7 @@ func (model *fullscreenModel) View() string {
 		Cache:    model.renderCache,
 		Title:    fmt.Sprintf("v%s  ·  %s/%s", Version, state.Model.Provider, state.Model.ID),
 		Messages: messages,
-		Sidebar: fullscreenSidebarWithStorage(model.info, model.session.workspaceRoot(), model.activity,
+		Sidebar: fullscreenSidebar(model.info, model.session.workspaceRoot(), model.activity,
 			len(state.PendingToolCalls), model.recentTool, planItems, model.session.sidebarStorageLine()),
 		Input:              model.editor.input,
 		Cursor:             model.editor.cursor,

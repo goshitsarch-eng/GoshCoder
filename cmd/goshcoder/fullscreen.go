@@ -320,14 +320,10 @@ func assistantTUIMessages(message llm.AssistantMessage) []tui.Message {
 	return result
 }
 
-func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem) []string {
-	return fullscreenSidebarWithStorage(info, cwd, activity, pendingTools, recentTool, items, "")
-}
-
-// fullscreenSidebarWithStorage is fullscreenSidebar plus the session's
+// fullscreenSidebar renders the right-hand panel. storage carries the session's
 // recording state, which is the one thing the panel could not otherwise tell
 // the user: whether closing this window keeps the conversation.
-func fullscreenSidebarWithStorage(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem, storage string) []string {
+func fullscreenSidebar(info claudetui.SessionInfo, cwd, activity string, pendingTools int, recentTool string, items []plannotator.ChecklistItem, storage string) []string {
 	name := info.Name
 	if name == "" {
 		name = "New Session"

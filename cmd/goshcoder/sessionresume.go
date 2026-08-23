@@ -179,9 +179,7 @@ func reportNotices(report sessionlog.LoadReport) []string {
 		out = append(out, fmt.Sprintf("%d unreadable line(s) were skipped: %s",
 			report.SkippedLines, strings.Join(report.Warnings, "; ")))
 	} else {
-		for _, warning := range report.Warnings {
-			out = append(out, warning)
-		}
+		out = append(out, report.Warnings...)
 	}
 	return out
 }

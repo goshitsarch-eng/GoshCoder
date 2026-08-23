@@ -258,6 +258,20 @@ Gloss; dependency checksums are committed in `go.sum`.
   (`@plannotator/pi-extension`), and `internal/claudetui`
   (`pi-claude-code-tui`). Planner uses a dependency-free stdlib browser
   reviewer; the visual UI is native Go rather than pi's npm/TUI runtime.
-- Persisted JSONL session trees, resume/branch pickers, TypeScript packages and
-  plugins, custom `models.json`, LSP/MCP management, and export/share remain
-  outside current parity.
+- Sessions are persisted in pi's **v3** JSONL format (`internal/sessionlog`),
+  not the v4 mutation log under `packages/agent/src/harness/session`. pi's
+  shipping CLI never imports v4 -- `CURRENT_SESSION_VERSION` is 3 -- and v3's
+  reader is lenient where forward compatibility needs it: an unknown entry type
+  joins the tree and projects to nothing, where v4 treats it as fatal. That is
+  what makes every later format addition backward-compatible.
+  Resume, branching, fork/clone, labels and JSONL/Markdown export/import are
+  implemented. v1 and v2 pi files are migrated in memory and never rewritten,
+  so continuing one forks it into a v3 file.
+- TypeScript packages and plugins, custom `models.json`, LSP/MCP management, and
+  HTML export/share remain outside current parity.
+- Plan state lives in the session log as a `custom` entry rather than in a
+  per-workspace file. `plannotator.Manager` owns no file: the host supplies
+  `Options.Initial` and receives `Options.OnChange`.
+- `/clear` appends a `transcript_reset` marker instead of rotating to a new
+  file. That entry type is a GoshCoder addition; pi tolerates it but will still
+  replay the cleared prefix, which is the one documented interop divergence.

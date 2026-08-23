@@ -68,6 +68,22 @@ goshcoder
 # Store a key (also reads the usual env vars, e.g. ANTHROPIC_API_KEY)
 goshcoder auth set anthropic
 
+# Come back to the last conversation in this workspace
+goshcoder chat -continue
+
+# Or pick one from a searchable list
+goshcoder chat -resume
+
+# Manage what has been saved
+goshcoder sessions list
+goshcoder sessions show <id>
+goshcoder sessions export <id> --md notes.md
+
+# Keep a prompt you refined, and carry your collection between machines
+goshcoder prompts list
+goshcoder prompts backup
+goshcoder prompts restore goshcoder-prompts-2026-08-23.tar.gz
+
 # Or log in with an Anthropic, OpenAI Codex, or Kimi subscription
 goshcoder auth login anthropic
 goshcoder auth login openai-codex
@@ -96,10 +112,23 @@ Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 | `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
 | `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
 | `-C` | Workspace directory for tools |
+| `-continue` | Reopen the most recent session for this workspace |
+| `-resume` | Choose a session to resume (chat only) |
+| `-session` | Session id, id prefix, or path |
+| `-name` | Display name for the session |
+| `-no-session` | Do not record this session |
+| `-read-only` | Open a session without claiming it |
+| `-sessions-dir` | Session storage root (default `~/.goshcoder/agent/sessions`) |
+
+`chat` records by default. `run` records only with `-continue`, `-session` or
+`-name`: it is the scripting entry point, and recording by default would turn
+every cron invocation into a permanent file.
 
 Credentials and config live in `~/.goshcoder/agent` (override with
 `GOSHCODER_AGENT_DIR`). The `auth.json` format matches pi's, so a directory can
-be pointed at either tool.
+be pointed at either tool. Sessions live under `sessions/`, sharded by working
+directory with pi's exact encoding and written in pi's v3 JSONL format, so
+`-sessions-dir ~/.pi/agent/sessions` reads and writes the same files pi does.
 
 ## Layout
 
@@ -116,6 +145,9 @@ be pointed at either tool.
 | `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
 | `internal/claudetui` | Claude-style cards and session information rendering |
 | `internal/tui` | Bubble Tea view renderer, responsive transcript, palette, composer, and sidebar |
+| `internal/sessionlog` | pi-compatible v3 session files: codec, entry tree, writer, store |
+| `internal/lockfile` | Cross-process advisory lock with a heartbeat and stale recovery |
+| `internal/atomicfile` | Staged temp-file write with an atomic rename |
 | `internal/config` | On-disk paths |
 | `cmd/goshcoder` | CLI |
 
@@ -247,19 +279,44 @@ boundary matters:
   refreshed token cannot be lost to a racing writer.
 - **Local servers** (OAuth callback, Planner review) bind loopback only, validate
   state/CSRF tokens and the `Host` header, and set no-store and CSP headers.
+- **Session transcripts** contain every file the agent read and every command's
+  output. `read` returns up to 50 KiB and `bash` output up to 30 KiB, and there
+  is no content filter, so `cat .env` lands in the session file verbatim. Files
+  are mode 0600 under `~/.goshcoder/agent/sessions`, never inside the workspace,
+  and are never sent anywhere. **No redaction is performed**: the only redaction
+  primitive in this tree replaces a *known* secret string, which cannot find a
+  key the agent read out of a file, and a partial filter would buy false
+  confidence. Use `-no-session` for work that should not be written down, and
+  `goshcoder sessions rm` to delete what already was.
+- **Prompt archives** written by `prompts backup` are read back as untrusted
+  input: member names are re-derived and re-validated rather than trusted, any
+  member that is not a regular file is refused, and both the entry count and the
+  decompressed size are bounded. Symlinked prompts are skipped on backup rather
+  than followed, so an archive you share cannot carry a file you did not choose.
+
+**Durability.** A completed turn survives a machine crash: entries are appended
+as they happen and flushed at each turn boundary. A turn still in flight
+survives a process crash -- a kill, a panic, a closed terminal -- but not a power
+loss, because the containing directory is not fsynced. That matches every other
+durable write in this repository. A session torn mid-append loses only the
+partial entry; the rest of the file loads normally.
 
 `make check` runs `govulncheck`; keep the Go toolchain patched and rerun it for
 release builds.
 
 ## Known gaps
 
-- Two sessions open on the same workspace share one Planner state file with no
-  cross-process lock, so the last writer wins on phase changes. Nothing is
-  corrupted -- writes are atomic -- but a plan phase set in one session can be
-  reverted by the other. Use one session per workspace for planning.
-- Session transcripts are not persisted: pi's JSONL session tree, resume picker,
-  branching, and export/share are not implemented. Closing the process discards
-  the conversation, which is why Ctrl+C at an idle prompt asks for confirmation.
+- Planner state belongs to a session rather than to a workspace, so
+  `-no-session` and a `run` without `-continue` do not persist it. Two windows
+  in one repository now have independent plan modes; `-continue` restores the
+  phase along with the transcript.
+- HTML export and `/share` are not implemented, and are not planned. pi's HTML
+  export inlines roughly 165 KB of vendored JavaScript into every output file;
+  `sessions export --md` writes Markdown instead. `/share` would mean sending a
+  file that by construction contains everything the agent read to a third-party
+  host.
+- BTW side threads are still memory-only. Closing a window discards them even
+  though the main conversation is saved.
 
 ## Deviations from pi
 
@@ -279,10 +336,21 @@ Documented at the top of each ported file. The notable ones:
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
   Redirected input/output automatically falls back to the pipeable line-oriented
   interface.
-- **Session scope.** Runtime transcript clearing and context compaction are
-  implemented. Pi's persisted JSONL session tree, resume picker, branching,
-  HTML export/share, TypeScript plugin host, packages, custom `models.json`
-  loading, LSP, and MCP management are not yet implemented. See **Known gaps**.
+- **Session scope.** Sessions are persisted in pi's v3 JSONL format, including
+  the entry tree, resume, branching, fork/clone, labels, and JSONL/Markdown
+  export and import. pi's older v1 and v2 files are read and migrated in memory;
+  they are never rewritten in place, so continuing one forks it into a v3 file.
+  Pi's HTML export/share, TypeScript plugin host, packages, custom `models.json`
+  loading, LSP, and MCP management are not implemented. See **Known gaps**.
+
+  Two deliberate differences inside the format. GoshCoder takes an exclusive
+  claim on a session file, which pi does not: two processes appending to one
+  file is the realistic corruption mode for `chat -continue` run twice, and
+  interleaved appends cross the parent links of two conversations. And `/clear`
+  appends a reset marker rather than starting a new file, so an accidental clear
+  stays recoverable with `sessions show --full`; pi reading such a file will
+  still replay the cleared prefix, since only this build knows the marker cuts
+  the context.
 
 ## Development
 
