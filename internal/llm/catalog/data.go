@@ -4,7 +4,8 @@
 //
 // The builtin model data lives in catalog.json, generated from the pi
 // reference by .tmp/regen-catalog.sh (pi's scripts/generate-models.ts in
-// --json-only mode). Custom coding-agent models.json loading is not ported.
+// --json-only mode), plus catalog_extra.json for models pi does not carry.
+// Custom coding-agent models.json loading is not ported.
 package catalog
 
 import (
@@ -18,6 +19,14 @@ import (
 
 //go:embed catalog.json
 var catalogJSON []byte
+
+// catalogExtraJSON holds model data that is not in the pi reference, in the
+// same shape as catalog.json. It is a separate file because catalog.json is
+// regenerated wholesale from pi and a hand-edit there would be lost on the
+// next regeneration.
+//
+//go:embed catalog_extra.json
+var catalogExtraJSON []byte
 
 // modelJSON mirrors llm.Model but keeps compat as raw JSON. llm.Model types
 // compat as *llm.OpenAICompletionsCompat only, while pi model data also
@@ -77,6 +86,7 @@ func init() {
 	if err := json.Unmarshal(catalogJSON, &raw); err != nil {
 		panic(fmt.Errorf("catalog: embedded catalog.json is invalid: %w", err))
 	}
+	mergeExtraModels(raw)
 	builtin.models = make(map[string]map[string]*llm.Model, len(raw))
 	builtin.rawCompat = make(map[string]map[string]json.RawMessage, len(raw))
 	for providerID, models := range raw {
@@ -130,4 +140,34 @@ func BuiltinProviderIDs() []string {
 func RawCompat(providerID, modelID string) (compat json.RawMessage, ok bool) {
 	compat, ok = builtin.rawCompat[providerID][modelID]
 	return compat, ok
+}
+
+// shadowedExtras names the models catalog_extra.json declares that the
+// generated catalog already carries. It is recorded rather than acted on:
+// TestExtraCatalogIsNotShadowed is what turns it into a failure, so the day pi
+// ships one of these models the duplicate gets deleted instead of quietly
+// diverging from pi's own definition.
+var shadowedExtras []string
+
+// mergeExtraModels folds catalog_extra.json into the generated catalog. The
+// generated data wins on a collision: the extra file exists to add models pi
+// does not carry, so where pi does carry one its definition is the authority.
+func mergeExtraModels(into map[string]map[string]*modelJSON) {
+	var extra map[string]map[string]*modelJSON
+	if err := json.Unmarshal(catalogExtraJSON, &extra); err != nil {
+		panic(fmt.Errorf("catalog: embedded catalog_extra.json is invalid: %w", err))
+	}
+	for providerID, models := range extra {
+		if into[providerID] == nil {
+			into[providerID] = map[string]*modelJSON{}
+		}
+		for modelID, model := range models {
+			if _, exists := into[providerID][modelID]; exists {
+				shadowedExtras = append(shadowedExtras, providerID+"/"+modelID)
+				continue
+			}
+			into[providerID][modelID] = model
+		}
+	}
+	sort.Strings(shadowedExtras)
 }

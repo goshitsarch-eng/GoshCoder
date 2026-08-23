@@ -34,6 +34,11 @@ const (
 	// AuthOAuthOnly has no api-key auth; only a stored OAuth credential
 	// configures the provider (pi: openai-codex).
 	AuthOAuthOnly
+	// AuthMetaBearer sends the Meta Model API key as an Authorization bearer
+	// token. Meta serves the Anthropic Messages shape but authenticates with
+	// Authorization rather than x-api-key, so the key must travel as a header
+	// instead of as the protocol's api key.
+	AuthMetaBearer
 )
 
 // Provider is the runtime unit of the catalog: static metadata, auth
@@ -52,7 +57,7 @@ type Provider struct {
 	// Kind selects the resolution strategy.
 	Kind AuthKind
 	// OAuth reports whether the provider supports OAuth. Login and refresh are
-	// implemented for Anthropic, OpenAI Codex, and Kimi Coding.
+	// implemented for Anthropic, OpenAI Codex, Kimi Coding, xAI, and Meta.
 	OAuth bool
 
 	// models is the provider's built-in model list, keyed by model id in
@@ -167,6 +172,11 @@ var builtinProviderConfigs = map[string]builtinProviderConfig{
 	"kimi-coding": {
 		name: "Kimi For Coding", baseURL: "https://api.kimi.com/coding",
 		keyName: "Kimi API key", envKeys: []string{"KIMI_API_KEY"}, oauth: true,
+	},
+	"meta": {
+		name: "Meta", baseURL: "https://api.meta.ai",
+		keyName: "Meta Model API key", envKeys: []string{"META_API_KEY"},
+		kind: AuthMetaBearer, oauth: true,
 	},
 	"minimax": {
 		name: "MiniMax", baseURL: "https://api.minimax.io/anthropic",

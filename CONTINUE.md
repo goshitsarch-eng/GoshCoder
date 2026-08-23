@@ -73,7 +73,8 @@ auth), which is what lets the refresh run inside `CredentialStore.Modify` — so
 the existing cross-process lock file prevents double-refresh of a rotated token.
 Expiry is re-checked under the lock (double-checked locking, as pi does).
 
-Registered refreshers: `anthropic`, `kimi-coding`, `openai-codex`.
+Registered refreshers: `anthropic`, `kimi-coding`, `meta`, `openai-codex`,
+`xai` (the last two of those were added later; see "xAI and Meta OAuth" below).
 
 Shape differences that matter:
 - Anthropic `ToAuth` → `apiKey`, and subtracts a 5-minute skew on expiry.
@@ -245,6 +246,76 @@ Gloss; dependency checksums are committed in `go.sum`.
 - `TransformMessages` normalization is **cross-model only**. Same-model replay
   keeps original tool call ids and thinking signatures. This tripped up test
   expectations three separate times.
+
+## xAI and Meta OAuth — done
+
+Both providers accept an API key *and* a subscription/account login; adding the
+login left the key path untouched.
+
+`internal/llm/catalog/oauth_xai.go` — xAI has a real first-party OIDC server at
+`auth.x.ai`, so this is its published surface rather than a scraped browser
+session: discovery, PKCE S256 over a loopback callback on `127.0.0.1:56121`, and
+RFC 8628 device code for headless sessions. Two decisions are load-bearing:
+
+- **Discovered endpoints are pinned to the issuer's host.** A discovery document
+  is fetched over the network; honoring an endpoint it moved to another host
+  would hand that host the authorization code and the refresh token. Discovery
+  failing falls back to the documented paths, because the paths are documented
+  and an outage there is not a reason to refuse a login. A discovery document
+  that *lies* is not advisory, and is refused.
+- **The device flow is offered first.** It needs no listening socket and no
+  browser on this machine, so it behaves the same over SSH as it does locally.
+
+The authorize URL sends `referrer=goshcoder`. Other clients of this public
+client send another product's name; misreporting who is asking for a grant is
+exactly what a consent screen exists to prevent.
+
+`internal/llm/catalog/oauth_meta.go` — Meta's login is two exchanges, not one.
+The device grant at `auth.meta.com/oidc/device/*` yields an identity token, and
+only the mint that follows at `api.meta.ai/muse-code/key` yields the credential
+`api.meta.ai` accepts. So the stored credential is laid out as pi's is: identity
+in `refresh`, the minted key in `access`, the OAuth refresh token in an extra.
+
+- `Refresh` means "mint a new key", which is what Meta's daily key rotation
+  needs and costs one request. Only when Meta rejects the identity is the
+  refresh token spent, so a renewal that fails is genuinely terminal.
+- Expiry is the sooner of the key's re-mint deadline and the identity's death:
+  either ending is a reason to refresh.
+- Meta answers an unusable refresh token with a bare `404`, not `invalid_grant`.
+  Read as a transport failure that would retry forever; it is mapped to
+  `ErrOAuthUnauthorized`, which is what it means.
+- `require_payment` on a mint is an account that has not finished signup, and
+  carries where to finish. It is reported as such rather than as a dead
+  credential -- logging in again fixes nothing.
+
+Meta's Model API speaks `anthropic-messages` but authenticates with
+`Authorization`. `AuthMetaBearer` therefore leaves `Auth.APIKey` **empty** and
+carries the key only in the header, because the streamer sets `x-api-key`
+whenever it has an api key. `TestAnthropicHeaderOnlyAuthSendsNoAPIKeyHeader` in
+`internal/llm` is what keeps that true.
+
+Meta's models are not in the pi reference, so they live in
+`internal/llm/catalog/catalog_extra.json`, merged in `data.go`.
+`catalog.json` is regenerated wholesale from pi and a hand-edit there would be
+lost. The generated data wins on a collision and
+`TestExtraCatalogIsNotShadowed` fails if pi ever ships the same model, so the
+duplicate is deleted rather than quietly diverging.
+
+The client ids are public desktop clients with no secret -- PKCE and the device
+flow replace one -- and `GOSHCODER_XAI_OAUTH_CLIENT_ID` /
+`GOSHCODER_META_OAUTH_CLIENT_ID` override them.
+
+Covered by `oauth_xai_test.go` and `oauth_meta_test.go` against fake issuer and
+mint servers: both login shapes, endpoint pinning, discovery fallback,
+non-rotating refresh tokens, the re-mint and renewal paths, terminal failures,
+and both providers' request-auth derivation.
+
+**Known caveat, xAI.** The subscription login authenticates a consumer Grok
+plan, and xAI enforces its own entitlement checks on the inference API
+afterwards: a login can succeed and inference still answer 403 for an account
+without the plan the endpoint wants. That is xAI's decision, not a client bug.
+`XAI_API_KEY` and `goshcoder auth set xai` remain the route for a developer
+account and are unaffected.
 
 ## Known deviations from pi (unchanged)
 

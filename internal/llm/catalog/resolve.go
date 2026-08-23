@@ -8,8 +8,9 @@ package catalog
 // credential owns the provider, and ambient environment/file credentials are
 // consulted only when nothing is stored.
 //
-// OAuth login and refresh are supported for Anthropic, OpenAI Codex, and Kimi
-// Coding. Other providers use their static or ambient credential strategies.
+// OAuth login and refresh are supported for Anthropic, OpenAI Codex, Kimi
+// Coding, xAI, and Meta. Other providers use their static or ambient
+// credential strategies.
 
 import (
 	"context"
@@ -256,6 +257,8 @@ func (c *Catalog) buildAPIKeyAuth(providerID string, config builtinProviderConfi
 		return c.resolveBedrockAuth(credential, source)
 	case AuthVertex:
 		return c.resolveVertexAuth(credential, source)
+	case AuthMetaBearer:
+		return c.resolveMetaAuth(config, credential, source)
 	default:
 		return c.resolveEnvKeyAuth(config, credential, source)
 	}
@@ -273,6 +276,37 @@ func (c *Catalog) resolveEnvKeyAuth(config builtinProviderConfig, credential *Cr
 		}
 	}
 	return nil, false
+}
+
+// resolveMetaAuth sends the Model API key as a bearer token.
+//
+// The key is deliberately left out of Auth.APIKey: the anthropic-messages
+// streamer sets x-api-key whenever it has one, and Meta's front door reads the
+// Authorization header instead. Carrying it only in the header is what keeps
+// the request to exactly the credential Meta expects.
+func (c *Catalog) resolveMetaAuth(config builtinProviderConfig, credential *Credential, source string) (*Auth, bool) {
+	var (
+		key string
+		env map[string]string
+	)
+	if credential != nil && credential.Key != "" {
+		key, env = credential.Key, copyEnv(credential.Env)
+	} else {
+		for _, name := range config.envKeys {
+			if value := c.env(name); value != "" {
+				key, source = value, name
+				break
+			}
+		}
+	}
+	if key == "" {
+		return nil, false
+	}
+	return &Auth{
+		Env:     env,
+		Headers: metaBearerHeaders("Bearer " + key),
+		Source:  source,
+	}, true
 }
 
 // resolveAnthropicAuth handles ANTHROPIC_AUTH_TOKEN, which must travel as an
