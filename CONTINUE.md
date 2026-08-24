@@ -1,20 +1,31 @@
 # GoshCoder — continuation notes
 
-Handoff for a fresh session. Last verified 2026-08-12.
+Maintainer handoff notes. For what GoshCoder *is* and where it comes from, read
+[`README.md`](README.md) first — in particular **Relationship to pi**, because
+almost every decision recorded below only makes sense against pi's design.
+Attribution for pi and for every natively adapted extension is in
+[`NOTICE`](NOTICE); GoshCoder's own licence is in [`LICENSE`](LICENSE).
 
 ## Verify state first
 
 ```sh
-export PATH="$PATH:/c/Program Files/Go/bin"   # Go is not on PATH in fresh shells
-cd /c/Users/vaugh/OneDrive/Desktop/GoshCoder
-go build ./... && go vet ./... && gofmt -l ./internal ./cmd && go test ./...
+make check
 ```
 
-Expected: all packages build, vet, and test clean. The fullscreen UI uses
-Bubble Tea/Lip Gloss dependencies recorded in `go.sum`.
+That is the gate CI runs: `fmt-check vet lint test-race test-hermetic vuln`.
+Expected: all packages build, vet, and test clean on Linux, macOS and Windows.
+The fullscreen UI's Bubble Tea / Lip Gloss dependencies are recorded in
+`go.sum`.
 
-The pi reference clone is at `reference/pi` (gitignored). Every port is written
-against it; read the TS before porting anything.
+Ports are written against a clone of the upstream source at `reference/pi`,
+which is gitignored because it is pi's code rather than GoshCoder's:
+
+```sh
+git clone https://github.com/earendil-works/pi reference/pi
+```
+
+Read the TypeScript before porting anything, and name the file you read at the
+top of the Go file.
 
 ## Goal
 

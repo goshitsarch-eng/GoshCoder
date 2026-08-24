@@ -1,6 +1,101 @@
-MIT License
+GoshCoder — attribution notices
+===============================
 
+GoshCoder is a Go reimplementation derived from pi. It is not an original
+work: the design, wire protocols, session format, tool surface, resource
+conventions and credential layout are all pi's. GoshCoder's own licence is in
+LICENSE; this file records the upstream copyrights it is built on.
+
+GoshCoder is not affiliated with, sponsored by, or endorsed by any of the
+projects or authors named below.
+
+
+Upstream: pi
+------------
+
+pi — https://github.com/earendil-works/pi
 Copyright (c) 2025 Mario Zechner
+MIT License (reproduced in full at the end of this file)
+
+Everything in this repository is derived from pi unless stated otherwise.
+Ported files name the pi source path they were written against in a comment at
+the top, and document where GoshCoder's behaviour deviates.
+
+
+Natively adapted extensions
+---------------------------
+
+pi loads extensions as TypeScript modules at runtime. GoshCoder has no plugin
+host, so a selected few are reimplemented as Go built-ins. Each is an
+adaptation, not a repackaging: no upstream code, generated web asset or npm
+dependency is bundled.
+
+pi-web-access — Web Search
+  Nico Bailon — https://github.com/nicobailon/pi-web-access
+  Copyright (c) 2025 Nico Bailon — MIT License
+
+@plannotator/pi-extension — Planner
+  backnotprop — https://github.com/backnotprop/plannotator
+  Copyright 2025-2026 backnotprop
+  "Dual-licensed under Apache 2.0 or MIT at your option" — GoshCoder exercises
+  the MIT option, reproduced below.
+  GoshCoder bundles none of Plannotator's generated web assets or npm
+  dependencies; the browser reviewer is a dependency-free stdlib server.
+
+@tmustier/pi-ralph-wiggum — Ralph loops
+  Thomas Mustier — https://github.com/tmustier/pi-extensions
+  MIT License
+  The upstream package credits the ralph-loop plugin as prior art:
+  https://github.com/anthropics/claude-plugins-official/tree/main/plugins/ralph-loop
+
+pi-claude-code-tui — Claude Code appearance
+  Phoobobo — https://pi.dev/packages/pi-claude-code-tui
+  Copyright (c) 2026 Phoobobo — MIT License
+
+omniroute-agent-extension — OmniRoute
+  Oscar Andrea / md-riaz —
+  https://github.com/md-riaz/omniroute-agent-extension
+  Copyright (c) 2026 Oscar Andrea — MIT License
+  Upstream was named omniroute-pi-ext-integration when this adaptation was
+  written, and is the name the code comments still cite. The URL above is the
+  current one; the old path survives only as a GitHub rename redirect.
+
+@narumitw/pi-btw — BTW side threads
+  narumiruna —
+  https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw
+  Copyright (c) 2026 narumiruna — MIT License
+
+
+Third-party Go dependencies
+---------------------------
+
+The interactive interface is built on Charm's Bubble Tea and Lip Gloss, which
+are fetched as ordinary Go modules rather than vendored here. Everything else
+GoshCoder does — provider requests, SSE parsing, AWS SigV4, archive handling,
+the cross-process lock — is written against the Go standard library.
+
+A Go binary statically links its dependencies, so a release archive has to
+carry their notices. `make dist` collects the licence text of every module
+that survives into the build — for that platform specifically, from
+`go list -deps` rather than from go.mod — into a `licenses/` directory beside
+the binary, with `licenses/modules.txt` listing each module and version. A
+dependency with no discoverable licence fails the build rather than shipping
+silently; see scripts/collect-licenses.sh.
+
+Building from source instead? The same texts are in your module cache, at the
+paths `go list -m -f '{{.Dir}}' <module>` prints. go.sum is not a substitute:
+it records versions and integrity hashes, not licences.
+
+One dependency needs a note. github.com/mattn/go-localereader, reached through
+Bubble Tea on Windows, ships no licence file and declares MIT in its README
+instead. The text carried in its place is recorded by hand under
+scripts/license-exceptions/ so the notice is auditable rather than inferred.
+
+
+MIT License
+-----------
+
+The following applies to pi and to each MIT-licensed project named above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,26 +114,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
----
-GoshCoder is a Go reimplementation derived from pi (https://github.com/earendil-works/pi),
-Copyright (c) 2025 Mario Zechner, used under the MIT License above.
-
-The native `pi-web-access` Web Search adaptation is based on pi-web-access by
-Nico Bailon (https://github.com/nicobailon/pi-web-access), Copyright (c) 2025
-Nico Bailon, used under the MIT License above.
-
-The native `pi-claude-code-tui` adaptation is based on the package by Phoobobo,
-Copyright (c) 2026 Phoobobo, used under the MIT License above.
-
-The native Plannotator workflow is based on @plannotator/pi-extension by the
-Plannotator contributors (https://github.com/backnotprop/plannotator), offered
-under MIT OR Apache-2.0. GoshCoder does not bundle Plannotator's generated web
-assets or npm dependencies.
-
-The native OmniRoute integration is based on omniroute-pi-ext-integration by
-Oscar Andrea / md-riaz (https://github.com/md-riaz/omniroute-pi-ext-integration),
-Copyright (c) 2026 Oscar Andrea, used under the MIT License above.
-
-The native BTW side-thread integration is based on @narumitw/pi-btw by
-narumiruna (https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw),
-Copyright (c) 2026 narumiruna, used under the MIT License above.

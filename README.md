@@ -1,8 +1,48 @@
 # GoshCoder
 
-A Go coding agent, ported from [pi](https://github.com/earendil-works/pi).
+**GoshCoder is a derivative work, not an original one.** It is a Go
+reimplementation of [pi](https://github.com/earendil-works/pi) — Mario
+Zechner's TypeScript coding agent — and the design it is good at is pi's.
 Its interactive interface is built with
-[Bubble Tea](https://github.com/charmbracelet/bubbletea) and Lip Gloss.
+[Bubble Tea](https://github.com/charmbracelet/bubbletea) and
+[Lip Gloss](https://github.com/charmbracelet/lipgloss).
+
+[Relationship to pi](#relationship-to-pi) explains what that means in
+practice. [`NOTICE`](NOTICE) credits every project adapted here, and
+[`LICENSE`](LICENSE) covers GoshCoder itself.
+
+## Relationship to pi
+
+GoshCoder is a **fork in substance**. It is not a git fork — the two share no
+source language, and every file here was written against pi's source rather
+than branched from it — but the lineage is not incidental. The wire protocols,
+the session format, the tool surface, the resource conventions, the credential
+layout and the model catalog are all pi's, and the project would not exist
+without it.
+
+What that means concretely:
+
+- **The formats are pi's on purpose.** `auth.json` uses pi's encoding, and
+  sessions are written in pi's v3 JSONL, so `-sessions-dir
+  ~/.pi/agent/sessions` reads and writes the same files pi does.
+  Interoperability is a goal here, not a side effect.
+- **The model catalog is generated from the pi reference**, not maintained by
+  hand. Models pi does not carry yet live in a separate
+  `catalog_extra.json` so a regeneration cannot silently drop them.
+- **Ported files name their source.** Each opens with a comment giving the pi
+  path it was written against, and documents inline wherever GoshCoder's
+  behaviour diverges.
+- **Where it differs, it says so.** See [Deviations from pi](#deviations-from-pi)
+  for the list, and [Known gaps](#known-gaps) for what is not implemented.
+
+Several pi extensions are reimplemented here as native Go built-ins rather
+than loaded as npm packages. Each is an adaptation with no upstream code
+bundled, and each is credited with its author, repository and licence in
+[`NOTICE`](NOTICE) — see [Extensions](#extensions).
+
+GoshCoder is not affiliated with, sponsored by, or endorsed by the pi project,
+its author, or any other project named in `NOTICE`. **Bugs you find here are
+GoshCoder's own — please report them on this repository, not upstream.**
 
 ## Install
 
@@ -179,9 +219,13 @@ reuse and optional zstd request compression are intentionally omitted.
 ## Extensions
 
 pi extensions are TypeScript modules loaded at runtime. GoshCoder has no plugin
-host, so selected extension features are native built-ins:
+host, so selected extension features are reimplemented as native built-ins.
+Each is an adaptation written against the original, with no upstream code,
+generated asset or npm dependency bundled; each author, repository and licence
+is recorded in [`NOTICE`](NOTICE).
 
-- `pi-web-access` **Web Search** (native adaptation): the `web_search` tool is
+- [`pi-web-access`](https://github.com/nicobailon/pi-web-access) by Nico Bailon
+  — **Web Search** (native adaptation): the `web_search` tool is
   enabled with the coding tools and supports single or batched queries, result
   counts, recency/domain filters, cited output, OpenAI/Codex subscription auth,
   zero-config Exa MCP fallback, direct Exa API keys, and Kagi Search. It reads
@@ -199,7 +243,9 @@ host, so selected extension features are native built-ins:
   Exa. This is a native Go port of the search tool, not an npm plugin runtime.
   The package's `fetch_content`, `get_search_content`, `source_check`, browser
   curator, video/PDF handling, and providers not listed above are not ported.
-- `omniroute-pi-ext-integration` **OmniRoute** (native adaptation): `/omni
+- [`omniroute-agent-extension`](https://github.com/md-riaz/omniroute-agent-extension)
+  by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation, written against
+  the package when it was named `omniroute-pi-ext-integration`): `/omni
   setup` validates and stores a local or remote gateway, `/omni sync` imports
   `/v1/models` into GoshCoder's live `/model`/Ctrl+P picker, `/omni status`
   checks health, and `/omni dashboard` reports the management URL. Synchronized
@@ -208,7 +254,8 @@ host, so selected extension features are native built-ins:
   prompt adapter and are converted back into normal agent tool events. Config
   is in `omniroute.json`; its API key stays independently in `auth.json` or
   `OMNIROUTE_API_KEY`.
-- `@narumitw/pi-btw` **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
+- [`@narumitw/pi-btw`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw)
+  by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
   context-aware side thread without adding the question or answer to the main
   transcript. The fullscreen side UI supports follow-ups, queued Steering,
   in-memory resume, independent model/thinking settings in `pi-btw.json`,
@@ -219,17 +266,22 @@ host, so selected extension features are native built-ins:
   `/btw resume <id> <question>` resumes one. The original's exact character/
   line range selector and nested bring-preview menus are not ported; native
   line mode offers deterministic `latest`, `all`, and `from:N` export instead.
-- `@tmustier/pi-ralph-wiggum`: persistent iterative loops and completion tools.
+- [`@tmustier/pi-ralph-wiggum`](https://github.com/tmustier/pi-extensions) by Thomas
+  Mustier — **Ralph** (native adaptation): persistent iterative loops and
+  completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. `/ralph` opens loop controls in the command palette.
-- **Planner** (native adaptation of `@plannotator/pi-extension`): `/planner`,
+- **Planner** (native adaptation of
+  [`@plannotator/pi-extension`](https://github.com/backnotprop/plannotator) by
+  the Plannotator contributors): `/planner`,
   browser plan approval/denial with line annotations, overall notes, direct
   Markdown edits, resubmission change views, responsive navigation, light/dark
   themes, planning write gates, persisted phase state, checklist progress,
   `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
   begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
   local git review needs only `git`.
-- `pi-claude-code-tui`: startup card, half-open rounded chat prompt, and an
+- [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
+  — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
   tools, changed files, branch, and active mode. The panel refreshes
   automatically after turns and state changes; `/status` can also print it on
@@ -403,9 +455,26 @@ drift apart into a release that 404s. Filesystem tools use Go's
 servers bind only to loopback, and network, disk, and subprocess inputs have
 explicit resource limits.
 
-The pi reference clone lives in `reference/pi` (gitignored) and is what the
-ports are written against.
+Ports are written against a local clone of the upstream source, which lives at
+`reference/pi` and is gitignored — it is pi's code, not GoshCoder's, and is
+never committed here:
+
+```sh
+git clone https://github.com/earendil-works/pi reference/pi
+```
+
+Read the TypeScript before porting anything, and name the file you read in a
+comment at the top of the Go file. That comment is what lets the next person
+check a port against its original instead of guessing at intent.
 
 ## License
 
-pi is MIT-licensed by Mario Zechner; see `NOTICE`.
+GoshCoder is MIT-licensed — see [`LICENSE`](LICENSE).
+
+It is a derivative work of [pi](https://github.com/earendil-works/pi),
+Copyright (c) 2025 Mario Zechner, used under the MIT License.
+[`NOTICE`](NOTICE) reproduces that copyright and credits every other project
+adapted here — `pi-web-access`, Plannotator, `pi-ralph-wiggum`,
+`pi-claude-code-tui`, OmniRoute and `pi-btw` — with its author, repository and
+licence. If you redistribute GoshCoder or a build of it, carry `NOTICE` with
+it: that is the condition every one of those licences attaches.

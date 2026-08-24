@@ -146,7 +146,8 @@ dist: clean-dist
 		mkdir -p "$$out"; \
 		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
 			$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o "$$out/$(BINARY)$$ext" $(PKG) || exit 1; \
-		cp README.md NOTICE "$$out/"; \
+		cp README.md NOTICE LICENSE "$$out/"; \
+		sh scripts/collect-licenses.sh "$$os" "$$arch" "$$out/licenses" || exit 1; \
 		if [ "$$os" = "windows" ]; then \
 			(cd dist && zip -qr "$$(basename $$out).zip" "$$(basename $$out)"); \
 		else \
