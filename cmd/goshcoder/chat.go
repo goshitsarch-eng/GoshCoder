@@ -265,11 +265,15 @@ func defaultChatModel() (string, error) {
 	}
 	catalog := newCatalog()
 	configured := catalog.ConfiguredProviderIDs()
+	// Each entry is the provider's current default for coding work, not its
+	// most expensive model: Codex bills against a subscription so the flagship
+	// is the right pick there, where the metered OpenAI API gets the balanced
+	// one. Revisit whenever the catalog gains a generation.
 	preferred := []struct{ provider, model string }{
-		{"openai-codex", "gpt-5.4"},
-		{"anthropic", "claude-sonnet-4-5"},
+		{"openai-codex", "gpt-5.6-sol"},
+		{"anthropic", "claude-sonnet-5"},
 		{"kimi-coding", "kimi-for-coding"},
-		{"openai", "gpt-5.1"},
+		{"openai", "gpt-5.6-terra"},
 	}
 	available := make(map[string]bool, len(configured))
 	for _, provider := range configured {

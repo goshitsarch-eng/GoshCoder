@@ -283,10 +283,15 @@ shell. It becomes a git ref, the archive filenames, and the version the binary
 reports (`make dist VERSION=<tag>`, which strips the leading `v` because that
 is the name `install.sh` derives from the release tag).
 
-The in-tree version (`cmd/goshcoder/version.go`, and the Makefile's `VERSION`
-fallback) stays at the `-dev` value for the release being prepared: the release
-build stamps the real one with `-ldflags`, so an untagged build never claims to
-be a release it is not.
+The in-tree version stays at the `-dev` value for the release being prepared:
+the release build stamps the real one with `-ldflags`, so an untagged build
+never claims to be a release it is not. It is written in four places, because
+each build route falls back on its own copy when no tag is reachable --
+`cmd/goshcoder/version.go`, the Makefile's `VERSION`, and the same fallback in
+`install.sh` and `install.ps1`. `TestDevVersionIsConsistent` fails when they
+disagree; bumping after a release is still a manual step, and skipping it is
+how `v0.2.0` and `v0.2.1` both shipped from a tree that still said
+`0.2.0-dev`. It now reads `0.3.0-dev`.
 
 ## xAI and Meta OAuth — done
 
@@ -338,7 +343,9 @@ whenever it has an api key. `TestAnthropicHeaderOnlyAuthSendsNoAPIKeyHeader` in
 Meta's models are not in the pi reference, so they live in
 `internal/llm/catalog/catalog_extra.json`, merged in `data.go`.
 `catalog.json` is regenerated wholesale from pi and a hand-edit there would be
-lost. The generated data wins on a collision and
+lost. A model pi *does* carry but describes wrongly is corrected in
+`catalog_overrides.json` instead; see [Model catalog currency and effort
+levels](#model-catalog-currency-and-effort-levels--done). The generated data wins on a collision and
 `TestExtraCatalogIsNotShadowed` fails if pi ever ships the same model, so the
 duplicate is deleted rather than quietly diverging.
 
@@ -372,6 +379,92 @@ without the plan the endpoint wants. That is xAI's decision, not a client bug.
 `XAI_API_KEY` and `goshcoder auth set xai` remain the route for a developer
 account and are unaffected.
 
+## Model catalog currency and effort levels — done
+
+The catalog was audited against each provider's own documentation on
+2026-08-23. Two kinds of drift showed up, and they need different files.
+
+**Models pi's snapshot predates** go in `catalog_extra.json`, the file that
+already carried Meta and the newer Grok entries:
+
+| Added | Source |
+| --- | --- |
+| `anthropic/claude-mythos-5` | Shares Claude Fable 5's specs and pricing; invitation-only under Project Glasswing, so the entry only resolves for an approved key |
+| `amazon-bedrock/anthropic.claude-opus-5` | The plain inference profile the Anthropic docs list as the Bedrock ID; pi carries only the regional `us.`/`eu.`/`au.`/`jp.`/`global.` ones |
+| `amazon-bedrock/us.xai.grok-4.6`, `global.xai.grok-4.6` | AWS's Grok 4.6 model card. In-Region inference is *not* offered on `bedrock-runtime`, so only the two cross-Region profiles are listed, at their separate rates ($2.20/$6.60/$0.55 Geo, $2.00/$6.00/$0.50 Global) |
+| `google/gemini-3.7-flash`, `google-vertex/gemini-3.7-flash` | GA 2026-08-13, 1M context, 64K output, introductory $0.75/$3.75 |
+| `zai/glm-5.3`, `zai-coding-cn/glm-5.3` | Released 2026-08-18 and on both coding-plan endpoints, so priced at zero like its siblings there |
+| `openrouter/x-ai/grok-4.6`, `z-ai/glm-5.3`, `google/gemini-3.7-flash` | OpenRouter's own model pages |
+| `meta/muse-spark-1.2-contributor` | The contributor tier on the Meta Model API, $0.10/$0.20 |
+
+**Fields pi's snapshot has since got wrong** cannot go there: the generated
+definition wins on a collision by design, so an entry for a model pi already
+ships is ignored. `catalog_overrides.json` patches those in place:
+
+| Overridden | Was | Now |
+| --- | --- | --- |
+| `openai/gpt-5.6-{sol,terra,luna}` context window | 272000 | 1050000 |
+| `openai/gpt-5.6-sol` pricing | $5/$30 | $4/$0.40/$20, long-context tier $8/$0.80/$30 |
+| `google/gemini-3.6-flash`, `google-vertex`, `openrouter` pricing | $1.50/$7.50/$0.15 | $0.75/$3.75/$0.075 |
+| `deepseek/deepseek-v4-{pro,flash}` thinking levels | `low` unsupported | `low` maps to `low`, which DeepSeek documents as a direct value |
+
+An override is a partial model object whose top-level keys replace the
+generated ones **wholesale**: a `thinkingLevelMap` override replaces the whole
+map rather than one level of it, because a null in that map means "unsupported"
+and a key-wise merge could not express removing one. `id` and `provider` are
+refused: they are what the merged catalog is indexed by. The pass runs *before*
+`mergeExtraModels`, so an override can only ever reach pi's data -- a model in
+`catalog_extra.json` is hand-written here and gets edited there instead.
+
+Two tests keep the file honest, the same way `TestExtraCatalogIsNotShadowed`
+keeps the extras honest. `TestOverridesTargetGeneratedModels` fails on an
+override whose target pi does not carry, which would silently do nothing.
+`TestOverridesStillCorrectPi` fails once an override restates what pi already
+says, which is the prompt to delete it after a regeneration.
+
+**Effort levels.** `xhigh` and `max` need an explicit `thinkingLevelMap` entry
+to be offered at all (`GetSupportedThinkingLevels`), so a model that gains one
+stays silently capped until its entry says so. The audit found the Anthropic and
+OpenAI maps already correct -- `max` on Fable 5, Mythos 5, Opus 5/4.8/4.7/4.6
+and Sonnet 5/4.6, `xhigh` on all of those but Opus 4.6 and Sonnet 4.6, both on
+every GPT-5.6 -- and three that were not: Grok 4.6 gained `xhigh` (xAI treats it
+as `high` on 4.5 and earlier, so 4.5 correctly still lacks it), DeepSeek V4 lost
+`low`, and Gemini 3.7 Flash dropped `MINIMAL`, which 3.6 Flash still takes.
+`TestEffortLevelsMatchProviderDocs` pins both halves: the levels each model must
+offer, and the ones it must not, since clamping onto an unsupported level sends
+a value the API rejects or silently demotes.
+
+**Deliberately not added.**
+
+- `gpt-5.6-cyber` and `gemini-3.5-flash-cyber`: exploit-development models behind
+  applicant-vetted programs (OpenAI's Daybreak Red, Google's equivalent), with no
+  public API spec to encode.
+- `claude-mythos-preview`: named in Anthropic's effort docs but with no published
+  specs of its own; Mythos 5's are documented as Fable 5's, the preview's are not.
+- `meta/muse-glimmer-30b`: open weights, not served by the Meta Model API. pi
+  already lists it on the aggregators that do host it.
+- `openai-codex` context windows: still 272000 for the GPT-5.6 family, which
+  matches what the Codex backend reports even after the long-context rollout.
+  Raising it here would only make requests fail further along.
+- Aggregator catalogs beyond OpenRouter's three flagships (`vercel-ai-gateway`,
+  `cloudflare-ai-gateway`, `huggingface`, `azure-openai-responses`): pi
+  regenerates those lists wholesale and they run to hundreds of entries.
+
+**The app's own defaults.** `defaultChatModel` in `cmd/goshcoder/chat.go` names
+a model per provider for the case where nothing is configured and nothing is
+remembered, and that list had aged into `gpt-5.4` / `claude-sonnet-4-5` /
+`gpt-5.1`. It now reads `gpt-5.6-sol` on Codex, `claude-sonnet-5`, and
+`gpt-5.6-terra` on the OpenAI API: the flagship where a subscription is paying
+and the balanced model where tokens are. `kimi-for-coding` stays as it is --
+the name is the plan's own pointer, not a pinned generation. The README's
+examples moved with it.
+
+**Pricing with an expiry.** Two of the corrected rates are promotional and will
+need revisiting rather than keeping: GPT-5.6 Sol's $4/$20 runs at least through
+2026-11-21, and the Gemini 3.6/3.7 Flash introductory rate through 2026-12-31.
+`gpt-5.6-sol`'s `cacheWrite` is the one figure not published at the new price;
+it keeps pi's 1.25x-of-input ratio ($5, $10 on the long-context tier).
+
 ## Windows CI
 
 `build & test (windows-latest)` was red on `main` from the repository's first
@@ -398,6 +491,39 @@ flakiness, all of them real differences the other two platforms hide.
   means something rather than dropped everywhere. **The 0600 guarantee is a
   Unix guarantee**; on Windows the file is protected by directory ACLs
   inherited from the user profile, not by mode bits.
+
+**The compressed lock timings, again.** `3f2cfb8` widened the test stale
+window from 200ms to a second so a starved heartbeat goroutine could not make a
+live holder look dead. It landed that value in
+`internal/llm/catalog/auth_lock_test.go` but not in `internal/lockfile`, where
+only the prose and the sleep multiplier changed -- so `fast()` still returned
+200ms while its own comment said a second, and `TestLiveHolderIsNotReclaimed`
+went on failing, this time on the Linux `-race` job, which multiplies every
+scheduling delay. The value now matches what that commit intended and what the
+sibling package already has. Like the original, it is a reasoned widening
+rather than a locally reproduced repair: ten runs at `GOMAXPROCS=1` under a
+saturated four-core box reproduce neither the old failure nor a new one, so CI
+remains the real test.
+
+**Windows answers a releasing lock with "Access is denied".** With the stale
+window fixed, `TestSlowModifyKeepsItsLock` failed on `windows-latest` instead,
+on a waiter whose open of the lock path returned a permission error. It is not
+a permission problem. Windows keeps a file alive until its last handle closes:
+`os.Remove` on a file something still has open marks it delete-pending, and
+every open in that window answers `ERROR_ACCESS_DENIED` rather than "file
+exists". `acquire` treated anything that was not `os.ErrExist` as fatal, so a
+waiter that arrived while the previous holder was letting go failed outright
+instead of retrying.
+
+The handle was our own: `release` closed the heartbeat's `done` channel and
+went straight to `os.Remove`, leaving a beat already inside `os.Chtimes` racing
+the unlink. So both halves are fixed. `release` now waits for the heartbeat
+goroutine to exit before touching the file, which also stops a late beat from
+refreshing a successor's lock; and `acquire` treats a permission error as a
+busy lock on Windows only, retrying to the deadline and surfacing the error if
+it never clears, so a genuinely unwritable path still says so rather than
+spinning. The Unix path is unchanged: there an unlink takes effect at once and
+this state does not exist.
 
 ## Known deviations from pi (unchanged)
 

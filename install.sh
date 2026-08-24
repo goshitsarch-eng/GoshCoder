@@ -248,7 +248,7 @@ install_from_source() {
 
 	info "compiling (this takes a minute)"
 	ver=$(cd "$srcdir" && git describe --tags --dirty --match 'v*' 2>/dev/null ||
-		printf '0.2.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
+		printf '0.3.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 	commit=$(cd "$srcdir" && git rev-parse HEAD 2>/dev/null || echo '')
 	date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 	if ! ( cd "$srcdir" && CGO_ENABLED=0 go build -trimpath \

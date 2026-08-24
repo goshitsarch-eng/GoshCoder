@@ -15,7 +15,7 @@ import (
 
 var (
 	// Version is the CLI version, stamped at release time.
-	Version = "0.2.0-dev"
+	Version = "0.3.0-dev"
 	// Commit is the git revision the binary was built from.
 	Commit = ""
 	// BuildDate is the RFC 3339 build timestamp.

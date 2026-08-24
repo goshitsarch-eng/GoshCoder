@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -187,7 +188,18 @@ func acquire(path string, t Timing) (func(), Owner, bool, error) {
 			return hold(path, tok, t.Heartbeat), Owner{}, true, nil
 		}
 		if !errors.Is(openErr, os.ErrExist) {
-			return nil, Owner{}, false, fmt.Errorf("lockfile: failed to acquire lock: %w", openErr)
+			// Windows answers an open of a file whose unlink is still
+			// settling with "Access is denied" rather than "file exists", so
+			// a waiter that arrives in that window sees what looks like a
+			// permission failure on a lock that is merely being released.
+			// Treat it as a busy lock: retry to the deadline, and surface the
+			// error if it never clears, which is what a genuinely unwritable
+			// path does.
+			if !deletePending(openErr) || !time.Now().Before(deadline) {
+				return nil, Owner{}, false, fmt.Errorf("lockfile: failed to acquire lock: %w", openErr)
+			}
+			time.Sleep(t.Retry)
+			continue
 		}
 		// Reclaim a lock whose owner stopped heartbeating. Removing it can
 		// race another waiter doing the same, which is why the winner is
@@ -218,7 +230,9 @@ func acquire(path string, t Timing) (func(), Owner, bool, error) {
 // the release function.
 func hold(path, tok string, heartbeat time.Duration) func() {
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(heartbeat)
 		defer ticker.Stop()
 		for {
@@ -237,6 +251,15 @@ func hold(path, tok string, heartbeat time.Duration) func() {
 	return func() {
 		once.Do(func() {
 			close(done)
+			// Wait for the heartbeat to stop before touching the file rather
+			// than only asking it to. Closing done leaves a beat that is
+			// already inside Chtimes still running, and that open handle is
+			// the difference between an unlink that completes and one that
+			// leaves the file delete-pending, which is what makes a waiter on
+			// Windows see "Access is denied" on a lock nobody holds. It also
+			// keeps a beat from landing on a successor's lock file and
+			// refreshing a lock this process no longer owns.
+			<-stopped
 			// Remove the lock only while it is still ours. If a waiter
 			// declared us stale and took it, deleting its file would admit a
 			// third writer.
@@ -246,4 +269,14 @@ func hold(path, tok string, heartbeat time.Duration) func() {
 			_ = os.Remove(path)
 		})
 	}
+}
+
+// deletePending reports whether err is the answer Windows gives for opening a
+// file whose deletion has been requested but not yet completed, because a
+// handle to it is still open. The state is unreachable on Unix, where the
+// unlink takes effect immediately and an open of the same path creates a new
+// file, so the classification is scoped to the platform that has it: elsewhere
+// a permission error on a lock path is exactly what it says.
+func deletePending(err error) bool {
+	return runtime.GOOS == "windows" && errors.Is(err, os.ErrPermission)
 }

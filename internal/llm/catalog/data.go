@@ -4,7 +4,8 @@
 //
 // The builtin model data lives in catalog.json, generated from the pi
 // reference by .tmp/regen-catalog.sh (pi's scripts/generate-models.ts in
-// --json-only mode), plus catalog_extra.json for models pi does not carry.
+// --json-only mode), plus catalog_extra.json for models pi does not carry and
+// catalog_overrides.json for fields pi's snapshot has since got wrong.
 // Custom coding-agent models.json loading is not ported.
 package catalog
 
@@ -27,6 +28,16 @@ var catalogJSON []byte
 //
 //go:embed catalog_extra.json
 var catalogExtraJSON []byte
+
+// catalogOverridesJSON patches individual fields of models the generated
+// catalog already carries. catalog_extra.json cannot do that: the generated
+// definition wins on a collision by design, so an entry there for a model pi
+// ships is ignored. Each entry is a partial model object whose keys replace
+// the generated ones wholesale -- a thinkingLevelMap override replaces the
+// whole map, not one level of it.
+//
+//go:embed catalog_overrides.json
+var catalogOverridesJSON []byte
 
 // modelJSON mirrors llm.Model but keeps compat as raw JSON. llm.Model types
 // compat as *llm.OpenAICompletionsCompat only, while pi model data also
@@ -86,6 +97,7 @@ func init() {
 	if err := json.Unmarshal(catalogJSON, &raw); err != nil {
 		panic(fmt.Errorf("catalog: embedded catalog.json is invalid: %w", err))
 	}
+	applyModelOverrides(raw)
 	mergeExtraModels(raw)
 	builtin.models = make(map[string]map[string]*llm.Model, len(raw))
 	builtin.rawCompat = make(map[string]map[string]json.RawMessage, len(raw))
@@ -170,4 +182,103 @@ func mergeExtraModels(into map[string]map[string]*modelJSON) {
 		}
 	}
 	sort.Strings(shadowedExtras)
+}
+
+// overrideRecord is one applied field patch. Applying is not enough on its
+// own: the record keeps what pi said so TestOverridesStillCorrectPi can tell
+// an override that still fixes the generated data from one pi has caught up
+// with, which is dead weight that reads as authoritative.
+type overrideRecord struct {
+	provider string
+	model    string
+	field    string
+	was      json.RawMessage
+	now      json.RawMessage
+}
+
+var (
+	appliedOverrides []overrideRecord
+	// orphanOverrides names overrides whose target the generated catalog does
+	// not carry. Recorded rather than acted on, like shadowedExtras:
+	// TestOverridesTargetGeneratedModels is what turns it into a failure.
+	orphanOverrides []string
+)
+
+// overridableField reports whether a field may be patched. Identity is not
+// negotiable: id and provider are the keys the merged catalog is indexed by,
+// and rewriting either would leave a model filed under someone else's name.
+func overridableField(field string) bool {
+	return field != "id" && field != "provider"
+}
+
+// applyModelOverrides folds catalog_overrides.json into the generated catalog.
+// It runs before mergeExtraModels so an override can only ever reach pi's own
+// data: catalog_extra.json is hand-written here, and a model in it is edited
+// there rather than patched from a second file.
+func applyModelOverrides(into map[string]map[string]*modelJSON) {
+	var overrides map[string]map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(catalogOverridesJSON, &overrides); err != nil {
+		panic(fmt.Errorf("catalog: embedded catalog_overrides.json is invalid: %w", err))
+	}
+	for _, providerID := range sortedKeys(overrides) {
+		for _, modelID := range sortedKeys(overrides[providerID]) {
+			model := into[providerID][modelID]
+			if model == nil {
+				orphanOverrides = append(orphanOverrides, providerID+"/"+modelID)
+				continue
+			}
+			patched, records, err := overrideModel(providerID, modelID, model, overrides[providerID][modelID])
+			if err != nil {
+				panic(err)
+			}
+			into[providerID][modelID] = patched
+			appliedOverrides = append(appliedOverrides, records...)
+		}
+	}
+}
+
+// overrideModel returns a copy of model with fields replaced. The patch is
+// applied to the model's JSON form rather than to the struct so that a partial
+// override stays partial: an absent key is untouched, where a zero value in a
+// decoded struct is indistinguishable from an unset one.
+func overrideModel(providerID, modelID string, model *modelJSON, fields map[string]json.RawMessage) (*modelJSON, []overrideRecord, error) {
+	data, err := json.Marshal(model)
+	if err != nil {
+		return nil, nil, fmt.Errorf("catalog: model %s/%s: cannot re-encode for override: %w", providerID, modelID, err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, nil, fmt.Errorf("catalog: model %s/%s: cannot re-decode for override: %w", providerID, modelID, err)
+	}
+	records := make([]overrideRecord, 0, len(fields))
+	for _, field := range sortedKeys(fields) {
+		if !overridableField(field) {
+			return nil, nil, fmt.Errorf("catalog: model %s/%s: field %q cannot be overridden", providerID, modelID, field)
+		}
+		records = append(records, overrideRecord{
+			provider: providerID, model: modelID, field: field,
+			was: object[field], now: fields[field],
+		})
+		object[field] = fields[field]
+	}
+	merged, err := json.Marshal(object)
+	if err != nil {
+		return nil, nil, fmt.Errorf("catalog: model %s/%s: cannot encode override: %w", providerID, modelID, err)
+	}
+	patched := &modelJSON{}
+	if err := json.Unmarshal(merged, patched); err != nil {
+		return nil, nil, fmt.Errorf("catalog: model %s/%s: invalid override: %w", providerID, modelID, err)
+	}
+	return patched, records, nil
+}
+
+// sortedKeys keeps the override pass deterministic, so the records the tests
+// read back do not depend on Go's map iteration order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
