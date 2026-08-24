@@ -283,10 +283,15 @@ shell. It becomes a git ref, the archive filenames, and the version the binary
 reports (`make dist VERSION=<tag>`, which strips the leading `v` because that
 is the name `install.sh` derives from the release tag).
 
-The in-tree version (`cmd/goshcoder/version.go`, and the Makefile's `VERSION`
-fallback) stays at the `-dev` value for the release being prepared: the release
-build stamps the real one with `-ldflags`, so an untagged build never claims to
-be a release it is not.
+The in-tree version stays at the `-dev` value for the release being prepared:
+the release build stamps the real one with `-ldflags`, so an untagged build
+never claims to be a release it is not. It is written in four places, because
+each build route falls back on its own copy when no tag is reachable --
+`cmd/goshcoder/version.go`, the Makefile's `VERSION`, and the same fallback in
+`install.sh` and `install.ps1`. `TestDevVersionIsConsistent` fails when they
+disagree; bumping after a release is still a manual step, and skipping it is
+how `v0.2.0` and `v0.2.1` both shipped from a tree that still said
+`0.2.0-dev`. It now reads `0.3.0-dev`.
 
 ## xAI and Meta OAuth — done
 
