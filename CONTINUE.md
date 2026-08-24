@@ -492,6 +492,19 @@ flakiness, all of them real differences the other two platforms hide.
   Unix guarantee**; on Windows the file is protected by directory ACLs
   inherited from the user profile, not by mode bits.
 
+**The compressed lock timings, again.** `3f2cfb8` widened the test stale
+window from 200ms to a second so a starved heartbeat goroutine could not make a
+live holder look dead. It landed that value in
+`internal/llm/catalog/auth_lock_test.go` but not in `internal/lockfile`, where
+only the prose and the sleep multiplier changed -- so `fast()` still returned
+200ms while its own comment said a second, and `TestLiveHolderIsNotReclaimed`
+went on failing, this time on the Linux `-race` job, which multiplies every
+scheduling delay. The value now matches what that commit intended and what the
+sibling package already has. Like the original, it is a reasoned widening
+rather than a locally reproduced repair: ten runs at `GOMAXPROCS=1` under a
+saturated four-core box reproduce neither the old failure nor a new one, so CI
+remains the real test.
+
 ## Known deviations from pi (unchanged)
 
 - Compat travels on options structs, with `Model.RawCompat` as the fallback.
