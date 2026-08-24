@@ -69,18 +69,27 @@ omniroute-agent-extension — OmniRoute
 Third-party Go dependencies
 ---------------------------
 
-The interactive interface is built on Charm's libraries, which are fetched as
-ordinary Go modules rather than vendored here; their licences travel with them
-in the module cache and are recorded in go.sum.
+The interactive interface is built on Charm's Bubble Tea and Lip Gloss, which
+are fetched as ordinary Go modules rather than vendored here. Everything else
+GoshCoder does — provider requests, SSE parsing, AWS SigV4, archive handling,
+the cross-process lock — is written against the Go standard library.
 
-  github.com/charmbracelet/bubbletea — MIT License
-  github.com/charmbracelet/lipgloss — MIT License
-  github.com/charmbracelet/x/ansi, x/term, x/cellbuf — MIT License
-  github.com/mattn/go-runewidth — MIT License
+A Go binary statically links its dependencies, so a release archive has to
+carry their notices. `make dist` collects the licence text of every module
+that survives into the build — for that platform specifically, from
+`go list -deps` rather than from go.mod — into a `licenses/` directory beside
+the binary, with `licenses/modules.txt` listing each module and version. A
+dependency with no discoverable licence fails the build rather than shipping
+silently; see scripts/collect-licenses.sh.
 
-Everything else GoshCoder does — provider requests, SSE parsing, AWS SigV4,
-archive handling, the cross-process lock — is written against the Go standard
-library.
+Building from source instead? The same texts are in your module cache, at the
+paths `go list -m -f '{{.Dir}}' <module>` prints. go.sum is not a substitute:
+it records versions and integrity hashes, not licences.
+
+One dependency needs a note. github.com/mattn/go-localereader, reached through
+Bubble Tea on Windows, ships no licence file and declares MIT in its README
+instead. The text carried in its place is recorded by hand under
+scripts/license-exceptions/ so the notice is auditable rather than inferred.
 
 
 MIT License
