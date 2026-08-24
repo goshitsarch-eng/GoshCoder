@@ -505,6 +505,26 @@ rather than a locally reproduced repair: ten runs at `GOMAXPROCS=1` under a
 saturated four-core box reproduce neither the old failure nor a new one, so CI
 remains the real test.
 
+**Windows answers a releasing lock with "Access is denied".** With the stale
+window fixed, `TestSlowModifyKeepsItsLock` failed on `windows-latest` instead,
+on a waiter whose open of the lock path returned a permission error. It is not
+a permission problem. Windows keeps a file alive until its last handle closes:
+`os.Remove` on a file something still has open marks it delete-pending, and
+every open in that window answers `ERROR_ACCESS_DENIED` rather than "file
+exists". `acquire` treated anything that was not `os.ErrExist` as fatal, so a
+waiter that arrived while the previous holder was letting go failed outright
+instead of retrying.
+
+The handle was our own: `release` closed the heartbeat's `done` channel and
+went straight to `os.Remove`, leaving a beat already inside `os.Chtimes` racing
+the unlink. So both halves are fixed. `release` now waits for the heartbeat
+goroutine to exit before touching the file, which also stops a late beat from
+refreshing a successor's lock; and `acquire` treats a permission error as a
+busy lock on Windows only, retrying to the deadline and surfacing the error if
+it never clears, so a genuinely unwritable path still says so rather than
+spinning. The Unix path is unchanged: there an unlink takes effect at once and
+this state does not exist.
+
 ## Known deviations from pi (unchanged)
 
 - Compat travels on options structs, with `Model.RawCompat` as the fallback.

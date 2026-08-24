@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -155,6 +156,63 @@ func TestLiveHolderIsNotReclaimed(t *testing.T) {
 	}
 	if owner.PID != os.Getpid() {
 		t.Fatalf("owner.PID = %d, want %d", owner.PID, os.Getpid())
+	}
+}
+
+// TestReleaseStopsTheHeartbeatBeforeReturning covers the window between asking
+// the heartbeat to stop and it actually stopping. A beat that lands after
+// release has returned touches a lock file this process no longer owns -- on
+// Windows it also holds the handle that turns the unlink into a delete-pending
+// state, where every waiter's open answers "Access is denied" on a lock nobody
+// holds.
+func TestReleaseStopsTheHeartbeatBeforeReturning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.lock")
+	timing := fast()
+	timing.Heartbeat = time.Millisecond
+
+	release, err := Acquire(path, timing)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	release()
+
+	// Stand in for the successor: a lock file this process must not touch.
+	if err := os.WriteFile(path, []byte("4242 a-different-holder\n"), 0o600); err != nil {
+		t.Fatalf("seed successor lock: %v", err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat successor lock: %v", err)
+	}
+
+	// Long enough that a heartbeat still running would have beaten many times.
+	time.Sleep(100 * timing.Heartbeat)
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat successor lock: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("a released holder's heartbeat touched the successor's lock: %v -> %v",
+			before.ModTime(), after.ModTime())
+	}
+}
+
+// TestDeletePendingIsWindowsOnly pins the classification acquire relies on. A
+// permission error on a lock path means one thing on Windows, where it is how
+// an unlink in progress reports itself, and another everywhere else, where it
+// is a path this process genuinely cannot write and retrying to the deadline
+// would only delay saying so.
+func TestDeletePendingIsWindowsOnly(t *testing.T) {
+	wrapped := &os.PathError{Op: "open", Path: "state.lock", Err: os.ErrPermission}
+	if got, want := deletePending(wrapped), runtime.GOOS == "windows"; got != want {
+		t.Errorf("deletePending(permission) = %v on %s, want %v", got, runtime.GOOS, want)
+	}
+	if deletePending(&os.PathError{Op: "open", Path: "state.lock", Err: os.ErrExist}) {
+		t.Error("deletePending(exists) = true; only a permission error is the pending-unlink case")
+	}
+	if deletePending(nil) {
+		t.Error("deletePending(nil) = true")
 	}
 }
 
