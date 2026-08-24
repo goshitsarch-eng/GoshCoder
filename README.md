@@ -59,10 +59,10 @@ goshcoder providers
 goshcoder models [provider]
 
 # One-shot prompt
-goshcoder run -m anthropic/claude-sonnet-4-5 "explain this repo"
+goshcoder run -m anthropic/claude-sonnet-5 "explain this repo"
 
 # Fullscreen interactive session; the last selected model is remembered
-goshcoder -m openai/gpt-5.1 -tools
+goshcoder -m openai/gpt-5.6-terra -tools
 
 # After the first launch, simply run
 goshcoder
@@ -94,7 +94,7 @@ goshcoder auth login xai      # Grok subscription; device code or browser
 goshcoder auth login meta     # Meta account; mints a Model API key
 
 # The same providers by API key, for a developer account
-goshcoder auth set xai        # then select xai/grok-4.3 or grok-build-0.1
+goshcoder auth set xai        # then select xai/grok-4.6 or grok-build-0.1
 goshcoder auth set meta       # then select meta/muse-spark-1.2
 ```
 
@@ -161,6 +161,14 @@ The built-in catalog covers all bundled models across nine wire protocols:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
+
+Model data is generated from the pi reference into `catalog.json`, which is
+replaced wholesale on every regeneration. Two hand-maintained files sit beside
+it: `catalog_extra.json` adds models the reference does not carry yet, and
+`catalog_overrides.json` corrects fields it carries wrongly -- a context window,
+a price, or the reasoning-effort levels a model accepts. Tests fail once the
+regenerated data catches up with either, so neither file quietly outlives the
+gap it was written for.
 
 Bedrock is reached without the AWS SDK: SigV4 signing and the binary
 event-stream framing are implemented against stdlib crypto.

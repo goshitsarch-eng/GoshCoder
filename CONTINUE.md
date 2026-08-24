@@ -338,7 +338,9 @@ whenever it has an api key. `TestAnthropicHeaderOnlyAuthSendsNoAPIKeyHeader` in
 Meta's models are not in the pi reference, so they live in
 `internal/llm/catalog/catalog_extra.json`, merged in `data.go`.
 `catalog.json` is regenerated wholesale from pi and a hand-edit there would be
-lost. The generated data wins on a collision and
+lost. A model pi *does* carry but describes wrongly is corrected in
+`catalog_overrides.json` instead; see [Model catalog currency and effort
+levels](#model-catalog-currency-and-effort-levels--done). The generated data wins on a collision and
 `TestExtraCatalogIsNotShadowed` fails if pi ever ships the same model, so the
 duplicate is deleted rather than quietly diverging.
 
@@ -371,6 +373,92 @@ afterwards: a login can succeed and inference still answer 403 for an account
 without the plan the endpoint wants. That is xAI's decision, not a client bug.
 `XAI_API_KEY` and `goshcoder auth set xai` remain the route for a developer
 account and are unaffected.
+
+## Model catalog currency and effort levels — done
+
+The catalog was audited against each provider's own documentation on
+2026-08-23. Two kinds of drift showed up, and they need different files.
+
+**Models pi's snapshot predates** go in `catalog_extra.json`, the file that
+already carried Meta and the newer Grok entries:
+
+| Added | Source |
+| --- | --- |
+| `anthropic/claude-mythos-5` | Shares Claude Fable 5's specs and pricing; invitation-only under Project Glasswing, so the entry only resolves for an approved key |
+| `amazon-bedrock/anthropic.claude-opus-5` | The plain inference profile the Anthropic docs list as the Bedrock ID; pi carries only the regional `us.`/`eu.`/`au.`/`jp.`/`global.` ones |
+| `amazon-bedrock/us.xai.grok-4.6`, `global.xai.grok-4.6` | AWS's Grok 4.6 model card. In-Region inference is *not* offered on `bedrock-runtime`, so only the two cross-Region profiles are listed, at their separate rates ($2.20/$6.60/$0.55 Geo, $2.00/$6.00/$0.50 Global) |
+| `google/gemini-3.7-flash`, `google-vertex/gemini-3.7-flash` | GA 2026-08-13, 1M context, 64K output, introductory $0.75/$3.75 |
+| `zai/glm-5.3`, `zai-coding-cn/glm-5.3` | Released 2026-08-18 and on both coding-plan endpoints, so priced at zero like its siblings there |
+| `openrouter/x-ai/grok-4.6`, `z-ai/glm-5.3`, `google/gemini-3.7-flash` | OpenRouter's own model pages |
+| `meta/muse-spark-1.2-contributor` | The contributor tier on the Meta Model API, $0.10/$0.20 |
+
+**Fields pi's snapshot has since got wrong** cannot go there: the generated
+definition wins on a collision by design, so an entry for a model pi already
+ships is ignored. `catalog_overrides.json` patches those in place:
+
+| Overridden | Was | Now |
+| --- | --- | --- |
+| `openai/gpt-5.6-{sol,terra,luna}` context window | 272000 | 1050000 |
+| `openai/gpt-5.6-sol` pricing | $5/$30 | $4/$0.40/$20, long-context tier $8/$0.80/$30 |
+| `google/gemini-3.6-flash`, `google-vertex`, `openrouter` pricing | $1.50/$7.50/$0.15 | $0.75/$3.75/$0.075 |
+| `deepseek/deepseek-v4-{pro,flash}` thinking levels | `low` unsupported | `low` maps to `low`, which DeepSeek documents as a direct value |
+
+An override is a partial model object whose top-level keys replace the
+generated ones **wholesale**: a `thinkingLevelMap` override replaces the whole
+map rather than one level of it, because a null in that map means "unsupported"
+and a key-wise merge could not express removing one. `id` and `provider` are
+refused: they are what the merged catalog is indexed by. The pass runs *before*
+`mergeExtraModels`, so an override can only ever reach pi's data -- a model in
+`catalog_extra.json` is hand-written here and gets edited there instead.
+
+Two tests keep the file honest, the same way `TestExtraCatalogIsNotShadowed`
+keeps the extras honest. `TestOverridesTargetGeneratedModels` fails on an
+override whose target pi does not carry, which would silently do nothing.
+`TestOverridesStillCorrectPi` fails once an override restates what pi already
+says, which is the prompt to delete it after a regeneration.
+
+**Effort levels.** `xhigh` and `max` need an explicit `thinkingLevelMap` entry
+to be offered at all (`GetSupportedThinkingLevels`), so a model that gains one
+stays silently capped until its entry says so. The audit found the Anthropic and
+OpenAI maps already correct -- `max` on Fable 5, Mythos 5, Opus 5/4.8/4.7/4.6
+and Sonnet 5/4.6, `xhigh` on all of those but Opus 4.6 and Sonnet 4.6, both on
+every GPT-5.6 -- and three that were not: Grok 4.6 gained `xhigh` (xAI treats it
+as `high` on 4.5 and earlier, so 4.5 correctly still lacks it), DeepSeek V4 lost
+`low`, and Gemini 3.7 Flash dropped `MINIMAL`, which 3.6 Flash still takes.
+`TestEffortLevelsMatchProviderDocs` pins both halves: the levels each model must
+offer, and the ones it must not, since clamping onto an unsupported level sends
+a value the API rejects or silently demotes.
+
+**Deliberately not added.**
+
+- `gpt-5.6-cyber` and `gemini-3.5-flash-cyber`: exploit-development models behind
+  applicant-vetted programs (OpenAI's Daybreak Red, Google's equivalent), with no
+  public API spec to encode.
+- `claude-mythos-preview`: named in Anthropic's effort docs but with no published
+  specs of its own; Mythos 5's are documented as Fable 5's, the preview's are not.
+- `meta/muse-glimmer-30b`: open weights, not served by the Meta Model API. pi
+  already lists it on the aggregators that do host it.
+- `openai-codex` context windows: still 272000 for the GPT-5.6 family, which
+  matches what the Codex backend reports even after the long-context rollout.
+  Raising it here would only make requests fail further along.
+- Aggregator catalogs beyond OpenRouter's three flagships (`vercel-ai-gateway`,
+  `cloudflare-ai-gateway`, `huggingface`, `azure-openai-responses`): pi
+  regenerates those lists wholesale and they run to hundreds of entries.
+
+**The app's own defaults.** `defaultChatModel` in `cmd/goshcoder/chat.go` names
+a model per provider for the case where nothing is configured and nothing is
+remembered, and that list had aged into `gpt-5.4` / `claude-sonnet-4-5` /
+`gpt-5.1`. It now reads `gpt-5.6-sol` on Codex, `claude-sonnet-5`, and
+`gpt-5.6-terra` on the OpenAI API: the flagship where a subscription is paying
+and the balanced model where tokens are. `kimi-for-coding` stays as it is --
+the name is the plan's own pointer, not a pinned generation. The README's
+examples moved with it.
+
+**Pricing with an expiry.** Two of the corrected rates are promotional and will
+need revisiting rather than keeping: GPT-5.6 Sol's $4/$20 runs at least through
+2026-11-21, and the Gemini 3.6/3.7 Flash introductory rate through 2026-12-31.
+`gpt-5.6-sol`'s `cacheWrite` is the one figure not published at the new price;
+it keeps pi's 1.25x-of-input ratio ($5, $10 on the long-context tier).
 
 ## Windows CI
 

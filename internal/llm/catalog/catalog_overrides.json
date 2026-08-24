@@ -1,0 +1,78 @@
+{
+  "deepseek": {
+    "deepseek-v4-flash": {
+      "thinkingLevelMap": {
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "max": "max"
+      }
+    },
+    "deepseek-v4-pro": {
+      "thinkingLevelMap": {
+        "minimal": null,
+        "low": "low",
+        "medium": null,
+        "high": "high",
+        "max": "max"
+      }
+    }
+  },
+  "google": {
+    "gemini-3.6-flash": {
+      "cost": {
+        "input": 0.75,
+        "output": 3.75,
+        "cacheRead": 0.075,
+        "cacheWrite": 0
+      }
+    }
+  },
+  "google-vertex": {
+    "gemini-3.6-flash": {
+      "cost": {
+        "input": 0.75,
+        "output": 3.75,
+        "cacheRead": 0.075,
+        "cacheWrite": 0
+      }
+    }
+  },
+  "openai": {
+    "gpt-5.6-luna": {
+      "contextWindow": 1050000
+    },
+    "gpt-5.6-sol": {
+      "contextWindow": 1050000,
+      "cost": {
+        "input": 4,
+        "output": 20,
+        "cacheRead": 0.4,
+        "cacheWrite": 5,
+        "tiers": [
+          {
+            "inputTokensAbove": 272000,
+            "input": 8,
+            "output": 30,
+            "cacheRead": 0.8,
+            "cacheWrite": 10
+          }
+        ]
+      }
+    },
+    "gpt-5.6-terra": {
+      "contextWindow": 1050000
+    }
+  },
+  "openrouter": {
+    "google/gemini-3.6-flash": {
+      "cost": {
+        "input": 0.75,
+        "output": 3.75,
+        "cacheRead": 0.075,
+        "cacheWrite": 0.04167
+      }
+    }
+  }
+}
