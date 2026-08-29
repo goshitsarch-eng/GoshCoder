@@ -193,7 +193,7 @@ function Install-FromSource {
         if ($LASTEXITCODE -ne 0 -or -not $ver) {
             $short = & git rev-parse --short HEAD 2>$null
             if (-not $short) { $short = 'unknown' }
-            $ver = "0.4.0-dev+$short"
+            $ver = "0.5.0-dev+$short"
         }
         $commit = & git rev-parse HEAD 2>$null
         if (-not $commit) { $commit = '' }
