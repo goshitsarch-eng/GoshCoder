@@ -17,7 +17,7 @@ GO_MIN_VERSION := 1.26.6
 # version with the short revision appended, so no build ever claims to be a
 # release it is not.
 VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
-	|| printf '0.3.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
+	|| printf '0.5.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
 
 # Release archives are named without the tag's leading "v", which is what both
