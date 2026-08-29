@@ -51,6 +51,10 @@ type Catalog struct {
 	// distinguish "no credential" from "your login expired".
 	oauthMu     sync.Mutex
 	oauthErrors map[string]error
+	// apertureState caches the Aperture gateway routing for this catalog view
+	// (see aperture.go); one Providers() enumeration reads the files once.
+	apertureOnce  sync.Once
+	apertureState *ApertureState
 }
 
 // NewCatalog returns a catalog over the builtin model data. credentials may be
@@ -142,6 +146,22 @@ func (c *Catalog) Provider(id string) *Provider {
 			}
 		}
 	}
+	if id == "aperture" {
+		// Native pi-ts-aperture dedicated mode: models come from the
+		// synchronized gateway snapshot, so they load instantly on startup
+		// even offline. Empty until the first /aperture sync (or session
+		// refresh) lands, or when the cache was built for a different
+		// gateway, provider selection, or api override set.
+		if models, baseURL := c.apertureDedicatedModels(); baseURL != "" {
+			provider.BaseURL = baseURL
+			provider.models = models
+		}
+	} else {
+		// Native pi-ts-aperture proxy mode: reroute this provider through the
+		// gateway when configured (base URL, api override, gateway model
+		// filter), keeping its own model definitions otherwise.
+		c.applyApertureProxy(provider)
+	}
 	return provider
 }
 
@@ -213,6 +233,32 @@ func (c *Catalog) resolveAuth(providerID, overrideKey string) (*Auth, bool) {
 			return nil, false
 		}
 		return c.buildAPIKeyAuth(providerID, config, &Credential{Type: "api_key", Key: overrideKey}, "override")
+	}
+
+	// The dedicated aperture provider is gateway-authenticated: Aperture
+	// injects the upstream credential server-side, so there is no user key to
+	// check for and the provider always counts as configured while a gateway
+	// is set up (dedicated/provider.ts auth).
+	if providerID == "aperture" {
+		if state := c.loadApertureState(); state.Configured && state.Resolved.DedicatedEnabled {
+			return &Auth{APIKey: "-", Source: "aperture gateway"}, true
+		}
+		return nil, false
+	}
+
+	// A proxied non-passthrough provider replaces its api-key auth with the
+	// gateway placeholder so it stays surfaced in the model picker without a
+	// local key; a stored OAuth credential still takes precedence
+	// (proxy/runtime.ts wrapped auth).
+	if proxyAuth, proxied := c.apertureProxyAuth(providerID); proxied {
+		if c.credentials != nil {
+			if stored, err := c.credentials.Read(providerID); err == nil && stored != nil && stored.Type == "oauth" && config.oauth {
+				if auth, ok := c.resolveOAuth(providerID, stored); ok {
+					return auth, true
+				}
+			}
+		}
+		return proxyAuth, true
 	}
 
 	// A stored credential owns the provider: no ambient fallback when one

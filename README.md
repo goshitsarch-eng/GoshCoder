@@ -184,6 +184,8 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `internal/webaccess` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
 | `internal/omniroute` | OmniRoute setup, public catalog synchronization, and metadata normalization |
+| `internal/aperture` | Tailscale Aperture gateway: config and migrations, dedicated catalog, proxy routing, connector tools |
+| `internal/computeruse` | computer-use-linux desktop control: binary discovery, mcp.json upkeep, stdio MCP client, `mcp` tool |
 | `internal/btw` | Ephemeral context-aware side threads and settings |
 | `internal/ralph` | Long-running iterative development loops |
 | `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
@@ -280,6 +282,76 @@ is recorded in [`NOTICE`](NOTICE).
   `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
   begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
   local git review needs only `git`.
+- [`@aliou/pi-ts-aperture`](https://github.com/aliou/pi-ts-aperture) by Aliou
+  Diallo — **Aperture (Tailscale)** (native adaptation of version 0.14.1):
+  route LLM providers and connector tools through
+  [Tailscale Aperture](https://tailscale.com/docs/features/aperture), a managed
+  AI gateway on your tailnet, so GoshCoder never needs upstream provider
+  credentials. All three capabilities are adapted:
+
+  - **Dedicated** (default): a standalone `aperture` provider whose models come
+    from the gateway, filtered per provider, each routed through the API
+    auto-picked from the gateway's compatibility map or a per-provider `api`
+    override (falling back to auto with a warning when the gateway stops
+    serving it). Model ids are provider-qualified except on APIs that embed the
+    id in the URL (Gemini, Vertex, Bedrock), which get bare ids; Anthropic and
+    Codex register the gateway root, Bedrock `/bedrock`, Gemini `/v1beta`, and
+    OpenAI-shaped providers `/v1` unless their upstream ends in a non-`/v1`
+    version segment. Capabilities come from the first source that knows the
+    model — GoshCoder's catalog, then [models.dev](https://models.dev), then
+    safe defaults — and costs come from the gateway. The catalog is cached
+    (`extensions/aperture-cache.json`) under a gateway/selection identity key,
+    so models load instantly on startup, even offline.
+  - **Proxy**: reroute existing providers through Aperture, keeping their own
+    model definitions; only the base URL, credentials, and headers are
+    overridden, requests carry the provider-qualified model id, passthrough
+    (`auth_mode`) providers keep sending real credentials, optional gateway
+    model checks warn about locally configured models the gateway is missing,
+    and `keepGatewayModelsOnly` hides them from the picker entirely.
+  - **Connectors**: gateway MCP tools surface either as the four discovery
+    meta-tools (`aperture_connector_list`, `..._tool_search`,
+    `..._tool_describe`, `..._tool_call`) that keep tool schemas out of the
+    system prompt, or as pinned first-class tools
+    (`/aperture pin <tool>`), with large responses overflowing to a temp file.
+
+  `/aperture onboarding` (also `/aperture:onboarding`) is the first-run wizard
+  — URL with inline health check, capability choice, provider selection, recap
+  — and `/aperture settings` (also `/aperture:settings`) shows or changes
+  every setting, including per-provider toggles and API overrides. `/aperture
+  sync`, `status`, `providers`, and `connectors` cover refresh and
+  diagnostics; the catalog also revalidates in the background at session
+  start. Config lives in pi's `extensions/aperture.json`, including the
+  original's content-gated migrations from its pre-0.6 shapes. Requests
+  carry the live session id in `x-session-id` for the Aperture dashboard; the
+  `Referer` names this repository rather than the original's `https://pi.dev`.
+  Transient "Aperture is restarting" failures are tagged so the standard
+  auto-retry recovers them. Not ported: the panel-based settings/onboarding
+  TUI (GoshCoder uses prompts and subcommands) and pi's models-store cache
+  file (a sibling cache file with the same identity-key semantics is used
+  instead).
+- [`@agent-sh/computer-use-linux`](https://github.com/agent-sh/computer-use-linux)
+  by Avi Fenesh — **Desktop control / Screenshots** (native adaptation of
+  version 0.4.10): Linux desktop observation and control through the
+  `computer-use-linux` MCP server — accessibility trees, window targeting,
+  screenshots, and input synthesis. The upstream pi extension registers the
+  server into `mcp.json` for the separate `pi-mcp-adapter`; GoshCoder has no
+  adapter package, so the whole chain is native: the same binary discovery
+  order (`COMPUTER_USE_LINUX_BIN`, then `PATH`, then `~/.local/bin` — the
+  npm-bundle-relative probe has no native equivalent), the same
+  pi-compatible `mcp.json` maintenance (other entries preserved; malformed
+  files reported, never overwritten), a stdio MCP client speaking the rmcp
+  2024-11-05 protocol, and an `mcp` tool covering the documented call shapes:
+  `mcp({server: "computer-use-linux"})`, `mcp({search: "windows"})`, and
+  `mcp({tool: "computer_use_linux_screenshot", args: {...}})`. Screenshots
+  return as inline images the model can see; upstream tool annotations are
+  surfaced as read-only/mutating/destructive markers; desktop calls run
+  sequentially because input is stateful. The bundled skill's operating
+  procedure (doctor first, semantic targeting, explicit input targets,
+  re-check after mutations) is folded into the tool description. Linux only,
+  like the upstream package; the server binary itself is not bundled —
+  install it with `npm install -g @agent-sh/computer-use-linux` or `cargo
+  install computer-use-linux` and check readiness with
+  `computer-use-linux doctor`.
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,

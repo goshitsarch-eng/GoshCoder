@@ -66,6 +66,26 @@ func OmniRoutePath() string { return filepath.Join(AgentDir(), "omniroute.json")
 // BTWPath stores the native pi-btw model and thinking preferences.
 func BTWPath() string { return filepath.Join(AgentDir(), "pi-btw.json") }
 
+// AperturePath stores the native Tailscale Aperture configuration. The file
+// lives under extensions/ because that is where @aliou/pi-ts-aperture keeps
+// it (~/.pi/agent/extensions/aperture.json), so an agent directory pointed at
+// pi reads and writes the same file.
+func AperturePath() string { return filepath.Join(AgentDir(), "extensions", "aperture.json") }
+
+// ApertureCachePath stores the synchronized Aperture dedicated catalog and
+// gateway snapshot. pi keeps the equivalent snapshot in its models store; the
+// shape here is GoshCoder's own, so it uses a sibling file rather than
+// overloading aperture.json (upstream migrated cached models out of the
+// config file on purpose).
+func ApertureCachePath() string {
+	return filepath.Join(AgentDir(), "extensions", "aperture-cache.json")
+}
+
+// MCPConfigPath is the agent-level MCP server registry
+// (pi-mcp-adapter-compatible mcp.json) that the native computer-use-linux
+// adaptation maintains.
+func MCPConfigPath() string { return filepath.Join(AgentDir(), "mcp.json") }
+
 // SessionsDir returns the root holding persisted session logs. Sessions are
 // sharded beneath it by a cwd-derived directory name; see internal/sessionlog.
 func SessionsDir() string { return filepath.Join(AgentDir(), "sessions") }

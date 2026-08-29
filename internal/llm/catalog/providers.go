@@ -121,6 +121,15 @@ var builtinProviderConfigs = map[string]builtinProviderConfig{
 		name: "Anthropic", baseURL: "https://api.anthropic.com",
 		keyName: "Anthropic API key", kind: AuthAnthropic, oauth: true,
 	},
+	// Native @aliou/pi-ts-aperture adaptation: the standalone gateway
+	// provider. It has no builtin models or key; its base URL and model list
+	// come from extensions/aperture.json and the synchronized gateway
+	// snapshot, resolved in Provider(). The gateway injects upstream
+	// credentials server-side, so auth resolution reports a placeholder key
+	// whenever the gateway is configured (resolve.go).
+	"aperture": {
+		name: "Aperture", keyName: "Aperture gateway",
+	},
 	"azure-openai-responses": {
 		name:    "Azure OpenAI",
 		keyName: "Azure OpenAI API key", envKeys: []string{"AZURE_OPENAI_API_KEY"},
