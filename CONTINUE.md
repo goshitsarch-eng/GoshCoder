@@ -179,6 +179,26 @@ The requested extension features are now native:
   `/omni setup|sync|status|dashboard`, dynamically discovered models in
   `/model` and Ctrl+P, normalized metadata, and prompt-emulated tools for
   web/chat-only models. Config is `omniroute.json`; auth stays in `auth.json`.
+- **Aperture** (`internal/aperture`, `internal/llm/catalog/aperture.go`,
+  `cmd/goshcoder/aperture*.go`): native `@aliou/pi-ts-aperture` 0.14.1
+  adaptation. `/aperture onboarding|settings|sync|status|providers|connectors|
+  pin|unpin` (colon-form aliases kept); dedicated `aperture` provider built
+  from the gateway with metadata layering (catalog → models.dev → defaults,
+  gateway pricing on top) and an identity-keyed offline cache; proxy rewrites
+  applied at catalog read time with per-request model-id qualification and
+  `Referer`/`x-session-id` headers in `streamAuthenticated`; connector
+  discovery meta-tools plus pinned tools registered from a background
+  session-start fetch (`SetTools` after the gateway answers). Config is pi's
+  `extensions/aperture.json` including its migrations; the snapshot cache is
+  GoshCoder's own `extensions/aperture-cache.json` because upstream keeps it
+  in pi's models store.
+- **computer-use-linux** (`internal/computeruse`): native
+  `@agent-sh/computer-use-linux` 0.4.10 adaptation — binary discovery, the
+  extension's pi-compatible `mcp.json` upkeep, a newline-delimited stdio
+  JSON-RPC MCP client, and the `mcp` proxy tool (list/search/call with
+  `computer_use_linux_` prefixed names, screenshots as inline images,
+  sequential execution). Registered with the coding tools on Linux only; the
+  Rust server binary is the user's install, never bundled.
 - **BTW** (`internal/btw`): native ephemeral side threads with main-transcript
   context, follow-ups, queued Steering, session-memory resume, dedicated
   fullscreen view, independent model/thinking settings, and latest-answer

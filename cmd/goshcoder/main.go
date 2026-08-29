@@ -40,6 +40,8 @@ Usage:
   goshcoder auth logout <provider>   Remove a stored credential
   goshcoder omni [status|sync|setup|dashboard]
                                      Manage an OmniRoute gateway
+  goshcoder aperture [status|onboarding|settings|sync|providers|connectors|pin|unpin]
+                                     Route providers through Tailscale Aperture
   goshcoder ralph list [--archived]  List ralph loops
   goshcoder ralph status             Show the active ralph loop
   goshcoder ralph resume <name>      Reactivate a paused loop
@@ -132,6 +134,8 @@ func main() {
 		err = authCommand(args)
 	case "omni":
 		err = omniCommand(args)
+	case "aperture":
+		err = apertureCommand(args)
 	case "ralph":
 		err = ralphCommand(args)
 	case "sessions":

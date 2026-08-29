@@ -65,6 +65,24 @@ omniroute-agent-extension — OmniRoute
   https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw
   Copyright (c) 2026 narumiruna — MIT License
 
+@aliou/pi-ts-aperture — Aperture (Tailscale)
+  Aliou Diallo — https://github.com/aliou/pi-ts-aperture
+  MIT License, declared in the package manifest (version 0.14.1); the
+  repository publishes no separate licence file, so the MIT text below
+  applies per that declaration.
+  Tailscale and Aperture are products of Tailscale Inc.; the adaptation
+  talks to a user-operated Aperture gateway and bundles nothing of
+  Tailscale's.
+
+@agent-sh/computer-use-linux — Desktop control / Screenshots
+  Avi Fenesh (agent-sh) — https://github.com/agent-sh/computer-use-linux
+  Copyright (c) 2026 Avi Fenesh — MIT License
+  The adaptation covers the package's pi extension, its mcp.json
+  registration, and an MCP client for the computer-use-linux server. The
+  Rust MCP server binary itself is NOT bundled: users install it from the
+  upstream npm package, crates.io, or its release binaries, under its own
+  licence.
+
 
 Third-party Go dependencies
 ---------------------------

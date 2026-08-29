@@ -38,6 +38,7 @@ const chatHelp = `Slash commands:
   /model [ref]          Show or switch the model
   /login [provider]     Add an OAuth or API-key provider (keeps existing logins)
   /omni [command]       Setup, sync, inspect, or open OmniRoute
+  /aperture [command]   Route providers and connector tools through Tailscale Aperture
   /btw [question]       Ask in an ephemeral, context-aware side thread
   /thinking [level]     Show or set the thinking level
   /system [text]        Show or replace the system prompt
@@ -308,6 +309,8 @@ func userMessage(text string) llm.UserMessage {
 // validator can read the real thing: a saved prompt called "plannotator" would
 // otherwise shadow an alias that still works, and a copied list would drift.
 var chatCommandAliases = map[string]string{
+	"/aperture:onboarding":  "/aperture onboarding",
+	"/aperture:settings":    "/aperture settings",
 	"/plannator":            "/planner",
 	"/plannotator":          "/planner",
 	"/plannotator-review":   "/planner-review",
@@ -320,8 +323,15 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 	command, rest, _ := strings.Cut(input, " ")
 	rest = strings.TrimSpace(rest)
 	// Preserve the old upstream command names as hidden compatibility aliases.
+	// An alias may expand to a command plus a leading subcommand
+	// (/aperture:settings -> /aperture settings).
 	if canonical, ok := chatCommandAliases[command]; ok {
-		command = canonical
+		if name, subcommand, hasSubcommand := strings.Cut(canonical, " "); hasSubcommand {
+			command = name
+			rest = strings.TrimSpace(subcommand + " " + rest)
+		} else {
+			command = canonical
+		}
 	}
 
 	switch command {
@@ -367,6 +377,13 @@ func (s *session) handleSlashCommand(input string) (exit bool, err error) {
 
 	case "/omni":
 		output, commandErr := runOmniCommand(context.Background(), strings.Fields(rest), true)
+		if output != "" {
+			fmt.Fprintln(os.Stderr, output)
+		}
+		return false, commandErr
+
+	case "/aperture":
+		output, commandErr := runApertureCommand(context.Background(), strings.Fields(rest), true)
 		if output != "" {
 			fmt.Fprintln(os.Stderr, output)
 		}

@@ -732,6 +732,13 @@ func (model *fullscreenModel) submitInput(streaming bool) tea.Cmd {
 		model.activityAt = time.Now()
 		return fullscreenOmniSetupCommand()
 	}
+	if prompt == "/aperture onboarding" || prompt == "/aperture setup" ||
+		prompt == "/aperture:onboarding" {
+		model.busyCommand = true
+		model.activity = "Opening Aperture onboarding"
+		model.activityAt = time.Now()
+		return fullscreenApertureOnboardingCommand()
+	}
 
 	if expanded, ok, expandErr := model.session.expandResourceInput(prompt); ok {
 		if expandErr != nil {
@@ -1028,6 +1035,17 @@ func fullscreenOmniSetupCommand() tea.Cmd {
 	})
 }
 
+func fullscreenApertureOnboardingCommand() tea.Cmd {
+	executable, err := os.Executable()
+	if err != nil {
+		return func() tea.Msg { return fullscreenCommandFinished{result: fullscreenResult{err: err}} }
+	}
+	command := exec.Command(executable, "aperture", "onboarding")
+	return tea.ExecProcess(command, func(err error) tea.Msg {
+		return fullscreenCommandFinished{result: fullscreenResult{err: err, output: map[bool]string{true: "Aperture onboarding finished.", false: ""}[err == nil]}}
+	})
+}
+
 func fullscreenLoginCommand(providerID string) tea.Cmd {
 	provider := newCatalog().Provider(providerID)
 	if provider == nil {
@@ -1088,6 +1106,7 @@ func fullscreenCommandRunsAsync(prompt string) bool {
 		command == "/tree" || command == "/fork" || command == "/clone" ||
 		command == "/export" || command == "/import" ||
 		(command == "/omni" && len(fields) > 1 && fields[1] != "setup") ||
+		(command == "/aperture" && !(len(fields) > 1 && (fields[1] == "onboarding" || fields[1] == "setup"))) ||
 		command == "/planner-review" || command == "/planner-annotate" || command == "/planner-last" ||
 		command == "/plannotator-review" || command == "/plannotator-annotate" || command == "/plannotator-last" ||
 		(command == "/ralph" && len(fields) > 1 && fields[1] == "start")
@@ -1280,6 +1299,29 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 		}
 		return suggestions
 	}
+	if strings.HasPrefix(lower, "/aperture ") {
+		query := strings.TrimSpace(strings.TrimPrefix(lower, "/aperture "))
+		if strings.ContainsAny(query, " \t\n") {
+			return nil
+		}
+		commands := []fullscreenSuggestion{
+			{label: "status", description: "Check gateway health and capabilities", value: "/aperture status", execute: true},
+			{label: "sync", description: "Refresh the dedicated catalog and gateway snapshot", value: "/aperture sync", execute: true},
+			{label: "onboarding", description: "First-time setup for Tailscale Aperture integration", value: "/aperture onboarding", execute: true},
+			{label: "settings", description: "Show or change connection, capabilities, providers, and pins", value: "/aperture settings", execute: true},
+			{label: "providers", description: "List gateway providers and routable APIs", value: "/aperture providers", execute: true},
+			{label: "connectors", description: "List MCP connectors and gateway tools", value: "/aperture connectors", execute: true},
+			{label: "pin", description: "Pin a connector tool first-class", value: "/aperture pin ", execute: false},
+			{label: "unpin", description: "Unpin a connector tool", value: "/aperture unpin ", execute: false},
+		}
+		var suggestions []fullscreenSuggestion
+		for _, command := range commands {
+			if strings.HasPrefix(command.label, query) {
+				suggestions = append(suggestions, command)
+			}
+		}
+		return suggestions
+	}
 	if strings.HasPrefix(lower, "/btw ") {
 		query := strings.TrimSpace(strings.TrimPrefix(lower, "/btw "))
 		if strings.ContainsAny(query, " \t\n") {
@@ -1353,7 +1395,7 @@ func fullscreenSuggestionsWithModels(session *session, input string, models []fu
 			value: command.name, execute: true,
 		}
 		switch command.name {
-		case "/model", "/login", "/omni", "/btw", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
+		case "/model", "/login", "/omni", "/aperture", "/btw", "/thinking", "/ralph", "/planner-annotate", "/steer", "/followup":
 			item.value += " "
 			item.execute = false
 		}
@@ -1559,6 +1601,9 @@ func fullscreenSuggestionTitle(input string) string {
 	}
 	if strings.HasPrefix(lower, "/omni ") {
 		return "OMNIROUTE  ·  setup, synchronize, and inspect the gateway"
+	}
+	if strings.HasPrefix(lower, "/aperture ") {
+		return "APERTURE  ·  route providers and connectors through your tailnet"
 	}
 	if strings.HasPrefix(lower, "/btw ") {
 		return "BTW  ·  ephemeral side questions that do not pollute main context"

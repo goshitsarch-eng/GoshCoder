@@ -94,6 +94,9 @@ type session struct {
 	loopTools  []agent.Tool
 	claudeTUI  bool
 	fullscreen bool
+	// extras carries the native Aperture connector tools and the
+	// computer-use-linux desktop session (see aperture_session.go).
+	extras apertureExtras
 
 	// log records the conversation to disk. It is nil only when -no-session
 	// was given, and every call site tolerates that rather than branching.
@@ -174,6 +177,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 			agentTools = append(workspace.All(), webaccess.New(
 				config.WebSearchPath(), resolveOpenAIWebSearchAuth,
 			).Tool())
+			// Native computer-use-linux adaptation: the desktop mcp proxy
+			// tool, registered when the server binary is discoverable.
+			agentTools = append(agentTools, s.desktopMCPTool(cfg.Quiet)...)
 		}
 		if !cfg.Quiet && cfg.EnableTools {
 			// The bash tool runs arbitrary commands with the user's privileges.
@@ -317,6 +323,9 @@ func newSession(cfg sessionConfig) (*session, error) {
 	if cfg.SessionName != "" && s.log != nil {
 		s.log.setName(cfg.SessionName)
 	}
+	// Native Aperture adaptation: onboarding notice, background catalog
+	// refresh, and connector tool registration.
+	s.apertureSessionStart(cfg.EnableTools)
 	return s, nil
 }
 
@@ -396,7 +405,16 @@ func (s *session) streamAuthenticated(model *llm.Model, request *llm.Context, op
 		}
 		return errorStream(model, fmt.Sprintf("provider %q has no credentials configured", model.Provider))
 	}
-	return authStreamFn(auth)(model, request, options)
+	// Native Aperture adaptation: gateway-routed requests carry the
+	// provider-qualified model id and the provenance headers, and transient
+	// gateway errors are tagged retryable (aperture_session.go).
+	apertureState := models.ApertureState()
+	routedModel := apertureRequestModel(apertureState, model, s.apertureSessionID())
+	stream := authStreamFn(auth)(routedModel, request, options)
+	if routedModel != model {
+		stream = markApertureRetryable(stream)
+	}
+	return stream
 }
 
 // sessionNotice is one message raised for the user from background work.
@@ -506,6 +524,7 @@ func (s *session) close() error {
 			firstErr = err
 		}
 	}
+	s.extras.close()
 	return firstErr
 }
 
@@ -649,15 +668,15 @@ func (s *session) planRuntimeTools() []agent.Tool {
 	// unregistered for the rest of the session even though the system prompt
 	// still instructs the model to call it.
 	if s.plan == nil || s.workspace == nil {
-		return mergeTools(s.normalTools, s.loopTools)
+		return mergeTools(s.normalTools, s.loopTools, s.extras.tools())
 	}
 	switch s.plan.State().Phase {
 	case plannotator.PhasePlanning:
-		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}, s.loopTools)
+		return mergeTools(withoutTool(s.normalTools, "bash"), s.workspace.Planning(), []agent.Tool{s.plan.Tool()}, s.loopTools, s.extras.tools())
 	case plannotator.PhaseExecuting:
-		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}, s.loopTools)
+		return mergeTools(s.normalTools, s.workspace.All(), []agent.Tool{s.plan.Tool()}, s.loopTools, s.extras.tools())
 	default:
-		return mergeTools(s.normalTools, s.loopTools)
+		return mergeTools(s.normalTools, s.loopTools, s.extras.tools())
 	}
 }
 
