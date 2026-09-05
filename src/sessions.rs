@@ -8,7 +8,7 @@ use std::{
     error::Error,
     fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -17,6 +17,7 @@ use time::{OffsetDateTime, format_description::FormatItem, macros::format_descri
 use crate::{
     config,
     llm::{self, ContentBlock},
+    session::ExportFormat,
     sessionlog::{self, ListOptions, SessionInfo, Store, Tree},
 };
 
@@ -26,11 +27,45 @@ const SECOND_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
 
 pub fn command(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let (sessions_dir, args) = parse_store_options(args)?;
     let cwd = std::env::current_dir()?;
-    let store = Store::new(config::sessions_dir());
+    let store = Store::new(sessions_dir.unwrap_or_else(config::sessions_dir));
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     run(&store, &cwd, args, &mut stdout, &mut stderr)
+}
+
+/// Parses options that select the session store before its subcommand.
+///
+/// `sessions --sessions-dir <path> list` must target the same custom root as
+/// a chat session opened with `-sessions-dir <path>`.
+fn parse_store_options(args: &[String]) -> Result<(Option<PathBuf>, &[String]), Box<dyn Error>> {
+    let mut sessions_dir = None;
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        let value = match argument.as_str() {
+            "--sessions-dir" | "-sessions-dir" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("sessions --sessions-dir needs a path".into());
+                };
+                value.as_str()
+            }
+            _ => match argument
+                .strip_prefix("--sessions-dir=")
+                .or_else(|| argument.strip_prefix("-sessions-dir="))
+            {
+                Some(value) => value,
+                None => break,
+            },
+        };
+        if sessions_dir.is_some() {
+            return Err("sessions --sessions-dir can be supplied only once".into());
+        }
+        sessions_dir = Some(config::expand_tilde(value));
+        index += 1;
+    }
+    Ok((sessions_dir, &args[index..]))
 }
 
 /// Runs a session command against an explicit store. Keeping the command
@@ -181,7 +216,7 @@ fn show(
         )?;
     }
     writeln!(output)?;
-    render_transcript(&tree, full, output)?;
+    render_transcript(&tree, full, diagnostics)?;
     Ok(())
 }
 
@@ -218,22 +253,15 @@ fn export(
     output: &mut dyn Write,
     diagnostics: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    let mut format = ExportFormat::Jsonl;
-    let mut reference = None;
-    let mut destination = None;
-    for argument in args {
-        match argument.as_str() {
-            "--jsonl" | "-jsonl" => format = ExportFormat::Jsonl,
-            "--md" | "-md" | "--markdown" => format = ExportFormat::Markdown,
-            _ if reference.is_none() => reference = Some(argument.as_str()),
-            _ if destination.is_none() => destination = Some(argument.as_str()),
-            _ => return Err("sessions export takes one session and one output path".into()),
-        }
-    }
-    let reference = reference
-        .ok_or_else(|| "sessions export needs a session id, prefix, or path".to_owned())?;
+    let options = parse_export_options(args);
+    let (reference, destination) = match options.values.as_slice() {
+        [] => return Err("sessions export needs a session id, prefix, or path".into()),
+        [reference] => (reference.as_str(), None),
+        [reference, destination] => (reference.as_str(), Some(destination.as_str())),
+        _ => return Err("sessions export takes one session and one output path".into()),
+    };
     let info = store.resolve(cwd, reference)?;
-    let content = match format {
+    let content = match options.format {
         ExportFormat::Jsonl => fs::read(&info.path)?,
         ExportFormat::Markdown => {
             let (tree, header, _) = store.load(&info.path)?;
@@ -348,10 +376,25 @@ fn gc(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum ExportFormat {
-    Jsonl,
-    Markdown,
+/// Parses the representation flags and positional values accepted by
+/// `sessions export` and the interactive `/export` command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportOptions {
+    pub format: ExportFormat,
+    pub values: Vec<String>,
+}
+
+pub fn parse_export_options(args: &[String]) -> ExportOptions {
+    let mut format = ExportFormat::Jsonl;
+    let mut values = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--jsonl" | "-jsonl" => format = ExportFormat::Jsonl,
+            "--md" | "-md" | "--markdown" => format = ExportFormat::Markdown,
+            _ => values.push(argument.clone()),
+        }
+    }
+    ExportOptions { format, values }
 }
 
 fn render_transcript(tree: &Tree, full: bool, output: &mut dyn Write) -> io::Result<()> {
@@ -592,7 +635,7 @@ mod tests {
             &mut diagnostics,
         )
         .expect("show");
-        assert!(String::from_utf8_lossy(&output).contains("transcript"));
+        assert!(String::from_utf8_lossy(&diagnostics).contains("transcript"));
 
         let export_path = root.join("session.md");
         run(
@@ -622,5 +665,36 @@ mod tests {
         assert!(age_cutoff("6w").is_ok());
         assert!(age_cutoff("30").is_err());
         assert!(age_cutoff("tomorrow").is_err());
+    }
+
+    #[test]
+    fn store_and_export_options_preserve_cli_positional_arguments() {
+        let arguments = [
+            "--sessions-dir".to_owned(),
+            "/tmp/custom-sessions".to_owned(),
+            "export".to_owned(),
+            "--md".to_owned(),
+            "session-id".to_owned(),
+            "out.md".to_owned(),
+        ];
+        let (sessions_dir, rest) = parse_store_options(&arguments).expect("parse store options");
+        assert_eq!(sessions_dir, Some(PathBuf::from("/tmp/custom-sessions")));
+        assert_eq!(
+            rest,
+            [
+                "export".to_owned(),
+                "--md".to_owned(),
+                "session-id".to_owned(),
+                "out.md".to_owned()
+            ]
+        );
+
+        assert_eq!(
+            parse_export_options(&rest[1..]),
+            ExportOptions {
+                format: ExportFormat::Markdown,
+                values: vec!["session-id".to_owned(), "out.md".to_owned()],
+            }
+        );
     }
 }

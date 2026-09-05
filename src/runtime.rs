@@ -777,7 +777,7 @@ fn parse_session_flags(arguments: &[String], config: &mut SessionConfig) -> Resu
             "C" => config.workdir = PathBuf::from(next_value()?),
             "session" => config.session_ref = Some(next_value()?),
             "name" => config.session_name = Some(next_value()?),
-            "sessions-dir" => config.sessions_dir = Some(PathBuf::from(next_value()?)),
+            "sessions-dir" => config.sessions_dir = Some(config::expand_tilde(next_value()?)),
             "tools" => config.enable_tools = bool_value(name, inline_value)?,
             "ralph" => config.enable_ralph = bool_value(name, inline_value)?,
             "planner" | "plan" => config.enable_planner = bool_value(name, inline_value)?,

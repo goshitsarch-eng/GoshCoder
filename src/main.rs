@@ -70,7 +70,8 @@ Usage:
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
   goshcoder ralph <subcommand>       Manage Ralph loops
-  goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
+  goshcoder sessions [--sessions-dir <dir>] [subcommand]
+                                     List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
@@ -1531,7 +1532,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1813,6 +1814,8 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
+        "/export" => dispatch_session_export_slash_command(view, prepared, rest, fullscreen),
+        "/import" => dispatch_session_import_slash_command(view, prepared, rest, fullscreen),
         "/resources" => {
             let resources = prepared.resources();
             append_view_message(
@@ -1847,14 +1850,11 @@ fn dispatch_runtime_slash_command(
             CommandDispatch::Handled
         }
         "/resume" if rest.is_empty() => {
-            match list_interactive_sessions(prepared) {
-                Ok(output) => append_view_message(
-                    view,
-                    MessageRole::Command,
-                    format!("{output}\n/resume <id> switches to a listed session."),
-                ),
-                Err(error) => append_view_message(view, MessageRole::Error, error),
-            }
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "/resume needs a session id, prefix, or path",
+            );
             CommandDispatch::Handled
         }
         "/resume" => {
@@ -2026,6 +2026,120 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+fn dispatch_session_export_slash_command(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let arguments = rest
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let options = sessions::parse_export_options(&arguments);
+    let destination = match options.values.as_slice() {
+        [] => None,
+        [destination] => Some(destination.clone()),
+        _ => {
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "usage: /export [--md|--jsonl] [output-path]",
+            );
+            return CommandDispatch::Handled;
+        }
+    };
+    if fullscreen && destination.as_deref().is_none_or(|path| path == "-") {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "give /export a destination path; the fullscreen interface has no console to print to",
+        );
+        return CommandDispatch::Handled;
+    }
+
+    let result = match destination.as_deref() {
+        None | Some("-") => {
+            let content = prepared.runtime.export(options.format);
+            content.and_then(|content| {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(&content)?;
+                stdout.flush()?;
+                Ok(())
+            })
+        }
+        Some(destination) => prepared.runtime.export_to(options.format, destination),
+    };
+    match result {
+        Ok(()) => {
+            view.activity = "Session exported".to_owned();
+            if let Some(destination) = destination.filter(|destination| destination != "-") {
+                let id = prepared
+                    .runtime
+                    .id()
+                    .map(|id| short_id(&id).to_owned())
+                    .unwrap_or_else(|| "session".to_owned());
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    format!("Exported {id} to {destination}."),
+                );
+            }
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn dispatch_session_import_slash_command(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let arguments = rest.split_whitespace().collect::<Vec<_>>();
+    let [source] = arguments.as_slice() else {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "/import needs exactly one .jsonl session path",
+        );
+        return CommandDispatch::Handled;
+    };
+    match prepared.runtime.import_copy(source) {
+        Ok(handle) => {
+            if !fullscreen {
+                let write_result = (|| -> io::Result<()> {
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "{}", handle.path.display())?;
+                    stdout.flush()
+                })();
+                if let Err(error) = write_result {
+                    append_view_message(view, MessageRole::Error, error.to_string());
+                    return CommandDispatch::Handled;
+                }
+            }
+            view.activity = format!("Imported session {}", short_id(&handle.id));
+            let location = if fullscreen {
+                format!("\n{}", handle.path.display())
+            } else {
+                String::new()
+            };
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "Imported as {}.{location}\nUse /resume {} to switch to it.",
+                    short_id(&handle.id),
+                    handle.id
+                ),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
 }
 
 /// Handles `/prompt` and its compatibility alias without writing directly to

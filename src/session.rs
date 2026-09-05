@@ -755,6 +755,24 @@ impl SessionRuntime {
         self.adopt_writer(writer, "imported session")
     }
 
+    /// Copies a session into this runtime's workspace without changing the
+    /// active recorder or the live conversation.
+    ///
+    /// This is the interactive `/import` behavior: importing makes a durable
+    /// session available for a later `/resume`, rather than replacing the
+    /// conversation that issued the command.
+    pub fn import_copy(&self, source: &str) -> Result<SessionHandle> {
+        let source = self.store.resolve(&self.cwd, source)?;
+        let mut writer = self.store.fork(&source, None, &self.cwd)?;
+        let handle = SessionHandle {
+            id: writer.id().to_owned(),
+            path: writer.path().to_path_buf(),
+            read_only: writer.read_only(),
+        };
+        writer.close()?;
+        Ok(handle)
+    }
+
     /// Returns the raw JSONL or a readable Markdown rendering of the current
     /// projected branch.
     pub fn export(&self, format: ExportFormat) -> Result<Vec<u8>> {
@@ -2103,6 +2121,49 @@ mod tests {
         );
 
         close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_copy_keeps_the_current_session_active() {
+        let root = temp_root("import-copy");
+        let source_workspace = root.join("source-workspace");
+        let target_workspace = root.join("target-workspace");
+        let mut source = SessionRuntime::open(options(&root, &source_workspace)).expect("source");
+        source
+            .agent()
+            .prompt("source prompt")
+            .expect("source prompt");
+        let source_path = source.path().expect("source path");
+        close(&mut source);
+
+        let mut target = SessionRuntime::open(options(&root, &target_workspace)).expect("target");
+        target
+            .agent()
+            .prompt("target prompt")
+            .expect("target prompt");
+        let current = target.handle().expect("current handle");
+
+        let imported = target
+            .import_copy(source_path.to_string_lossy().as_ref())
+            .expect("import copy");
+
+        assert_ne!(imported.id, current.id);
+        assert_eq!(target.handle().expect("still current").id, current.id);
+        target
+            .agent()
+            .prompt("current session continues")
+            .expect("continue current");
+        assert!(
+            String::from_utf8_lossy(&fs::read(&current.path).expect("read current"))
+                .contains("current session continues")
+        );
+        assert!(
+            String::from_utf8_lossy(&fs::read(&imported.path).expect("read imported"))
+                .contains("source prompt")
+        );
+
+        close(&mut target);
         let _ = fs::remove_dir_all(root);
     }
 
