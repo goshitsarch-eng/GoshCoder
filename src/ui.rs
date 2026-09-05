@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -47,19 +47,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let regions = if sidebar_width > 0 {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(sidebar_width)])
+            .constraints([
+                Constraint::Min(20),
+                Constraint::Length(1),
+                Constraint::Length(sidebar_width),
+            ])
             .split(area)
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(0)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(0),
+                Constraint::Length(0),
+            ])
             .split(area)
     };
     let main = regions[0];
 
     render_main(frame, main, app);
     if sidebar_width > 0 {
-        render_sidebar(frame, regions[1], &app.sidebar);
+        render_sidebar(frame, regions[2], &app.sidebar);
     }
 }
 
@@ -103,35 +111,63 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
     ]);
     frame.render_widget(header, chunks[0]);
 
-    render_transcript(frame, chunks[1], app);
+    let suggestions = app.suggestions();
+    let visible_suggestions = suggestions.len().min(9) as u16;
+    let palette_height = if visible_suggestions > 0 && chunks[1].height > 3 {
+        (visible_suggestions + 2).min(chunks[1].height.saturating_sub(1))
+    } else {
+        0
+    };
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(palette_height)])
+        .split(chunks[1]);
+    render_transcript(frame, body[0], app);
+    if palette_height > 0 {
+        render_suggestions(frame, body[1], app, &suggestions);
+    }
     render_editor(frame, chunks[2], app, &editor);
     render_status(frame, chunks[3], app);
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let lines = transcript_lines(&app.messages, app.tools_expanded, app.hide_thinking);
+    let max_scroll = lines.len().saturating_sub(area.height as usize);
+    let scroll = usize::from(app.scroll).min(max_scroll);
+    let start = lines
+        .len()
+        .saturating_sub(area.height as usize)
+        .saturating_sub(scroll)
+        .min(u16::MAX as usize) as u16;
     let transcript = Paragraph::new(Text::from(lines))
         .style(Style::default().fg(TEXT).bg(BACKGROUND))
-        .scroll((app.scroll, 0))
+        .scroll((start, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(transcript, area);
+}
 
-    let suggestions = app.suggestions();
+fn render_suggestions(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    suggestions: &[crate::state::Suggestion],
+) {
     if suggestions.is_empty() || area.width < 16 || area.height < 3 {
         return;
     }
-    let popup_height = min(area.height.saturating_sub(1), suggestions.len() as u16 + 2);
-    let popup_width = min(area.width.saturating_sub(4), 72);
-    let popup = Rect {
-        x: area.x.saturating_add(2),
-        y: area
-            .y
-            .saturating_add(area.height.saturating_sub(popup_height)),
-        width: popup_width,
-        height: popup_height,
-    };
-    frame.render_widget(Clear, popup);
-    let items: Vec<ListItem<'_>> = suggestions
+    let item_capacity = area.height.saturating_sub(2) as usize;
+    if item_capacity == 0 {
+        return;
+    }
+    let selected = app
+        .selected_suggestion
+        .min(suggestions.len().saturating_sub(1));
+    let first = selected
+        .saturating_add(1)
+        .saturating_sub(item_capacity)
+        .min(suggestions.len().saturating_sub(item_capacity));
+    let visible = &suggestions[first..suggestions.len().min(first + item_capacity)];
+    let items: Vec<ListItem<'_>> = visible
         .iter()
         .map(|suggestion| {
             let text = format!(
@@ -139,7 +175,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 suggestion.label,
                 truncate(
                     &suggestion.description,
-                    popup.width.saturating_sub(6) as usize
+                    area.width.saturating_sub(6) as usize
                 )
             );
             ListItem::new(Line::from(text))
@@ -161,8 +197,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         )
         .highlight_symbol("▌");
     let mut state = ListState::default();
-    state.select(Some(app.selected_suggestion.min(suggestions.len() - 1)));
-    frame.render_stateful_widget(list, popup, &mut state);
+    state.select(Some(selected.saturating_sub(first)));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow) {
@@ -231,15 +267,54 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_sidebar(frame: &mut Frame, area: Rect, lines: &[SidebarLine]) {
-    let rendered = lines.iter().map(sidebar_line).collect::<Vec<_>>();
+    let rendered = fit_sidebar(lines, area.height as usize)
+        .iter()
+        .map(|line| sidebar_line(line))
+        .collect::<Vec<_>>();
     let sidebar = Paragraph::new(rendered)
         .style(Style::default().bg(PANEL_BACKGROUND))
         .wrap(Wrap { trim: true });
     frame.render_widget(sidebar, area);
 }
 
+fn fit_sidebar<'a>(lines: &'a [SidebarLine], height: usize) -> Vec<&'a SidebarLine> {
+    if height == 0 || lines.len() <= height {
+        return lines.iter().collect();
+    }
+    let mut blank_indices = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, line)| (line.kind == SidebarKind::Blank).then_some(index));
+    let footer_start = blank_indices
+        .nth(1)
+        .unwrap_or_else(|| lines.len().saturating_sub(6));
+    let footer = &lines[footer_start..];
+    if footer.len() >= height {
+        return footer[footer.len() - height..].iter().collect();
+    }
+    let head_budget = height - footer.len();
+    if head_budget <= 1 {
+        return footer.iter().collect();
+    }
+    let mut result = lines[..footer_start.min(head_budget - 1)]
+        .iter()
+        .collect::<Vec<_>>();
+    result.push(&SIDEBAR_ELLIPSIS);
+    result.extend(footer);
+    result
+}
+
+static SIDEBAR_ELLIPSIS: SidebarLine = SidebarLine {
+    kind: SidebarKind::Meta,
+    value: String::new(),
+};
+
 fn sidebar_line(line: &SidebarLine) -> Line<'static> {
     let value = sanitize(&line.value);
+    if matches!(line.kind, SidebarKind::Meta) && value.is_empty() {
+        return Line::from(Span::styled("  …", Style::default().fg(MUTED)));
+    }
     match line.kind {
         SidebarKind::Title | SidebarKind::Section => Line::from(Span::styled(
             format!("  {}", value),
@@ -447,19 +522,60 @@ fn editor_window(input: &str, cursor: usize, width: usize) -> EditorWindow {
     let all_lines: Vec<&str> = input.split('\n').collect();
     let before_cursor = &input[..cursor];
     let cursor_line = before_cursor.bytes().filter(|byte| *byte == b'\n').count();
-    let start = cursor_line.saturating_sub(2);
+    let mut start = cursor_line.saturating_sub(2);
+    if all_lines.len().saturating_sub(start) < 3 {
+        start = all_lines.len().saturating_sub(3);
+    }
     let end = min(all_lines.len(), start + 3);
-    let cursor_column = before_cursor
-        .rsplit('\n')
-        .next()
-        .map_or(0, UnicodeWidthStr::width);
+    let cursor_text = before_cursor.rsplit('\n').next().unwrap_or_default();
+    let (cursor_window, cursor_column) = horizontal_editor_window(cursor_text, width);
     EditorWindow {
         lines: all_lines[start..end]
             .iter()
-            .map(|line| truncate(line, width))
+            .enumerate()
+            .map(|(index, line)| {
+                if start + index == cursor_line {
+                    let suffix = &line[cursor_text.len()..];
+                    let mut value = cursor_window.clone();
+                    append_to_width(&mut value, suffix, width);
+                    value
+                } else {
+                    truncate(line, width)
+                }
+            })
             .collect(),
         cursor_row: cursor_line - start,
-        cursor_column: min(cursor_column, width),
+        cursor_column,
+    }
+}
+
+fn horizontal_editor_window(before_cursor: &str, width: usize) -> (String, usize) {
+    if width == 0 {
+        return (String::new(), 0);
+    }
+    let mut start = before_cursor.len();
+    while start > 0 {
+        let previous = before_cursor[..start]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        if before_cursor[previous..].width() > width {
+            break;
+        }
+        start = previous;
+    }
+    let visible = before_cursor[start..].to_owned();
+    let column = visible.width().min(width);
+    (visible, column)
+}
+
+fn append_to_width(output: &mut String, suffix: &str, width: usize) {
+    for character in suffix.chars() {
+        let character_width = character.to_string().width();
+        if output.width() + character_width > width {
+            break;
+        }
+        output.push(character);
     }
 }
 
@@ -485,9 +601,23 @@ fn suggestion_title(input: &str) -> &'static str {
 }
 
 fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
-        .collect()
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.peek() == Some(&'[') {
+            characters.next();
+            while let Some(parameter) = characters.next() {
+                if ('@'..='~').contains(&parameter) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if !character.is_control() || matches!(character, '\n' | '\t') {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -565,6 +695,45 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(output, "  hello[2Jworld");
+        assert_eq!(output, "  helloworld");
+    }
+
+    #[test]
+    fn editor_window_keeps_a_long_cursor_line_visible() {
+        let input = "prefix-which-is-long";
+        let editor = editor_window(input, input.len(), 8);
+
+        assert_eq!(editor.lines, ["-is-long"]);
+        assert_eq!(editor.cursor_column, 8);
+    }
+
+    #[test]
+    fn fitted_sidebar_preserves_workspace_footer() {
+        let mut lines = vec![
+            SidebarLine::title("Session"),
+            SidebarLine::section("Context"),
+            SidebarLine::meta("120 tokens"),
+        ];
+        lines.extend((0..30).map(|_| SidebarLine {
+            kind: SidebarKind::Todo { complete: false },
+            value: "step".to_owned(),
+        }));
+        lines.extend([
+            SidebarLine::blank(),
+            SidebarLine::section("Workspace"),
+            SidebarLine::meta("main"),
+            SidebarLine::path("~/src"),
+            SidebarLine::blank(),
+            SidebarLine::brand("● GoshCoder"),
+        ]);
+
+        let fitted = fit_sidebar(&lines, 12);
+        let values = fitted
+            .iter()
+            .map(|line| line.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"Workspace"));
+        assert!(values.contains(&"● GoshCoder"));
+        assert!(values.contains(&""));
     }
 }
