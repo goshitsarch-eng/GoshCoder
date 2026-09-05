@@ -482,9 +482,7 @@ impl Store {
         let trimmed = resolved
             .to_string_lossy()
             .trim_start_matches(['/', '\\'])
-            .replace('/', "-")
-            .replace('\\', "-")
-            .replace(':', "-");
+            .replace(['/', '\\', ':'], "-");
         format!("--{trimmed}--")
     }
 
@@ -594,13 +592,13 @@ impl Store {
                 }
             };
 
-            if let Some(parent) = entry.parent_id.as_deref() {
-                if !tree.has(parent) {
-                    entry.parent_id = last_added.clone();
-                    report.warnings.push(format!(
-                        "line {line_number} referenced an entry that is not in the file; it was reattached so earlier conversation stays reachable"
-                    ));
-                }
+            if let Some(parent) = entry.parent_id.as_deref()
+                && !tree.has(parent)
+            {
+                entry.parent_id = last_added.clone();
+                report.warnings.push(format!(
+                    "line {line_number} referenced an entry that is not in the file; it was reattached so earlier conversation stays reachable"
+                ));
             }
             match tree.add(entry.clone(), &line) {
                 Ok(()) => {
