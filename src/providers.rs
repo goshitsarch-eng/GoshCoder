@@ -681,7 +681,8 @@ impl ProviderResponderFactory {
         session_id: &str,
     ) -> Result<Response> {
         let endpoint = protocol_endpoint(model, protocol, credentials)?;
-        let headers = build_request_headers(protocol, model, credentials, session_id)?;
+        let headers =
+            build_request_headers(protocol, model, credentials, session_id, cancellation)?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
@@ -1181,6 +1182,7 @@ fn build_request_headers(
     model: &llm::Model,
     credentials: &ProviderCredentials,
     session_id: &str,
+    cancellation: &agent::CancellationToken,
 ) -> Result<HeaderMap> {
     let mut overrides = BTreeMap::<String, Option<String>>::new();
     set_header_override(
@@ -1245,6 +1247,15 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCodexResponses => Some(extract_codex_account_id(api_key)?),
         _ => None,
     };
+    if protocol == ProviderProtocol::AzureOpenAiResponses {
+        // The Azure default must be installed before configured model/auth
+        // headers so a proxy can intentionally replace or suppress it.
+        set_header_override(
+            &mut overrides,
+            "api-key".to_owned(),
+            Some(api_key.to_owned()),
+        );
+    }
     let vertex_api_key = if protocol == ProviderProtocol::GoogleVertex {
         resolve_vertex_api_key(api_key)
     } else {
@@ -1253,8 +1264,16 @@ fn build_request_headers(
     let vertex_access_token =
         if protocol == ProviderProtocol::GoogleVertex && vertex_api_key.is_empty() {
             Some(
-                google_auth::resolve_access_token(&credentials.environment)
-                    .map_err(|error| ProviderAdapterError::Protocol(error.to_string()))?,
+                match google_auth::resolve_access_token_with_cancellation(
+                    &credentials.environment,
+                    cancellation,
+                ) {
+                    Ok(token) => token,
+                    Err(google_auth::GoogleAuthError::Cancelled) => {
+                        return Err(ProviderAdapterError::Cancelled);
+                    }
+                    Err(error) => return Err(ProviderAdapterError::Protocol(error.to_string())),
+                },
             )
         } else {
             None
@@ -1314,13 +1333,6 @@ fn build_request_headers(
     }
 
     match protocol {
-        ProviderProtocol::AzureOpenAiResponses => {
-            set_header_override(
-                &mut overrides,
-                "api-key".to_owned(),
-                Some(api_key.to_owned()),
-            );
-        }
         ProviderProtocol::OpenAiCodexResponses => {
             let account_id = codex_account_id.expect("Codex account ID was validated");
             set_header_override(
@@ -1378,6 +1390,7 @@ fn build_request_headers(
         }
         ProviderProtocol::OpenAiCompletions
         | ProviderProtocol::OpenAiResponses
+        | ProviderProtocol::AzureOpenAiResponses
         | ProviderProtocol::AnthropicMessages
         | ProviderProtocol::GoogleGenerativeAi
         | ProviderProtocol::GoogleVertex
@@ -5659,6 +5672,7 @@ fn consume_anthropic_messages(
 mod tests {
     use std::{
         collections::BTreeMap,
+        fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         sync::{
@@ -5666,7 +5680,7 @@ mod tests {
             mpsc::{self, Receiver},
         },
         thread::{self, JoinHandle},
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::{Value, json};
@@ -6478,6 +6492,146 @@ mod tests {
     }
 
     #[test]
+    fn catalog_vertex_prefetched_token_reaches_the_resource_endpoint() {
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let environment = BTreeMap::from([
+            (
+                "GOOGLE_OAUTH_ACCESS_TOKEN".to_owned(),
+                "ya29.prefetched".to_owned(),
+            ),
+            (
+                "GOOGLE_CLOUD_PROJECT".to_owned(),
+                "catalog-project".to_owned(),
+            ),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                None,
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog"),
+        );
+        let mut request_model = catalog
+            .provider("google-vertex")
+            .expect("Vertex provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("Vertex model");
+        request_model.base_url = format!("{base_url}/v1");
+        let response = factory(0).catalog_assistant_responder(catalog)(
+            &request_model,
+            &text_context(),
+            options(agent::CancellationToken::default()),
+        )
+        .expect("catalog-backed Vertex response");
+        let request = requests.recv().expect("captured Vertex request");
+        server.join().expect("Vertex test server finishes");
+
+        assert_eq!(
+            request.target,
+            format!(
+                "/v1/projects/catalog-project/locations/us-central1/publishers/google/models/{}:streamGenerateContent?alt=sse",
+                request_model.id
+            )
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer ya29.prefetched")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+    }
+
+    #[test]
+    fn vertex_token_exchange_cancellation_returns_an_aborted_message_promptly() {
+        google_auth::clear_token_cache();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind token server");
+        let address = listener.local_addr().expect("token server address");
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let token_server = thread::spawn(move || {
+            let (mut connection, _) = listener.accept().expect("accept token request");
+            let _request = read_request(&mut connection);
+            started_sender.send(()).expect("signal token request");
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release token response");
+            let body = br#"{"access_token":"ya29.refreshed","expires_in":3600}"#;
+            connection
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("write token response headers");
+            connection
+                .write_all(body)
+                .expect("write token response body");
+        });
+        let credential_path = std::env::temp_dir().join(format!(
+            "goshcoder-vertex-cancellation-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
+        fs::write(
+            &credential_path,
+            json!({
+                "type": "authorized_user",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "refresh_token": "refresh-token",
+                "token_uri": format!("http://{address}"),
+            })
+            .to_string(),
+        )
+        .expect("write credential fixture");
+
+        let mut credentials = ProviderCredentials::api_key(catalog::AUTHENTICATED_SENTINEL);
+        credentials.environment = BTreeMap::from([
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                credential_path.display().to_string(),
+            ),
+            ("GOOGLE_CLOUD_PROJECT".to_owned(), "project".to_owned()),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
+        ]);
+        let cancellation = agent::CancellationToken::default();
+        let request_cancellation = cancellation.clone();
+        let (result_sender, result_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let response = factory_with_credentials(0, credentials).respond(
+                &model(API_GOOGLE_VERTEX, "http://127.0.0.1:1/v1".to_owned()),
+                &llm::Context::default(),
+                options(request_cancellation),
+            );
+            let _ = result_sender.send(response);
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("token exchange starts");
+        cancellation.cancel();
+        let response = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation interrupts token exchange")
+            .expect("normalized cancelled response");
+        release_sender.send(()).expect("release token server");
+        token_server.join().expect("token server finishes");
+        let _ = fs::remove_file(&credential_path);
+        google_auth::clear_token_cache();
+
+        assert_eq!(response.stop_reason, stream::STOP_ABORTED);
+        assert!(response.error_message.contains("request aborted"));
+    }
+
+    #[test]
     fn vertex_endpoint_and_thinking_helpers_follow_vertex_specific_rules() {
         let environment = BTreeMap::from([
             ("GOOGLE_CLOUD_PROJECT".to_owned(), "project".to_owned()),
@@ -6743,6 +6897,39 @@ mod tests {
         assert_eq!(response.stop_reason, stream::STOP_ERROR);
         assert!(response.error_message.contains("no API key"));
         assert!(!response.error_message.contains(header_secret));
+    }
+
+    #[test]
+    fn azure_configured_api_key_headers_override_or_suppress_the_default() {
+        let request_model = model(
+            API_AZURE_OPENAI_RESPONSES,
+            "https://example.openai.azure.com/openai/v1".to_owned(),
+        );
+        let cancellation = agent::CancellationToken::default();
+        let overridden = build_request_headers(
+            ProviderProtocol::AzureOpenAiResponses,
+            &request_model,
+            &ProviderCredentials::api_key("azure-default").with_header("api-key", "proxy-key"),
+            "",
+            &cancellation,
+        )
+        .expect("override Azure headers");
+        assert_eq!(
+            overridden
+                .get("api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("proxy-key")
+        );
+
+        let suppressed = build_request_headers(
+            ProviderProtocol::AzureOpenAiResponses,
+            &request_model,
+            &ProviderCredentials::api_key("azure-default").without_header("api-key"),
+            "",
+            &cancellation,
+        )
+        .expect("suppress Azure header");
+        assert!(!suppressed.contains_key("api-key"));
     }
 
     #[test]

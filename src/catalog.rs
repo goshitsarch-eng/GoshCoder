@@ -2338,30 +2338,53 @@ impl Catalog {
     }
 
     fn resolve_vertex_auth(&self, credential: Option<&Credential>, source: &str) -> Option<Auth> {
+        let environment = self.vertex_environment(credential);
         if let Some(credential) = credential.filter(|credential| !credential.key().is_empty()) {
             return Some(Auth::with_api_key(
                 credential.key().to_owned(),
-                credential.environment().clone(),
+                environment,
                 BTreeMap::new(),
                 source,
             ));
         }
-        if let Some(key) = environment_value(&self.environment, "GOOGLE_CLOUD_API_KEY") {
+        if let Some(key) = environment
+            .get("GOOGLE_CLOUD_API_KEY")
+            .filter(|key| !key.is_empty())
+        {
             return Some(Auth::with_api_key(
-                key,
-                BTreeMap::new(),
+                key.clone(),
+                environment,
                 BTreeMap::new(),
                 "GOOGLE_CLOUD_API_KEY",
             ));
         }
 
-        let has_project = environment_value(&self.environment, "GOOGLE_CLOUD_PROJECT").is_some()
-            || environment_value(&self.environment, "GCLOUD_PROJECT").is_some();
-        let has_location = environment_value(&self.environment, "GOOGLE_CLOUD_LOCATION").is_some();
-        if has_project && has_location && self.has_vertex_adc_credentials() {
+        let has_project = environment
+            .get("GOOGLE_CLOUD_PROJECT")
+            .is_some_and(|project| !project.is_empty())
+            || environment
+                .get("GCLOUD_PROJECT")
+                .is_some_and(|project| !project.is_empty());
+        let has_location = environment
+            .get("GOOGLE_CLOUD_LOCATION")
+            .is_some_and(|location| !location.is_empty());
+        if has_project
+            && has_location
+            && environment
+                .get("GOOGLE_OAUTH_ACCESS_TOKEN")
+                .is_some_and(|token| !token.is_empty())
+        {
             return Some(Auth::with_api_key(
                 AUTHENTICATED_SENTINEL.to_owned(),
+                environment,
                 BTreeMap::new(),
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+            ));
+        }
+        if has_project && has_location && self.has_vertex_adc_credentials(&environment) {
+            return Some(Auth::with_api_key(
+                AUTHENTICATED_SENTINEL.to_owned(),
+                environment,
                 BTreeMap::new(),
                 "Application Default Credentials",
             ));
@@ -2369,8 +2392,31 @@ impl Catalog {
         None
     }
 
-    fn has_vertex_adc_credentials(&self) -> bool {
-        if let Some(path) = environment_value(&self.environment, "GOOGLE_APPLICATION_CREDENTIALS") {
+    fn vertex_environment(&self, credential: Option<&Credential>) -> BTreeMap<String, String> {
+        let mut environment = credential
+            .map(|credential| credential.environment().clone())
+            .unwrap_or_default();
+        for name in [
+            "GOOGLE_CLOUD_API_KEY",
+            "GOOGLE_OAUTH_ACCESS_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+        ] {
+            environment
+                .entry(name.to_owned())
+                .or_insert_with(|| environment_value(&self.environment, name).unwrap_or_default());
+        }
+        environment.retain(|_, value| !value.is_empty());
+        environment
+    }
+
+    fn has_vertex_adc_credentials(&self, environment: &BTreeMap<String, String>) -> bool {
+        if let Some(path) = environment
+            .get("GOOGLE_APPLICATION_CREDENTIALS")
+            .filter(|path| !path.is_empty())
+        {
             return (self.file_exists)(Path::new(&path));
         }
         let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) else {
@@ -2888,6 +2934,52 @@ mod tests {
             .expect("Meta auth");
         assert_eq!(auth.api_key(), None);
         assert_eq!(auth.header("Authorization"), Some(Some("Bearer meta-key")));
+    }
+
+    #[test]
+    fn vertex_prefetched_token_configures_and_resolves_models() {
+        let catalog = test_catalog(&[
+            ("GOOGLE_OAUTH_ACCESS_TOKEN", "ya29.prefetched"),
+            ("GOOGLE_CLOUD_PROJECT", "test-project"),
+            ("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        ]);
+        let auth = catalog
+            .resolve_auth("google-vertex")
+            .expect("resolve Vertex auth")
+            .expect("prefetched token configures Vertex");
+        assert!(auth.is_ambient());
+        assert_eq!(auth.source(), "GOOGLE_OAUTH_ACCESS_TOKEN");
+        assert_eq!(
+            auth.environment()
+                .get("GOOGLE_OAUTH_ACCESS_TOKEN")
+                .map(String::as_str),
+            Some("ya29.prefetched")
+        );
+        assert_eq!(
+            catalog
+                .configured_provider_ids()
+                .expect("configured providers"),
+            vec!["google-vertex"]
+        );
+
+        let model = catalog
+            .provider("google-vertex")
+            .expect("Vertex provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("Vertex model");
+        let resolved = catalog
+            .resolve_model(&format!("google-vertex/{}", model.id))
+            .expect("resolve configured Vertex model");
+        assert_eq!(
+            resolved
+                .auth()
+                .environment()
+                .get("GOOGLE_CLOUD_PROJECT")
+                .map(String::as_str),
+            Some("test-project")
+        );
     }
 
     #[test]

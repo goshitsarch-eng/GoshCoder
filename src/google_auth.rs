@@ -11,7 +11,8 @@ use std::{
     fmt, fs,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, OnceLock, mpsc},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -57,6 +58,7 @@ impl AccessToken {
 #[derive(Debug)]
 pub enum GoogleAuthError {
     Message(String),
+    Cancelled,
     Io(std::io::Error),
     Http(reqwest::Error),
     Json(serde_json::Error),
@@ -66,6 +68,7 @@ impl fmt::Display for GoogleAuthError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message(message) => formatter.write_str(message),
+            Self::Cancelled => formatter.write_str("Google token exchange aborted"),
             Self::Io(error) => write!(formatter, "Google credential I/O failed: {error}"),
             Self::Http(error) => write!(formatter, "Google token exchange failed: {error}"),
             Self::Json(error) => write!(formatter, "parsing Google credentials failed: {error}"),
@@ -79,7 +82,7 @@ impl Error for GoogleAuthError {
             Self::Io(error) => Some(error),
             Self::Http(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Message(_) => None,
+            Self::Message(_) | Self::Cancelled => None,
         }
     }
 }
@@ -139,6 +142,20 @@ struct TokenResponse {
 pub fn resolve_access_token(
     environment: &BTreeMap<String, String>,
 ) -> Result<String, GoogleAuthError> {
+    resolve_access_token_with_cancellation(environment, &crate::agent::CancellationToken::default())
+}
+
+/// Cancellation-aware form of [`resolve_access_token`].
+///
+/// `reqwest::blocking` cannot interrupt an in-flight socket read directly, so
+/// a token exchange is isolated in a short-lived worker and this caller races
+/// its result against the agent cancellation token. This keeps the agent turn
+/// responsive while the bounded exchange worker winds down.
+pub fn resolve_access_token_with_cancellation(
+    environment: &BTreeMap<String, String>,
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<String, GoogleAuthError> {
+    ensure_not_cancelled(cancellation)?;
     if let Some(token) = provider_env_value(environment, "GOOGLE_OAUTH_ACCESS_TOKEN") {
         return Ok(token);
     }
@@ -158,17 +175,30 @@ pub fn resolve_access_token(
         .filter(|token| token.is_valid())
         .map(|token| token.value.clone())
     {
+        ensure_not_cancelled(cancellation)?;
         return Ok(token);
     }
 
     let credentials = load_credential_file(&path)?;
-    let token = exchange_credentials(&credentials)?;
+    ensure_not_cancelled(cancellation)?;
+    let token = exchange_credentials(&credentials, cancellation)?;
+    ensure_not_cancelled(cancellation)?;
     let value = token.value.clone();
     token_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(path, token);
     Ok(value)
+}
+
+fn ensure_not_cancelled(
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<(), GoogleAuthError> {
+    if cancellation.is_cancelled() {
+        Err(GoogleAuthError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 fn provider_env_value(environment: &BTreeMap<String, String>, name: &str) -> Option<String> {
@@ -219,14 +249,20 @@ fn load_credential_file(path: &Path) -> Result<CredentialFile, GoogleAuthError> 
     Ok(serde_json::from_slice(&content)?)
 }
 
-fn exchange_credentials(credentials: &CredentialFile) -> Result<AccessToken, GoogleAuthError> {
+fn exchange_credentials(
+    credentials: &CredentialFile,
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<AccessToken, GoogleAuthError> {
+    ensure_not_cancelled(cancellation)?;
     match credentials.kind.as_str() {
-        "service_account" => exchange_service_account(credentials),
-        "authorized_user" => exchange_refresh_token(credentials),
+        "service_account" => exchange_service_account(credentials, cancellation),
+        "authorized_user" => exchange_refresh_token(credentials, cancellation),
         _ if !credentials.private_key.is_empty() && !credentials.client_email.is_empty() => {
-            exchange_service_account(credentials)
+            exchange_service_account(credentials, cancellation)
         }
-        _ if !credentials.refresh_token.is_empty() => exchange_refresh_token(credentials),
+        _ if !credentials.refresh_token.is_empty() => {
+            exchange_refresh_token(credentials, cancellation)
+        }
         _ => Err(GoogleAuthError::Message(format!(
             "unsupported Google credential type {:?}; set GOOGLE_OAUTH_ACCESS_TOKEN instead",
             credentials.kind
@@ -234,7 +270,11 @@ fn exchange_credentials(credentials: &CredentialFile) -> Result<AccessToken, Goo
     }
 }
 
-fn exchange_service_account(credentials: &CredentialFile) -> Result<AccessToken, GoogleAuthError> {
+fn exchange_service_account(
+    credentials: &CredentialFile,
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<AccessToken, GoogleAuthError> {
+    ensure_not_cancelled(cancellation)?;
     let key = parse_rsa_private_key(&credentials.private_key)?;
     let token_uri = token_uri(credentials);
     let now = SystemTime::now()
@@ -260,10 +300,14 @@ fn exchange_service_account(credentials: &CredentialFile) -> Result<AccessToken,
         .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
         .append_pair("assertion", &assertion)
         .finish();
-    post_token_request(&token_uri, body)
+    post_token_request(&token_uri, body, cancellation)
 }
 
-fn exchange_refresh_token(credentials: &CredentialFile) -> Result<AccessToken, GoogleAuthError> {
+fn exchange_refresh_token(
+    credentials: &CredentialFile,
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<AccessToken, GoogleAuthError> {
+    ensure_not_cancelled(cancellation)?;
     if credentials.client_id.is_empty()
         || credentials.client_secret.is_empty()
         || credentials.refresh_token.is_empty()
@@ -279,7 +323,7 @@ fn exchange_refresh_token(credentials: &CredentialFile) -> Result<AccessToken, G
         .append_pair("client_secret", &credentials.client_secret)
         .append_pair("refresh_token", &credentials.refresh_token)
         .finish();
-    post_token_request(&token_uri(credentials), body)
+    post_token_request(&token_uri(credentials), body, cancellation)
 }
 
 fn token_uri(credentials: &CredentialFile) -> String {
@@ -290,7 +334,38 @@ fn token_uri(credentials: &CredentialFile) -> String {
     }
 }
 
-fn post_token_request(token_uri: &str, body: String) -> Result<AccessToken, GoogleAuthError> {
+fn post_token_request(
+    token_uri: &str,
+    body: String,
+    cancellation: &crate::agent::CancellationToken,
+) -> Result<AccessToken, GoogleAuthError> {
+    ensure_not_cancelled(cancellation)?;
+    let token_uri = token_uri.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(post_token_request_blocking(&token_uri, body));
+    });
+    loop {
+        ensure_not_cancelled(cancellation)?;
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => {
+                ensure_not_cancelled(cancellation)?;
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(GoogleAuthError::Message(
+                    "Google token exchange worker stopped unexpectedly".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn post_token_request_blocking(
+    token_uri: &str,
+    body: String,
+) -> Result<AccessToken, GoogleAuthError> {
     let client = Client::builder()
         .timeout(GOOGLE_TOKEN_REQUEST_TIMEOUT)
         .build()?;
@@ -398,16 +473,19 @@ mod tests {
 
     #[test]
     fn incomplete_authorized_user_credentials_are_rejected() {
-        let error = exchange_credentials(&CredentialFile {
-            kind: "authorized_user".to_owned(),
-            client_id: "client".to_owned(),
-            client_secret: String::new(),
-            refresh_token: "refresh".to_owned(),
-            private_key: String::new(),
-            client_email: String::new(),
-            private_key_id: String::new(),
-            token_uri: String::new(),
-        })
+        let error = exchange_credentials(
+            &CredentialFile {
+                kind: "authorized_user".to_owned(),
+                client_id: "client".to_owned(),
+                client_secret: String::new(),
+                refresh_token: "refresh".to_owned(),
+                private_key: String::new(),
+                client_email: String::new(),
+                private_key_id: String::new(),
+                token_uri: String::new(),
+            },
+            &crate::agent::CancellationToken::default(),
+        )
         .expect_err("incomplete authorized-user credentials");
         assert!(
             error
