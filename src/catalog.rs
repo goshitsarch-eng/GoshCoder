@@ -1349,7 +1349,7 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), CatalogError> {
     })?;
     let mut file = file.ok_or_else(|| CatalogError::Io {
         operation: "create an auth.json temporary file",
-        source: io::Error::new(io::ErrorKind::Other, "temporary file was not retained"),
+        source: io::Error::other("temporary file was not retained"),
     })?;
     let write_result = (|| {
         file.write_all(bytes).map_err(|source| CatalogError::Io {
@@ -1447,7 +1447,7 @@ fn acquire_auth_file_lock(path: &Path) -> Result<AuthFileLock, CatalogError> {
                 source: io::Error::last_os_error(),
             });
         }
-        return Ok(AuthFileLock { file });
+        Ok(AuthFileLock { file })
     }
 
     #[cfg(not(unix))]
@@ -2066,28 +2066,28 @@ impl Catalog {
             return Ok(self.build_api_key_auth(definition, Some(&override_credential), "override"));
         }
 
-        if let Some(store) = &self.credentials {
-            if let Some(stored) = store.read_with_environment(provider_id, &self.environment)? {
-                match stored.kind() {
-                    CredentialKind::ApiKey => {
-                        if definition.auth_kind == AuthKind::OAuthOnly {
-                            return Ok(None);
-                        }
-                        return Ok(self.build_api_key_auth(
-                            definition,
-                            Some(&stored),
-                            "stored credential",
-                        ));
-                    }
-                    CredentialKind::OAuth => {
-                        // TODO: Port OAuth access-token use, expiry checks, and
-                        // refresh/login flows. A stored OAuth credential owns
-                        // the provider, so do not silently fall back to an
-                        // ambient API key while OAuth is unimplemented.
+        if let Some(store) = &self.credentials
+            && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
+        {
+            match stored.kind() {
+                CredentialKind::ApiKey => {
+                    if definition.auth_kind == AuthKind::OAuthOnly {
                         return Ok(None);
                     }
-                    CredentialKind::Other(_) => return Ok(None),
+                    return Ok(self.build_api_key_auth(
+                        definition,
+                        Some(&stored),
+                        "stored credential",
+                    ));
                 }
+                CredentialKind::OAuth => {
+                    // TODO: Port OAuth access-token use, expiry checks, and
+                    // refresh/login flows. A stored OAuth credential owns
+                    // the provider, so do not silently fall back to an
+                    // ambient API key while OAuth is unimplemented.
+                    return Ok(None);
+                }
+                CredentialKind::Other(_) => return Ok(None),
             }
         }
 

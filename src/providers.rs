@@ -19,7 +19,7 @@
 //! equivalents.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
     io::Read,
@@ -2186,10 +2186,10 @@ fn consume_openai_completions(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
-        if emitter.message.response_id.is_empty() {
-            if let Some(id) = value_string(&chunk, "id") {
-                emitter.message.response_id = id.to_owned();
-            }
+        if emitter.message.response_id.is_empty()
+            && let Some(id) = value_string(&chunk, "id")
+        {
+            emitter.message.response_id = id.to_owned();
         }
         if let Some(response_model) = value_string(&chunk, "model")
             && response_model != model.id
@@ -2283,15 +2283,12 @@ fn consume_openai_completions(
                 })
                 .unwrap_or_default();
             let id = value_string(call, "id").unwrap_or_default();
-            if !tool_calls.contains_key(&key) {
+            if let Entry::Vacant(entry) = tool_calls.entry(key.clone()) {
                 let content_index = emitter.start_tool(id, name)?;
-                tool_calls.insert(
-                    key,
-                    OpenAiToolState {
-                        content_index,
-                        arguments: stream::IncrementalJsonObjectParser::new(),
-                    },
-                );
+                entry.insert(OpenAiToolState {
+                    content_index,
+                    arguments: stream::IncrementalJsonObjectParser::new(),
+                });
             }
             let (content_index, arguments) = {
                 let state = tool_calls

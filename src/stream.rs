@@ -173,10 +173,10 @@ impl Error for EventStreamConfigurationError {}
 /// can retry it, drop it intentionally, or turn it into a provider failure.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventStreamPushError {
-    Closed(AssistantMessageEvent),
-    Full(AssistantMessageEvent),
-    TimedOut(AssistantMessageEvent),
-    InvalidTerminalEvent(AssistantMessageEvent),
+    Closed(Box<AssistantMessageEvent>),
+    Full(Box<AssistantMessageEvent>),
+    TimedOut(Box<AssistantMessageEvent>),
+    InvalidTerminalEvent(Box<AssistantMessageEvent>),
 }
 
 impl fmt::Display for EventStreamPushError {
@@ -355,7 +355,9 @@ impl AssistantMessageEventStream {
         let terminal_result = if event.is_terminal() {
             match event.terminal_message() {
                 Some(message) => Some(message),
-                None => return Err(EventStreamPushError::InvalidTerminalEvent(event)),
+                None => {
+                    return Err(EventStreamPushError::InvalidTerminalEvent(Box::new(event)));
+                }
             }
         } else {
             None
@@ -365,7 +367,7 @@ impl AssistantMessageEventStream {
 
         loop {
             if state.ended || state.terminal_result.is_some() {
-                return Err(EventStreamPushError::Closed(event));
+                return Err(EventStreamPushError::Closed(Box::new(event)));
             }
             if state.queue.len() < self.inner.capacity {
                 if let Some(result) = terminal_result {
@@ -388,9 +390,9 @@ impl AssistantMessageEventStream {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return if timeout == Some(Duration::ZERO) {
-                            Err(EventStreamPushError::Full(event))
+                            Err(EventStreamPushError::Full(Box::new(event)))
                         } else {
-                            Err(EventStreamPushError::TimedOut(event))
+                            Err(EventStreamPushError::TimedOut(Box::new(event)))
                         };
                     }
                     let (next_state, wait) = self
@@ -401,9 +403,9 @@ impl AssistantMessageEventStream {
                     state = next_state;
                     if wait.timed_out() && state.queue.len() >= self.inner.capacity {
                         if state.ended || state.terminal_result.is_some() {
-                            return Err(EventStreamPushError::Closed(event));
+                            return Err(EventStreamPushError::Closed(Box::new(event)));
                         }
-                        return Err(EventStreamPushError::TimedOut(event));
+                        return Err(EventStreamPushError::TimedOut(Box::new(event)));
                     }
                 }
                 // An extremely large timeout could not be represented as an
@@ -987,10 +989,10 @@ pub fn parse_json_with_repair(input: &str) -> Result<Value, serde_json::Error> {
         Ok(value) => Ok(value),
         Err(original_error) => {
             let repaired = repair_json(input);
-            if repaired != input {
-                if let Ok(value) = serde_json::from_str(&repaired) {
-                    return Ok(value);
-                }
+            if repaired != input
+                && let Ok(value) = serde_json::from_str(&repaired)
+            {
+                return Ok(value);
             }
             Err(original_error)
         }
@@ -1493,20 +1495,15 @@ pub fn is_abort_error(error: &(dyn Error + 'static)) -> bool {
 pub const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 /// Controls the allowed delay from Retry-After headers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RetryDelayLimit {
     /// Reject server delays longer than [`DEFAULT_MAX_RETRY_DELAY`].
+    #[default]
     Default,
     /// Do not impose a local cap.
     Unlimited,
     /// Reject server delays longer than this duration.
     Maximum(Duration),
-}
-
-impl Default for RetryDelayLimit {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl RetryDelayLimit {
@@ -1561,10 +1558,10 @@ pub fn parse_retry_after_ms(value: &str) -> Option<Duration> {
 
 /// Parses a standard `Retry-After` value: decimal seconds or an HTTP date.
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
-    if let Ok(seconds) = value.trim().parse::<f64>() {
-        if let Some(delay) = duration_from_milliseconds(seconds * 1_000.0) {
-            return Some(delay);
-        }
+    if let Ok(seconds) = value.trim().parse::<f64>()
+        && let Some(delay) = duration_from_milliseconds(seconds * 1_000.0)
+    {
+        return Some(delay);
     }
     parse_http_date(value.trim())
         .map(|retry_at| retry_at.duration_since(now).unwrap_or(Duration::ZERO))
@@ -1576,14 +1573,14 @@ pub fn validate_server_retry_delay(
     limit: RetryDelayLimit,
     provider_message: impl Into<String>,
 ) -> Result<Duration, RetryDelayError> {
-    if let Some(maximum) = limit.maximum() {
-        if delay > maximum {
-            return Err(RetryDelayError::ServerDelayExceedsLimit {
-                requested: delay,
-                maximum,
-                provider_message: provider_message.into(),
-            });
-        }
+    if let Some(maximum) = limit.maximum()
+        && delay > maximum
+    {
+        return Err(RetryDelayError::ServerDelayExceedsLimit {
+            requested: delay,
+            maximum,
+            provider_message: provider_message.into(),
+        });
     }
     Ok(delay)
 }
@@ -1629,15 +1626,15 @@ pub fn retry_delay_with_jitter(
     limit: RetryDelayLimit,
     jitter_fraction: f64,
 ) -> Result<Duration, RetryDelayError> {
-    if let Some(value) = error.header("retry-after-ms") {
-        if let Some(delay) = parse_retry_after_ms(value) {
-            return validate_server_retry_delay(delay, limit, error.to_string());
-        }
+    if let Some(value) = error.header("retry-after-ms")
+        && let Some(delay) = parse_retry_after_ms(value)
+    {
+        return validate_server_retry_delay(delay, limit, error.to_string());
     }
-    if let Some(value) = error.header("retry-after") {
-        if let Some(delay) = parse_retry_after(value, now) {
-            return validate_server_retry_delay(delay, limit, error.to_string());
-        }
+    if let Some(value) = error.header("retry-after")
+        && let Some(delay) = parse_retry_after(value, now)
+    {
+        return validate_server_retry_delay(delay, limit, error.to_string());
     }
     Ok(exponential_retry_delay(retry_index, jitter_fraction))
 }
@@ -2017,14 +2014,13 @@ fn last_assistant_usage(messages: &[llm::Message]) -> Option<(&llm::Usage, usize
     let mut latest_prefix_timestamp = i64::MIN;
     let mut found = None;
     for (index, message) in messages.iter().enumerate() {
-        if let llm::Message::Assistant(assistant) = message {
-            if assistant.timestamp >= latest_prefix_timestamp
-                && assistant.stop_reason != STOP_ABORTED
-                && assistant.stop_reason != STOP_ERROR
-                && calculate_context_tokens(&assistant.usage) > 0
-            {
-                found = Some((&assistant.usage, index));
-            }
+        if let llm::Message::Assistant(assistant) = message
+            && assistant.timestamp >= latest_prefix_timestamp
+            && assistant.stop_reason != STOP_ABORTED
+            && assistant.stop_reason != STOP_ERROR
+            && calculate_context_tokens(&assistant.usage) > 0
+        {
+            found = Some((&assistant.usage, index));
         }
         latest_prefix_timestamp = latest_prefix_timestamp.max(message_timestamp(message));
     }
