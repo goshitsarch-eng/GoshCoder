@@ -849,9 +849,21 @@ impl ProviderResponderFactory {
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
             let aperture_state = catalog.aperture_state();
+            let is_aperture_routed = aperture_state.configured
+                && ((model.provider == aperture::DEDICATED_PROVIDER_ID
+                    && aperture_state.resolved.dedicated_enabled)
+                    || aperture_state.routes.contains_key(&model.provider));
+            // Keep explicit caller overrides (notably test/enterprise base
+            // URLs) for native providers. Aperture must instead use the
+            // current catalog model so changed gateway routing takes effect.
+            let request_model = if is_aperture_routed {
+                &resolved.model
+            } else {
+                model
+            };
             let routed_model = aperture::rewrite_request_model(
                 Some(&aperture_state),
-                &resolved.model,
+                request_model,
                 &options.session_id,
             );
             let aperture_routed = matches!(&routed_model, std::borrow::Cow::Owned(_));
