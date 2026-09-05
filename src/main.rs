@@ -1057,7 +1057,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, BTW, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1346,6 +1346,56 @@ fn dispatch_runtime_slash_command(
                 MessageRole::Command,
                 resources.report(&prepared.resource_paths).render(),
             );
+            CommandDispatch::Handled
+        }
+        "/reload" => {
+            match prepared.reload_resources() {
+                Ok(resources) => {
+                    view.activity = "Local resources reloaded".to_owned();
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!(
+                            "Reloaded local resources. They apply to future turns.\n\n{}",
+                            resources.report(&prepared.resource_paths).render()
+                        ),
+                    );
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+            }
+            CommandDispatch::Handled
+        }
+        "/sessions" => {
+            match list_interactive_sessions(prepared) {
+                Ok(output) => append_view_message(view, MessageRole::Command, output),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/resume" if rest.is_empty() => {
+            match list_interactive_sessions(prepared) {
+                Ok(output) => append_view_message(
+                    view,
+                    MessageRole::Command,
+                    format!("{output}\n/resume <id> switches to a listed session."),
+                ),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/resume" => {
+            match prepared.runtime.switch_to(rest) {
+                Ok(handle) => {
+                    app.scroll = 0;
+                    view.activity = format!("Resumed session {}", short_id(&handle.id));
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!("Switched to session {}.", handle.id),
+                    );
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+            }
             CommandDispatch::Handled
         }
         "/prompt" | "/prompts" => dispatch_prompt_slash_command(view, prepared, rest, fullscreen),
@@ -1832,6 +1882,42 @@ fn last_user_prompt(messages: &[llm::Message]) -> Option<String> {
         let text = user_message_text(user).trim().to_owned();
         (!text.is_empty()).then_some(text)
     })
+}
+
+fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<String, String> {
+    let cwd =
+        runtime::absolute_workdir(&prepared.config.workdir).map_err(|error| error.to_string())?;
+    let store = sessionlog::Store::new(
+        prepared
+            .config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(config::sessions_dir),
+    );
+    let sessions = session_picker::list_sessions_for_picker(&store, &cwd)
+        .map_err(|error| error.to_string())?;
+    Ok(render_interactive_session_list(&sessions))
+}
+
+fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> String {
+    if sessions.is_empty() {
+        return "No saved sessions for this workspace.".to_owned();
+    }
+    const SHOWN: usize = 10;
+    let labels = sessionlog::short_ids(sessions);
+    let mut lines = Vec::with_capacity(SHOWN + 2);
+    for (index, (session, label)) in sessions.iter().zip(labels).enumerate() {
+        if index >= SHOWN {
+            lines.push(format!(
+                "… {} more · goshcoder sessions list",
+                sessions.len() - SHOWN
+            ));
+            break;
+        }
+        let (label, description) = session_picker::describe_session(session, &label, false);
+        lines.push(format!("{label}  {description}"));
+    }
+    lines.join("\n")
 }
 
 fn start_planner_review<F>(
@@ -2483,6 +2569,33 @@ mod tests {
             last_user_prompt(&messages),
             Some("final request".to_owned())
         );
+    }
+
+    #[test]
+    fn interactive_session_list_is_bounded_and_actionable() {
+        let sessions = (0..12)
+            .map(|index| sessionlog::SessionInfo {
+                id: format!("session-{index:02}-0000-7000-8000-000000000000"),
+                path: std::path::PathBuf::from(format!("/sessions/{index}.jsonl")),
+                cwd: "/workspace".to_owned(),
+                name: format!("session {index}"),
+                first_message: String::new(),
+                created: None,
+                modified: UNIX_EPOCH,
+                messages: index as usize + 1,
+                cleared: 0,
+                size: 0,
+                search_text: String::new(),
+                locked: false,
+                owner: sessionlog::LockOwner::default(),
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = render_interactive_session_list(&sessions);
+
+        assert!(rendered.contains("session 0"));
+        assert!(rendered.contains("… 2 more · goshcoder sessions list"));
+        assert!(!rendered.contains("session 10"));
     }
 
     #[test]

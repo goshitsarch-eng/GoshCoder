@@ -105,6 +105,7 @@ pub struct PreparedSession {
     pub workspace: Option<Workspace>,
     pub resource_paths: ResourcePaths,
     resources: Mutex<ResourceSet>,
+    explicit_system_prompt: Mutex<String>,
     pub config: SessionConfig,
 }
 
@@ -147,10 +148,50 @@ impl PreparedSession {
         Ok(())
     }
 
-    /// Replaces the user-controlled base prompt while keeping active Ralph and
-    /// Planner layers composed in their Go-compatible order.
+    /// Replaces the user-controlled prompt and reloads derived local context.
+    ///
+    /// `SYSTEM.md`, `APPEND_SYSTEM.md`, context files, and skills remain
+    /// layered beneath the explicit prompt just as they are at startup.
     pub fn set_base_system_prompt(&self, prompt: impl Into<String>) -> Result<()> {
         let prompt = prompt.into();
+        let previous = {
+            let mut explicit = lock_value(&self.explicit_system_prompt);
+            std::mem::replace(&mut *explicit, prompt)
+        };
+        if let Err(error) = self.reload_resources() {
+            *lock_value(&self.explicit_system_prompt) = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Re-discovers local context, prompts, and skills, then rebuilds the
+    /// active system prompt without changing the current session or tools.
+    pub fn reload_resources(&self) -> Result<ResourceSet> {
+        let updated = resources::discover(&self.resource_paths)
+            .map_err(|error| RuntimeError::Resource(error.to_string()))?;
+        let explicit = lock_value(&self.explicit_system_prompt).clone();
+        let tool_names = self
+            .runtime
+            .agent()
+            .state()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        let system_prompt = updated.build_system_prompt(
+            &explicit,
+            &self.resource_paths.workspace,
+            tool_names.iter(),
+        );
+        self.apply_resource_system_prompt(system_prompt)?;
+        *lock_resources(&self.resources) = updated.clone();
+        Ok(updated)
+    }
+
+    /// Applies a complete resource-derived prompt while keeping active Ralph
+    /// and Planner layers composed in their Go-compatible order.
+    fn apply_resource_system_prompt(&self, prompt: String) -> Result<()> {
         if let Some(planner) = self.planner.as_ref() {
             planner.set_base_system_prompt(prompt.clone());
         }
@@ -555,6 +596,7 @@ pub fn prepare_session(
         workspace,
         resource_paths,
         resources: Mutex::new(resources),
+        explicit_system_prompt: Mutex::new(config.system_prompt.clone()),
         config,
     })
 }
@@ -653,6 +695,12 @@ pub fn expand_resource_input(resources: &ResourceSet, input: &str) -> Result<Opt
 
 fn lock_resources(resources: &Mutex<ResourceSet>) -> std::sync::MutexGuard<'_, ResourceSet> {
     resources
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_value<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    value
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
