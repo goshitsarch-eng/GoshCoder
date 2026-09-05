@@ -2,6 +2,7 @@ pub mod agent;
 pub mod aperture;
 pub mod aperture_cli;
 pub mod aperture_mcp;
+pub mod aperture_tools;
 pub mod bedrock;
 pub mod btw;
 pub mod btw_runtime;
@@ -15,6 +16,7 @@ pub mod markdown;
 pub mod mistral;
 pub mod oauth;
 pub mod omni_cli;
+pub mod omni_prompt_tools;
 pub mod omniroute;
 pub mod planner_runtime;
 pub mod plannotator;
@@ -49,7 +51,10 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEventKind, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -398,25 +403,33 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Vec::new(),
     )?;
     let agent = prepared.runtime.agent().clone();
-    let (agent_event_sender, agent_event_receiver) = mpsc::sync_channel(64);
+    // Unbounded on purpose: `emit` never runs under the agent's state lock,
+    // and dropping the last events of a burst (a tool's end, the turn's end)
+    // would leave the status line stuck on stale activity.
+    let (agent_event_sender, agent_event_receiver) = mpsc::channel();
     let (turn_sender, turn_receiver) = mpsc::channel();
     let _agent_event_subscription = agent.subscribe(move |event| {
-        let _ = agent_event_sender.try_send(event);
+        let _ = agent_event_sender.send(event);
     });
 
-    enable_raw_mode()?;
-    let mut stderr = io::stderr();
-    if let Err(error) = execute!(stderr, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
+    // A panic anywhere on the UI thread must not leave the shell in raw mode
+    // on the alternate screen; the hook restores the terminal before the
+    // default hook prints the message.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_modes();
+        previous_hook(info);
+    }));
+
+    if let Err(error) = enter_terminal_modes() {
+        restore_terminal_modes();
         return Err(error.into());
     }
-    let backend = CrosstermBackend::new(stderr);
+    let backend = CrosstermBackend::new(io::stderr());
     let mut terminal = match Terminal::new(backend) {
         Ok(terminal) => terminal,
         Err(error) => {
-            let mut cleanup = io::stderr();
-            let _ = execute!(cleanup, LeaveAlternateScreen, DisableMouseCapture);
-            let _ = disable_raw_mode();
+            restore_terminal_modes();
             return Err(error.into());
         }
     };
@@ -430,19 +443,104 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         quiet,
     );
 
-    let terminal_cleanup = (|| -> io::Result<()> {
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()
-    })();
+    restore_terminal_modes();
+    let terminal_cleanup = terminal.show_cursor();
     let session_cleanup = prepared.runtime.close();
     terminal_cleanup?;
     session_cleanup?;
     result
+}
+
+/// Raw mode, the alternate screen, mouse capture, and bracketed paste. The
+/// last one is what makes a multi-line paste arrive as one `Event::Paste`
+/// instead of a burst of Enter keys that submit line by line.
+fn enter_terminal_modes() -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        io::stderr(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+}
+
+/// Undoes [`enter_terminal_modes`]. Safe to call more than once and from a
+/// panic hook: every step is best effort.
+fn restore_terminal_modes() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stderr(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+}
+
+/// Steps the fullscreen interface aside for a command that needs the real
+/// terminal (an OAuth login, onboarding prompts, `$EDITOR`), then takes the
+/// screen back and redraws from scratch.
+fn with_suspended_terminal<T>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    run: impl FnOnce() -> T,
+) -> io::Result<T> {
+    restore_terminal_modes();
+    let _ = terminal.show_cursor();
+    let outcome = run();
+    enter_terminal_modes()?;
+    terminal.clear()?;
+    Ok(outcome)
+}
+
+/// Runs this executable again with `arguments`, sharing the terminal, and
+/// reports a non-zero exit as an error. Subcommands that prompt (`auth login`,
+/// `aperture onboarding`, `omni setup`) are reused this way rather than
+/// re-implemented against the alternate screen.
+fn run_self_subprocess(arguments: &[&str]) -> Result<(), String> {
+    let executable =
+        std::env::current_exe().map_err(|error| format!("locate goshcoder: {error}"))?;
+    let status = std::process::Command::new(&executable)
+        .args(arguments)
+        .status()
+        .map_err(|error| format!("run goshcoder {}: {error}", arguments.join(" ")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "goshcoder {} exited with {status}",
+            arguments.join(" ")
+        ))
+    }
+}
+
+/// Runs a network-bound command off the terminal thread. Its output arrives
+/// through [`drain_interactive_events`], so the interface keeps drawing while
+/// a gateway answers slowly.
+fn start_background_command(
+    view: &mut InteractiveView,
+    label: &str,
+    job: impl FnOnce() -> Result<String, String> + Send + 'static,
+) {
+    if let Some(running) = view.background.as_ref() {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!(
+                "wait for {} to finish before running {label}",
+                running.label
+            ),
+        );
+        return;
+    }
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(job());
+    });
+    view.background = Some(BackgroundCommand {
+        label: label.to_owned(),
+        receiver,
+    });
+    view.activity = format!("Running {label}");
+    view.activity_since = Some(Instant::now());
 }
 
 /// Resolves `chat -resume` before the frontend creates a session runtime.
@@ -588,6 +686,33 @@ fn line_interactive_loop(
                 &input,
                 false,
             );
+            let outcome = match outcome {
+                CommandDispatch::Suspended(run) => {
+                    match run() {
+                        Ok(output) if !output.is_empty() => {
+                            append_view_message(&mut view, MessageRole::Command, output);
+                        }
+                        Ok(_) => {}
+                        Err(error) => append_view_message(&mut view, MessageRole::Error, error),
+                    }
+                    CommandDispatch::Handled
+                }
+                other => other,
+            };
+            if let Some(background) = view.background.take() {
+                match background.receiver.recv() {
+                    Ok(Ok(output)) if !output.is_empty() => {
+                        append_view_message(&mut view, MessageRole::Command, output);
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => append_view_message(&mut view, MessageRole::Error, error),
+                    Err(_) => append_view_message(
+                        &mut view,
+                        MessageRole::Error,
+                        format!("{} stopped without reporting a result", background.label),
+                    ),
+                }
+            }
             if view.turn_pending {
                 match turn_receiver.recv() {
                     Ok(result) if view.pending_btw_thread.is_some() => {
@@ -665,6 +790,14 @@ struct InteractiveView {
     turn_pending: bool,
     pending_btw_thread: Option<String>,
     pending_btw_turn_start: Option<usize>,
+    /// A gateway command running off the terminal thread.
+    background: Option<BackgroundCommand>,
+}
+
+/// A command whose result is still on its way from a worker thread.
+struct BackgroundCommand {
+    label: String,
+    receiver: Receiver<Result<String, String>>,
 }
 
 impl Default for InteractiveView {
@@ -677,6 +810,7 @@ impl Default for InteractiveView {
             turn_pending: false,
             pending_btw_thread: None,
             pending_btw_turn_start: None,
+            background: None,
         }
     }
 }
@@ -702,16 +836,56 @@ fn event_loop(
         }
     }
 
+    // Rebuilding the view means cloning the agent transcript and re-rendering
+    // it, so it happens only when something changed or a spinner is running,
+    // not on every poll timeout of an idle session.
+    let mut dirty = true;
     loop {
-        drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
-        refresh_runtime_app(&mut app, prepared, &view);
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        if drain_interactive_events(&mut view, prepared, &agent_events, &turn_results) {
+            dirty = true;
+        }
+        let animating = app.streaming || view.turn_pending || view.background.is_some();
+        if dirty || animating {
+            refresh_runtime_app(&mut app, prepared, &view);
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+            dirty = false;
+        }
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => match app.handle_key(key) {
+        // Every event already queued (a key-repeat burst, a large paste) is
+        // applied before the next draw instead of costing one frame each.
+        loop {
+            dirty = true;
+            let status_before = app.status.clone();
+            let action = match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => app.handle_key(key),
+                Event::Paste(text) => {
+                    app.paste(&text);
+                    Action::None
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(3),
+                        MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(3),
+                        _ => {}
+                    }
+                    Action::None
+                }
+                _ => Action::None,
+            };
+            // Feedback the editor set for this key (Ctrl-C confirmation, a
+            // toggle) survives the next refresh, which would otherwise
+            // overwrite it with the idle activity text.
+            if app.status != status_before {
+                view.activity = app.status.clone();
+            }
+            let submission = match &action {
+                Action::FollowUp(_) => Submission::FollowUp,
+                _ => Submission::Prompt,
+            };
+            match action {
                 Action::None => {}
                 Action::Quit => {
                     if let Some(thread) = view.pending_btw_thread.as_deref() {
@@ -747,7 +921,8 @@ fn event_loop(
                         "This model only supports thinking off.",
                     ),
                 },
-                Action::Submit(input) => {
+                Action::Submit(input) | Action::FollowUp(input) => {
+                    let follow_up = matches!(submission, Submission::FollowUp);
                     match submit_interactive_input(
                         &mut app,
                         &mut view,
@@ -755,42 +930,42 @@ fn event_loop(
                         catalog,
                         turn_sender.clone(),
                         input,
-                        false,
+                        follow_up,
                     ) {
                         CommandDispatch::Quit => {
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
-                        CommandDispatch::Handled | CommandDispatch::NotCommand => {}
-                    }
-                }
-                Action::FollowUp(input) => {
-                    match submit_interactive_input(
-                        &mut app,
-                        &mut view,
-                        prepared,
-                        catalog,
-                        turn_sender.clone(),
-                        input,
-                        true,
-                    ) {
-                        CommandDispatch::Quit => {
-                            prepared.runtime.agent().abort();
-                            return Ok(());
+                        CommandDispatch::Suspended(run) => {
+                            match with_suspended_terminal(terminal, run)? {
+                                Ok(output) if !output.is_empty() => {
+                                    append_view_message(&mut view, MessageRole::Command, output);
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    append_view_message(&mut view, MessageRole::Error, error);
+                                }
+                            }
+                            // Whatever was typed at the child process is
+                            // not input for this screen.
+                            break;
                         }
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
-            },
-            Event::Paste(text) => app.paste(&text),
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(3),
-                MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(3),
-                _ => {}
-            },
-            _ => {}
+            }
+            if !event::poll(Duration::ZERO)? {
+                break;
+            }
         }
     }
+}
+
+/// Whether a submitted line starts a turn or queues a follow-up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Submission {
+    Prompt,
+    FollowUp,
 }
 
 fn drain_interactive_events(
@@ -798,8 +973,10 @@ fn drain_interactive_events(
     prepared: &runtime::PreparedSession,
     agent_events: &Receiver<agent::Event>,
     turn_results: &Receiver<Result<(), String>>,
-) {
+) -> bool {
+    let mut changed = false;
     while let Ok(event) = agent_events.try_recv() {
+        changed = true;
         match event.kind {
             agent::EventKind::AgentStart => {
                 view.turn_pending = true;
@@ -854,22 +1031,63 @@ fn drain_interactive_events(
         }
     }
     while let Ok(result) = turn_results.try_recv() {
+        changed = true;
         if view.pending_btw_thread.is_some() {
             let _ = finish_pending_btw(view, prepared, result);
             continue;
         }
         view.turn_pending = false;
+        view.activity = "Ready".to_owned();
+        view.activity_since = None;
         if let Err(error) = result {
             append_view_message(view, MessageRole::Error, error);
         }
     }
-    for notice in prepared.runtime.drain_notices() {
+    if let Some(background) = view.background.as_ref() {
+        match background.receiver.try_recv() {
+            Ok(result) => {
+                changed = true;
+                let label = background.label.clone();
+                view.background = None;
+                if !view.turn_pending {
+                    view.activity = "Ready".to_owned();
+                    view.activity_since = None;
+                }
+                match result {
+                    Ok(output) if !output.is_empty() => {
+                        append_view_message(view, MessageRole::Command, output);
+                    }
+                    Ok(_) => {
+                        append_view_message(view, MessageRole::Notice, format!("{label} finished"))
+                    }
+                    Err(error) => append_view_message(view, MessageRole::Error, error),
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                changed = true;
+                let label = background.label.clone();
+                view.background = None;
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    format!("{label} stopped without reporting a result"),
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    let notices = prepared.runtime.drain_notices();
+    if !notices.is_empty() {
+        changed = true;
+    }
+    for notice in notices {
         append_view_message(
             view,
             MessageRole::Notice,
             format!("{}: {}", notice.kind, notice.text),
         );
     }
+    changed
 }
 
 /// Turns a completed asynchronous side-thread request into a visible
@@ -938,15 +1156,15 @@ fn finish_pending_btw(
     true
 }
 
-fn submit_interactive_input(
+fn submit_interactive_input<'a>(
     app: &mut App,
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
-    catalog: &catalog::Catalog,
+    prepared: &'a runtime::PreparedSession,
+    catalog: &'a catalog::Catalog,
     turn_sender: Sender<Result<(), String>>,
     input: String,
     follow_up: bool,
-) -> CommandDispatch {
+) -> CommandDispatch<'a> {
     app.record_submission(&input);
     let input = match prepared.expand_resource_input(&input) {
         Ok(Some(expanded)) => expanded,
@@ -994,11 +1212,16 @@ fn submit_interactive_input(
     CommandDispatch::NotCommand
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommandDispatch {
+/// A command the fullscreen interface must step aside for: it talks to the
+/// user through the raw terminal (an OAuth login, onboarding prompts,
+/// `$EDITOR`). The closure runs once the screen has been handed back.
+type SuspendedCommand<'a> = Box<dyn FnOnce() -> Result<String, String> + 'a>;
+
+enum CommandDispatch<'a> {
     NotCommand,
     Handled,
     Quit,
+    Suspended(SuspendedCommand<'a>),
 }
 
 fn begin_interactive_turn(
@@ -1023,13 +1246,13 @@ fn begin_interactive_turn(
     });
 }
 
-fn dispatch_ralph_slash_command(
+fn dispatch_ralph_slash_command<'a>(
     app: &mut App,
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
+    prepared: &'a runtime::PreparedSession,
     turn_sender: Sender<Result<(), String>>,
     rest: &str,
-) -> CommandDispatch {
+) -> CommandDispatch<'a> {
     let Some(ralph_runtime) = prepared.ralph.as_ref() else {
         append_view_message(
             view,
@@ -1140,13 +1363,13 @@ fn dispatch_ralph_slash_command(
 
 /// Handles independent, in-memory side discussions without adding their turns
 /// to the main session transcript.
-fn dispatch_btw_slash_command(
+fn dispatch_btw_slash_command<'a>(
     app: &mut App,
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
+    prepared: &'a runtime::PreparedSession,
     turn_sender: Sender<Result<(), String>>,
     rest: &str,
-) -> CommandDispatch {
+) -> CommandDispatch<'a> {
     let (action, argument) = split_prompt_action(rest);
     match action.to_ascii_lowercase().as_str() {
         "" | "list" => {
@@ -1393,17 +1616,143 @@ fn start_btw_question(
 /// Executes slash commands that can be served without leaving the fullscreen
 /// Ratatui program. Commands with an unavailable integration report that fact
 /// in the transcript rather than pretending they changed runtime state.
-fn dispatch_runtime_slash_command(
+/// `/login [provider]`: adds an OAuth subscription or an API key without
+/// replacing any other stored credential. The prompts run in a child process
+/// that owns the terminal, exactly as the previous interface did.
+fn dispatch_login_command<'a>(
+    view: &mut InteractiveView,
+    catalog: &'a catalog::Catalog,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    if rest.is_empty() {
+        append_view_message(
+            view,
+            MessageRole::Command,
+            format!(
+                "Usage: /login <provider>\nOAuth subscriptions: {}\nOther providers prompt for an API key; existing provider credentials are preserved.",
+                oauth::implemented_provider_ids().join(", ")
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
+    let fields = rest.split_whitespace().collect::<Vec<_>>();
+    let [provider_id] = fields.as_slice() else {
+        append_view_message(view, MessageRole::Error, "usage: /login <provider>");
+        return CommandDispatch::Handled;
+    };
+    if catalog.provider(provider_id).is_none() {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!("unknown provider {provider_id:?}"),
+        );
+        return CommandDispatch::Handled;
+    }
+    let provider_id = (*provider_id).to_owned();
+    let subcommand = if login_flow_available(&provider_id) {
+        "login"
+    } else {
+        "set"
+    };
+    CommandDispatch::Suspended(Box::new(move || {
+        run_self_subprocess(&["auth", subcommand, &provider_id])?;
+        catalog.clear_oauth_refresh_failure(&provider_id);
+        Ok(format!(
+            "Added {provider_id}. Use /model to switch providers."
+        ))
+    }))
+}
+
+fn login_flow_available(provider_id: &str) -> bool {
+    oauth::OAuthProviderId::parse(provider_id).is_some_and(|provider| {
+        oauth::metadata_for(provider).flow_support != oauth::OAuthFlowSupport::MetadataOnly
+    })
+}
+
+/// `/omni [status|sync|setup|dashboard]`. Setup prompts for a URL and key,
+/// so it owns the terminal; the rest talk to the gateway off the UI thread.
+fn dispatch_omni_command<'a>(
+    view: &mut InteractiveView,
+    catalog: &'a catalog::Catalog,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    let arguments = rest
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let Err(error) = omniroute::CliCommand::parse(&arguments) {
+        append_view_message(view, MessageRole::Error, error.to_string());
+        return CommandDispatch::Handled;
+    }
+    if omni_cli::needs_terminal(&arguments) {
+        return CommandDispatch::Suspended(Box::new(move || {
+            run_self_subprocess(&["omni", "setup"])?;
+            catalog.refresh_dynamic();
+            Ok("OmniRoute setup complete. Run /omni sync.".to_owned())
+        }));
+    }
+    let label = format!("/omni {rest}").trim_end().to_owned();
+    let catalog = catalog.clone();
+    start_background_command(view, &label, move || {
+        let output = omni_cli::execute(&arguments).map_err(|error| error.to_string());
+        catalog.refresh_dynamic();
+        output
+    });
+    CommandDispatch::Handled
+}
+
+/// `/aperture [subcommand]`. Onboarding prompts through the terminal; every
+/// other subcommand runs off the UI thread and the catalog re-reads the
+/// gateway state once it finishes.
+fn dispatch_aperture_command<'a>(
+    view: &mut InteractiveView,
+    catalog: &'a catalog::Catalog,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    let arguments = rest
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if aperture_cli::needs_terminal(&arguments) {
+        return CommandDispatch::Suspended(Box::new(move || {
+            let mut child_arguments = vec!["aperture"];
+            child_arguments.extend(arguments.iter().map(String::as_str));
+            run_self_subprocess(&child_arguments)?;
+            catalog.refresh_dynamic();
+            Ok("Aperture onboarding finished.".to_owned())
+        }));
+    }
+    let label = format!("/aperture {rest}").trim_end().to_owned();
+    let catalog = catalog.clone();
+    start_background_command(view, &label, move || {
+        let output = aperture_cli::execute(&arguments, false).map_err(|error| error.to_string());
+        catalog.refresh_dynamic();
+        output
+    });
+    CommandDispatch::Handled
+}
+
+fn dispatch_runtime_slash_command<'a>(
     app: &mut App,
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
-    catalog: &catalog::Catalog,
+    prepared: &'a runtime::PreparedSession,
+    catalog: &'a catalog::Catalog,
     turn_sender: Sender<Result<(), String>>,
     input: &str,
     fullscreen: bool,
-) -> CommandDispatch {
+) -> CommandDispatch<'a> {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
+    // pi's extension registers `/aperture:onboarding`-style commands as well
+    // as the spaced form; both reach the same handler.
+    let aperture_alias;
+    let (command, rest) = match command.strip_prefix("/aperture:") {
+        Some(subcommand) => {
+            aperture_alias = format!("{subcommand} {rest}");
+            ("/aperture", aperture_alias.trim())
+        }
+        None => (command, rest),
+    };
     match command {
         "/exit" | "/quit" => {
             if let Some(thread) = view.pending_btw_thread.as_deref() {
@@ -1415,7 +1764,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Add an OAuth or API-key provider (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1885,19 +2234,14 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
-        "/login" => {
-            append_view_message(
-                view,
-                MessageRole::Error,
-                "OAuth login is not available in the Rust frontend yet; use `goshcoder auth set <provider>` outside chat.",
-            );
-            CommandDispatch::Handled
-        }
+        "/login" => dispatch_login_command(view, catalog, rest),
+        "/omni" => dispatch_omni_command(view, catalog, rest),
+        "/aperture" => dispatch_aperture_command(view, catalog, rest),
         _ if command.starts_with('/') => {
             append_view_message(
                 view,
                 MessageRole::Error,
-                format!("{command} has not yet been migrated to the Rust frontend."),
+                format!("unknown command {command}; /help lists the available commands"),
             );
             CommandDispatch::Handled
         }
@@ -1908,38 +2252,48 @@ fn dispatch_runtime_slash_command(
 /// Handles `/prompt` and its compatibility alias without writing directly to
 /// the terminal. This keeps prompt management usable in both line mode and
 /// the Ratatui alternate screen.
-fn dispatch_prompt_slash_command(
+fn dispatch_prompt_slash_command<'a>(
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
+    prepared: &'a runtime::PreparedSession,
     rest: &str,
     fullscreen: bool,
-) -> CommandDispatch {
-    let result = prompt_slash_command(prepared, rest, fullscreen);
-    match result {
-        Ok(output) if !output.is_empty() => append_view_message(view, MessageRole::Command, output),
-        Ok(_) => {}
+) -> CommandDispatch<'a> {
+    match prompt_slash_command(prepared, rest, fullscreen) {
+        Ok(PromptOutcome::Text(output)) if !output.is_empty() => {
+            append_view_message(view, MessageRole::Command, output);
+        }
+        Ok(PromptOutcome::Text(_)) => {}
+        Ok(PromptOutcome::Suspend(run)) => return CommandDispatch::Suspended(run),
         Err(error) => append_view_message(view, MessageRole::Error, error),
     }
     CommandDispatch::Handled
 }
 
-fn prompt_slash_command(
-    prepared: &runtime::PreparedSession,
+/// What a `/prompt` action produced: text to show, or an editor session the
+/// fullscreen interface must hand the terminal to first.
+enum PromptOutcome<'a> {
+    Text(String),
+    Suspend(SuspendedCommand<'a>),
+}
+
+fn prompt_slash_command<'a>(
+    prepared: &'a runtime::PreparedSession,
     rest: &str,
     fullscreen: bool,
-) -> Result<String, String> {
+) -> Result<PromptOutcome<'a>, String> {
     let (action, argument) = split_prompt_action(rest);
-    match action {
+    let text = match action {
         "" | "list" => prompt_list(prepared),
         "save" => prompt_save(prepared, argument),
         "rm" | "remove" | "delete" => prompt_remove(prepared, argument),
-        "edit" => prompt_edit(prepared, argument, fullscreen),
+        "edit" => return prompt_edit(prepared, argument, fullscreen),
         "backup" => prompt_backup(prepared, argument),
         "restore" => prompt_restore(prepared, argument),
         action => Err(format!(
             "unknown /prompt action {action:?}; use list, save, edit, rm, backup or restore"
         )),
-    }
+    }?;
+    Ok(PromptOutcome::Text(text))
 }
 
 fn split_prompt_action(input: &str) -> (&str, &str) {
@@ -2054,11 +2408,11 @@ fn prompt_remove(prepared: &runtime::PreparedSession, argument: &str) -> Result<
     Ok(message)
 }
 
-fn prompt_edit(
-    prepared: &runtime::PreparedSession,
+fn prompt_edit<'a>(
+    prepared: &'a runtime::PreparedSession,
     argument: &str,
     fullscreen: bool,
-) -> Result<String, String> {
+) -> Result<PromptOutcome<'a>, String> {
     let (name, _) = parse_prompt_scope(argument);
     if name.is_empty() {
         return Err("/prompt edit needs a name".to_owned());
@@ -2074,33 +2428,36 @@ fn prompt_edit(
             .filter(|value| !value.trim().is_empty())
     });
     let Some(editor) = editor else {
-        return Ok(format!(
+        return Ok(PromptOutcome::Text(format!(
             "set $EDITOR to edit in place; the file is {}",
             path.display()
-        ));
+        )));
     };
-    if fullscreen {
-        return Ok(format!(
-            "edit it outside the app: {editor} {}",
-            path.display()
-        ));
-    }
-    let mut fields = editor.split_whitespace();
+    let mut fields = editor.split_whitespace().map(str::to_owned);
     let program = fields
         .next()
         .ok_or_else(|| "$EDITOR does not contain an executable".to_owned())?;
-    let status = std::process::Command::new(program)
-        .args(fields)
-        .arg(&path)
-        .status()
-        .map_err(|error| format!("run {editor}: {error}"))?;
-    if !status.success() {
-        return Err(format!("run {editor}: exited with {status}"));
+    let arguments = fields.collect::<Vec<_>>();
+    let run = move || -> Result<String, String> {
+        let status = std::process::Command::new(&program)
+            .args(&arguments)
+            .arg(&path)
+            .status()
+            .map_err(|error| format!("run {editor}: {error}"))?;
+        if !status.success() {
+            return Err(format!("run {editor}: exited with {status}"));
+        }
+        prepared
+            .reload_templates()
+            .map_err(|error| format!("edited /{name}, but could not reload prompts: {error}"))?;
+        Ok(format!("reloaded /{name}"))
+    };
+    if fullscreen {
+        // The editor needs the real terminal; the event loop steps aside.
+        Ok(PromptOutcome::Suspend(Box::new(run)))
+    } else {
+        run().map(PromptOutcome::Text)
     }
-    prepared
-        .reload_templates()
-        .map_err(|error| format!("edited /{name}, but could not reload prompts: {error}"))?;
-    Ok(format!("reloaded /{name}"))
 }
 
 fn prompt_backup(prepared: &runtime::PreparedSession, argument: &str) -> Result<String, String> {
@@ -2281,14 +2638,14 @@ fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> Stri
     lines.join("\n")
 }
 
-fn start_planner_review<F>(
+fn start_planner_review<'a, F>(
     app: &mut App,
     view: &mut InteractiveView,
-    prepared: &runtime::PreparedSession,
+    prepared: &'a runtime::PreparedSession,
     turn_sender: Sender<Result<(), String>>,
     activity: &str,
     request: F,
-) -> CommandDispatch
+) -> CommandDispatch<'a>
 where
     F: FnOnce() -> Result<(String, plannotator::ReviewRequest), String> + Send + 'static,
 {
@@ -2357,7 +2714,7 @@ fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view:
         state.model.provider,
         state.model.id
     );
-    app.status = interactive_status(view, app.streaming);
+    app.status = interactive_status(view, app.streaming || view.background.is_some());
     app.sidebar = runtime_sidebar(prepared, &state, view);
 }
 
@@ -2741,10 +3098,10 @@ fn configured_model_references(catalog: &catalog::Catalog) -> Vec<String> {
         .flat_map(|provider| {
             provider.models().into_iter().map(move |model| {
                 let reference = format!("{}/{}", provider.id, model.id);
-                if providers::ProviderProtocol::from_api(&model.api).is_ok() {
+                if providers::supports_api(&model.api) {
                     reference
                 } else {
-                    format!("{reference}\n  [protocol not yet migrated]")
+                    format!("{reference}\n  [unsupported protocol {}]", model.api)
                 }
             })
         })
@@ -2762,7 +3119,7 @@ fn interactive_models(catalog: &catalog::Catalog) -> Result<Vec<llm::Model>, Str
         .into_iter()
         .filter(|provider| configured.contains(&provider.id))
         .flat_map(|provider| provider.models())
-        .filter(|model| providers::ProviderProtocol::from_api(&model.api).is_ok())
+        .filter(|model| providers::supports_api(&model.api))
         .collect::<Vec<_>>();
     models.sort_by(|left, right| (&left.provider, &left.id).cmp(&(&right.provider, &right.id)));
     Ok(models)

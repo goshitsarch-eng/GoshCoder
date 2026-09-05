@@ -222,8 +222,17 @@ impl App {
                     Action::None
                 }
             }
+            // Real terminals report Shift+Tab as BackTab; a synthetic
+            // Tab+SHIFT is accepted for callers that build events directly.
+            (KeyCode::BackTab, _) => Action::CycleThinking,
             (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                 Action::CycleThinking
+            }
+            // Shift/Ctrl+Enter need the kitty keyboard protocol; Ctrl-J is
+            // the newline every legacy terminal can deliver.
+            (KeyCode::Char('j'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert("\n");
+                Action::None
             }
             (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.set_input("/model ");
@@ -366,9 +375,13 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        // Terminals deliver pasted line breaks as CR; keep them as newlines
+        // instead of filtering them out with the other control characters.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let sanitized: String = text
             .chars()
             .filter(|character| !character.is_control() || *character == '\n')
+            .map(|character| if character == '\t' { ' ' } else { character })
             .collect();
         self.insert(&sanitized);
     }

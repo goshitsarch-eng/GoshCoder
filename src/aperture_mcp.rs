@@ -455,6 +455,17 @@ impl McpSession {
         McpClient::new(base_url)?.initialize()
     }
 
+    /// An uninitialized session for tests of code that never reaches the
+    /// gateway; every request through it fails at the socket.
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_tests(base_url: &str) -> Self {
+        Self {
+            client: McpClient::new(base_url).expect("valid test endpoint"),
+            session_id: "test-session".to_owned(),
+            next_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     /// Alias for [`McpSession::new`] that emphasizes the network operation.
     pub fn connect(base_url: impl AsRef<str>) -> Result<Self> {
         Self::new(base_url)

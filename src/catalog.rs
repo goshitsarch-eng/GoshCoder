@@ -1,18 +1,19 @@
 //! Built-in model catalog, credential storage, and provider auth resolution.
 //!
-//! This is deliberately a standalone module while the provider runtime is
-//! migrated. It uses the existing [`crate::llm`] model types and
-//! [`crate::config`] path layout, but does not expose credentials through
-//! `Debug` or error messages.
-//!
-//! TODO: Declare this module from the executable when the provider runtime is
-//! wired into the Rust command surface. This file intentionally makes no
-//! changes to `main.rs`.
+//! Ported from pi's `packages/coding-agent/src/core/model-registry.ts` and
+//! `auth-storage.ts`, with GoshCoder's own additions: the embedded snapshot is
+//! layered with the gateway integrations (OmniRoute's synchronized models and
+//! Aperture's dedicated catalog and proxy routes) so they reach `/model`,
+//! model resolution, and the request path exactly like a built-in provider.
+//! The module uses the [`crate::llm`] model types and [`crate::config`] path
+//! layout, and does not expose credentials through `Debug` or error messages.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
+    ffi::OsStr,
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -23,7 +24,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[cfg(unix)]
@@ -36,11 +37,11 @@ use std::os::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::{Map, Value};
 
-use crate::{config, llm, oauth};
+use crate::{aperture, config, llm, oauth, omniroute};
 
-const CATALOG_JSON: &str = include_str!("../internal/llm/catalog/catalog.json");
-const CATALOG_EXTRA_JSON: &str = include_str!("../internal/llm/catalog/catalog_extra.json");
-const CATALOG_OVERRIDES_JSON: &str = include_str!("../internal/llm/catalog/catalog_overrides.json");
+const CATALOG_JSON: &str = include_str!("../data/catalog.json");
+const CATALOG_EXTRA_JSON: &str = include_str!("../data/catalog_extra.json");
+const CATALOG_OVERRIDES_JSON: &str = include_str!("../data/catalog_overrides.json");
 
 const MAX_AUTH_FILE_BYTES: usize = 10 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -50,6 +51,9 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Marker returned for credentials that the wire implementation must discover
 /// itself (AWS profiles, IRSA, Google Application Default Credentials, etc.).
 pub const AUTHENTICATED_SENTINEL: &str = "<authenticated>";
+
+/// The api key sent on a request the Aperture gateway authenticates itself.
+pub const APERTURE_PLACEHOLDER_KEY: &str = "-";
 
 /// Process environment lookup used by config values and provider resolution.
 ///
@@ -837,10 +841,9 @@ impl Credential {
         }
     }
 
-    /// Creates an OAuth credential for persistence only.
-    ///
-    /// TODO: OAuth login, expiry handling, and refresh are intentionally not
-    /// implemented in this non-OAuth catalog port.
+    /// Creates an OAuth credential. Login, expiry, and refresh live in
+    /// [`crate::oauth`]; resolution consults them through
+    /// [`Catalog::resolve_auth`].
     pub fn oauth(
         access: impl Into<String>,
         refresh: impl Into<String>,
@@ -1863,6 +1866,18 @@ impl Auth {
         }
     }
 
+    /// The `-` key a gateway-authenticated request carries: Aperture injects
+    /// the real upstream credential server-side and only needs the header to
+    /// be present.
+    fn placeholder(source: impl Into<String>) -> Self {
+        Self::with_api_key(
+            APERTURE_PLACEHOLDER_KEY.to_owned(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            source,
+        )
+    }
+
     /// Returns the key for a request builder. Callers must not log it.
     pub fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
@@ -1932,6 +1947,11 @@ pub struct Catalog {
     file_exists: FileExists,
     oauth_client: Arc<oauth::OAuthClient>,
     oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
+    dynamic_paths: DynamicPaths,
+    /// The gateway-integration state layered over the embedded snapshot.
+    /// Clones share it, so a sync performed through one handle is visible to
+    /// every other handle on the next read.
+    dynamic: Arc<Mutex<Option<Arc<DynamicLayer>>>>,
 }
 
 impl Catalog {
@@ -1968,6 +1988,7 @@ impl Catalog {
     ) -> Result<Self, CatalogError> {
         let oauth_client =
             oauth::OAuthClient::system().map_err(|_| CatalogError::OAuthClientUnavailable)?;
+        let dynamic_paths = DynamicPaths::from_environment(&environment);
         Ok(Self {
             data: builtin_data()?,
             credentials,
@@ -1975,7 +1996,68 @@ impl Catalog {
             file_exists,
             oauth_client: Arc::new(oauth_client),
             oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
+            dynamic_paths,
+            dynamic: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Replaces where the gateway integrations' state is read from. Tests
+    /// point this at a temporary agent directory; [`DynamicPaths::disabled`]
+    /// turns the layer off entirely.
+    #[must_use]
+    pub fn with_dynamic_paths(mut self, paths: DynamicPaths) -> Self {
+        self.dynamic_paths = paths;
+        self.dynamic = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Where this catalog reads the gateway integrations' state from.
+    pub fn dynamic_paths(&self) -> &DynamicPaths {
+        &self.dynamic_paths
+    }
+
+    /// Forces the next read to reload OmniRoute and Aperture state. A sync
+    /// performed inside the running process calls this so it never depends
+    /// on file-timestamp granularity to notice its own write.
+    pub fn refresh_dynamic(&self) {
+        *lock_unpoisoned(&self.dynamic) = None;
+    }
+
+    /// Returns the resolved Aperture routing state, or `None` when no gateway
+    /// is configured. It powers diagnostics and the per-request rewrite.
+    pub fn aperture_state(&self) -> Option<aperture::ApertureState> {
+        let layer = self.dynamic();
+        layer.aperture.configured.then(|| layer.aperture.clone())
+    }
+
+    /// Applies the per-request rewrites pi's Aperture extension installs in
+    /// its stream wrappers: model-id qualification for gateway-routed models
+    /// plus the `Referer` and live `x-session-id` provenance headers. A model
+    /// that is not gateway-routed is borrowed unchanged.
+    pub fn aperture_request_model<'a>(
+        &self,
+        model: &'a llm::Model,
+        session_id: &str,
+    ) -> Cow<'a, llm::Model> {
+        let layer = self.dynamic();
+        aperture::rewrite_request_model(Some(&layer.aperture), model, session_id)
+    }
+
+    fn dynamic(&self) -> Arc<DynamicLayer> {
+        let fingerprint = self.dynamic_paths.fingerprint();
+        let mut cached = lock_unpoisoned(&self.dynamic);
+        if let Some(layer) = cached.as_ref()
+            && layer.fingerprint == fingerprint
+        {
+            return Arc::clone(layer);
+        }
+        let layer = Arc::new(build_dynamic_layer(
+            self.data,
+            &self.dynamic_paths,
+            fingerprint,
+        ));
+        *cached = Some(Arc::clone(&layer));
+        layer
     }
 
     pub fn credentials(&self) -> Option<&CredentialStore> {
@@ -2005,24 +2087,47 @@ impl Catalog {
 
     /// Returns an independent provider/model view.
     ///
-    /// TODO: Load configured OmniRoute base URLs and models here. This method
-    /// intentionally exposes only embedded static Omni metadata.
-    ///
-    /// TODO: Apply Aperture dedicated/proxy routing here. Dynamic Aperture
-    /// provider state is intentionally outside this non-OAuth core port.
+    /// The embedded snapshot is layered with the gateway integrations: `omni`
+    /// reads its base URL and models from `omniroute.json`, the dedicated
+    /// `aperture` provider serves the synchronized gateway cache (so models
+    /// load instantly, even offline), and a provider routed through an
+    /// Aperture proxy carries the gateway URL, API override, and gateway model
+    /// filter on every model while keeping bare model ids for the picker.
     pub fn provider(&self, id: &str) -> Option<Provider> {
+        self.provider_with_layer(&self.dynamic(), id)
+    }
+
+    fn provider_with_layer(&self, layer: &DynamicLayer, id: &str) -> Option<Provider> {
         let definition = provider_definition(id)?;
-        let models = self
+        let mut base_url = definition.base_url.to_owned();
+        let mut models: Vec<llm::Model> = self
             .data
             .models
             .get(id)
             .map(|models| models.values().cloned().collect())
             .unwrap_or_default();
+        if id == omniroute::OMNI_PROVIDER_ID {
+            if let Some(omni) = &layer.omni {
+                base_url = omni.base_url.clone();
+                models = omni.models.clone();
+            }
+        } else if id == aperture::DEDICATED_PROVIDER_ID {
+            if let Some(dedicated) = &layer.dedicated {
+                base_url = dedicated.base_url.clone();
+                models = dedicated.models.clone();
+            }
+        } else if let Some(route) = layer.aperture.routes.get(id) {
+            base_url = route.base_url.clone();
+            models = models
+                .iter()
+                .filter_map(|model| aperture::apply_proxy_route(model, route))
+                .collect();
+        }
         let raw_compat = self.data.raw_compat.get(id).cloned().unwrap_or_default();
         Some(Provider {
             id: definition.id.to_owned(),
             name: definition.name.to_owned(),
-            base_url: definition.base_url.to_owned(),
+            base_url,
             key_name: definition.key_name.to_owned(),
             env_keys: definition
                 .env_keys
@@ -2038,19 +2143,48 @@ impl Catalog {
 
     /// Returns every statically known provider in lexical ID order.
     pub fn providers(&self) -> Vec<Provider> {
+        let layer = self.dynamic();
         self.provider_ids()
             .into_iter()
-            .filter_map(|id| self.provider(&id))
+            .filter_map(|id| self.provider_with_layer(&layer, &id))
             .collect()
     }
 
-    /// Returns an independent model copy.
+    /// Returns an independent model copy, seen through the same gateway layer
+    /// as [`Catalog::provider`].
     pub fn model(&self, provider_id: &str, model_id: &str) -> Option<llm::Model> {
-        self.data
-            .models
-            .get(provider_id)
-            .and_then(|models| models.get(model_id))
-            .cloned()
+        self.model_with_layer(&self.dynamic(), provider_id, model_id)
+    }
+
+    fn model_with_layer(
+        &self,
+        layer: &DynamicLayer,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Option<llm::Model> {
+        if provider_id == omniroute::OMNI_PROVIDER_ID
+            && let Some(omni) = &layer.omni
+        {
+            return omni
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .cloned();
+        }
+        if provider_id == aperture::DEDICATED_PROVIDER_ID
+            && let Some(dedicated) = &layer.dedicated
+        {
+            return dedicated
+                .models
+                .iter()
+                .find(|model| model.id == model_id)
+                .cloned();
+        }
+        let model = self.data.models.get(provider_id)?.get(model_id)?;
+        match layer.aperture.routes.get(provider_id) {
+            Some(route) => aperture::apply_proxy_route(model, route),
+            None => Some(model.clone()),
+        }
     }
 
     /// Returns raw protocol compatibility metadata for one model.
@@ -2092,6 +2226,37 @@ impl Catalog {
             }
             let override_credential = Credential::api_key(override_key);
             return Ok(self.build_api_key_auth(definition, Some(&override_credential), "override"));
+        }
+
+        let layer = self.dynamic();
+        // The dedicated aperture provider is gateway-authenticated: Aperture
+        // injects the upstream credential server-side, so there is no user
+        // key to look for and the provider counts as configured whenever a
+        // gateway with the dedicated capability is set up.
+        if provider_id == aperture::DEDICATED_PROVIDER_ID {
+            return Ok(layer
+                .dedicated
+                .is_some()
+                .then(|| Auth::placeholder("aperture gateway")));
+        }
+        // A proxied non-passthrough provider replaces its api-key auth with
+        // the gateway placeholder so it stays in the model picker without a
+        // local key. A stored OAuth credential still takes precedence, as the
+        // extension only replaces the api-key resolver on the wrapped
+        // provider; a refresh failure falls back to the placeholder rather
+        // than surfacing, because the gateway can still serve the request.
+        if let Some(route) = layer.aperture.routes.get(provider_id)
+            && !route.passthrough
+        {
+            if definition.supports_oauth
+                && let Some(store) = &self.credentials
+                && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
+                && matches!(stored.kind(), CredentialKind::OAuth)
+                && let Ok(Some(auth)) = self.resolve_stored_oauth(provider_id)
+            {
+                return Ok(Some(auth));
+            }
+            return Ok(Some(Auth::placeholder("aperture proxy")));
         }
 
         if let Some(store) = &self.credentials
@@ -2562,6 +2727,204 @@ impl Catalog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gateway integrations layered over the embedded snapshot
+//
+// pi's extensions register and re-register wrapped Provider objects at
+// runtime. GoshCoder's catalog is read on demand instead, so the equivalent is
+// computed from the integrations' files and cached by their fingerprint: a
+// sync, an edit, or a removal is picked up on the next read without a restart.
+
+/// Where the gateway integrations keep their state.
+///
+/// The paths derive from the catalog's injected environment rather than the
+/// process environment, so a test lookup that names no home directory never
+/// reads a developer's real configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DynamicPaths {
+    /// The agent directory the other paths live under, for integrations that
+    /// keep further state there (the pi-compatible `mcp.json`).
+    pub agent_dir: Option<PathBuf>,
+    pub omniroute: Option<PathBuf>,
+    pub aperture: Option<PathBuf>,
+    pub aperture_cache: Option<PathBuf>,
+}
+
+impl DynamicPaths {
+    /// Reads no gateway state at all.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// The standard layout beneath one agent directory.
+    pub fn for_agent_dir(agent_dir: &Path) -> Self {
+        Self {
+            agent_dir: Some(agent_dir.to_path_buf()),
+            omniroute: Some(config::omni_route_path_in(agent_dir)),
+            aperture: Some(config::aperture_path_in(agent_dir)),
+            aperture_cache: Some(config::aperture_cache_path_in(agent_dir)),
+        }
+    }
+
+    fn from_environment(environment: &EnvironmentLookup) -> Self {
+        let override_dir = environment_value(environment, config::ENV_AGENT_DIR);
+        let home = environment_value(environment, "HOME")
+            .or_else(|| environment_value(environment, "USERPROFILE"));
+        if override_dir.is_none() && home.is_none() {
+            return Self::disabled();
+        }
+        let agent_dir = config::agent_dir_from(
+            override_dir.as_deref().map(OsStr::new),
+            home.as_deref().map(Path::new),
+        );
+        Self::for_agent_dir(&agent_dir)
+    }
+
+    fn fingerprint(&self) -> DynamicFingerprint {
+        DynamicFingerprint(
+            [&self.omniroute, &self.aperture, &self.aperture_cache]
+                .into_iter()
+                .map(|path| file_fingerprint(path.as_deref()))
+                .collect(),
+        )
+    }
+}
+
+/// Modification time and size of each backing file; enough to notice a sync
+/// or an edit between two reads without parsing anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DynamicFingerprint(Vec<Option<(SystemTime, u64)>>);
+
+fn file_fingerprint(path: Option<&Path>) -> Option<(SystemTime, u64)> {
+    let metadata = fs::metadata(path?).ok()?;
+    Some((
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        metadata.len(),
+    ))
+}
+
+/// Models served by one gateway, replacing a provider's embedded list.
+#[derive(Clone, Debug, Default)]
+struct GatewayModels {
+    base_url: String,
+    models: Vec<llm::Model>,
+}
+
+struct DynamicLayer {
+    fingerprint: DynamicFingerprint,
+    omni: Option<GatewayModels>,
+    dedicated: Option<GatewayModels>,
+    aperture: aperture::ApertureState,
+}
+
+fn build_dynamic_layer(
+    data: &BuiltinData,
+    paths: &DynamicPaths,
+    fingerprint: DynamicFingerprint,
+) -> DynamicLayer {
+    // Unconfigured and malformed both leave the catalog untouched; the
+    // `/omni` and `/aperture` commands surface malformed files explicitly.
+    let omni = paths
+        .omniroute
+        .as_deref()
+        .and_then(|path| omniroute::Config::load(path).ok())
+        .map(|config| GatewayModels {
+            base_url: config.api_base_url(),
+            models: config
+                .live_catalog()
+                .models
+                .iter()
+                .map(omni_live_model)
+                .collect(),
+        });
+    let aperture = paths
+        .aperture
+        .as_deref()
+        .and_then(|path| aperture::load_config(path).ok())
+        .map(|config| {
+            let cache = paths
+                .aperture_cache
+                .as_deref()
+                .and_then(|path| aperture::load_cache(path).ok());
+            aperture::build_aperture_state(&config, cache.as_ref(), |provider_id| {
+                native_provider_info(data, provider_id)
+            })
+        })
+        .unwrap_or_default();
+    let dedicated =
+        (aperture.configured && aperture.resolved.dedicated_enabled).then(|| GatewayModels {
+            base_url: aperture::provider_base_url(&aperture.resolved.base_url),
+            models: aperture.dedicated_models.clone(),
+        });
+    DynamicLayer {
+        fingerprint,
+        omni,
+        dedicated,
+        aperture,
+    }
+}
+
+/// The immutable local facts a proxy plan is built from, taken from the
+/// embedded snapshot before any gateway rewrite can influence them.
+fn native_provider_info(
+    data: &BuiltinData,
+    provider_id: &str,
+) -> Option<aperture::NativeProviderInfo> {
+    let models = data.models.get(provider_id)?;
+    let first = models.values().next()?;
+    let base_url = provider_definition(provider_id)
+        .map(|definition| definition.base_url)
+        .filter(|base_url| !base_url.is_empty())
+        .map_or_else(|| first.base_url.clone(), str::to_owned);
+    Some(aperture::NativeProviderInfo {
+        api: first.api.clone(),
+        base_url,
+        model_ids: models.keys().cloned().collect(),
+    })
+}
+
+/// Converts a synchronized OmniRoute model into the catalog shape. Field by
+/// field rather than through JSON so a negative tier threshold cannot fail
+/// the whole provider.
+fn omni_live_model(live: &omniroute::LiveModel) -> llm::Model {
+    llm::Model {
+        id: live.id.clone(),
+        name: live.name.clone(),
+        api: live.api.clone(),
+        provider: live.provider.clone(),
+        base_url: live.base_url.clone(),
+        reasoning: live.reasoning,
+        thinking_level_map: live.thinking_level_map.clone(),
+        input: live.input.clone(),
+        cost: llm::ModelCost {
+            rates: omni_cost_rates(&live.cost.rates),
+            tiers: live
+                .cost
+                .tiers
+                .iter()
+                .map(|tier| llm::ModelCostTier {
+                    rates: omni_cost_rates(&tier.rates),
+                    input_tokens_above: u64::try_from(tier.input_tokens_above).unwrap_or(0),
+                })
+                .collect(),
+        },
+        context_window: live.context_window,
+        max_tokens: live.max_tokens,
+        sampling_params: None,
+        headers: BTreeMap::new(),
+        compat: None,
+    }
+}
+
+fn omni_cost_rates(rates: &omniroute::ModelCostRates) -> llm::ModelCostRates {
+    llm::ModelCostRates {
+        input: rates.input,
+        output: rates.output,
+        cache_read: rates.cache_read,
+        cache_write: rates.cache_write,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2590,6 +2953,232 @@ mod tests {
             Arc::new(|_| false),
         )
         .expect("embedded catalog loads")
+    }
+
+    fn gateway_catalog(agent_dir: &Path, values: &[(&str, &str)]) -> Catalog {
+        test_catalog(values).with_dynamic_paths(DynamicPaths::for_agent_dir(agent_dir))
+    }
+
+    fn write_omni_config(agent_dir: &Path, model_ids: &[&str]) {
+        let config = omniroute::Config {
+            server_url: "http://127.0.0.1:20999".to_owned(),
+            models: model_ids
+                .iter()
+                .map(|id| omniroute::Model {
+                    id: (*id).to_owned(),
+                    tool_calling: Some(*id != "chat-only"),
+                    ..omniroute::Model::default()
+                })
+                .collect(),
+            ..omniroute::Config::default()
+        };
+        config
+            .save(config::omni_route_path_in(agent_dir))
+            .expect("write omniroute.json");
+    }
+
+    fn aperture_gateway_config() -> aperture::Config {
+        aperture::Config {
+            base_url: "http://127.0.0.1:20998".to_owned(),
+            onboarding_done: Some(true),
+            ..aperture::Config::default()
+        }
+    }
+
+    #[test]
+    fn a_lookup_without_a_home_directory_reads_no_gateway_state() {
+        let catalog = test_catalog(&[]);
+        assert_eq!(catalog.dynamic_paths, DynamicPaths::disabled());
+        let omni = catalog.provider("omni").expect("omni is a known provider");
+        assert_eq!(omni.base_url, "http://127.0.0.1:20128/v1");
+        assert!(catalog.aperture_state().is_none());
+    }
+
+    #[test]
+    fn gateway_paths_follow_the_agent_dir_of_the_injected_environment() {
+        let catalog = test_catalog(&[(config::ENV_AGENT_DIR, "/tmp/goshcoder-agent")]);
+        assert_eq!(
+            catalog.dynamic_paths,
+            DynamicPaths::for_agent_dir(Path::new("/tmp/goshcoder-agent"))
+        );
+        let from_home = test_catalog(&[("HOME", "/home/someone")]);
+        assert_eq!(
+            from_home.dynamic_paths.omniroute,
+            Some(PathBuf::from(
+                "/home/someone/.goshcoder/agent/omniroute.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn omni_provider_serves_the_synchronized_gateway_models() {
+        let agent_dir = test_directory("omni");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        write_omni_config(&agent_dir, &["gpt-x", "chat-only"]);
+        let catalog = gateway_catalog(&agent_dir, &[("OMNIROUTE_API_KEY", "omni-key")]);
+
+        let omni = catalog.provider("omni").expect("omni provider");
+        assert_eq!(omni.base_url, "http://127.0.0.1:20999/v1");
+        assert_eq!(
+            omni.models()
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-x", "chat-only"]
+        );
+        let chat_only = catalog.model("omni", "chat-only").expect("dynamic lookup");
+        assert_eq!(chat_only.api, omniroute::PROMPT_TOOLS_API);
+        assert_eq!(chat_only.provider, "omni");
+        assert_eq!(chat_only.base_url, "http://127.0.0.1:20999/v1");
+        assert_eq!(chat_only.context_window, omniroute::DEFAULT_CONTEXT_WINDOW);
+
+        let resolved = catalog.resolve_model("omni/gpt-x").expect("resolves");
+        assert_eq!(resolved.model.api, omniroute::OPENAI_COMPLETIONS_API);
+        assert_eq!(resolved.auth.api_key(), Some("omni-key"));
+        assert!(
+            catalog.resolve_model("omni/unknown").is_err(),
+            "models absent from the synchronized config stay unknown"
+        );
+
+        // A later sync changes the file; the next read must see it without
+        // any explicit invalidation.
+        write_omni_config(&agent_dir, &["gpt-x", "chat-only", "third-model"]);
+        assert!(catalog.model("omni", "third-model").is_some());
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn dedicated_aperture_provider_comes_from_the_cache_and_counts_as_configured() {
+        let agent_dir = test_directory("aperture-dedicated");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let configuration = aperture_gateway_config();
+        aperture::save_config(config::aperture_path_in(&agent_dir), &configuration)
+            .expect("write aperture.json");
+        let resolved = configuration.resolve();
+        let gateway = aperture::gateway_url(&resolved.base_url);
+        let dedicated_model = llm::Model {
+            id: "anthropic/claude-sonnet-5".to_owned(),
+            name: "Claude Sonnet 5".to_owned(),
+            api: "anthropic-messages".to_owned(),
+            provider: aperture::DEDICATED_PROVIDER_ID.to_owned(),
+            base_url: aperture::provider_base_url(&resolved.base_url),
+            context_window: 200_000,
+            max_tokens: 64_000,
+            ..llm::Model::default()
+        };
+        let cache = aperture::new_cache(
+            aperture::build_catalog_key(&gateway, &resolved),
+            std::slice::from_ref(&dedicated_model),
+            &[],
+        );
+        aperture::save_cache(config::aperture_cache_path_in(&agent_dir), &cache)
+            .expect("write cache");
+
+        let catalog = gateway_catalog(&agent_dir, &[]);
+        let provider = catalog.provider("aperture").expect("aperture provider");
+        assert_eq!(provider.base_url, "http://127.0.0.1:20998/v1");
+        assert_eq!(provider.models().len(), 1);
+        assert!(catalog.is_configured("aperture").expect("auth lookup"));
+        let resolved_model = catalog
+            .resolve_model("aperture/anthropic/claude-sonnet-5")
+            .expect("dedicated model resolves");
+        assert_eq!(
+            resolved_model.auth.api_key(),
+            Some(APERTURE_PLACEHOLDER_KEY)
+        );
+        assert_eq!(resolved_model.auth.source(), "aperture gateway");
+
+        // The request path strips the catalog prefix for path-embedding APIs
+        // and adds the provenance headers.
+        let request_model = catalog.aperture_request_model(&resolved_model.model, "session-1");
+        assert_eq!(
+            request_model
+                .headers
+                .get("x-session-id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request_model.headers.get("Referer").map(String::as_str),
+            Some(aperture::APERTURE_REFERER)
+        );
+
+        // A cache built for a different gateway selection is ignored.
+        let stale = aperture::new_cache("other-key", std::slice::from_ref(&dedicated_model), &[]);
+        aperture::save_cache(config::aperture_cache_path_in(&agent_dir), &stale)
+            .expect("write stale cache");
+        assert!(
+            catalog
+                .provider("aperture")
+                .expect("provider")
+                .models()
+                .is_empty()
+        );
+        assert!(catalog.is_configured("aperture").expect("auth lookup"));
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn proxied_provider_is_rerouted_through_the_gateway_with_placeholder_auth() {
+        let agent_dir = test_directory("aperture-proxy");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let mut configuration = aperture_gateway_config();
+        configuration.proxy = Some(aperture::ProxyConfig {
+            enabled: Some(true),
+            upstream_providers: Some(vec![aperture::ProxiedProviderConfig {
+                id: "openai".to_owned(),
+                ..aperture::ProxiedProviderConfig::default()
+            }]),
+        });
+        aperture::save_config(config::aperture_path_in(&agent_dir), &configuration)
+            .expect("write aperture.json");
+
+        let catalog = gateway_catalog(&agent_dir, &[]);
+        let native = test_catalog(&[])
+            .provider("openai")
+            .expect("openai provider");
+        let proxied = catalog.provider("openai").expect("openai provider");
+        assert_ne!(proxied.base_url, native.base_url);
+        assert!(proxied.base_url.starts_with("http://127.0.0.1:20998"));
+        assert_eq!(proxied.models().len(), native.models().len());
+        assert!(
+            proxied
+                .models()
+                .iter()
+                .all(|model| model.base_url == proxied.base_url),
+            "every proxied model carries the gateway URL"
+        );
+        let first = &native.models()[0];
+        let routed = catalog.model("openai", &first.id).expect("model lookup");
+        assert_eq!(routed.base_url, proxied.base_url);
+        assert_eq!(routed.id, first.id, "the picker keeps bare model ids");
+
+        // No local key is needed once the gateway injects one.
+        let auth = catalog
+            .resolve_auth("openai")
+            .expect("lookup")
+            .expect("configured");
+        assert_eq!(auth.api_key(), Some(APERTURE_PLACEHOLDER_KEY));
+        assert_eq!(auth.source(), "aperture proxy");
+        let unrouted = catalog.resolve_auth("mistral").expect("lookup");
+        assert!(
+            unrouted.is_none(),
+            "other providers still need their own key"
+        );
+
+        let request_model = catalog.aperture_request_model(&routed, "session-2");
+        assert_eq!(
+            request_model.id,
+            aperture::qualify_model_id("openai", &routed.api, &routed.id)
+        );
+        let untouched = catalog.model("mistral", "mistral-large-latest");
+        if let Some(untouched) = untouched {
+            assert!(matches!(
+                catalog.aperture_request_model(&untouched, "session-2"),
+                Cow::Borrowed(_)
+            ));
+        }
+        fs::remove_dir_all(&agent_dir).ok();
     }
 
     fn test_directory(label: &str) -> PathBuf {

@@ -24,6 +24,7 @@
 //! equivalents.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
@@ -45,7 +46,10 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, bedrock, catalog, google_auth, llm, mistral, stream};
+use crate::{
+    agent, aperture, bedrock, catalog, google_auth, llm, mistral, omni_prompt_tools, omniroute,
+    stream,
+};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -90,6 +94,13 @@ pub enum ProviderProtocol {
     GoogleVertex,
     MistralConversations,
     BedrockConverseStream,
+}
+
+/// Whether the live responder can serve a model with this `api`. The
+/// prompt-emulated OmniRoute protocol is layered over chat completions rather
+/// than being a wire protocol of its own, so it is not a [`ProviderProtocol`].
+pub fn supports_api(api: &str) -> bool {
+    api == omniroute::PROMPT_TOOLS_API || ProviderProtocol::from_api(api).is_ok()
 }
 
 impl ProviderProtocol {
@@ -503,6 +514,7 @@ impl ProviderResponderFactory {
         if model.api == bedrock::API_BEDROCK_CONVERSE_STREAM {
             return self.stream_bedrock_with_credentials(model, context, options, credentials);
         }
+        let prompt_tools = model.api == omniroute::PROMPT_TOOLS_API;
         let events =
             stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
                 .expect("validated provider event buffer capacity");
@@ -513,13 +525,90 @@ impl ProviderResponderFactory {
         thread::spawn(move || {
             let cancellation = options.cancellation.clone();
             let mut emitter = MessageEmitter::new(worker_events, &model);
-            if let Err(error) =
+            let outcome = if prompt_tools {
+                factory.run_omni_prompt_tools(&model, &context, options, credentials, &mut emitter)
+            } else {
                 factory.run_stream(&model, &context, options, credentials, &mut emitter)
-            {
+            };
+            if let Err(error) = outcome {
                 let _ = emitter.fail(error, &cancellation);
             }
         });
         events
+    }
+
+    /// Serves a chat-only OmniRoute model: the tools are rendered into the
+    /// prompt, the transcript is flattened, the reply is fetched over plain
+    /// chat completions, and `<tool_call>` blocks are re-emitted as ordinary
+    /// tool events. The reply is buffered rather than streamed because the
+    /// blocks can only be parsed once complete.
+    fn run_omni_prompt_tools(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+        emitter: &mut MessageEmitter,
+    ) -> Result<()> {
+        ensure_not_cancelled(&options.cancellation)?;
+        emitter.start()?;
+        let inner_model = llm::Model {
+            api: omniroute::OPENAI_COMPLETIONS_API.to_owned(),
+            ..model.clone()
+        };
+        let inner_context = omni_prompt_tools::inner_context(context);
+        let inner_options = agent::RequestOptions {
+            assistant_event_listener: None,
+            ..options.clone()
+        };
+        let result = self.respond_with_credentials(
+            &inner_model,
+            &inner_context,
+            inner_options,
+            credentials,
+        )?;
+        emitter.message.usage = result.usage.clone();
+        emitter.message.response_id = result.response_id.clone();
+        emitter.message.response_model = result.response_model.clone();
+        emitter.message.raw_stop_reason = result.raw_stop_reason.clone();
+        if result.stop_reason == stream::STOP_ERROR || result.stop_reason == stream::STOP_ABORTED {
+            let message = if result.error_message.is_empty() {
+                "OmniRoute returned no assistant message".to_owned()
+            } else {
+                result.error_message
+            };
+            return Err(ProviderAdapterError::Protocol(message));
+        }
+        ensure_not_cancelled(&options.cancellation)?;
+
+        let parsed =
+            omni_prompt_tools::parse_tool_calls(&omni_prompt_tools::content_text(&result.content));
+        let prose = parsed.prose_with_problems();
+        if !prose.is_empty() {
+            let index = emitter.start_text("")?;
+            emitter.append_text(index, &prose)?;
+            emitter.end_text(index)?;
+        }
+        let had_calls = !parsed.calls.is_empty();
+        for call in parsed.calls {
+            let id = omni_prompt_tools::next_call_id();
+            let index = emitter.start_tool(&id, &call.name)?;
+            let encoded = serde_json::to_string(&call.arguments)?;
+            emitter.set_tool_arguments(index, call.arguments)?;
+            emitter.tool_delta(index, &encoded)?;
+            emitter.end_tool(index)?;
+        }
+        // Keep a truncated reply's stop reason: tool calls parsed out of a
+        // response cut off mid-generation must not run as if the model had
+        // finished asking for them.
+        emitter.message.stop_reason = if result.stop_reason == stream::STOP_LENGTH {
+            stream::STOP_LENGTH.to_owned()
+        } else if had_calls {
+            stream::STOP_TOOL_USE.to_owned()
+        } else {
+            stream::STOP_STOP.to_owned()
+        };
+        emitter.finish()
     }
 
     fn stream_bedrock_with_credentials(
@@ -845,9 +934,27 @@ impl ProviderResponderFactory {
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
-            transport
-                .respond_with_credentials(model, context, options, credentials)
-                .map_err(|error| error.to_string())
+            // Native Aperture adaptation: a gateway-routed request carries the
+            // provider-qualified model id and the provenance headers, and a
+            // transient gateway restart is tagged so the retry classifier
+            // recognizes it (cmd/goshcoder/aperture_session.go).
+            let routed = catalog.aperture_request_model(model, &options.session_id);
+            let gateway_routed = matches!(routed, Cow::Owned(_));
+            let result = transport
+                .respond_with_credentials(&routed, context, options, credentials)
+                .map_err(|error| error.to_string());
+            if !gateway_routed {
+                return result;
+            }
+            match result {
+                Ok(mut message) => {
+                    if let Some(tagged) = aperture::mark_retryable_error(&message.error_message) {
+                        message.error_message = tagged;
+                    }
+                    Ok(message)
+                }
+                Err(error) => Err(aperture::mark_retryable_error(&error).unwrap_or(error)),
+            }
         })
     }
 }
@@ -7016,6 +7123,96 @@ mod tests {
         assert!(observed_events.contains(&stream::EVENT_START.to_owned()));
         assert!(observed_events.contains(&stream::EVENT_TEXT_DELTA.to_owned()));
         assert!(observed_events.contains(&stream::EVENT_DONE.to_owned()));
+    }
+
+    #[test]
+    fn omni_prompt_tools_render_the_protocol_and_reemit_parsed_tool_calls() {
+        let body = concat!(
+            r#"data: {"id":"omni_1","choices":[{"delta":{"content":"Checking. "}}]}"#,
+            "\n\n",
+            r#"data: {"id":"omni_1","choices":[{"delta":{"content":"<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"omni_1","choices":[{"finish_reason":"stop","delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29}}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut request_model = model(API_OPENAI_COMPLETIONS, base_url);
+        request_model.api = omniroute::PROMPT_TOOLS_API.to_owned();
+        request_model.provider = "omni".to_owned();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut request_options = options(agent::CancellationToken::default());
+        let log = Arc::clone(&observed);
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            log.lock()
+                .expect("event log")
+                .push(event.event_type.clone());
+        }));
+
+        let response = factory(0)
+            .respond(&request_model, &text_context(), request_options)
+            .expect("prompt-tools response");
+        let request = requests.recv().expect("captured chat request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(request.target, "/chat/completions");
+        let sent: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert!(sent.get("tools").is_none(), "native tools are never sent");
+        let system = sent["messages"][0]["content"]
+            .as_str()
+            .expect("system prompt");
+        assert!(system.starts_with("be concise\n\n# Tool calling protocol"));
+        assert!(system.contains("### weather\nLook up weather"));
+        assert_eq!(sent["messages"][1]["content"], "weather?");
+
+        assert_eq!(response.api, omniroute::PROMPT_TOOLS_API);
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+        assert_eq!(response.content[0].plain_text(), Some("Checking."));
+        let llm::ContentBlock::ToolCall(call) = &response.content[1] else {
+            panic!("second block is the parsed tool call");
+        };
+        assert_eq!(call.name, "weather");
+        assert_eq!(call.arguments["city"], json!("Paris"));
+        assert!(call.id.starts_with("call_omni_"));
+        assert_eq!(response.usage.total_tokens, 29);
+        let observed = observed.lock().expect("event log");
+        assert_eq!(
+            observed.first().map(String::as_str),
+            Some(stream::EVENT_START)
+        );
+        assert!(observed.contains(&stream::EVENT_TEXT_END.to_owned()));
+        assert!(observed.contains(&stream::EVENT_TOOLCALL_END.to_owned()));
+        assert_eq!(
+            observed.last().map(String::as_str),
+            Some(stream::EVENT_DONE)
+        );
+    }
+
+    #[test]
+    fn omni_prompt_tools_keep_a_truncated_reply_from_running_its_tool_calls() {
+        let body = concat!(
+            r#"data: {"id":"omni_2","choices":[{"delta":{"content":"<tool_call>{\"name\":\"weather\",\"arguments\":{}}</tool_call>"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"omni_2","choices":[{"finish_reason":"length","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, _requests, server) = test_server(vec![http_response(200, body)]);
+        let mut request_model = model(API_OPENAI_COMPLETIONS, base_url);
+        request_model.api = omniroute::PROMPT_TOOLS_API.to_owned();
+        let response = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("prompt-tools response");
+        server.join().expect("test server finishes");
+        assert_eq!(response.stop_reason, stream::STOP_LENGTH);
+        assert!(matches!(
+            response.content[0],
+            llm::ContentBlock::ToolCall(_)
+        ));
     }
 
     #[test]
