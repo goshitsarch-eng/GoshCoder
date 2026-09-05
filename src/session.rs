@@ -2092,12 +2092,13 @@ mod tests {
             entries.len() > restored.messages.len(),
             "the compacted prefix must remain on disk"
         );
-        let mut messages = restored.messages.clone();
+        let state = runtime.agent().state();
+        let mut messages = state.messages;
         let mut fresh = assistant("new answer", "fallback", "fallback-model");
         fresh.usage.cost.total = 0.75;
         messages.push(llm::Message::Assistant(Box::new(fresh)));
         assert_eq!(
-            crate::compaction::conversation_cost(&messages, &restored.compactions),
+            crate::compaction::conversation_cost(&messages, &state.compactions),
             5.75
         );
 
