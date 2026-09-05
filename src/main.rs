@@ -8,8 +8,8 @@ pub mod markdown;
 pub mod omni_cli;
 pub mod omniroute;
 pub mod prompts;
-pub mod providers;
 pub mod provider_cli;
+pub mod providers;
 pub mod ralph;
 pub mod ralph_cli;
 pub mod resources;
@@ -191,12 +191,7 @@ fn render_run_event<Out: Write, Err: Write>(
             } else {
                 format!("{} {arguments}", event.tool_name)
             };
-            writeln!(
-                stderr,
-                "\n{} {}",
-                dim("→", color),
-                bold(&activity, color)
-            )?;
+            writeln!(stderr, "\n{} {}", dim("→", color), bold(&activity, color))?;
         }
         agent::EventKind::ToolExecutionEnd => {
             let status = if event.is_error { "✗" } else { "✓" };
@@ -271,7 +266,9 @@ fn first_line(text: &str) -> String {
     }
 }
 
-fn summarize_tool_arguments(arguments: &std::collections::BTreeMap<String, serde_json::Value>) -> String {
+fn summarize_tool_arguments(
+    arguments: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> String {
     arguments
         .iter()
         .map(|(key, value)| {
