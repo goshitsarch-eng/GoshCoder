@@ -3402,8 +3402,14 @@ mod tests {
             Some("us-gov-west-1".to_owned())
         );
         let endpoint_model = test_model("https://bedrock-runtime.eu-central-1.amazonaws.com");
+        // The options map deliberately overlays the process environment. Give
+        // this assertion an explicit region so the hermetic test remains
+        // deterministic even when a CI runner exports AWS_REGION.
         let endpoint_options = BedrockOptions {
-            environment: isolated,
+            environment: isolated
+                .into_iter()
+                .chain([("AWS_REGION".to_owned(), "eu-central-1".to_owned())])
+                .collect(),
             ..BedrockOptions::default()
         };
         let target = resolve_bedrock_target(&endpoint_model, &endpoint_options);
