@@ -792,6 +792,38 @@ struct InteractiveView {
     pending_btw_turn_start: Option<usize>,
     /// A gateway command running off the terminal thread.
     background: Option<BackgroundCommand>,
+    /// Palette entries cached while `/model ` or `/login ` is being typed.
+    model_choices: Option<Vec<state::Suggestion>>,
+    login_choices: Option<Vec<state::Suggestion>>,
+}
+
+/// Reports a worker's outcome exactly once, including when the worker
+/// panics: without this a panic leaves the turn marked pending forever and
+/// every later Enter becomes a steering message for an idle agent.
+struct TurnCompletion {
+    sender: Option<Sender<Result<(), String>>>,
+}
+
+impl TurnCompletion {
+    fn new(sender: Sender<Result<(), String>>) -> Self {
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    fn finish(mut self, result: Result<(), String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for TurnCompletion {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err("the worker stopped unexpectedly".to_owned()));
+        }
+    }
 }
 
 /// A command whose result is still on its way from a worker thread.
@@ -811,6 +843,8 @@ impl Default for InteractiveView {
             pending_btw_thread: None,
             pending_btw_turn_start: None,
             background: None,
+            model_choices: None,
+            login_choices: None,
         }
     }
 }
@@ -846,7 +880,7 @@ fn event_loop(
         }
         let animating = app.streaming || view.turn_pending || view.background.is_some();
         if dirty || animating {
-            refresh_runtime_app(&mut app, prepared, &view);
+            refresh_runtime_app(&mut app, prepared, catalog, &mut view);
             terminal.draw(|frame| ui::draw(frame, &app))?;
             dirty = false;
         }
@@ -867,8 +901,8 @@ fn event_loop(
                 }
                 Event::Mouse(mouse) => {
                     match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll = app.scroll.saturating_add(3),
-                        MouseEventKind::ScrollDown => app.scroll = app.scroll.saturating_sub(3),
+                        MouseEventKind::ScrollUp => app.scroll_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_down(3),
                         _ => {}
                     }
                     Action::None
@@ -1208,7 +1242,14 @@ fn submit_interactive_input<'a>(
         append_view_message(view, MessageRole::Error, error.to_string());
         return CommandDispatch::Handled;
     }
-    begin_interactive_turn(view, agent, turn_sender, input, "Starting response");
+    begin_interactive_turn(
+        view,
+        agent,
+        prepared.runtime.notice_sender(),
+        turn_sender,
+        input,
+        "Starting response",
+    );
     CommandDispatch::NotCommand
 }
 
@@ -1227,6 +1268,7 @@ enum CommandDispatch<'a> {
 fn begin_interactive_turn(
     view: &mut InteractiveView,
     agent: agent::Agent,
+    prepared_notices: session::SessionNoticeSender,
     turn_sender: Sender<Result<(), String>>,
     prompt: String,
     activity: &str,
@@ -1234,16 +1276,38 @@ fn begin_interactive_turn(
     view.turn_pending = true;
     view.activity = activity.to_owned();
     view.activity_since = Some(Instant::now());
+    let notices = prepared_notices;
     thread::spawn(move || {
+        let completion = TurnCompletion::new(turn_sender);
         let result = compaction::maybe_auto_compact(&agent)
-            .and_then(|_| {
+            .and_then(|outcome| {
+                report_dropped_queue(&notices, outcome.as_ref());
                 agent
                     .prompt(prompt)
                     .map_err(compaction::CompactionError::Agent)
             })
             .map_err(|error| error.to_string());
-        let _ = turn_sender.send(result);
+        completion.finish(result);
     });
+}
+
+/// Compaction clears the steering and follow-up queues; anything typed while
+/// the summary was being written is gone and the user should hear so.
+fn report_dropped_queue(
+    notices: &session::SessionNoticeSender,
+    outcome: Option<&compaction::Outcome>,
+) {
+    if let Some(outcome) = outcome
+        && outcome.dropped_queued_messages > 0
+    {
+        notices.push(
+            "compaction",
+            format!(
+                "{} queued message(s) were discarded by compaction",
+                outcome.dropped_queued_messages
+            ),
+        );
+    }
 }
 
 fn dispatch_ralph_slash_command<'a>(
@@ -1313,6 +1377,7 @@ fn dispatch_ralph_slash_command<'a>(
             begin_interactive_turn(
                 view,
                 prepared.runtime.agent().clone(),
+                prepared.runtime.notice_sender(),
                 turn_sender,
                 ralph::build_prompt(&state, &task, false),
                 "Starting Ralph iteration",
@@ -1604,12 +1669,13 @@ fn start_btw_question(
     view.activity = "BTW side thread is answering".to_owned();
     view.activity_since = Some(Instant::now());
     thread::spawn(move || {
+        let completion = TurnCompletion::new(turn_sender);
         let result = match side_runtime.run_next(&state, &worker_thread_id) {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err("BTW side thread did not have a queued question".to_owned()),
             Err(error) => Err(error.to_string()),
         };
-        let _ = turn_sender.send(result);
+        completion.finish(result);
     });
 }
 
@@ -2200,15 +2266,17 @@ fn dispatch_runtime_slash_command<'a>(
                 return CommandDispatch::Handled;
             }
             let agent = prepared.runtime.agent().clone();
+            let notices = prepared.runtime.notice_sender();
             let instructions = rest.to_owned();
             view.turn_pending = true;
             view.activity = "Compacting context".to_owned();
             view.activity_since = Some(Instant::now());
             thread::spawn(move || {
+                let completion = TurnCompletion::new(turn_sender);
                 let result = compaction::compact(&agent, &instructions)
-                    .map(|_| ())
+                    .map(|outcome| report_dropped_queue(&notices, Some(&outcome)))
                     .map_err(|error| error.to_string());
-                let _ = turn_sender.send(result);
+                completion.finish(result);
             });
             CommandDispatch::Handled
         }
@@ -2671,6 +2739,7 @@ where
     view.activity = activity.to_owned();
     view.activity_since = Some(Instant::now());
     thread::spawn(move || {
+        let completion = TurnCompletion::new(turn_sender);
         let result = request().and_then(|(subject, request)| {
             let decision = review.review(&request).map_err(|error| error.to_string())?;
             if let Some(feedback) = plannotator::review_feedback_prompt(&subject, &decision) {
@@ -2680,7 +2749,7 @@ where
                 Ok(())
             }
         });
-        let _ = turn_sender.send(result);
+        completion.finish(result);
     });
     CommandDispatch::Handled
 }
@@ -2698,8 +2767,14 @@ fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl
     }
 }
 
-fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view: &InteractiveView) {
+fn refresh_runtime_app(
+    app: &mut App,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    view: &mut InteractiveView,
+) {
     let state = prepared.runtime.agent().state();
+    app.dynamic_suggestions = palette_suggestions(app, catalog, &state, view);
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
         messages.extend(agent_messages(std::slice::from_ref(message)));
@@ -2716,6 +2791,81 @@ fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view:
     );
     app.status = interactive_status(view, app.streaming || view.background.is_some());
     app.sidebar = runtime_sidebar(prepared, &state, view);
+}
+
+/// Fills the argument palette for `/model `, `/thinking `, and `/login `.
+///
+/// Listing configured providers resolves credentials, which can refresh an
+/// OAuth token over the network, so those two lists are computed once per
+/// palette opening and reused until the composer leaves the command.
+fn palette_suggestions(
+    app: &App,
+    catalog: &catalog::Catalog,
+    state: &agent::State,
+    view: &mut InteractiveView,
+) -> Vec<state::Suggestion> {
+    let input = app.input.as_str();
+    if !input.starts_with("/model ") {
+        view.model_choices = None;
+    }
+    if !input.starts_with("/login ") {
+        view.login_choices = None;
+    }
+    if state::dynamic_palette_argument(input).is_none() {
+        return Vec::new();
+    }
+    if input.starts_with("/thinking ") {
+        return stream::supported_thinking_levels(&state.model)
+            .into_iter()
+            .map(|level| state::Suggestion {
+                value: format!("/thinking {level}"),
+                label: level,
+                description: String::new(),
+                execute: true,
+            })
+            .collect();
+    }
+    if input.starts_with("/model ") {
+        return view
+            .model_choices
+            .get_or_insert_with(|| {
+                interactive_models(catalog)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|model| state::Suggestion {
+                        label: format!("{}/{}", model.provider, model.id),
+                        description: model.name,
+                        value: format!("/model {}/{}", model.provider, model.id),
+                        execute: true,
+                    })
+                    .collect()
+            })
+            .clone();
+    }
+    view.login_choices
+        .get_or_insert_with(|| {
+            catalog
+                .providers()
+                .into_iter()
+                .filter(|provider| {
+                    provider
+                        .models()
+                        .iter()
+                        .any(|model| providers::supports_api(&model.api))
+                })
+                .map(|provider| state::Suggestion {
+                    description: if login_flow_available(&provider.id) {
+                        format!("{}  ·  OAuth / subscription", provider.name)
+                    } else {
+                        format!("{}  ·  API key", provider.name)
+                    },
+                    value: format!("/login {}", provider.id),
+                    label: provider.id,
+                    execute: true,
+                })
+                .collect()
+        })
+        .clone()
 }
 
 fn interactive_status(view: &InteractiveView, busy: bool) -> String {

@@ -24,3 +24,6 @@ dist/
 
 # Coverage output
 coverage.out
+
+# Agent worktrees created during automated sessions
+.claude/worktrees/

@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -77,6 +80,13 @@ pub struct App {
     pub tools_expanded: bool,
     pub hide_thinking: bool,
     pub history: Vec<String>,
+    /// Suggestions the runtime supplies for an argument palette (`/model `,
+    /// `/thinking `, `/login `); the static command list covers the rest.
+    pub dynamic_suggestions: Vec<Suggestion>,
+    /// The largest useful scroll offset at the last draw. The renderer
+    /// writes it so key handling can clamp instead of letting the offset
+    /// run past the top of the transcript.
+    pub last_max_scroll: Cell<u16>,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -152,6 +162,8 @@ impl App {
             tools_expanded: false,
             hide_thinking: false,
             history: Vec::new(),
+            dynamic_suggestions: Vec::new(),
+            last_max_scroll: Cell::new(0),
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -159,7 +171,31 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
+        if let Some(argument) = dynamic_palette_argument(&self.input) {
+            let query = argument.to_lowercase();
+            return self
+                .dynamic_suggestions
+                .iter()
+                .filter(|suggestion| {
+                    query.is_empty() || suggestion.label.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
+        }
         suggestions_for(&self.input)
+    }
+
+    /// Scrolls the transcript towards older content, never past its top.
+    pub fn scroll_up(&mut self, rows: u16) {
+        self.scroll = self
+            .scroll
+            .saturating_add(rows)
+            .min(self.last_max_scroll.get());
+    }
+
+    /// Scrolls the transcript towards the newest content.
+    pub fn scroll_down(&mut self, rows: u16) {
+        self.scroll = self.scroll.saturating_sub(rows);
     }
 
     /// Clears the composer and remembers a submitted value without adding
@@ -319,11 +355,11 @@ impl App {
                 Action::None
             }
             (KeyCode::PageUp, _) => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll_up(10);
                 Action::None
             }
             (KeyCode::PageDown, _) => {
-                self.scroll = self.scroll.saturating_sub(10);
+                self.scroll_down(10);
                 Action::None
             }
             (KeyCode::Enter, modifiers)
@@ -377,11 +413,13 @@ impl App {
     pub fn paste(&mut self, text: &str) {
         // Terminals deliver pasted line breaks as CR; keep them as newlines
         // instead of filtering them out with the other control characters.
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        let sanitized: String = text
+        let text = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        let sanitized: String = crate::markdown::sanitize_terminal_text(&text)
             .chars()
             .filter(|character| !character.is_control() || *character == '\n')
-            .map(|character| if character == '\t' { ' ' } else { character })
             .collect();
         self.insert(&sanitized);
     }
@@ -703,6 +741,15 @@ fn byte_at_character(input: &str, start: usize, character_offset: usize) -> usiz
         .map_or(input.len(), |(index, _)| start + index)
 }
 
+/// The commands whose argument the runtime completes, and the argument typed
+/// so far. `None` for everything else, including the bare command.
+pub fn dynamic_palette_argument(input: &str) -> Option<&str> {
+    ["/model ", "/thinking ", "/login "]
+        .into_iter()
+        .find_map(|prefix| input.strip_prefix(prefix))
+        .map(str::trim)
+}
+
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
     const COMMANDS: &[(&str, &str, bool)] = &[
         ("/help", "Show all commands", true),
@@ -787,6 +834,61 @@ mod tests {
 
         assert_eq!(app.input, "好");
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn backtab_cycles_thinking_and_ctrl_j_inserts_a_newline() {
+        let mut app = App::new();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Action::CycleThinking
+        );
+        app.set_input("a");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "a\n");
+    }
+
+    #[test]
+    fn paste_keeps_carriage_return_line_breaks() {
+        let mut app = App::new();
+        app.paste("a\r\nb\rc\td\x1b[2Je");
+        assert_eq!(app.input, "a\nb\nc    de");
+    }
+
+    #[test]
+    fn scrolling_is_clamped_to_the_last_rendered_extent() {
+        let mut app = App::new();
+        app.last_max_scroll.set(4);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 4);
+        app.scroll_down(10);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn argument_palettes_filter_runtime_suggestions() {
+        let mut app = App::new();
+        app.dynamic_suggestions = vec![
+            Suggestion {
+                label: "openai/gpt-5.6-terra".to_owned(),
+                description: "GPT".to_owned(),
+                value: "/model openai/gpt-5.6-terra".to_owned(),
+                execute: true,
+            },
+            Suggestion {
+                label: "anthropic/claude-sonnet-5".to_owned(),
+                description: "Claude".to_owned(),
+                value: "/model anthropic/claude-sonnet-5".to_owned(),
+                execute: true,
+            },
+        ];
+        app.set_input("/model claude");
+        let suggestions = app.suggestions();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].label, "anthropic/claude-sonnet-5");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(dynamic_palette_argument("/thinking "), Some(""));
+        assert_eq!(dynamic_palette_argument("/help"), None);
     }
 
     #[test]
