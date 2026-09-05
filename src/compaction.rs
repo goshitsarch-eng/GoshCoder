@@ -146,7 +146,7 @@ pub fn maybe_auto_compact(agent: &agent::Agent) -> Result<Option<Outcome>> {
         return Ok(None);
     }
     let used = measured_context_tokens(&state.messages);
-    let reserve = min(16_384, max(2_048, context_window / 5));
+    let reserve = (context_window / 5).clamp(2_048, 16_384);
     if used <= context_window.saturating_sub(reserve) {
         return Ok(None);
     }

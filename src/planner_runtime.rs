@@ -229,9 +229,7 @@ fn restored_state(
     notices: &SessionNoticeSender,
 ) -> Option<plannotator::State> {
     let restored = runtime.restored();
-    let Some(raw) = restored.custom.get(CUSTOM_TYPE) else {
-        return None;
-    };
+    let raw = restored.custom.get(CUSTOM_TYPE)?;
     match serde_json::from_value::<plannotator::State>(raw.clone()) {
         Ok(state) => Some(state),
         Err(error) => {

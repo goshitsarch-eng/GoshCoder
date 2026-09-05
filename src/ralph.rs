@@ -1422,10 +1422,11 @@ fn execute_done_tool(
             advance.reflection,
         )));
     }
-    let reflection = advance
-        .reflection
-        .then_some(" (reflection checkpoint)")
-        .unwrap_or_default();
+    let reflection = if advance.reflection {
+        " (reflection checkpoint)"
+    } else {
+        ""
+    };
     Ok(agent::ToolResult::text(format!(
         "Iteration {previous} complete; iteration {} queued{reflection}.",
         state.iteration

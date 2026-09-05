@@ -1049,12 +1049,12 @@ fn decode_json_rpc_response(payload: &[u8], expected_id: Option<u64>) -> Result<
             "MCP response did not declare JSON-RPC 2.0".to_owned(),
         ));
     }
-    if let Some(expected_id) = expected_id {
-        if object.get("id").and_then(Value::as_u64) != Some(expected_id) {
-            return Err(McpError::Protocol(format!(
-                "MCP response id did not match request id {expected_id}"
-            )));
-        }
+    if let Some(expected_id) = expected_id
+        && object.get("id").and_then(Value::as_u64) != Some(expected_id)
+    {
+        return Err(McpError::Protocol(format!(
+            "MCP response id did not match request id {expected_id}"
+        )));
     }
     if let Some(error) = object.get("error").filter(|error| !error.is_null()) {
         let error = error

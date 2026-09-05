@@ -2791,7 +2791,7 @@ mod tests {
             .expect("future credential is present");
         assert_eq!(future.extra("future"), Some(&json!({"nested": true})));
         future_store
-            .modify("future-provider", |current| Ok(current))
+            .modify("future-provider", Ok)
             .expect("re-serialize future credential");
         let future = future_store
             .read_raw("future-provider")

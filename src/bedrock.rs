@@ -771,7 +771,7 @@ pub fn encode_event_stream_message(
     let total_length = 16_usize
         .checked_add(encoded_headers.len())
         .and_then(|length| length.checked_add(payload.len()))
-        .ok_or_else(|| EventStreamError::ImplausibleLength(usize::MAX))?;
+        .ok_or(EventStreamError::ImplausibleLength(usize::MAX))?;
     if total_length > u32::MAX as usize {
         return Err(EventStreamError::ImplausibleLength(total_length));
     }
@@ -862,10 +862,10 @@ fn shared_credentials_path(environment: &BTreeMap<String, String>) -> Option<Pat
     {
         return value.map(PathBuf::from);
     }
-    if let Ok(path) = env::var("AWS_SHARED_CREDENTIALS_FILE") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
+    if let Ok(path) = env::var("AWS_SHARED_CREDENTIALS_FILE")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
     }
     home_directory().map(|home| home.join(".aws").join("credentials"))
 }
@@ -878,10 +878,10 @@ fn shared_config_path(environment: &BTreeMap<String, String>) -> Option<PathBuf>
     {
         return value.map(PathBuf::from);
     }
-    if let Ok(path) = env::var("AWS_CONFIG_FILE") {
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
+    if let Ok(path) = env::var("AWS_CONFIG_FILE")
+        && !path.is_empty()
+    {
+        return Some(PathBuf::from(path));
     }
     home_directory().map(|home| home.join(".aws").join("config"))
 }
@@ -1017,10 +1017,10 @@ pub fn region_from_profile(
         candidates.push((path, profile.to_owned()));
     }
     for (path, section) in candidates {
-        if let Ok(values) = read_aws_ini_section(path, &section) {
-            if let Some(region) = values.get("region").filter(|region| !region.is_empty()) {
-                return region.clone();
-            }
+        if let Ok(values) = read_aws_ini_section(path, &section)
+            && let Some(region) = values.get("region").filter(|region| !region.is_empty())
+        {
+            return region.clone();
         }
     }
     String::new()
@@ -1628,10 +1628,7 @@ fn convert_bedrock_messages(
             }
             llm::Message::ToolResult(_) => {
                 let mut results = Vec::new();
-                loop {
-                    let llm::Message::ToolResult(next) = &transformed[index] else {
-                        break;
-                    };
+                while let llm::Message::ToolResult(next) = &transformed[index] {
                     results.push(json!({
                         "toolResult": {
                             "toolUseId": next.tool_call_id,
@@ -1662,15 +1659,13 @@ fn convert_bedrock_messages(
                 .and_then(Value::as_str),
             Some("user")
         )
-    {
-        if let Some(content) = result
+        && let Some(content) = result
             .last_mut()
             .and_then(Value::as_object_mut)
             .and_then(|message| message.get_mut("content"))
             .and_then(Value::as_array_mut)
-        {
-            content.push(bedrock_cache_point(cache_retention));
-        }
+    {
+        content.push(bedrock_cache_point(cache_retention));
     }
     Ok(result)
 }
@@ -2314,10 +2309,10 @@ impl BedrockStreamer {
     fn stream_once(&mut self) -> Result<(), BedrockError> {
         self.check_cancelled()?;
         let mut params = build_bedrock_params(&self.model, &self.context, &self.options)?;
-        if let Some(callback) = &self.options.on_payload {
-            if let Some(replacement) = callback(params.clone(), &self.model) {
-                params = replacement;
-            }
+        if let Some(callback) = &self.options.on_payload
+            && let Some(replacement) = callback(params.clone(), &self.model)
+        {
+            params = replacement;
         }
 
         let mut response = self.retry_request(&params)?;
@@ -2657,12 +2652,11 @@ impl BedrockStreamer {
                 reparsed.then(|| block.tool_json.tool_arguments()),
             )
         };
-        if let Some(arguments) = preview {
-            if let Some(llm::ContentBlock::ToolCall(tool_call)) =
+        if let Some(arguments) = preview
+            && let Some(llm::ContentBlock::ToolCall(tool_call)) =
                 self.output.content.get_mut(content_index)
-            {
-                tool_call.arguments = arguments;
-            }
+        {
+            tool_call.arguments = arguments;
         }
         self.push_progress(stream::AssistantMessageEvent {
             event_type: stream::EVENT_TOOLCALL_DELTA.to_owned(),
@@ -2717,12 +2711,11 @@ impl BedrockStreamer {
                 ..stream::AssistantMessageEvent::default()
             })?;
         }
-        if !signature.is_empty() {
-            if let Some(llm::ContentBlock::Thinking(thinking)) =
+        if !signature.is_empty()
+            && let Some(llm::ContentBlock::Thinking(thinking)) =
                 self.output.content.get_mut(content_index)
-            {
-                thinking.thinking_signature.push_str(signature);
-            }
+        {
+            thinking.thinking_signature.push_str(signature);
         }
         Ok(())
     }
@@ -3985,9 +3978,13 @@ mod tests {
             constrained_sampling: Some(json!({"type": "json_schema", "strict": "require"})),
         };
         assert!(
-            convert_bedrock_tool_config(&[tool.clone()], &BedrockToolChoice::None, false)
-                .expect("none omits tools")
-                .is_none()
+            convert_bedrock_tool_config(
+                std::slice::from_ref(&tool),
+                &BedrockToolChoice::None,
+                false
+            )
+            .expect("none omits tools")
+            .is_none()
         );
         assert!(convert_bedrock_tool_config(&[tool], &BedrockToolChoice::Auto, false).is_err());
     }
