@@ -1220,7 +1220,7 @@ fn submit_interactive_input(
     CommandDispatch::NotCommand
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CommandDispatch {
     NotCommand,
     Handled,
