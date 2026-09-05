@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     io::{self, BufRead, IsTerminal, Read, Write},
+    path::Path,
     time::Duration,
 };
 
@@ -21,38 +22,74 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Executes `goshcoder omni [status|sync|setup|dashboard]`.
 pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let command = omniroute::CliCommand::parse(arguments)?;
+    let catalog = Catalog::with_default_credentials()?;
+    let output = execute(
+        arguments,
+        &catalog,
+        io::stdin().is_terminal() && io::stderr().is_terminal(),
+    )?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// Executes an OmniRoute command and returns terminal-ready output.
+///
+/// The interactive frontend calls this instead of writing directly to stdout,
+/// so status, synchronization, and dashboard results remain visible in its
+/// transcript. Setup intentionally requires a line-oriented terminal because
+/// it prompts for a gateway URL and API key.
+pub fn execute(
+    arguments: &[String],
+    catalog: &Catalog,
+    interactive: bool,
+) -> Result<String, Box<dyn Error>> {
     let transport = ReqwestTransport::new(HEALTH_TIMEOUT)?;
+    execute_with_transport(arguments, catalog, interactive, &transport)
+}
+
+fn execute_with_transport<T: omniroute::HttpTransport + ?Sized>(
+    arguments: &[String],
+    catalog: &Catalog,
+    interactive: bool,
+    transport: &T,
+) -> Result<String, Box<dyn Error>> {
+    let command = omniroute::CliCommand::parse(arguments)?;
+    let config_path = catalog.omniroute_config_path();
     match command {
         omniroute::CliCommand::Status => {
-            let key = resolved_key().unwrap_or_default();
-            let report = omniroute::status_command(config::omni_route_path(), &key, &transport)?;
+            let key = resolved_key(catalog).unwrap_or_default();
+            let report = omniroute::status_command(&config_path, &key, transport)?;
             if report.configured && key.is_empty() {
                 return Err(command_error(
                     "OmniRoute credentials are missing; run `goshcoder omni setup`",
                 ));
             }
-            println!("{}", report.render());
+            Ok(report.render())
         }
-        omniroute::CliCommand::Dashboard => {
-            println!(
-                "{}",
-                omniroute::dashboard_command(config::omni_route_path())?
-            );
-        }
+        omniroute::CliCommand::Dashboard => omniroute::dashboard_command(&config_path)
+            .map_err(|error| Box::new(error) as Box<dyn Error>),
         omniroute::CliCommand::Sync => {
-            let key = resolved_key_required()?;
-            let result = omniroute::sync_command_now(config::omni_route_path(), &key, &transport)?;
-            println!("{}", result.render());
+            let key = resolved_key_required(catalog)?;
+            let result = omniroute::sync_command_now(&config_path, &key, transport)?;
+            Ok(result.render())
         }
         omniroute::CliCommand::Setup => {
-            setup(&transport)?;
+            if !interactive {
+                return Err(command_error(
+                    "OmniRoute setup requires a line-oriented interactive terminal; run `goshcoder omni setup` outside fullscreen chat",
+                ));
+            }
+            setup(transport, &config_path)
         }
     }
-    Ok(())
 }
 
-fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
+fn setup<T: omniroute::HttpTransport + ?Sized>(
+    transport: &T,
+    config_path: &Path,
+) -> Result<String, Box<dyn Error>> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         return Err(command_error(
@@ -65,7 +102,7 @@ fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
     stdin.lock().read_line(&mut url)?;
     let key = read_secret("OmniRoute API key (blank for local/public): ")?;
     let result = omniroute::setup_command(
-        config::omni_route_path(),
+        config_path,
         omniroute::SetupRequest {
             server_url: url.trim().to_owned(),
             api_key: key,
@@ -76,20 +113,18 @@ fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
     let message = result.render();
     config::ensure_agent_dir()?;
     CredentialStore::default_file().put("omni", Credential::api_key(result.credential_to_store))?;
-    println!("{message}");
-    Ok(())
+    Ok(message)
 }
 
-fn resolved_key() -> Result<String, Box<dyn Error>> {
-    let catalog = Catalog::with_default_credentials()?;
+fn resolved_key(catalog: &Catalog) -> Result<String, Box<dyn Error>> {
     Ok(catalog
         .resolve_auth("omni")?
         .and_then(|authentication| authentication.api_key().map(str::to_owned))
         .unwrap_or_default())
 }
 
-fn resolved_key_required() -> Result<String, Box<dyn Error>> {
-    let key = resolved_key()?;
+fn resolved_key_required(catalog: &Catalog) -> Result<String, Box<dyn Error>> {
+    let key = resolved_key(catalog)?;
     if key.is_empty() {
         return Err(command_error(
             "OmniRoute credentials are missing; run `goshcoder omni setup`",
@@ -151,6 +186,39 @@ impl omniroute::HttpTransport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct GatewayTransport;
+
+    impl omniroute::HttpTransport for GatewayTransport {
+        fn execute(
+            &self,
+            request: omniroute::HttpRequest,
+        ) -> std::result::Result<omniroute::HttpResponse, omniroute::HttpTransportError> {
+            assert_eq!(request.method, omniroute::HttpMethod::Get);
+            assert!(request.url.ends_with("/v1/models"));
+            Ok(omniroute::HttpResponse {
+                status: 200,
+                body: br#"{"data":[{"id":"gateway/chat","name":"Gateway Chat"}]}"#.to_vec(),
+            })
+        }
+    }
+
+    fn test_config_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "goshcoder-omni-cli-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn transport_keeps_the_response_bound_without_exposing_request_secrets() {
@@ -172,5 +240,57 @@ mod tests {
     fn missing_key_has_a_clear_setup_remedy() {
         let error = command_error("OmniRoute credentials are missing; run `goshcoder omni setup`");
         assert!(error.to_string().contains("goshcoder omni setup"));
+    }
+
+    #[test]
+    fn interactive_sync_uses_the_active_catalog_path_and_refreshes_models() {
+        let path = test_config_path().join("omniroute.json");
+        omniroute::Config::new("https://omni.example.test")
+            .expect("valid config")
+            .save(&path)
+            .expect("save config");
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name: &str| (name == "OMNIROUTE_API_KEY").then(|| "gateway-key".to_owned())),
+        )
+        .expect("catalog")
+        .with_omniroute_path(path.clone());
+
+        let output =
+            execute_with_transport(&["sync".to_owned()], &catalog, false, &GatewayTransport)
+                .expect("sync command");
+
+        assert!(output.contains("Synced 1 OmniRoute models"));
+        let model = catalog
+            .model(omniroute::OMNI_PROVIDER_ID, "gateway/chat")
+            .expect("refreshed model");
+        assert_eq!(model.base_url, "https://omni.example.test/v1");
+        assert_eq!(model.api, omniroute::OPENAI_COMPLETIONS_API);
+        assert_eq!(
+            catalog
+                .resolve_model("omni/gateway/chat")
+                .expect("resolved refreshed model")
+                .auth()
+                .api_key(),
+            Some("gateway-key")
+        );
+
+        let _ = fs::remove_dir_all(path.parent().expect("parent directory"));
+    }
+
+    #[test]
+    fn fullscreen_setup_reports_a_safe_terminal_requirement() {
+        let path = test_config_path().join("omniroute.json");
+        let catalog = Catalog::with_environment(None, Arc::new(|_: &str| None))
+            .expect("catalog")
+            .with_omniroute_path(path);
+        let error =
+            execute_with_transport(&["setup".to_owned()], &catalog, false, &GatewayTransport)
+                .expect_err("fullscreen setup must not consume terminal input");
+        assert!(
+            error
+                .to_string()
+                .contains("line-oriented interactive terminal")
+        );
     }
 }
