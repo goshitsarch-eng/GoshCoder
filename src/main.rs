@@ -58,6 +58,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{Action, App, Message, MessageRole};
 
@@ -415,6 +416,227 @@ fn bold(text: &str, color: bool) -> String {
     }
 }
 
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(80)
+}
+
+fn native_accent(text: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[38;2;215;119;87m{text}\x1b[39m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn native_display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn native_truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if native_display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut output = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output.push('…');
+    output
+}
+
+fn native_pad(text: &str, width: usize) -> String {
+    let text = native_truncate(text, width);
+    let padding = width.saturating_sub(native_display_width(&text));
+    format!("{text}{}", " ".repeat(padding))
+}
+
+fn native_center(text: &str, width: usize) -> String {
+    let text = native_truncate(text, width);
+    format!(
+        "{}{text}",
+        " ".repeat(width.saturating_sub(native_display_width(&text)) / 2)
+    )
+}
+
+fn native_format_cwd(cwd: &Path) -> String {
+    let cwd = cwd.display().to_string();
+    let Ok(home) = std::env::var("HOME") else {
+        return cwd;
+    };
+    if cwd == home {
+        return "~".to_owned();
+    }
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    cwd.strip_prefix(&(home + &separator))
+        .map_or(cwd.clone(), |suffix| format!("~{separator}{suffix}"))
+}
+
+fn native_line_info(prepared: &runtime::PreparedSession) -> NativeLineInfo {
+    let state = prepared.runtime.agent().state();
+    let git = scan_sidebar_git(&sidebar_workspace_path(prepared));
+    let planner_state = prepared
+        .planner
+        .as_ref()
+        .map(|planner| planner.manager().state());
+    let (mode, _) = planner_sidebar_details(planner_state);
+    NativeLineInfo {
+        model: format!("{}/{}", state.model.provider, state.model.id),
+        context_used: compaction::measured_context_tokens(&state.messages),
+        context_limit: state.model.context_window,
+        cost: compaction::conversation_cost(&state.messages, &state.compactions),
+        messages: state.messages.len(),
+        tools: state.tools.len(),
+        changed_files: git.changed_files,
+        branch: git.branch.unwrap_or_else(|| "not a git repo".to_owned()),
+        mode,
+        thinking: state.thinking_level,
+    }
+}
+
+fn native_info_lines(info: &NativeLineInfo) -> Vec<String> {
+    let mut context = compact_number(info.context_used);
+    if info.context_limit > 0 {
+        let percent = info
+            .context_used
+            .saturating_mul(100)
+            .saturating_div(info.context_limit)
+            .min(100);
+        context.push_str(&format!(
+            "/{} · {percent}%",
+            compact_number(info.context_limit)
+        ));
+    }
+    let mode = if info.thinking.is_empty() || info.thinking == llm::THINKING_OFF {
+        info.mode.clone()
+    } else {
+        format!("{} · {}", info.mode, info.thinking)
+    };
+    vec![
+        "Session".to_owned(),
+        native_truncate(&info.model, 24),
+        format!("Context  {context}"),
+        format!("Cost     ${:.4}", info.cost),
+        format!("Messages {} · Tools {}", info.messages, info.tools),
+        format!("Files    {} changed", info.changed_files),
+        format!("Branch   {}", info.branch),
+        format!("Mode     {mode}"),
+    ]
+}
+
+fn native_line_sidebar(info: &NativeLineInfo, width: usize, color: bool) -> String {
+    let width = width.max(24);
+    let inner = width.saturating_sub(2);
+    let mut lines = vec![native_accent(&format!("╭{}╮", "─".repeat(inner)), color)];
+    lines.extend(native_info_lines(info).into_iter().map(|line| {
+        format!(
+            "{} {} {}",
+            native_accent("│", color),
+            native_pad(&line, inner.saturating_sub(2)),
+            native_accent("│", color),
+        )
+    }));
+    lines.push(native_accent(&format!("╰{}╯", "─".repeat(inner)), color));
+    lines.join("\n")
+}
+
+fn native_line_header(
+    width: usize,
+    app_version: &str,
+    cwd: &Path,
+    info: &NativeLineInfo,
+    color: bool,
+) -> String {
+    if width < 24 {
+        return format!("GoshCoder v{app_version}");
+    }
+    let inner = width.saturating_sub(2);
+    let use_tips = inner >= 55;
+    let right_width = if use_tips {
+        (inner.saturating_mul(28) / 100).clamp(16, 28)
+    } else {
+        0
+    };
+    let left_width = if use_tips {
+        inner.saturating_sub(right_width + 3)
+    } else {
+        inner
+    };
+    let logo = ["  ██████  ", " ██  ███  ", "  ███  ██ ", "  ██   ██ "];
+    let mut left = logo
+        .iter()
+        .map(|line| native_center(line, left_width))
+        .collect::<Vec<_>>();
+    left.extend([
+        native_center("Let's build something great", left_width),
+        native_center(
+            &format!("{} · {} effort", info.model, info.thinking),
+            left_width,
+        ),
+        native_center(&native_format_cwd(cwd), left_width),
+        String::new(),
+    ]);
+    let mut right = native_info_lines(info);
+    while right.len() < left.len() {
+        right.push(String::new());
+    }
+    let label = format!(" GoshCoder v{app_version} ");
+    let fill = width
+        .saturating_sub(2)
+        .saturating_sub(native_display_width(&label))
+        .saturating_sub(3);
+    let mut lines = vec![native_accent(
+        &format!("╭───{label}{}╮", "─".repeat(fill)),
+        color,
+    )];
+    for (index, line) in left.iter().enumerate() {
+        let content = if use_tips {
+            format!(
+                "{} {} {}",
+                native_pad(line, left_width),
+                "│",
+                native_pad(&right[index], right_width),
+            )
+        } else {
+            native_pad(line, left_width)
+        };
+        lines.push(format!(
+            "{}{}{}",
+            native_accent("│", color),
+            native_pad(&content, inner),
+            native_accent("│", color)
+        ));
+    }
+    lines.push(native_accent(&format!("╰{}╯", "─".repeat(inner)), color));
+    lines.join("\n")
+}
+
+fn native_line_input_prompt(width: usize, color: bool) -> String {
+    if width < 8 {
+        return "> ".to_owned();
+    }
+    format!(
+        "{}\n{} ",
+        native_accent(&format!("╭{}╮", "─".repeat(width.saturating_sub(2))), color),
+        native_accent("╰─❯", color),
+    )
+}
+
 fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut invocation = runtime::parse_chat(arguments)?;
     choose_resume_session(&mut invocation.config)?;
@@ -619,36 +841,55 @@ fn line_interactive_loop(
     quiet: bool,
 ) -> Result<(), Box<dyn Error>> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let color = color_enabled();
+    let mut claude_tui = prepared.config.claude_tui;
+    let mut last_native_sidebar = None;
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            eprintln!("{}", dim(&format!("session: {notice}"), color));
         }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
             if prepared.runtime.resumed() {
                 let messages = prepared.runtime.restored().messages;
                 let mut stderr = io::stderr().lock();
-                render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
+                render_restored_transcript(&messages, &banner, &mut stderr, color)?;
             } else {
-                eprintln!("{}", dim(&banner, color_enabled()));
+                eprintln!("{}", dim(&banner, color));
             }
         }
         if let Some(hint) = session_continue_hint(&prepared.runtime) {
-            eprintln!("{}", dim(&hint, color_enabled()));
+            eprintln!("{}", dim(&hint, color));
         }
         if interactive {
-            let state = prepared.runtime.agent().state();
-            eprintln!(
-                "{}",
-                dim(
-                    &format!(
-                        "goshcoder {} · {}/{} · /help for commands",
-                        build_version(),
-                        state.model.provider,
-                        state.model.id
-                    ),
-                    color_enabled()
-                )
-            );
+            if claude_tui {
+                let info = native_line_info(prepared);
+                let sidebar = native_line_sidebar(&info, terminal_width().min(42), color);
+                eprintln!(
+                    "{}",
+                    native_line_header(
+                        terminal_width(),
+                        &build_version(),
+                        &sidebar_workspace_path(prepared),
+                        &info,
+                        color,
+                    )
+                );
+                last_native_sidebar = Some(sidebar);
+            } else {
+                let state = prepared.runtime.agent().state();
+                eprintln!(
+                    "{}",
+                    dim(
+                        &format!(
+                            "goshcoder {} · {}/{} · /help for commands",
+                            build_version(),
+                            state.model.provider,
+                            state.model.id
+                        ),
+                        color
+                    )
+                );
+            }
         }
     }
 
@@ -658,7 +899,25 @@ fn line_interactive_loop(
         raw.clear();
         if interactive {
             let mut stderr = io::stderr().lock();
-            write!(stderr, "\n> ")?;
+            if claude_tui {
+                let sidebar = native_line_sidebar(
+                    &native_line_info(prepared),
+                    terminal_width().min(42),
+                    color,
+                );
+                if last_native_sidebar.as_deref() != Some(sidebar.as_str()) {
+                    writeln!(stderr)?;
+                    writeln!(stderr, "{sidebar}")?;
+                    last_native_sidebar = Some(sidebar);
+                }
+                write!(
+                    stderr,
+                    "\n{}",
+                    native_line_input_prompt(terminal_width().min(88), color)
+                )?;
+            } else {
+                write!(stderr, "\n> ")?;
+            }
             stderr.flush()?;
         }
         if stdin.lock().read_line(&mut raw)? == 0 {
@@ -686,6 +945,7 @@ fn line_interactive_loop(
             app.streaming = prepared.runtime.agent().state().is_streaming;
             let mut view = InteractiveView::default();
             let (turn_sender, turn_receiver) = mpsc::channel();
+            let prior_claude_tui = claude_tui;
             let outcome = dispatch_runtime_slash_command(
                 &mut app,
                 &mut view,
@@ -694,7 +954,11 @@ fn line_interactive_loop(
                 turn_sender,
                 &input,
                 false,
+                Some(&mut claude_tui),
             );
+            if claude_tui != prior_claude_tui {
+                last_native_sidebar = None;
+            }
             if view.turn_pending {
                 match turn_receiver.recv() {
                     Ok(completion) => finish_interactive_task(&mut view, prepared, completion),
@@ -805,6 +1069,7 @@ struct InteractiveView {
 #[derive(Clone, Debug, Default)]
 struct SidebarGitInfo {
     branch: Option<String>,
+    changed_files: usize,
     changes: Vec<SidebarGitChange>,
 }
 
@@ -812,6 +1077,20 @@ struct SidebarGitInfo {
 struct SidebarGitChange {
     status: state::FileStatus,
     path: String,
+}
+
+#[derive(Clone, Debug)]
+struct NativeLineInfo {
+    model: String,
+    context_used: u64,
+    context_limit: u64,
+    cost: f64,
+    messages: usize,
+    tools: usize,
+    changed_files: usize,
+    branch: String,
+    mode: String,
+    thinking: String,
 }
 
 impl Default for InteractiveView {
@@ -1341,6 +1620,7 @@ fn submit_interactive_input(
             turn_sender,
             &input,
             true,
+            None,
         );
     }
 
@@ -1827,6 +2107,7 @@ fn dispatch_runtime_slash_command(
     turn_sender: Sender<InteractiveTaskResult>,
     input: &str,
     fullscreen: bool,
+    line_claude_tui: Option<&mut bool>,
 ) -> CommandDispatch {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
@@ -1841,7 +2122,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /use-claude-code-tui  Enable the native startup/editor look in line mode\n  /use-default-tui      Restore the plain line-oriented look\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2335,6 +2616,40 @@ fn dispatch_runtime_slash_command(
                     );
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+            }
+            CommandDispatch::Handled
+        }
+        "/use-claude-code-tui" => {
+            if fullscreen {
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "The fullscreen interface already uses the native sidebar layout; this switch only affects line mode.",
+                );
+            } else if let Some(claude_tui) = line_claude_tui {
+                *claude_tui = true;
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "Using native pi-claude-code-tui look.",
+                );
+            }
+            CommandDispatch::Handled
+        }
+        "/use-default-tui" => {
+            if fullscreen {
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "The fullscreen layout cannot be changed in-place; restart with -fullscreen=false for the line-mode interface.",
+                );
+            } else if let Some(claude_tui) = line_claude_tui {
+                *claude_tui = false;
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "Using default GoshCoder interface.",
+                );
             }
             CommandDispatch::Handled
         }
@@ -3164,6 +3479,7 @@ fn parse_sidebar_git_status(output: &str) -> SidebarGitInfo {
         let Some((status, path)) = parse_sidebar_git_change(line) else {
             continue;
         };
+        info.changed_files += 1;
         if info.changes.len() >= SIDEBAR_GIT_MAX_CHANGES {
             continue;
         }
@@ -4659,6 +4975,31 @@ mod tests {
         let info = parse_sidebar_git_status("## HEAD (detached at 1234567)\n");
 
         assert_eq!(info.branch.as_deref(), Some("detached HEAD"));
+    }
+
+    #[test]
+    fn native_line_ui_renders_session_card_and_prompt() {
+        let info = NativeLineInfo {
+            model: "openai/gpt-test".to_owned(),
+            context_used: 1_000,
+            context_limit: 4_000,
+            cost: 0.0123,
+            messages: 4,
+            tools: 7,
+            changed_files: 2,
+            branch: "feature/native-ui".to_owned(),
+            mode: "executing".to_owned(),
+            thinking: "high".to_owned(),
+        };
+
+        let sidebar = native_line_sidebar(&info, 32, false);
+        assert!(sidebar.contains("Context  1.0k/4.0k · 25%"));
+        assert!(sidebar.contains("Files    2 changed"));
+        assert!(sidebar.contains("Mode     executing · high"));
+        let header = native_line_header(80, "test", Path::new("/workspace"), &info, false);
+        assert!(header.contains("GoshCoder vtest"));
+        assert!(header.contains("openai/gpt-test"));
+        assert_eq!(native_line_input_prompt(8, false), "╭──────╮\n╰─❯ ");
     }
 
     #[test]
