@@ -116,7 +116,8 @@ pub fn compact_with_summaries(
 
     let summary = generate_summary(agent, &state.model, &source, instructions)?;
     let tokens_before = estimate_messages_tokens(&state.messages);
-    let marker = summary_message(&summary, now_millis());
+    let timestamp = now_millis();
+    let marker = summary_message(&summary, timestamp);
     let dropped_queued_messages = agent.queued_message_count();
     agent.compact(
         marker,
@@ -126,7 +127,7 @@ pub fn compact_with_summaries(
             tokens_before,
             cost_before: conversation_cost(&state.messages, summaries),
             retained_messages: retained.len(),
-            timestamp: now_millis(),
+            timestamp,
         },
     )?;
     agent.clear_all_queues();

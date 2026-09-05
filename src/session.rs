@@ -2042,6 +2042,70 @@ mod tests {
     }
 
     #[test]
+    fn compaction_resume_preserves_cost_and_pi_compatible_details() {
+        let root = temp_root("compaction-cost");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("old question").expect("prompt");
+        let mut retained = assistant("kept answer", "fallback", "fallback-model");
+        retained.usage.cost.total = 1.25;
+        let retained = llm::Message::Assistant(Box::new(retained));
+        runtime
+            .record_compaction(
+                CompactionSummary {
+                    summary: "Earlier work.".to_owned(),
+                    tokens_before: 148_002,
+                    cost_before: 5.0,
+                    retained_messages: 1,
+                    timestamp: 1_756_044_151_512,
+                },
+                std::slice::from_ref(&retained),
+            )
+            .expect("record compaction");
+        let id = runtime.id().expect("id");
+        let path = runtime.path().expect("path");
+        close(&mut runtime);
+
+        let entries = fs::read_to_string(&path)
+            .expect("read log")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid JSONL entry"))
+            .collect::<Vec<_>>();
+        let compaction = entries
+            .iter()
+            .find(|entry| entry["type"] == sessionlog::TYPE_COMPACTION)
+            .expect("compaction entry");
+        assert!(
+            compaction["firstKeptEntryId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        assert_eq!(compaction["tokensBefore"], 148_002);
+        assert_eq!(compaction["details"]["goshcoder"]["costBefore"], 5.0);
+        assert_eq!(compaction["details"]["goshcoder"]["retainedMessages"], 1);
+
+        let mut resumed = options(&root, &cwd);
+        resumed.selection = SessionSelection::Session(id);
+        let mut runtime = SessionRuntime::open(resumed).expect("reopen");
+        let restored = runtime.restored();
+        assert!(
+            entries.len() > restored.messages.len(),
+            "the compacted prefix must remain on disk"
+        );
+        let mut messages = restored.messages.clone();
+        let mut fresh = assistant("new answer", "fallback", "fallback-model");
+        fresh.usage.cost.total = 0.75;
+        messages.push(llm::Message::Assistant(Box::new(fresh)));
+        assert_eq!(
+            crate::compaction::conversation_cost(&messages, &restored.compactions),
+            5.75
+        );
+
+        close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn agent_compaction_event_persists_the_same_live_context_cut() {
         let root = temp_root("agent-compaction");
         let cwd = root.join("workspace");

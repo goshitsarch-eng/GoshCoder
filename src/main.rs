@@ -188,7 +188,9 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     });
 
     prepared.sync_extensions()?;
-    let _ = compaction::maybe_auto_compact(&agent)?;
+    if let Some(outcome) = compaction::maybe_auto_compact(&agent)? {
+        print_compaction_outcome(&outcome, true, color);
+    }
     agent.prompt(prompt)?;
     prepared.runtime.sync()?;
     if !quiet {
@@ -275,27 +277,13 @@ fn render_run_event<Out: Write, Err: Write>(
                 )?;
             }
         }
-        agent::EventKind::ContextCompacted => {
-            if let Some(info) = event.compaction.as_ref() {
-                writeln!(
-                    stderr,
-                    "{}",
-                    dim(
-                        &format!(
-                            "context compacted: {} tokens → summary + {} recent messages",
-                            info.tokens_before, info.retained_messages
-                        ),
-                        color,
-                    )
-                )?;
-            }
-        }
         agent::EventKind::AgentStart
         | agent::EventKind::TurnStart
         | agent::EventKind::MessageStart
         | agent::EventKind::ToolExecutionUpdate
         | agent::EventKind::ModelChange
         | agent::EventKind::ThinkingLevelChange
+        | agent::EventKind::ContextCompacted
         | agent::EventKind::TranscriptReset => {}
     }
     stdout.flush()?;
@@ -590,17 +578,7 @@ fn line_interactive_loop(
             );
             if view.turn_pending {
                 match turn_receiver.recv() {
-                    Ok(result) if view.pending_btw_thread.is_some() => {
-                        let _ = finish_pending_btw(&mut view, prepared, result);
-                    }
-                    Ok(Ok(())) => {
-                        view.turn_pending = false;
-                        view.activity = "Ready".to_owned();
-                    }
-                    Ok(Err(error)) => {
-                        view.turn_pending = false;
-                        append_view_message(&mut view, MessageRole::Error, error);
-                    }
+                    Ok(completion) => finish_interactive_task(&mut view, prepared, completion),
                     Err(_) => {
                         view.turn_pending = false;
                         append_view_message(
@@ -620,9 +598,13 @@ fn line_interactive_loop(
                 eprintln!("error: {error}");
                 continue;
             }
-            if let Err(error) = compaction::maybe_auto_compact(prepared.runtime.agent()) {
-                eprintln!("error: {error}");
-                continue;
+            match compaction::maybe_auto_compact(prepared.runtime.agent()) {
+                Ok(Some(outcome)) => print_compaction_outcome(&outcome, true, color_enabled()),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    continue;
+                }
             }
             if let Err(error) = prepared.runtime.agent().prompt(input) {
                 eprintln!("error: {error}");
@@ -681,13 +663,34 @@ impl Default for InteractiveView {
     }
 }
 
+/// Completion reported by a fullscreen background task.
+///
+/// Compaction has user-visible outcomes beyond success or failure, so it must
+/// not be flattened into the ordinary turn result channel.
+enum InteractiveTaskResult {
+    Finished {
+        result: Result<(), String>,
+        automatic_compaction: Option<compaction::Outcome>,
+    },
+    Compaction(Result<compaction::Outcome, String>),
+}
+
+impl InteractiveTaskResult {
+    fn finished(result: Result<(), String>) -> Self {
+        Self::Finished {
+            result,
+            automatic_compaction: None,
+        }
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     agent_events: Receiver<agent::Event>,
-    turn_sender: Sender<Result<(), String>>,
-    turn_results: Receiver<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
+    turn_results: Receiver<InteractiveTaskResult>,
     quiet: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
@@ -797,7 +800,7 @@ fn drain_interactive_events(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     agent_events: &Receiver<agent::Event>,
-    turn_results: &Receiver<Result<(), String>>,
+    turn_results: &Receiver<InteractiveTaskResult>,
 ) {
     while let Ok(event) = agent_events.try_recv() {
         match event.kind {
@@ -830,17 +833,9 @@ fn drain_interactive_events(
                 view.activity_since = None;
             }
             agent::EventKind::ContextCompacted => {
-                if let Some(info) = event.compaction {
+                if event.compaction.is_some() {
                     view.activity = "Context compacted".to_owned();
                     view.activity_since = None;
-                    append_view_message(
-                        view,
-                        MessageRole::Notice,
-                        format!(
-                            "Context compacted: {} tokens → summary + {} recent messages.",
-                            info.tokens_before, info.retained_messages
-                        ),
-                    );
                 }
             }
             agent::EventKind::TurnStart
@@ -853,15 +848,8 @@ fn drain_interactive_events(
             | agent::EventKind::TranscriptReset => {}
         }
     }
-    while let Ok(result) = turn_results.try_recv() {
-        if view.pending_btw_thread.is_some() {
-            let _ = finish_pending_btw(view, prepared, result);
-            continue;
-        }
-        view.turn_pending = false;
-        if let Err(error) = result {
-            append_view_message(view, MessageRole::Error, error);
-        }
+    while let Ok(completion) = turn_results.try_recv() {
+        finish_interactive_task(view, prepared, completion);
     }
     for notice in prepared.runtime.drain_notices() {
         append_view_message(
@@ -869,6 +857,86 @@ fn drain_interactive_events(
             MessageRole::Notice,
             format!("{}: {}", notice.kind, notice.text),
         );
+    }
+}
+
+fn compaction_notice_text(outcome: &compaction::Outcome, automatic: bool) -> String {
+    let action = if automatic {
+        "compacted context automatically"
+    } else {
+        "compacted context"
+    };
+    format!(
+        "{action}: {} messages → summary + {} recent messages",
+        outcome.messages_before, outcome.retained_messages
+    )
+}
+
+fn compaction_discard_notice(outcome: &compaction::Outcome) -> Option<String> {
+    (outcome.dropped_queued_messages > 0).then(|| {
+        format!(
+            "{} queued message(s) were discarded: they were written against the transcript that was just compacted",
+            outcome.dropped_queued_messages
+        )
+    })
+}
+
+fn print_compaction_outcome(outcome: &compaction::Outcome, automatic: bool, color: bool) {
+    eprintln!(
+        "{}",
+        dim(&compaction_notice_text(outcome, automatic), color)
+    );
+    if let Some(notice) = compaction_discard_notice(outcome) {
+        eprintln!("{}", dim(&notice, color));
+    }
+}
+
+fn report_interactive_compaction(
+    view: &mut InteractiveView,
+    outcome: &compaction::Outcome,
+    automatic: bool,
+) {
+    view.activity = "Context compacted".to_owned();
+    view.activity_since = None;
+    append_view_message(
+        view,
+        MessageRole::Notice,
+        compaction_notice_text(outcome, automatic),
+    );
+    if let Some(notice) = compaction_discard_notice(outcome) {
+        append_view_message(view, MessageRole::Notice, notice);
+    }
+}
+
+fn finish_interactive_task(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    completion: InteractiveTaskResult,
+) {
+    match completion {
+        InteractiveTaskResult::Finished {
+            result,
+            automatic_compaction,
+        } => {
+            if view.pending_btw_thread.is_some() {
+                let _ = finish_pending_btw(view, prepared, result);
+                return;
+            }
+            view.turn_pending = false;
+            if let Some(outcome) = automatic_compaction {
+                report_interactive_compaction(view, &outcome, true);
+            }
+            if let Err(error) = result {
+                append_view_message(view, MessageRole::Error, error);
+            }
+        }
+        InteractiveTaskResult::Compaction(result) => {
+            view.turn_pending = false;
+            match result {
+                Ok(outcome) => report_interactive_compaction(view, &outcome, false),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+        }
     }
 }
 
@@ -943,7 +1011,7 @@ fn submit_interactive_input(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     input: String,
     follow_up: bool,
 ) -> CommandDispatch {
@@ -1004,7 +1072,7 @@ enum CommandDispatch {
 fn begin_interactive_turn(
     view: &mut InteractiveView,
     agent: agent::Agent,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     prompt: String,
     activity: &str,
 ) {
@@ -1012,14 +1080,18 @@ fn begin_interactive_turn(
     view.activity = activity.to_owned();
     view.activity_since = Some(Instant::now());
     thread::spawn(move || {
-        let result = compaction::maybe_auto_compact(&agent)
-            .and_then(|_| {
-                agent
-                    .prompt(prompt)
-                    .map_err(compaction::CompactionError::Agent)
-            })
-            .map_err(|error| error.to_string());
-        let _ = turn_sender.send(result);
+        let automatic_compaction = match compaction::maybe_auto_compact(&agent) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = turn_sender.send(InteractiveTaskResult::finished(Err(error.to_string())));
+                return;
+            }
+        };
+        let result = agent.prompt(prompt).map_err(|error| error.to_string());
+        let _ = turn_sender.send(InteractiveTaskResult::Finished {
+            result,
+            automatic_compaction,
+        });
     });
 }
 
@@ -1027,7 +1099,7 @@ fn dispatch_ralph_slash_command(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     rest: &str,
 ) -> CommandDispatch {
     let Some(ralph_runtime) = prepared.ralph.as_ref() else {
@@ -1144,7 +1216,7 @@ fn dispatch_btw_slash_command(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     rest: &str,
 ) -> CommandDispatch {
     let (action, argument) = split_prompt_action(rest);
@@ -1333,7 +1405,7 @@ fn start_btw_question(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     thread_id: String,
     question: String,
 ) {
@@ -1386,7 +1458,7 @@ fn start_btw_question(
             Ok(None) => Err("BTW side thread did not have a queued question".to_owned()),
             Err(error) => Err(error.to_string()),
         };
-        let _ = turn_sender.send(result);
+        let _ = turn_sender.send(InteractiveTaskResult::finished(result));
     });
 }
 
@@ -1398,7 +1470,7 @@ fn dispatch_runtime_slash_command(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     input: &str,
     fullscreen: bool,
 ) -> CommandDispatch {
@@ -1856,10 +1928,9 @@ fn dispatch_runtime_slash_command(
             view.activity = "Compacting context".to_owned();
             view.activity_since = Some(Instant::now());
             thread::spawn(move || {
-                let result = compaction::compact(&agent, &instructions)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
-                let _ = turn_sender.send(result);
+                let result =
+                    compaction::compact(&agent, &instructions).map_err(|error| error.to_string());
+                let _ = turn_sender.send(InteractiveTaskResult::Compaction(result));
             });
             CommandDispatch::Handled
         }
@@ -2285,7 +2356,7 @@ fn start_planner_review<F>(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     activity: &str,
     request: F,
 ) -> CommandDispatch
@@ -2323,7 +2394,7 @@ where
                 Ok(())
             }
         });
-        let _ = turn_sender.send(result);
+        let _ = turn_sender.send(InteractiveTaskResult::finished(result));
     });
     CommandDispatch::Handled
 }
@@ -3042,5 +3113,31 @@ mod tests {
         assert!(summary.starts_with("a=\"value\" z=\""));
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= "a=\"value\" z=".len() + 63);
+    }
+
+    #[test]
+    fn compaction_notices_report_message_counts_and_dropped_queue() {
+        let outcome = compaction::Outcome {
+            messages_before: 12,
+            retained_messages: 4,
+            tokens_before: 40_000,
+            dropped_queued_messages: 2,
+        };
+
+        assert_eq!(
+            compaction_notice_text(&outcome, false),
+            "compacted context: 12 messages → summary + 4 recent messages"
+        );
+        assert_eq!(
+            compaction_notice_text(&outcome, true),
+            "compacted context automatically: 12 messages → summary + 4 recent messages"
+        );
+        assert_eq!(
+            compaction_discard_notice(&outcome),
+            Some(
+                "2 queued message(s) were discarded: they were written against the transcript that was just compacted"
+                    .to_owned()
+            )
+        );
     }
 }
