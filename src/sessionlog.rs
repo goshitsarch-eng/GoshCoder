@@ -181,6 +181,7 @@ pub type Result<T> = std::result::Result<T, SessionError>;
 pub struct Header {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
     pub version: u32,
     pub id: String,
     pub timestamp: String,
@@ -247,6 +248,7 @@ impl Header {
 pub struct Entry {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default)]
     pub id: String,
     #[serde(rename = "parentId", default)]
     pub parent_id: Option<String>,
