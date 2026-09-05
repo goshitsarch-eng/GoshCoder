@@ -12,6 +12,7 @@ pub mod session;
 pub mod sessionlog;
 pub mod sessions;
 mod state;
+pub mod stream;
 pub mod tools;
 mod ui;
 
