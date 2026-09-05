@@ -4,8 +4,8 @@
 //! metadata. This module owns the live `/v1/mcp` JSON-RPC session used to
 //! discover and invoke connector tools. It mirrors the Go implementation's
 //! protocol version, deadlines, bounded response handling, SSE compatibility,
-//! and best-effort `notifications/initialized` behavior without requiring a
-//! runtime integration point.
+//! and best-effort `notifications/initialized` behavior. The session runtime
+//! uses its agent-tool adapters for configured connector pins and discovery.
 //!
 //! `reqwest::blocking` cannot interrupt a socket read from another thread.
 //! Cancellation is therefore checked before dispatch, after headers arrive,

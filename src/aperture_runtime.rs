@@ -299,9 +299,11 @@ mod tests {
         CapturedRequest {
             method,
             target,
-            body: (!body.is_empty())
-                .then(|| serde_json::from_slice(&body).expect("JSON request"))
-                .unwrap_or(Value::Null),
+            body: if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&body).expect("JSON request")
+            },
         }
     }
 

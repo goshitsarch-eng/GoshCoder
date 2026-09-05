@@ -1,9 +1,9 @@
 //! Tailscale Aperture configuration and routing primitives.
 //!
 //! This is a standalone port of the non-UI Aperture core.  It intentionally
-//! depends only on the crate's LLM model representation so a later runtime
-//! integration can load configuration, build a catalog, apply proxy routes,
-//! and rewrite requests without reimplementing the compatibility rules.
+//! depends only on the crate's LLM model representation so catalog, request,
+//! CLI, and session runtime integrations can reuse its compatibility rules
+//! without reimplementing them.
 
 use std::{
     borrow::Cow,
