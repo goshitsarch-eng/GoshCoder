@@ -45,7 +45,7 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, bedrock, catalog, google_auth, llm, mistral, stream};
+use crate::{agent, aperture, bedrock, catalog, google_auth, llm, mistral, stream};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -845,9 +845,22 @@ impl ProviderResponderFactory {
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            let routed_model = aperture::rewrite_request_model(
+                Some(catalog.aperture_state()),
+                &resolved.model,
+                &options.session_id,
+            );
+            let aperture_routed = matches!(&routed_model, std::borrow::Cow::Owned(_));
             transport
-                .respond_with_credentials(model, context, options, credentials)
-                .map_err(|error| error.to_string())
+                .respond_with_credentials(routed_model.as_ref(), context, options, credentials)
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if aperture_routed {
+                        aperture::mark_retryable_error(&message).unwrap_or(message)
+                    } else {
+                        message
+                    }
+                })
         })
     }
 }
@@ -6679,6 +6692,99 @@ mod tests {
             Some("Bearer ya29.prefetched")
         );
         assert_eq!(response.stop_reason, stream::STOP_STOP);
+    }
+
+    #[test]
+    fn catalog_responder_rewrites_dedicated_aperture_models_and_provenance_headers() {
+        let body = concat!(
+            "data: {\"id\":\"chat_1\",\"model\":\"route-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let root = std::env::temp_dir().join(format!(
+            "goshcoder-aperture-request-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
+        let configuration = aperture::Config {
+            base_url: base_url.clone(),
+            onboarding_done: Some(true),
+            dedicated: Some(aperture::DedicatedConfig {
+                enabled: Some(true),
+                ..aperture::DedicatedConfig::default()
+            }),
+            ..aperture::Config::default()
+        };
+        let cached_model = llm::Model {
+            id: "openai/route-model".to_owned(),
+            name: "Routed model".to_owned(),
+            api: API_OPENAI_COMPLETIONS.to_owned(),
+            provider: aperture::DEDICATED_PROVIDER_ID.to_owned(),
+            base_url: format!("{base_url}/v1"),
+            input: vec!["text".to_owned()],
+            context_window: 128_000,
+            max_tokens: 4_096,
+            ..llm::Model::default()
+        };
+        let cache = aperture::Cache {
+            catalog_key: aperture::build_catalog_key(
+                &aperture::gateway_url(&configuration.base_url),
+                &configuration.resolve(),
+            ),
+            models: vec![aperture::CachedModel {
+                model: cached_model,
+                raw_compat: None,
+            }],
+            ..aperture::Cache::default()
+        };
+        let configuration_path = root.join("extensions").join("aperture.json");
+        let cache_path = root.join("extensions").join("aperture-cache.json");
+        aperture::save_config(&configuration_path, &configuration).expect("save Aperture config");
+        aperture::save_cache(&cache_path, &cache).expect("save Aperture cache");
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(None, Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(configuration_path, cache_path),
+        );
+        let request_model = catalog
+            .provider(aperture::DEDICATED_PROVIDER_ID)
+            .expect("Aperture provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("Aperture model");
+
+        let response = factory(0).catalog_assistant_responder(catalog)(
+            &request_model,
+            &text_context(),
+            options(agent::CancellationToken::default()),
+        )
+        .expect("Aperture response");
+        let request = requests.recv().expect("captured Aperture request");
+        server.join().expect("Aperture server finishes");
+        let payload = serde_json::from_slice::<Value>(&request.body).expect("request JSON");
+
+        assert_eq!(request.target, "/v1/chat/completions");
+        assert_eq!(payload["model"], "route-model");
+        assert_eq!(
+            request.headers.get("referer").map(String::as_str),
+            Some(aperture::APERTURE_REFERER)
+        );
+        assert_eq!(
+            request.headers.get("x-session-id").map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer -")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

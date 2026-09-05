@@ -5,10 +5,6 @@
 //! [`crate::config`] path layout, but does not expose credentials through
 //! `Debug` or error messages.
 //!
-//! TODO: Declare this module from the executable when the provider runtime is
-//! wired into the Rust command surface. This file intentionally makes no
-//! changes to `main.rs`.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -36,7 +32,7 @@ use std::os::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::{Map, Value};
 
-use crate::{config, llm, oauth};
+use crate::{aperture, config, llm, oauth};
 
 const CATALOG_JSON: &str = include_str!("../internal/llm/catalog/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../internal/llm/catalog/catalog_extra.json");
@@ -669,6 +665,24 @@ impl Provider {
 
 type RawModel = Map<String, Value>;
 type RawCatalog = BTreeMap<String, BTreeMap<String, RawModel>>;
+
+/// The configurable files which establish one immutable Aperture catalog
+/// snapshot. Kept alongside the catalog so cloned catalogs observe the same
+/// routing state throughout a session.
+#[derive(Clone)]
+struct AperturePaths {
+    config: PathBuf,
+    cache: PathBuf,
+}
+
+impl Default for AperturePaths {
+    fn default() -> Self {
+        Self {
+            config: config::aperture_path(),
+            cache: config::aperture_cache_path(),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct BuiltinData {
@@ -1932,6 +1946,8 @@ pub struct Catalog {
     file_exists: FileExists,
     oauth_client: Arc<oauth::OAuthClient>,
     oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
+    aperture_paths: AperturePaths,
+    aperture_state: Arc<OnceLock<aperture::ApertureState>>,
 }
 
 impl Catalog {
@@ -1960,6 +1976,22 @@ impl Catalog {
         )
     }
 
+    /// Overrides the Aperture configuration and cache locations for this
+    /// catalog. Embedders use this to keep a session's gateway routing
+    /// separate from the process-wide agent directory.
+    pub fn with_aperture_paths(
+        mut self,
+        configuration: impl Into<PathBuf>,
+        cache: impl Into<PathBuf>,
+    ) -> Self {
+        self.aperture_paths = AperturePaths {
+            config: configuration.into(),
+            cache: cache.into(),
+        };
+        self.aperture_state = Arc::new(OnceLock::new());
+        self
+    }
+
     /// Creates a catalog with injectable environment and ADC file checks.
     pub fn with_environment_and_file_exists(
         credentials: Option<Arc<CredentialStore>>,
@@ -1975,6 +2007,8 @@ impl Catalog {
             file_exists,
             oauth_client: Arc::new(oauth_client),
             oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
+            aperture_paths: AperturePaths::default(),
+            aperture_state: Arc::new(OnceLock::new()),
         })
     }
 
@@ -2003,13 +2037,56 @@ impl Catalog {
         self.data.models.keys().cloned().collect()
     }
 
+    /// Returns Aperture's immutable dedicated/proxy routing state for this
+    /// catalog. Configuration errors leave the static catalog usable; the
+    /// Aperture management command reports those errors explicitly.
+    pub fn aperture_state(&self) -> &aperture::ApertureState {
+        self.aperture_state
+            .get_or_init(|| self.build_aperture_state())
+    }
+
+    fn build_aperture_state(&self) -> aperture::ApertureState {
+        let Ok(configuration) = aperture::load_config(&self.aperture_paths.config) else {
+            return aperture::ApertureState::default();
+        };
+        let cache = aperture::load_cache(&self.aperture_paths.cache).ok();
+        aperture::build_aperture_state(&configuration, cache.as_ref(), |provider_id| {
+            self.native_provider_info(provider_id)
+        })
+    }
+
+    fn native_provider_info(&self, provider_id: &str) -> Option<aperture::NativeProviderInfo> {
+        let models = self.data.models.get(provider_id)?;
+        let first_model = models.values().next()?;
+        let mut base_url = first_model.base_url.clone();
+        if let Some(definition) = provider_definition(provider_id)
+            && !definition.base_url.is_empty()
+        {
+            base_url = definition.base_url.to_owned();
+        }
+        Some(aperture::NativeProviderInfo {
+            api: first_model.api.clone(),
+            base_url,
+            model_ids: models.keys().cloned().collect(),
+        })
+    }
+
+    fn aperture_proxy_auth(&self, provider_id: &str) -> Option<Auth> {
+        let route = self.aperture_state().routes.get(provider_id)?;
+        (!route.passthrough).then(|| {
+            Auth::with_api_key(
+                "-".to_owned(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                "aperture proxy",
+            )
+        })
+    }
+
     /// Returns an independent provider/model view.
     ///
     /// TODO: Load configured OmniRoute base URLs and models here. This method
     /// intentionally exposes only embedded static Omni metadata.
-    ///
-    /// TODO: Apply Aperture dedicated/proxy routing here. Dynamic Aperture
-    /// provider state is intentionally outside this non-OAuth core port.
     pub fn provider(&self, id: &str) -> Option<Provider> {
         let definition = provider_definition(id)?;
         let models = self
@@ -2019,7 +2096,7 @@ impl Catalog {
             .map(|models| models.values().cloned().collect())
             .unwrap_or_default();
         let raw_compat = self.data.raw_compat.get(id).cloned().unwrap_or_default();
-        Some(Provider {
+        let mut provider = Provider {
             id: definition.id.to_owned(),
             name: definition.name.to_owned(),
             base_url: definition.base_url.to_owned(),
@@ -2033,7 +2110,22 @@ impl Catalog {
             supports_oauth: definition.supports_oauth,
             models,
             raw_compat,
-        })
+        };
+        if id == aperture::DEDICATED_PROVIDER_ID {
+            let state = self.aperture_state();
+            if state.configured && state.resolved.dedicated_enabled {
+                provider.base_url = aperture::provider_base_url(&state.resolved.base_url);
+                provider.models = state.dedicated_models.clone();
+            }
+        } else if let Some(route) = self.aperture_state().routes.get(id) {
+            provider.models = provider
+                .models
+                .iter()
+                .filter_map(|model| aperture::apply_proxy_route(model, route))
+                .collect();
+            provider.base_url = route.base_url.clone();
+        }
+        Some(provider)
     }
 
     /// Returns every statically known provider in lexical ID order.
@@ -2046,20 +2138,14 @@ impl Catalog {
 
     /// Returns an independent model copy.
     pub fn model(&self, provider_id: &str, model_id: &str) -> Option<llm::Model> {
-        self.data
-            .models
-            .get(provider_id)
-            .and_then(|models| models.get(model_id))
-            .cloned()
+        self.provider(provider_id)
+            .and_then(|provider| provider.model(model_id))
     }
 
     /// Returns raw protocol compatibility metadata for one model.
     pub fn raw_compat(&self, provider_id: &str, model_id: &str) -> Option<Value> {
-        self.data
-            .raw_compat
-            .get(provider_id)
-            .and_then(|models| models.get(model_id))
-            .cloned()
+        self.provider(provider_id)
+            .and_then(|provider| provider.raw_compat(model_id))
     }
 
     /// Resolves stored or ambient authentication for a known provider.
@@ -2092,6 +2178,32 @@ impl Catalog {
             }
             let override_credential = Credential::api_key(override_key);
             return Ok(self.build_api_key_auth(definition, Some(&override_credential), "override"));
+        }
+
+        if provider_id == aperture::DEDICATED_PROVIDER_ID {
+            let state = self.aperture_state();
+            return Ok(
+                (state.configured && state.resolved.dedicated_enabled).then(|| {
+                    Auth::with_api_key(
+                        "-".to_owned(),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        "aperture gateway",
+                    )
+                }),
+            );
+        }
+
+        if let Some(proxy_auth) = self.aperture_proxy_auth(provider_id) {
+            if definition.supports_oauth
+                && let Some(store) = &self.credentials
+                && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
+                && stored.kind() == CredentialKind::OAuth
+                && let Ok(Some(auth)) = self.resolve_stored_oauth(provider_id)
+            {
+                return Ok(Some(auth));
+            }
+            return Ok(Some(proxy_auth));
         }
 
         if let Some(store) = &self.credentials
@@ -2584,12 +2696,18 @@ mod tests {
     }
 
     fn test_catalog(values: &[(&str, &str)]) -> Catalog {
-        Catalog::with_environment_and_file_exists(
+        let mut catalog = Catalog::with_environment_and_file_exists(
             None,
             test_environment(values),
             Arc::new(|_| false),
         )
-        .expect("embedded catalog loads")
+        .expect("embedded catalog loads");
+        let root = test_directory("unconfigured-aperture");
+        catalog.aperture_paths = AperturePaths {
+            config: root.join("aperture.json"),
+            cache: root.join("aperture-cache.json"),
+        };
+        catalog
     }
 
     fn test_directory(label: &str) -> PathBuf {
@@ -2598,6 +2716,169 @@ mod tests {
             "goshcoder-catalog-{label}-{}-{sequence}",
             process::id()
         ))
+    }
+
+    fn aperture_catalog(
+        values: &[(&str, &str)],
+        configuration: &aperture::Config,
+        cache: &aperture::Cache,
+    ) -> (Catalog, PathBuf) {
+        let root = test_directory("aperture");
+        let paths = AperturePaths {
+            config: root.join("extensions").join("aperture.json"),
+            cache: root.join("extensions").join("aperture-cache.json"),
+        };
+        aperture::save_config(&paths.config, configuration).expect("save aperture config");
+        aperture::save_cache(&paths.cache, cache).expect("save aperture cache");
+        let mut catalog = test_catalog(values);
+        catalog.aperture_paths = paths;
+        (catalog, root)
+    }
+
+    #[test]
+    fn aperture_dedicated_provider_uses_matching_cached_models_and_gateway_auth() {
+        let configuration = aperture::Config {
+            base_url: "http://aperture.test".to_owned(),
+            onboarding_done: Some(true),
+            dedicated: Some(aperture::DedicatedConfig {
+                enabled: Some(true),
+                ..aperture::DedicatedConfig::default()
+            }),
+            ..aperture::Config::default()
+        };
+        let model = llm::Model {
+            id: "openai/test-model".to_owned(),
+            name: "Test model".to_owned(),
+            api: "openai-completions".to_owned(),
+            provider: aperture::DEDICATED_PROVIDER_ID.to_owned(),
+            base_url: "http://aperture.test/v1".to_owned(),
+            ..llm::Model::default()
+        };
+        let cache = aperture::Cache {
+            catalog_key: aperture::build_catalog_key(
+                &aperture::gateway_url(&configuration.base_url),
+                &configuration.resolve(),
+            ),
+            models: vec![aperture::CachedModel {
+                model: model.clone(),
+                raw_compat: None,
+            }],
+            ..aperture::Cache::default()
+        };
+        let (catalog, root) = aperture_catalog(&[], &configuration, &cache);
+
+        let provider = catalog
+            .provider(aperture::DEDICATED_PROVIDER_ID)
+            .expect("dedicated provider");
+        assert_eq!(provider.base_url, "http://aperture.test/v1");
+        assert_eq!(provider.models(), vec![model]);
+        let resolved = catalog
+            .resolve_model("aperture/openai/test-model")
+            .expect("resolve dedicated model");
+        assert_eq!(resolved.auth().api_key(), Some("-"));
+        assert_eq!(resolved.auth().source(), "aperture gateway");
+        assert!(
+            catalog
+                .configured_provider_ids()
+                .expect("configured providers")
+                .contains(&aperture::DEDICATED_PROVIDER_ID.to_owned())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn aperture_proxy_routes_filter_models_and_supply_gateway_auth() {
+        let template = test_catalog(&[])
+            .provider("openai")
+            .expect("OpenAI provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("OpenAI model");
+        let configuration = aperture::Config {
+            base_url: "http://aperture.test".to_owned(),
+            onboarding_done: Some(true),
+            proxy: Some(aperture::ProxyConfig {
+                enabled: Some(true),
+                upstream_providers: Some(vec![aperture::ProxiedProviderConfig {
+                    id: "openai".to_owned(),
+                    keep_gateway_models_only: true,
+                    ..aperture::ProxiedProviderConfig::default()
+                }]),
+            }),
+            ..aperture::Config::default()
+        };
+        let cache = aperture::Cache {
+            gateway: vec![aperture::GatewaySnapshot {
+                id: "openai".to_owned(),
+                models: vec![template.id.clone()],
+                ..aperture::GatewaySnapshot::default()
+            }],
+            ..aperture::Cache::default()
+        };
+        let (catalog, root) = aperture_catalog(&[], &configuration, &cache);
+
+        let route = catalog
+            .aperture_state()
+            .routes
+            .get("openai")
+            .expect("OpenAI proxy route");
+        let provider = catalog.provider("openai").expect("proxied OpenAI provider");
+        assert_eq!(provider.base_url, route.base_url);
+        assert_eq!(provider.models().len(), 1);
+        assert_eq!(provider.models()[0].id, template.id);
+        let resolved = catalog
+            .resolve_model(&format!("openai/{}", template.id))
+            .expect("resolve proxied model");
+        assert_eq!(resolved.model.base_url, route.base_url);
+        assert_eq!(resolved.auth().api_key(), Some("-"));
+        assert_eq!(resolved.auth().source(), "aperture proxy");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn aperture_proxy_passthrough_retains_native_authentication() {
+        let template = test_catalog(&[])
+            .provider("openai")
+            .expect("OpenAI provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("OpenAI model");
+        let configuration = aperture::Config {
+            base_url: "http://aperture.test".to_owned(),
+            onboarding_done: Some(true),
+            proxy: Some(aperture::ProxyConfig {
+                enabled: Some(true),
+                upstream_providers: Some(vec![aperture::ProxiedProviderConfig {
+                    id: "openai".to_owned(),
+                    ..aperture::ProxiedProviderConfig::default()
+                }]),
+            }),
+            ..aperture::Config::default()
+        };
+        let cache = aperture::Cache {
+            gateway: vec![aperture::GatewaySnapshot {
+                id: "openai".to_owned(),
+                models: vec![template.id],
+                requires_client_auth: true,
+                ..aperture::GatewaySnapshot::default()
+            }],
+            ..aperture::Cache::default()
+        };
+        let (catalog, root) =
+            aperture_catalog(&[("OPENAI_API_KEY", "native-key")], &configuration, &cache);
+
+        let auth = catalog
+            .resolve_auth("openai")
+            .expect("resolve OpenAI auth")
+            .expect("native OpenAI auth");
+        assert_eq!(auth.api_key(), Some("native-key"));
+        assert_eq!(auth.source(), "OPENAI_API_KEY");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

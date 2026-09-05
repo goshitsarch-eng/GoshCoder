@@ -355,7 +355,7 @@ impl SessionRuntime {
             .writer
             .as_ref()
             .map(|writer| writer.id().to_owned())
-            .unwrap_or_default();
+            .unwrap_or_else(|| format!("goshcoder-{}", std::process::id()));
         let agent = agent::Agent::new(agent::AgentOptions {
             initial_state: agent::InitialState {
                 system_prompt: options.system_prompt.clone(),
@@ -437,6 +437,12 @@ impl SessionRuntime {
         mut model_notices: Vec<String>,
         model_selection: ModelSelection,
     ) -> Result<Self> {
+        let session_id = opened
+            .writer
+            .as_ref()
+            .map(|writer| writer.id().to_owned())
+            .unwrap_or_else(|| format!("goshcoder-{}", std::process::id()));
+        agent.set_session_id(session_id);
         let notices = NoticeSink::new(options.on_notice.clone());
         for notice in opened.notices {
             notices.push("Session", notice);
@@ -859,6 +865,7 @@ impl SessionRuntime {
             read_only: writer.read_only(),
         };
         let previous = self.recorder.swap(writer);
+        self.agent.set_session_id(handle.id.clone());
         if let Some(mut previous) = previous
             && let Err(error) = previous.close()
         {

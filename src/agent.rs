@@ -450,7 +450,7 @@ struct AgentInner {
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     tool_execution: ToolExecutionMode,
-    session_id: String,
+    session_id: Mutex<String>,
 }
 
 struct InnerState {
@@ -503,7 +503,7 @@ impl Agent {
                 steering_mode: options.steering_mode,
                 follow_up_mode: options.follow_up_mode,
                 tool_execution: options.tool_execution,
-                session_id: options.session_id,
+                session_id: Mutex::new(options.session_id),
             }),
         }
     }
@@ -522,6 +522,13 @@ impl Agent {
             pending_tool_calls: state.pending_tool_calls.iter().cloned().collect(),
             error_message: state.error_message.clone(),
         }
+    }
+
+    /// Replaces the durable-session identity included in future provider
+    /// requests. Session runtimes call this after cloning or switching their
+    /// active log so request provenance follows the conversation.
+    pub fn set_session_id(&self, session_id: impl Into<String>) {
+        *lock(&self.inner.session_id) = session_id.into();
     }
 
     pub fn subscribe(&self, listener: impl Fn(Event) + Send + Sync + 'static) -> Subscription {
@@ -872,7 +879,7 @@ impl Agent {
                     max_tokens: None,
                     tool_choice: None,
                     cache_retention: CacheRetention::Short,
-                    session_id: self.inner.session_id.clone(),
+                    session_id: lock(&self.inner.session_id).clone(),
                     assistant_event_listener: Some(assistant_event_listener),
                 },
             )
@@ -1360,6 +1367,33 @@ mod tests {
                 EventKind::TurnEnd,
                 EventKind::AgentEnd,
             ]
+        );
+    }
+
+    #[test]
+    fn provider_requests_follow_updated_session_identity() {
+        let session_ids = Arc::new(Mutex::new(Vec::new()));
+        let recorded_ids = Arc::clone(&session_ids);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, options| {
+                lock(&recorded_ids).push(options.session_id);
+                Ok(assistant_text("ok"))
+            })),
+            session_id: "original-session".to_owned(),
+            ..AgentOptions::default()
+        });
+
+        agent.prompt("first").expect("first request");
+        agent.set_session_id("switched-session");
+        agent.prompt("second").expect("second request");
+
+        assert_eq!(
+            lock(&session_ids).as_slice(),
+            ["original-session", "switched-session"]
         );
     }
 
