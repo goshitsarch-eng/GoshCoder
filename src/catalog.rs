@@ -2711,6 +2711,30 @@ mod tests {
     }
 
     #[test]
+    fn mistral_api_key_configures_native_conversations_models() {
+        let catalog = test_catalog(&[("MISTRAL_API_KEY", "test-mistral-key")]);
+        assert!(
+            catalog
+                .configured_provider_ids()
+                .expect("configured providers")
+                .contains(&"mistral".to_owned())
+        );
+
+        let model = catalog
+            .provider("mistral")
+            .expect("Mistral provider")
+            .models()
+            .into_iter()
+            .find(|model| model.api == "mistral-conversations")
+            .expect("Mistral Conversations model in embedded catalog");
+        let resolved = catalog
+            .resolve_model(&format!("mistral/{}", model.id))
+            .expect("resolve configured Mistral model");
+        assert_eq!(resolved.model.api, "mistral-conversations");
+        assert_eq!(resolved.auth().api_key(), Some("test-mistral-key"));
+    }
+
+    #[test]
     fn config_values_expand_templates_without_caching_environment_reads() {
         let lookup =
             test_environment(&[("LEFT", "left"), ("RIGHT", "right"), ("SCOPED", "process")]);
