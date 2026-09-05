@@ -82,6 +82,10 @@ pub struct App {
     model_suggestions_model: Option<String>,
     login_suggestions: Vec<Suggestion>,
     login_suggestions_query: Option<String>,
+    thinking_suggestions: Vec<Suggestion>,
+    thinking_suggestions_query: Option<String>,
+    thinking_suggestions_model: Option<String>,
+    thinking_suggestions_level: Option<String>,
     resource_suggestions: Vec<Suggestion>,
     resource_suggestions_query: Option<String>,
     history_index: Option<usize>,
@@ -164,6 +168,10 @@ impl App {
             model_suggestions_model: None,
             login_suggestions: Vec::new(),
             login_suggestions_query: None,
+            thinking_suggestions: Vec::new(),
+            thinking_suggestions_query: None,
+            thinking_suggestions_model: None,
+            thinking_suggestions_level: None,
             resource_suggestions: Vec::new(),
             resource_suggestions_query: None,
             history_index: None,
@@ -173,27 +181,34 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        match model_query(&self.input) {
-            Some(query) if self.model_suggestions_query.as_deref() == Some(query) => {
+        if let Some(query) = model_query(&self.input) {
+            return if self.model_suggestions_query.as_deref() == Some(query) {
                 self.model_suggestions.clone()
-            }
-            Some(_) => Vec::new(),
-            None => match login_query(&self.input) {
-                Some(query) if self.login_suggestions_query.as_deref() == Some(query) => {
-                    self.login_suggestions.clone()
-                }
-                Some(_) => Vec::new(),
-                None => {
-                    let mut suggestions = suggestions_for(&self.input);
-                    if let Some(query) = resource_query(&self.input)
-                        && self.resource_suggestions_query.as_deref() == Some(query)
-                    {
-                        suggestions.extend(self.resource_suggestions.clone());
-                    }
-                    suggestions
-                }
-            },
+            } else {
+                Vec::new()
+            };
         }
+        if let Some(query) = login_query(&self.input) {
+            return if self.login_suggestions_query.as_deref() == Some(query) {
+                self.login_suggestions.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(query) = thinking_query(&self.input) {
+            return if self.thinking_suggestions_query.as_deref() == Some(query) {
+                self.thinking_suggestions.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        let mut suggestions = suggestions_for(&self.input);
+        if let Some(query) = resource_query(&self.input)
+            && self.resource_suggestions_query.as_deref() == Some(query)
+        {
+            suggestions.extend(self.resource_suggestions.clone());
+        }
+        suggestions
     }
 
     /// Rebuilds the `/model` picker only when its query or active model
@@ -256,6 +271,43 @@ impl App {
         self.login_suggestions_query = None;
     }
 
+    /// Rebuilds thinking-level choices when either the picker query or active
+    /// model state changes.
+    pub fn refresh_thinking_suggestions<F>(
+        &mut self,
+        model_reference: &str,
+        thinking_level: &str,
+        load: F,
+    ) where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = thinking_query(&self.input) else {
+            self.invalidate_thinking_suggestions();
+            return;
+        };
+        if self.thinking_suggestions_query.as_deref() == Some(query)
+            && self.thinking_suggestions_model.as_deref() == Some(model_reference)
+            && self.thinking_suggestions_level.as_deref() == Some(thinking_level)
+        {
+            return;
+        }
+        self.thinking_suggestions = load(query);
+        self.thinking_suggestions_query = Some(query.to_owned());
+        self.thinking_suggestions_model = Some(model_reference.to_owned());
+        self.thinking_suggestions_level = Some(thinking_level.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.thinking_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates choices when a model or its thinking level changes.
+    pub fn invalidate_thinking_suggestions(&mut self) {
+        self.thinking_suggestions.clear();
+        self.thinking_suggestions_query = None;
+        self.thinking_suggestions_model = None;
+        self.thinking_suggestions_level = None;
+    }
+
     /// Rebuilds local template and skill entries only after their command
     /// prefix changes. Resource loading stays in the runtime, not the
     /// renderer, so palette painting is always side-effect free.
@@ -298,6 +350,7 @@ impl App {
         self.selected_suggestion = 0;
         self.invalidate_model_suggestions();
         self.invalidate_login_suggestions();
+        self.invalidate_thinking_suggestions();
         self.invalidate_resource_suggestions();
     }
 
@@ -825,6 +878,115 @@ fn byte_at_character(input: &str, start: usize, character_offset: usize) -> usiz
 }
 
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
+    if let Some(query) = nested_command_query(input, "/omni ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "status",
+                    "Check gateway health and synchronized models",
+                    "/omni status",
+                    true,
+                ),
+                ("sync", "Refresh models from /v1/models", "/omni sync", true),
+                ("setup", "Configure URL and API key", "/omni setup", true),
+                (
+                    "dashboard",
+                    "Show the management dashboard URL",
+                    "/omni dashboard",
+                    true,
+                ),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/aperture ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "status",
+                    "Check gateway health and capabilities",
+                    "/aperture status",
+                    true,
+                ),
+                (
+                    "sync",
+                    "Refresh the dedicated catalog and gateway snapshot",
+                    "/aperture sync",
+                    true,
+                ),
+                (
+                    "onboarding",
+                    "First-time setup for Tailscale Aperture integration",
+                    "/aperture onboarding",
+                    true,
+                ),
+                (
+                    "settings",
+                    "Show or change connection, capabilities, providers, and pins",
+                    "/aperture settings",
+                    true,
+                ),
+                (
+                    "providers",
+                    "List gateway providers and routable APIs",
+                    "/aperture providers",
+                    true,
+                ),
+                (
+                    "connectors",
+                    "List MCP connectors and gateway tools",
+                    "/aperture connectors",
+                    true,
+                ),
+                (
+                    "pin",
+                    "Pin a connector tool first-class",
+                    "/aperture pin ",
+                    false,
+                ),
+                ("unpin", "Unpin a connector tool", "/aperture unpin ", false),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/btw ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                ("list", "List in-memory side threads", "/btw list", true),
+                (
+                    "resume",
+                    "Resume a side thread by ID",
+                    "/btw resume ",
+                    false,
+                ),
+                (
+                    "settings",
+                    "View or change side-thread settings",
+                    "/btw settings",
+                    true,
+                ),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/ralph ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "start",
+                    "Start a new iterative development loop",
+                    "/ralph start ",
+                    false,
+                ),
+                ("status", "Show the active loop", "/ralph status", true),
+                ("list", "List saved loops", "/ralph list", true),
+                ("resume", "Resume a paused loop", "/ralph resume ", false),
+                ("stop", "Stop an active loop", "/ralph stop ", false),
+            ],
+        );
+    }
+
     const COMMANDS: &[(&str, &str, bool)] = &[
         ("/help", "Show all commands", true),
         ("/model", "Choose from authenticated models", false),
@@ -900,8 +1062,38 @@ fn model_query(input: &str) -> Option<&str> {
     input.strip_prefix("/model ").map(str::trim)
 }
 
+fn thinking_query(input: &str) -> Option<&str> {
+    nested_command_query(input, "/thinking ")
+}
+
 fn resource_query(input: &str) -> Option<&str> {
     (input.starts_with('/') && !input.chars().any(char::is_whitespace)).then_some(input)
+}
+
+fn nested_command_query<'input>(input: &'input str, prefix: &str) -> Option<&'input str> {
+    let suffix = input.get(prefix.len()..)?;
+    if !input.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let query = suffix.trim();
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn nested_command_suggestions(
+    query: &str,
+    commands: &[(&str, &str, &str, bool)],
+) -> Vec<Suggestion> {
+    let query = query.to_ascii_lowercase();
+    commands
+        .iter()
+        .filter(|(label, _, _, _)| label.starts_with(&query))
+        .map(|(label, description, value, execute)| Suggestion {
+            label: (*label).to_owned(),
+            description: (*description).to_owned(),
+            value: (*value).to_owned(),
+            execute: *execute,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -995,6 +1187,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/help"]
         );
+    }
+
+    #[test]
+    fn nested_palettes_complete_gateway_and_extension_commands() {
+        let mut app = App::new();
+        app.set_input("/omni ");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect::<Vec<_>>(),
+            vec![
+                "/omni status",
+                "/omni sync",
+                "/omni setup",
+                "/omni dashboard"
+            ]
+        );
+
+        app.set_input("/aperture p");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect::<Vec<_>>(),
+            vec!["/aperture providers", "/aperture pin "]
+        );
+
+        app.set_input("/ralph res");
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "resume".to_owned(),
+                description: "Resume a paused loop".to_owned(),
+                value: "/ralph resume ".to_owned(),
+                execute: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn thinking_palette_caches_choices_per_model_and_level() {
+        let mut app = App::new();
+        app.set_input("/thinking ");
+        app.refresh_thinking_suggestions("openai/gpt", "high", |query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "high".to_owned(),
+                description: "CURRENT · Complex implementation work".to_owned(),
+                value: "/thinking high".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_thinking_suggestions("openai/gpt", "high", |_| {
+            panic!("unchanged thinking picker must be cached")
+        });
+        app.refresh_thinking_suggestions("openai/gpt", "low", |query| {
+            assert!(query.is_empty());
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
     }
 
     #[test]

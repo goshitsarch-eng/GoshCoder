@@ -851,13 +851,17 @@ fn event_loop(
                     match cycle_interactive_model(&prepared.runtime, catalog, direction) {
                         Ok(model) => {
                             app.invalidate_model_suggestions();
+                            app.invalidate_thinking_suggestions();
                             view.activity = format!("Model set to {model}");
                         }
                         Err(error) => append_view_message(&mut view, MessageRole::Error, error),
                     }
                 }
                 Action::CycleThinking => match cycle_interactive_thinking(&prepared.runtime) {
-                    Some(level) => view.activity = format!("Thinking set to {level}"),
+                    Some(level) => {
+                        app.invalidate_thinking_suggestions();
+                        view.activity = format!("Thinking set to {level}");
+                    }
                     None => append_view_message(
                         &mut view,
                         MessageRole::Notice,
@@ -973,6 +977,7 @@ fn complete_fullscreen_terminal_success(
 ) {
     app.invalidate_model_suggestions();
     app.invalidate_login_suggestions();
+    app.invalidate_thinking_suggestions();
     view.activity_since = None;
     match command {
         FullscreenTerminalCommand::Login { provider_id, .. } => {
@@ -1842,6 +1847,7 @@ fn dispatch_runtime_slash_command(
             match runtime::set_model(&prepared.runtime, catalog, rest) {
                 Ok(model) => {
                     app.invalidate_model_suggestions();
+                    app.invalidate_thinking_suggestions();
                     view.activity = format!("Model set to {}/{}", model.provider, model.id)
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
@@ -1868,6 +1874,7 @@ fn dispatch_runtime_slash_command(
             let levels = stream::supported_thinking_levels(&state.model);
             if levels.iter().any(|level| level == rest) {
                 prepared.runtime.agent().set_thinking_level(rest);
+                app.invalidate_thinking_suggestions();
                 view.activity = format!("Thinking set to {rest}");
             } else {
                 append_view_message(
@@ -3000,6 +3007,9 @@ fn refresh_runtime_app(
         model_picker_suggestions(catalog, &state.model, query)
     });
     app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
+    app.refresh_thinking_suggestions(&model_reference, &state.thinking_level, |query| {
+        thinking_picker_suggestions(&state.model, &state.thinking_level, query)
+    });
     app.refresh_resource_suggestions(|query| {
         resource_palette_suggestions(&prepared.resources(), query)
     });
@@ -3543,6 +3553,44 @@ fn resource_palette_suggestions(
     suggestions
 }
 
+fn thinking_picker_suggestions(
+    model: &llm::Model,
+    current_level: &str,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let query = query.to_ascii_lowercase();
+    stream::supported_thinking_levels(model)
+        .into_iter()
+        .filter(|level| level.starts_with(&query))
+        .map(|level| {
+            let description = thinking_level_description(&level);
+            state::Suggestion {
+                label: level.clone(),
+                description: if level == current_level {
+                    format!("CURRENT · {description}")
+                } else {
+                    description.to_owned()
+                },
+                value: format!("/thinking {level}"),
+                execute: true,
+            }
+        })
+        .collect()
+}
+
+fn thinking_level_description(level: &str) -> &'static str {
+    match level {
+        "off" => "Fastest responses, no extra reasoning",
+        "minimal" => "Very brief reasoning",
+        "low" => "Quick tasks and small edits",
+        "medium" => "Balanced depth and speed",
+        "high" => "Complex implementation work",
+        "xhigh" => "Deep analysis for difficult problems",
+        "max" => "Maximum available reasoning",
+        _ => "Reasoning effort",
+    }
+}
+
 fn login_provider_suggestions(catalog: &catalog::Catalog, query: &str) -> Vec<state::Suggestion> {
     let configured = catalog
         .configured_provider_ids()
@@ -3903,6 +3951,30 @@ mod tests {
                 value: "/skill:deploy".to_owned(),
                 execute: true,
             }]
+        );
+    }
+
+    #[test]
+    fn thinking_picker_marks_the_current_supported_level() {
+        let model = llm::Model {
+            reasoning: true,
+            ..llm::Model::default()
+        };
+
+        let choices = thinking_picker_suggestions(&model, "high", "h");
+
+        assert_eq!(
+            choices,
+            vec![state::Suggestion {
+                label: "high".to_owned(),
+                description: "CURRENT · Complex implementation work".to_owned(),
+                value: "/thinking high".to_owned(),
+                execute: true,
+            }]
+        );
+        assert_eq!(
+            thinking_level_description("xhigh"),
+            "Deep analysis for difficult problems"
         );
     }
 

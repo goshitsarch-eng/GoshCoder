@@ -668,19 +668,19 @@ fn suggestion_title(input: &str) -> &'static str {
     if input.starts_with("/model ") {
         " SELECT MODEL · type to filter authenticated providers "
     } else if input.starts_with("/thinking ") {
-        " THINKING LEVEL "
+        " THINKING LEVEL · model-supported options "
     } else if input.starts_with("/login ") {
         " ADD PROVIDER · OAuth or API key · existing logins are kept "
     } else if input.starts_with("/omni ") {
-        " OMNIROUTE "
+        " OMNIROUTE · setup, synchronize, and inspect the gateway "
     } else if input.starts_with("/aperture ") {
-        " APERTURE "
+        " APERTURE · route providers and connectors through your tailnet "
     } else if input.starts_with("/btw ") {
-        " BTW "
+        " BTW · ephemeral side questions that do not pollute main context "
     } else if input.starts_with("/ralph ") {
-        " RALPH LOOP "
+        " RALPH LOOP · iterative development controls "
     } else {
-        " COMMANDS "
+        " COMMANDS · ↑/↓ navigate · Tab complete · Enter select "
     }
 }
 
