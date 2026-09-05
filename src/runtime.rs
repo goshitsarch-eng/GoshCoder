@@ -671,8 +671,11 @@ fn desktop_mcp_runtime(
 ) -> (Option<DesktopMcpRuntime>, Vec<String>) {
     #[cfg(target_os = "linux")]
     {
+        if !enable_tools {
+            return (None, Vec::new());
+        }
         desktop_mcp_runtime_from_binary(
-            enable_tools,
+            true,
             quiet,
             computeruse::find_binary(),
             config::mcp_config_path(),
