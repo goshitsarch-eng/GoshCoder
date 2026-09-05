@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod aperture;
 pub mod bedrock;
 pub mod btw;
 pub mod catalog;
@@ -12,6 +13,7 @@ pub mod omniroute;
 pub mod prompts;
 pub mod provider_cli;
 pub mod providers;
+pub mod plannotator;
 pub mod ralph;
 pub mod ralph_cli;
 pub mod resources;
