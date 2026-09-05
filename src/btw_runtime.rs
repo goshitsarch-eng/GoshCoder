@@ -198,7 +198,7 @@ enum Activity {
 }
 
 enum ResponderOutcome {
-    Answered(llm::AssistantMessage),
+    Answered(Box<llm::AssistantMessage>),
     Failed(String),
     Cancelled,
 }
@@ -457,7 +457,7 @@ impl Runtime {
                 ResponderOutcome::Answered(response) => self
                     .inner
                     .manager
-                    .record_answered(&id, queued_question.question.clone(), response)
+                    .record_answered(&id, queued_question.question.clone(), *response)
                     .map(|answer| DispatchStatus::Answered { answer })
                     .map_err(runtime_thread_error),
                 ResponderOutcome::Failed(message) => self
@@ -633,7 +633,7 @@ impl Runtime {
             Ok(Ok(response)) if response_was_error(&response) => {
                 ResponderOutcome::Failed(response_error_message(&response))
             }
-            Ok(Ok(response)) => ResponderOutcome::Answered(response),
+            Ok(Ok(response)) => ResponderOutcome::Answered(Box::new(response)),
             Ok(Err(error)) if error.trim().is_empty() => {
                 ResponderOutcome::Failed("side responder returned an error".to_owned())
             }

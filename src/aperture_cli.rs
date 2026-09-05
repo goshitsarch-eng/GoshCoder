@@ -97,7 +97,7 @@ fn execute(arguments: &[String], interactive: bool) -> CliResult<String> {
     }
 }
 
-fn parse_invocation<'a>(arguments: &'a [String]) -> CliResult<(Subcommand, &'a [String])> {
+fn parse_invocation(arguments: &[String]) -> CliResult<(Subcommand, &[String])> {
     validate_arguments(arguments)?;
     let Some(first) = arguments
         .first()
@@ -1098,7 +1098,7 @@ fn providers_command() -> CliResult<String> {
         let apis = aperture::selectable_apis(&provider.compatibility);
         let routing = match apis.split_first() {
             None => "no routable api".to_owned(),
-            Some((first, rest)) if rest.is_empty() => format!("auto: {first}"),
+            Some((first, [])) => format!("auto: {first}"),
             Some((first, rest)) => format!("auto: {first} (also {})", rest.join(", ")),
         };
         let authentication = if provider.requires_client_auth {

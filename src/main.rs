@@ -1944,9 +1944,11 @@ fn prompt_list(prepared: &runtime::PreparedSession) -> Result<String, String> {
         .templates
         .iter()
         .map(|template| {
-            let description = (!template.description.is_empty())
-                .then(|| format!("  {}", template.description))
-                .unwrap_or_default();
+            let description = if template.description.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", template.description)
+            };
             format!(
                 "/{}{}\n    {}",
                 template.name,
@@ -2904,7 +2906,7 @@ mod tests {
     fn prompt_capture_uses_the_last_nonempty_user_message() {
         let messages = vec![
             llm::Message::User(llm::UserMessage::text("first", 1)),
-            llm::Message::Assistant(Box::new(llm::AssistantMessage::default())),
+            llm::Message::Assistant(Box::default()),
             llm::Message::User(llm::UserMessage::text("  final request  ", 2)),
         ];
         assert_eq!(
