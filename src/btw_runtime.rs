@@ -625,6 +625,7 @@ impl Runtime {
                     cancellation,
                     thinking_level,
                     session_id,
+                    assistant_event_listener: None,
                 },
             )
         }));

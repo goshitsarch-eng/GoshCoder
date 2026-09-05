@@ -437,9 +437,14 @@ impl ProviderResponderFactory {
         options: agent::RequestOptions,
         credentials: ProviderCredentials,
     ) -> Result<llm::AssistantMessage> {
+        let assistant_event_listener = options.assistant_event_listener.clone();
         let events = self.stream_with_credentials(model, context, options, credentials);
         while let Some(event) = events.next() {
-            if let Some(message) = event.terminal_message() {
+            let terminal_message = event.terminal_message();
+            if let Some(listener) = &assistant_event_listener {
+                listener(event);
+            }
+            if let Some(message) = terminal_message {
                 return Ok((*message).clone());
             }
         }
@@ -4636,6 +4641,7 @@ mod tests {
             cancellation,
             thinking_level: llm::THINKING_HIGH.to_owned(),
             session_id: "session-1".to_owned(),
+            assistant_event_listener: None,
         }
     }
 

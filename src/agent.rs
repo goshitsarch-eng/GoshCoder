@@ -19,7 +19,7 @@ use std::{
 
 use serde_json::{Number, Value};
 
-use crate::llm;
+use crate::{llm, stream};
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -178,12 +178,34 @@ impl Tool {
     }
 }
 
+/// Receives normalized provider events as they arrive.
+pub type AssistantEventListener =
+    Arc<dyn Fn(stream::AssistantMessageEvent) + Send + Sync + 'static>;
+
 /// Per-request provider inputs that are not encoded in the transcript.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RequestOptions {
     pub cancellation: CancellationToken,
     pub thinking_level: llm::ThinkingLevel,
     pub session_id: String,
+    /// Streaming responders call this for each normalized provider event.
+    /// Responders that only return a completed message can leave it unused.
+    pub assistant_event_listener: Option<AssistantEventListener>,
+}
+
+impl fmt::Debug for RequestOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestOptions")
+            .field("cancellation", &self.cancellation)
+            .field("thinking_level", &self.thinking_level)
+            .field("session_id", &self.session_id)
+            .field(
+                "has_assistant_event_listener",
+                &self.assistant_event_listener.is_some(),
+            )
+            .finish()
+    }
 }
 
 pub type AssistantResponder = Arc<
@@ -291,6 +313,11 @@ pub struct CompactionInfo {
 pub struct Event {
     pub kind: EventKind,
     pub message: Option<llm::Message>,
+    /// The normalized provider event underlying a streamed assistant update.
+    /// Present only for streamed message lifecycle notifications.
+    pub assistant_event: Option<stream::AssistantMessageEvent>,
+    /// Whether a completed assistant message was delivered incrementally.
+    pub assistant_was_streamed: bool,
     pub messages: Vec<llm::Message>,
     pub kept: Vec<llm::Message>,
     pub compaction: Option<CompactionInfo>,
@@ -310,6 +337,8 @@ impl Event {
         Self {
             kind,
             message: None,
+            assistant_event: None,
+            assistant_was_streamed: false,
             messages: Vec::new(),
             kept: Vec::new(),
             compaction: None,
@@ -799,6 +828,10 @@ impl Agent {
                 state.thinking_level.clone(),
             )
         };
+        let event_agent = self.clone();
+        let assistant_event_listener: AssistantEventListener = Arc::new(move |event| {
+            event_agent.forward_assistant_event(event);
+        });
         let response = catch_unwind(AssertUnwindSafe(|| {
             (self.inner.responder)(
                 &model,
@@ -807,6 +840,7 @@ impl Agent {
                     cancellation: cancellation.clone(),
                     thinking_level,
                     session_id: self.inner.session_id.clone(),
+                    assistant_event_listener: Some(assistant_event_listener),
                 },
             )
         }));
@@ -961,13 +995,21 @@ impl Agent {
     }
 
     fn record_message(&self, message: llm::Message) {
-        {
+        let assistant_was_streamed = {
             let mut state = lock(&self.inner.state);
+            let assistant_was_streamed = matches!(&message, llm::Message::Assistant(_))
+                && matches!(
+                    state.streaming_message.as_ref(),
+                    Some(llm::Message::Assistant(_))
+                );
             state.streaming_message = Some(message.clone());
+            assistant_was_streamed
+        };
+        if !assistant_was_streamed {
+            let mut start = Event::kind(EventKind::MessageStart);
+            start.message = Some(message.clone());
+            self.emit(start);
         }
-        let mut start = Event::kind(EventKind::MessageStart);
-        start.message = Some(message.clone());
-        self.emit(start);
         {
             let mut state = lock(&self.inner.state);
             state.messages.push(message.clone());
@@ -980,7 +1022,27 @@ impl Agent {
         }
         let mut end = Event::kind(EventKind::MessageEnd);
         end.message = Some(message);
+        end.assistant_was_streamed = assistant_was_streamed;
         self.emit(end);
+    }
+
+    fn forward_assistant_event(&self, assistant_event: stream::AssistantMessageEvent) {
+        let message = assistant_event
+            .partial
+            .clone()
+            .or_else(|| assistant_event.terminal_message())
+            .map(|message| llm::Message::Assistant(Box::new((*message).clone())));
+        if let Some(message) = message.as_ref() {
+            lock(&self.inner.state).streaming_message = Some(message.clone());
+        }
+        let mut event = Event::kind(if assistant_event.event_type == stream::EVENT_START {
+            EventKind::MessageStart
+        } else {
+            EventKind::MessageUpdate
+        });
+        event.message = message;
+        event.assistant_event = Some(assistant_event);
+        self.emit(event);
     }
 
     fn drain_steering(&self) -> Vec<llm::Message> {
@@ -1266,6 +1328,81 @@ mod tests {
                 EventKind::AgentEnd,
             ]
         );
+    }
+
+    #[test]
+    fn streamed_responder_forwards_incremental_events_without_a_duplicate_start() {
+        let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let event_log = Arc::clone(&events);
+        let response = assistant_text("streamed answer");
+        let partial = llm::AssistantMessage {
+            stop_reason: stream::STOP_PENDING.to_owned(),
+            ..response.clone()
+        };
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, options| {
+                let listener = options
+                    .assistant_event_listener
+                    .expect("agent supplies a stream listener");
+                listener(stream::AssistantMessageEvent::start(Arc::new(
+                    partial.clone(),
+                )));
+                listener(stream::AssistantMessageEvent {
+                    event_type: stream::EVENT_TEXT_DELTA.to_owned(),
+                    delta: "streamed answer".to_owned(),
+                    partial: Some(Arc::new(response.clone())),
+                    ..stream::AssistantMessageEvent::default()
+                });
+                listener(stream::AssistantMessageEvent::done(
+                    stream::STOP_STOP,
+                    Arc::new(response.clone()),
+                ));
+                Ok(response.clone())
+            })),
+            ..AgentOptions::default()
+        });
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event));
+
+        agent.prompt("hello").expect("prompt");
+
+        let events = lock(&events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageStart)
+                .count(),
+            2,
+            "one user start and one streamed assistant start"
+        );
+        let updates = events
+            .iter()
+            .filter(|event| event.kind == EventKind::MessageUpdate)
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0]
+                .assistant_event
+                .as_ref()
+                .map(|event| event.event_type.as_str()),
+            Some(stream::EVENT_TEXT_DELTA)
+        );
+        assert_eq!(
+            updates[0]
+                .assistant_event
+                .as_ref()
+                .map(|event| event.delta.as_str()),
+            Some("streamed answer")
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::MessageEnd
+                && event.assistant_was_streamed
+                && matches!(event.message.as_ref(), Some(llm::Message::Assistant(_)))
+        }));
+        assert!(agent.state().streaming_message.is_none());
     }
 
     #[test]

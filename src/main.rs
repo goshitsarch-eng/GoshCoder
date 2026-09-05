@@ -206,15 +206,29 @@ fn render_run_event<Out: Write, Err: Write>(
     color: bool,
 ) -> io::Result<()> {
     match event.kind {
+        agent::EventKind::MessageUpdate => {
+            if let Some(update) = event.assistant_event.as_ref() {
+                match update.event_type.as_str() {
+                    stream::EVENT_TEXT_DELTA => write!(stdout, "{}", update.delta)?,
+                    stream::EVENT_THINKING_DELTA => {
+                        write!(stderr, "{}", dim(&update.delta, color))?;
+                    }
+                    stream::EVENT_THINKING_END => writeln!(stderr)?,
+                    _ => {}
+                }
+            }
+        }
         agent::EventKind::MessageEnd => {
             if let Some(llm::Message::Assistant(message)) = event.message.as_ref() {
-                for content in &message.content {
-                    match content {
-                        llm::ContentBlock::Text(text) => write!(stdout, "{}", text.text)?,
-                        llm::ContentBlock::Thinking(thinking) => {
-                            write!(stderr, "{}", dim(&thinking.thinking, color))?;
+                if !event.assistant_was_streamed {
+                    for content in &message.content {
+                        match content {
+                            llm::ContentBlock::Text(text) => write!(stdout, "{}", text.text)?,
+                            llm::ContentBlock::Thinking(thinking) => {
+                                write!(stderr, "{}", dim(&thinking.thinking, color))?;
+                            }
+                            llm::ContentBlock::Image(_) | llm::ContentBlock::ToolCall(_) => {}
                         }
-                        llm::ContentBlock::Image(_) | llm::ContentBlock::ToolCall(_) => {}
                     }
                 }
                 if !message.error_message.is_empty() {
@@ -276,7 +290,6 @@ fn render_run_event<Out: Write, Err: Write>(
         agent::EventKind::AgentStart
         | agent::EventKind::TurnStart
         | agent::EventKind::MessageStart
-        | agent::EventKind::MessageUpdate
         | agent::EventKind::ToolExecutionUpdate
         | agent::EventKind::ModelChange
         | agent::EventKind::ThinkingLevelChange
@@ -2841,6 +2854,8 @@ mod tests {
         agent::Event {
             kind,
             message: None,
+            assistant_event: None,
+            assistant_was_streamed: false,
             messages: Vec::new(),
             kept: Vec::new(),
             compaction: None,
@@ -2980,11 +2995,34 @@ mod tests {
         };
         let mut completed = event(agent::EventKind::MessageEnd);
         completed.message = Some(llm::Message::Assistant(Box::new(assistant.clone())));
+        completed.assistant_was_streamed = true;
         let mut ended = event(agent::EventKind::AgentEnd);
         ended.messages = vec![llm::Message::Assistant(Box::new(assistant))];
+        let mut thinking_delta = event(agent::EventKind::MessageUpdate);
+        thinking_delta.assistant_event = Some(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_THINKING_DELTA.to_owned(),
+            delta: "reasoning".to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        });
+        let mut thinking_end = event(agent::EventKind::MessageUpdate);
+        thinking_end.assistant_event = Some(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_THINKING_END.to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        });
+        let mut text_delta = event(agent::EventKind::MessageUpdate);
+        text_delta.assistant_event = Some(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_DELTA.to_owned(),
+            delta: "answer".to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        });
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        render_run_event(&thinking_delta, &mut stdout, &mut stderr, false)
+            .expect("render thinking delta");
+        render_run_event(&thinking_end, &mut stdout, &mut stderr, false)
+            .expect("render thinking end");
+        render_run_event(&text_delta, &mut stdout, &mut stderr, false).expect("render text delta");
         render_run_event(&completed, &mut stdout, &mut stderr, false).expect("render message");
         render_run_event(
             &event(agent::EventKind::TurnEnd),
