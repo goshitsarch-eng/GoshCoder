@@ -162,7 +162,7 @@ pub fn cut_index(messages: &[llm::Message], context_window: u64) -> usize {
     if context_window > 0 && context_window / 3 < keep_tokens {
         keep_tokens = max(2_000, context_window / 3);
     }
-    let mut recent_tokens = 0;
+    let mut recent_tokens = 0_u64;
     for index in (1..messages.len()).rev() {
         recent_tokens = recent_tokens.saturating_add(estimate_message_tokens(&messages[index]));
         if recent_tokens >= keep_tokens && messages[index].role() == "user" {
@@ -399,6 +399,7 @@ fn generate_summary(
             thinking_level,
             tools: Vec::new(),
             messages: Vec::new(),
+            compactions: Vec::new(),
         },
         responder: Some(source_agent.responder()),
         ..agent::AgentOptions::default()
@@ -432,7 +433,6 @@ fn generate_summary(
                 .iter()
                 .filter_map(llm::ContentBlock::plain_text)
                 .filter(|text| !text.trim().is_empty())
-                .copied()
                 .collect::<Vec<_>>()
                 .join("\n");
             (!text.trim().is_empty()).then_some(text)
