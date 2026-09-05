@@ -144,14 +144,14 @@ impl Tool {
         description: impl Into<String>,
         parameters: Value,
         execute: impl Fn(
-                CancellationToken,
-                String,
-                BTreeMap<String, Value>,
-                ToolUpdate,
-            ) -> std::result::Result<ToolResult, String>
-            + Send
-            + Sync
-            + 'static,
+            CancellationToken,
+            String,
+            BTreeMap<String, Value>,
+            ToolUpdate,
+        ) -> std::result::Result<ToolResult, String>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -402,10 +402,7 @@ impl Agent {
         }
     }
 
-    pub fn subscribe(
-        &self,
-        listener: impl Fn(Event) + Send + Sync + 'static,
-    ) -> Subscription {
+    pub fn subscribe(&self, listener: impl Fn(Event) + Send + Sync + 'static) -> Subscription {
         let id = self.inner.next_listener_id.fetch_add(1, Ordering::Relaxed);
         lock(&self.inner.listeners).insert(id, Arc::new(listener));
         Subscription {
@@ -618,8 +615,7 @@ impl Agent {
             } else {
                 self.request_assistant(cancellation.clone())
             };
-            let is_terminal_error =
-                matches!(assistant.stop_reason.as_str(), "error" | "aborted");
+            let is_terminal_error = matches!(assistant.stop_reason.as_str(), "error" | "aborted");
             self.record_message(llm::Message::Assistant(Box::new(assistant.clone())));
             new_messages.push(llm::Message::Assistant(Box::new(assistant.clone())));
 
@@ -754,16 +750,18 @@ impl Agent {
                 ));
             }
             for (index, handle) in handles {
-                let outcome = handle.join().unwrap_or_else(|_| ToolOutcome::error(
-                    llm::ToolCall {
-                        id: "unknown".to_owned(),
-                        name: "unknown".to_owned(),
-                        arguments: BTreeMap::new(),
-                        thought_signature: String::new(),
-                        namespace: String::new(),
-                    },
-                    "tool worker panicked",
-                ));
+                let outcome = handle.join().unwrap_or_else(|_| {
+                    ToolOutcome::error(
+                        llm::ToolCall {
+                            id: "unknown".to_owned(),
+                            name: "unknown".to_owned(),
+                            arguments: BTreeMap::new(),
+                            thought_signature: String::new(),
+                            namespace: String::new(),
+                        },
+                        "tool worker panicked",
+                    )
+                });
                 outcomes.push((index, outcome));
             }
         }
@@ -935,17 +933,20 @@ impl ToolOutcome {
     }
 }
 
-fn prepare_tool_call(tools: &[Tool], call: llm::ToolCall) -> std::result::Result<PreparedToolCall, ToolOutcome> {
+fn prepare_tool_call(
+    tools: &[Tool],
+    call: llm::ToolCall,
+) -> std::result::Result<PreparedToolCall, ToolOutcome> {
     let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() else {
         return Err(ToolOutcome::error(
             call,
             format!("Tool {} not found", call.name),
         ));
     };
-    let arguments = tool
-        .prepare_arguments
-        .as_ref()
-        .map_or_else(|| call.arguments.clone(), |prepare| prepare(call.arguments.clone()));
+    let arguments = tool.prepare_arguments.as_ref().map_or_else(
+        || call.arguments.clone(),
+        |prepare| prepare(call.arguments.clone()),
+    );
     match validate_arguments(&tool.parameters, arguments) {
         Ok(arguments) => Ok(PreparedToolCall {
             call,
@@ -968,7 +969,11 @@ fn validate_arguments(
     let Value::Object(schema) = schema else {
         return Ok(arguments);
     };
-    if schema.get("type").and_then(Value::as_str).is_some_and(|kind| kind != "object") {
+    if schema
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "object")
+    {
         return Err("tool schema must describe an object".to_owned());
     }
     for required in schema
@@ -1243,7 +1248,9 @@ mod tests {
         let agent = Agent::new(AgentOptions {
             initial_state: InitialState {
                 model: model(),
-                messages: vec![llm::Message::Assistant(Box::new(assistant_text("previous")))],
+                messages: vec![llm::Message::Assistant(Box::new(assistant_text(
+                    "previous",
+                )))],
                 ..InitialState::default()
             },
             responder: Some(Arc::new(move |_, _, _| {
