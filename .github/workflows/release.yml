@@ -39,7 +39,7 @@ permissions:
   contents: write
 
 env:
-  GO_VERSION: "1.26.6"
+  CARGO_TERM_COLOR: always
 
 jobs:
   release:
@@ -160,17 +160,21 @@ jobs:
           git push origin "refs/tags/$TAG"
           echo "created and pushed $TAG at $(git rev-parse --short HEAD)"
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu,aarch64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-zigbuild
 
       # A release must never ship code that does not pass the gate.
       - name: verify
         run: |
-          go vet -all ./...
-          go test -count=1 ./...
+          make check
+          cargo audit
 
       - name: build archives
         env:

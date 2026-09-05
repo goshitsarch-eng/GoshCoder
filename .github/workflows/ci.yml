@@ -14,9 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Earlier Go 1.26 patch releases carry standard-library vulnerabilities that
-  # govulncheck reports as reachable from this tree.
-  GO_VERSION: "1.26.6"
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
@@ -28,106 +26,77 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
 
-      - name: go build
-        run: go build ./...
+      - name: cargo build
+        run: cargo build --locked --all-targets
 
-      - name: go vet
-        run: go vet -all ./...
+      - name: cargo test
+        run: cargo test --locked --all-targets
 
-      - name: go test
-        shell: bash
-        run: go test -count=1 ./...
-
-      # The suite must ignore ambient provider credentials rather than reading
-      # whatever the runner or a developer shell happens to export. Setting
-      # obviously-wrong values catches any test that silently inherits them.
-      - name: go test (hermeticity probe)
-        shell: bash
+      # Tests must not read credentials injected by a runner or developer
+      # environment. Deliberately invalid values expose accidental leakage.
+      - name: cargo test (hermeticity probe)
         env:
           AWS_ACCESS_KEY_ID: hermeticity-probe
           AWS_SECRET_ACCESS_KEY: hermeticity-probe
           AWS_REGION: hermeticity-probe
           AWS_PROFILE: hermeticity-probe
-        run: go test -count=1 ./...
-
-  race:
-    name: race detector
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
-      - name: go test -race
-        run: go test -race -count=1 ./...
+        run: cargo test --locked --all-targets
 
   lint:
-    name: gofmt, staticcheck, govulncheck
+    name: rustfmt, clippy, cargo-audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l ./cmd ./internal)
-          if [ -n "$unformatted" ]; then
-            echo "these files need gofmt:"; echo "$unformatted"; exit 1
-          fi
+      - name: rustfmt
+        run: cargo fmt --all -- --check
 
-      - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          "$(go env GOPATH)/bin/staticcheck" ./...
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          "$(go env GOPATH)/bin/govulncheck" ./...
+      - name: cargo audit
+        run: cargo audit
 
   cross-compile:
-    name: cross-compile
+    name: cross-compile release targets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu,aarch64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
       - name: build every release target
-        run: |
-          set -eu
-          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            os="${platform%/*}"; arch="${platform#*/}"
-            echo "::group::$os/$arch"
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o /dev/null ./cmd/goshcoder
-            echo "::endgroup::"
-          done
+        run: make dist
 
   installer:
     name: installer scripts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: goto-bus-stop/setup-zig@v2
+      - uses: taiki-e/install-action@v2
         with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
+          tool: cargo-zigbuild
 
       - name: shellcheck install.sh
         run: |
@@ -151,9 +120,7 @@ jobs:
           sh install.sh --from-source --dir "$RUNNER_TEMP/bin" --no-modify-path
           "$RUNNER_TEMP/bin/goshcoder" version
 
-      # The Makefile and the installers derive the release archive's name
-      # independently, so a mismatch is invisible until a published release
-      # 404s for every user. This serves real artifacts and drives the real
-      # download path.
+      # The Makefile and the installer derive archive names independently.
+      # Exercise a served archive to prevent release-only 404 regressions.
       - name: release archives match what the installers request
         run: sh scripts/release-roundtrip.sh v9.9.9

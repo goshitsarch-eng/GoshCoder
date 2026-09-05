@@ -5,8 +5,8 @@
 .DESCRIPTION
     Downloads the latest published release for this machine's architecture and
     verifies its SHA-256 against the published checksums file before installing.
-    When no release is published it falls back to building from source, which
-    requires a Go toolchain. Re-running upgrades an existing installation.
+    When no release is published it falls back to building from source with the
+    stable Rust toolchain. Re-running upgrades an existing installation.
 
 .PARAMETER InstallDir
     Where to place goshcoder.exe. Defaults to %LOCALAPPDATA%\Programs\goshcoder.
@@ -39,7 +39,6 @@ Set-StrictMode -Version Latest
 
 $Repo   = 'goshitsarch-eng/goshcoder'
 $Binary = 'goshcoder'
-$GoMin  = [version] '1.26.6'
 
 function Write-Step { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Ok   { param([string] $Message) Write-Host "[ok] $Message" -ForegroundColor Green }
@@ -147,14 +146,12 @@ function Install-FromRelease {
 function Install-FromSource {
     param([string] $Workdir)
 
-    if (-not (Test-Command 'go')) {
-        Stop-WithError "building from source needs Go $GoMin or newer; install it from https://go.dev/dl/"
+    if (-not (Test-Command 'cargo')) {
+        Stop-WithError 'building from source needs Rust stable; install it from https://rustup.rs/'
     }
 
-    $goVersionRaw = (& go env GOVERSION) -replace '^go', '' -replace '[^0-9.].*$', ''
-
     $srcDir = $null
-    if ((Test-Path './go.mod') -and ((Get-Content './go.mod' -First 1) -match '^module goshcoder')) {
+    if ((Test-Path './Cargo.toml') -and (Select-String -Path './Cargo.toml' -Pattern '^name\s*=\s*"goshcoder"' -Quiet)) {
         $srcDir = (Get-Location).Path
         Write-Step "building from the checkout in $srcDir"
     } else {
@@ -167,25 +164,6 @@ function Install-FromSource {
         if ($LASTEXITCODE -ne 0) { Stop-WithError "could not clone https://github.com/$Repo.git" }
     }
 
-    # The requirement is whatever go.mod actually states, read from the tree
-    # being built rather than from a constant here that can drift away from it.
-    $required = $GoMin
-    $goModLine = Select-String -Path (Join-Path $srcDir 'go.mod') -Pattern '^go\s+([0-9][0-9.]*)' -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($goModLine) { $required = $goModLine.Matches[0].Groups[1].Value }
-
-    $needsToolchain = $false
-    try { $needsToolchain = ([version] $goVersionRaw -lt [version] $required) } catch { }
-    if ($needsToolchain) {
-        # go.mod states a hard minimum, not a preference: an older toolchain
-        # refuses the build outright. Go resolves this itself when it is allowed
-        # to, so ask it to -- this also overrides a GOTOOLCHAIN pinned to
-        # "local" by whatever installed Go.
-        Write-Step "Go $goVersionRaw is older than the $required this project requires"
-        Write-Step "fetching the Go $required toolchain"
-        $env:GOTOOLCHAIN = "go$required+auto"
-    }
-
     Write-Step 'compiling (this takes a minute)'
     Push-Location $srcDir
     try {
@@ -195,22 +173,33 @@ function Install-FromSource {
             if (-not $short) { $short = 'unknown' }
             $ver = "0.5.0-dev+$short"
         }
-        $commit = & git rev-parse HEAD 2>$null
-        if (-not $commit) { $commit = '' }
-        $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-
-        $out = Join-Path $Workdir "$Binary.exe"
-        $env:CGO_ENABLED = '0'
-        & go build -trimpath `
-            -ldflags "-s -w -X main.Version=$ver -X main.Commit=$commit -X main.BuildDate=$date" `
-            -o $out ./cmd/goshcoder
-        if ($LASTEXITCODE -ne 0) {
-            if ($needsToolchain) {
-                Stop-WithError "build failed: this needs Go $required and $goVersionRaw is installed. Either install Go $required from https://go.dev/dl/, or allow Go to fetch it by clearing GOTOOLCHAIN=local from your environment."
+        $oldTarget = $env:CARGO_TARGET_DIR
+        $oldVersion = $env:GOSHCODER_VERSION
+        $target = Join-Path $Workdir 'cargo-target'
+        try {
+            $env:CARGO_TARGET_DIR = $target
+            $env:GOSHCODER_VERSION = $ver
+            & cargo build --release --locked --bin $Binary
+            if ($LASTEXITCODE -ne 0) {
+                Stop-WithError 'build failed; ensure the stable Rust toolchain selected by rust-toolchain.toml is installed'
             }
-            Stop-WithError 'build failed'
+            $out = Join-Path $target "release\$Binary.exe"
+            if (-not (Test-Path $out)) {
+                Stop-WithError "build succeeded but did not produce $out"
+            }
+            return $out
+        } finally {
+            if ($null -eq $oldTarget) {
+                Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+            } else {
+                $env:CARGO_TARGET_DIR = $oldTarget
+            }
+            if ($null -eq $oldVersion) {
+                Remove-Item Env:GOSHCODER_VERSION -ErrorAction SilentlyContinue
+            } else {
+                $env:GOSHCODER_VERSION = $oldVersion
+            }
         }
-        return $out
     } finally {
         Pop-Location
     }

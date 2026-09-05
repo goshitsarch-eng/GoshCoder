@@ -113,7 +113,22 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn print_version() {
-    println!("goshcoder {}", env!("CARGO_PKG_VERSION"));
+    println!("goshcoder {}", build_version());
+}
+
+/// Release automation supplies a VCS-derived version through `GOSHCODER_VERSION`;
+/// ordinary Cargo builds retain the manifest version without requiring a build
+/// script or a Git checkout.
+fn build_version() -> &'static str {
+    option_env!("GOSHCODER_VERSION")
+        .filter(|version| !version.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+fn ui_version() -> &'static str {
+    build_version()
+        .strip_prefix('v')
+        .unwrap_or_else(build_version)
 }
 
 /// Executes the pipeable one-shot command on the same durable session stack
@@ -1345,7 +1360,7 @@ fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view:
     app.set_recording_active(prepared.runtime.recording());
     app.title = format!(
         "v{}  ·  {}/{}",
-        env!("CARGO_PKG_VERSION"),
+        ui_version(),
         state.model.provider,
         state.model.id
     );
@@ -1663,7 +1678,7 @@ fn runtime_sidebar(
         state::SidebarLine::section("Workspace"),
         state::SidebarLine::path(cwd),
         state::SidebarLine::blank(),
-        state::SidebarLine::brand(format!("● GoshCoder v{}", env!("CARGO_PKG_VERSION"))),
+        state::SidebarLine::brand(format!("● GoshCoder v{}", ui_version())),
     ]);
     lines
 }
