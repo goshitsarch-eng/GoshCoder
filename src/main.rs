@@ -168,7 +168,13 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
         }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
+            if prepared.runtime.resumed() {
+                let messages = prepared.runtime.restored().messages;
+                let mut stderr = io::stderr().lock();
+                render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
+            } else {
+                eprintln!("{}", dim(&banner, color_enabled()));
+            }
         }
     }
 
@@ -295,6 +301,38 @@ fn last_assistant(messages: &[llm::Message]) -> Option<&llm::AssistantMessage> {
         llm::Message::Assistant(message) => Some(message.as_ref()),
         llm::Message::User(_) | llm::Message::ToolResult(_) => None,
     })
+}
+
+fn restored_transcript_text(messages: &[llm::Message], header: &str) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![header.to_owned()];
+    for message in messages {
+        if let Some(summary) = compaction::summary_text(message) {
+            lines.push(format!("· compacted {}", first_line(&summary)));
+            continue;
+        }
+        let text = first_line(&message.text_preview());
+        if !text.trim().is_empty() {
+            lines.push(format!("· {} {text}", message.role()));
+        }
+    }
+    lines.push("─".repeat(40));
+    lines.join("\n")
+}
+
+fn render_restored_transcript<Err: Write>(
+    messages: &[llm::Message],
+    header: &str,
+    stderr: &mut Err,
+    color: bool,
+) -> io::Result<()> {
+    let transcript = restored_transcript_text(messages, header);
+    if !transcript.is_empty() {
+        writeln!(stderr, "{}", dim(&transcript, color))?;
+    }
+    Ok(())
 }
 
 fn tool_result_text(result: Option<&agent::ToolResult>) -> String {
@@ -513,7 +551,13 @@ fn line_interactive_loop(
             eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
         }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
+            if prepared.runtime.resumed() {
+                let messages = prepared.runtime.restored().messages;
+                let mut stderr = io::stderr().lock();
+                render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
+            } else {
+                eprintln!("{}", dim(&banner, color_enabled()));
+            }
         }
         if interactive {
             let state = prepared.runtime.agent().state();
@@ -1823,6 +1867,14 @@ fn dispatch_runtime_slash_command(
                         MessageRole::Notice,
                         format!("Switched to session {}.", handle.id),
                     );
+                    if !fullscreen {
+                        let restored = prepared.runtime.restored();
+                        let transcript =
+                            restored_transcript_text(&restored.messages, "resumed transcript");
+                        if !transcript.is_empty() {
+                            append_view_message(view, MessageRole::Command, transcript);
+                        }
+                    }
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
@@ -3100,6 +3152,27 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr");
         assert!(stderr.contains("reasoning"));
         assert!(stderr.contains("tokens: 12 in / 4 out  cost: $0.0123"));
+    }
+
+    #[test]
+    fn restored_transcript_includes_a_compaction_preview() {
+        let messages = vec![
+            compaction::summary_message("Prior work\nwith details", 1),
+            llm::Message::User(llm::UserMessage::text("latest request", 2)),
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::text("latest response")],
+                ..llm::AssistantMessage::default()
+            })),
+        ];
+
+        assert_eq!(
+            restored_transcript_text(&messages, "resumed 3 message(s) from session"),
+            "resumed 3 message(s) from session\n\
+             · compacted Prior work ...\n\
+             · user latest request\n\
+             · assistant latest response\n\
+             ────────────────────────────────────────"
+        );
     }
 
     #[test]

@@ -218,10 +218,15 @@ pub fn summary_message(summary: &str, timestamp: i64) -> llm::Message {
 
 /// Returns whether a user message is an internal context-compaction marker.
 pub fn is_summary_message(message: &llm::Message) -> bool {
+    summary_text(message).is_some()
+}
+
+/// Extracts the summary body from an internal context-compaction marker.
+pub fn summary_text(message: &llm::Message) -> Option<String> {
     let llm::Message::User(message) = message else {
-        return false;
+        return None;
     };
-    previous_summary_text(message).is_some()
+    previous_summary_text(message)
 }
 
 /// Computes accumulated usage, including a persisted compaction prefix.
@@ -269,8 +274,8 @@ pub fn serialize_messages(messages: &[llm::Message]) -> String {
 /// Serializes one message in the loss-bounded summary-source format.
 pub fn serialize_message(message: &llm::Message) -> String {
     match message {
-        llm::Message::User(message) => previous_summary_text(message).map_or_else(
-            || format!("[User]: {}", user_text(message)),
+        llm::Message::User(user) => previous_summary_text(user).map_or_else(
+            || format!("[User]: {}", user_text(user)),
             |summary| format!("[Previous conversation summary]: {summary}"),
         ),
         llm::Message::Assistant(message) => serialize_assistant(message),

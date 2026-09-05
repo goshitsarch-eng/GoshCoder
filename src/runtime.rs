@@ -716,12 +716,15 @@ fn lock_value<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Builds the short status text shown after opening a session.
 pub fn session_banner(runtime: &SessionRuntime) -> Option<String> {
     runtime.handle().map(|handle| {
-        let action = if runtime.resumed() {
-            "resumed"
+        if runtime.resumed() {
+            format!(
+                "resumed {} message(s) from {}",
+                runtime.restored().messages.len(),
+                short_id(&handle.id)
+            )
         } else {
-            "recording"
-        };
-        format!("{action} session {}", short_id(&handle.id))
+            format!("recording session {}", short_id(&handle.id))
+        }
     })
 }
 
