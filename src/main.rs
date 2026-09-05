@@ -3,6 +3,7 @@ pub mod config;
 pub mod llm;
 pub mod markdown;
 pub mod ralph;
+pub mod resources;
 pub mod session;
 pub mod sessionlog;
 pub mod sessions;
