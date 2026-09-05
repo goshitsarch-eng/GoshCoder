@@ -122,6 +122,9 @@ fn run_interactive() -> Result<(), Box<dyn Error>> {
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
+    // The temporary standalone frontend has no recorder yet. The integrated
+    // session runtime updates this as soon as it owns the terminal loop.
+    app.set_recording_active(false);
     loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
