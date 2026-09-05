@@ -1,9 +1,10 @@
 //! Durable Ralph loop state and prompt helpers.
 //!
-//! This module deliberately has no terminal or agent-runtime integration. A
-//! caller can parse a CLI or slash command with [`parse_command`], execute it
-//! against [`Store`], and use [`prepare_next_turn`] plus the prompt helpers to
-//! wire the resulting state into its own runtime.
+//! This module deliberately has no terminal or agent-runtime lifecycle
+//! integration. A caller can parse a CLI or slash command with
+//! [`parse_command`], execute it against [`Store`], register [`Store::tools`]
+//! with an agent, and use [`prepare_next_turn`] plus the prompt helpers to wire
+//! the resulting state into its own runtime.
 //!
 //! Unlike the older workspace-local `.ralph` implementation, this store keeps
 //! its files below the agent configuration directory:
@@ -19,6 +20,7 @@
 //! with the same name in different workspaces independent.
 
 use std::{
+    collections::BTreeMap,
     error::Error as StdError,
     fmt,
     fs::{self, File, OpenOptions},
@@ -26,7 +28,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -36,9 +38,13 @@ use std::{
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::llm::{AssistantMessage, ContentBlock};
+use crate::{
+    agent,
+    llm::{self, AssistantMessage, ContentBlock},
+};
 
 /// Directory below the agent configuration directory that owns Ralph data.
 pub const STORE_DIR: &str = "ralph";
@@ -46,6 +52,8 @@ pub const ARCHIVE_DIR: &str = "archive";
 pub const COMPLETE_MARKER: &str = "<promise>COMPLETE</promise>";
 pub const DEFAULT_MAX_ITERATIONS: i64 = 50;
 pub const MAX_RALPH_FILE_BYTES: usize = 2 * 1024 * 1024;
+pub const START_TOOL_NAME: &str = "ralph_start";
+pub const DONE_TOOL_NAME: &str = "ralph_done";
 
 /// The task document used when code starts a loop without task content.
 pub const DEFAULT_TEMPLATE: &str = r#"# Task
@@ -88,7 +96,7 @@ Before completion:
 pub const DEFAULT_STALE_PROMPT_GUARD: &str = r#"STALE PROMPT GUARD
 
 Before doing any work from a Ralph prompt, reload the loop state file named in the prompt from the agent configuration directory.
-If the state says "status": "completed", do not edit files, do not run task commands, and do not advance the loop. Reply briefly that the stale prompt was ignored because the loop is already completed."#;
+If the state says "status": "completed", do not edit files, do not run task commands, and do not call ralph_done. Reply briefly that the stale prompt was ignored because the loop is already completed."#;
 
 /// The reflection checkpoint inserted at configured iteration boundaries.
 pub const DEFAULT_REFLECT_INSTRUCTIONS: &str = r#"REFLECTION CHECKPOINT
@@ -399,13 +407,15 @@ pub enum NextIteration {
 }
 
 /// One workspace-scoped loop store under the agent configuration directory.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Store {
     agent_config_dir: PathBuf,
     workspace: PathBuf,
     workspace_key: String,
     session_id: String,
-    current: Mutex<Option<String>>,
+    // Tool closures own a cloned Store. Sharing this cache keeps those
+    // closures and direct lifecycle calls scoped to the same current loop.
+    current: Arc<Mutex<Option<String>>>,
 }
 
 impl Store {
@@ -427,7 +437,7 @@ impl Store {
             workspace,
             workspace_key,
             session_id: session_id.into(),
-            current: Mutex::new(None),
+            current: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -560,7 +570,7 @@ impl Store {
     /// Returns the active loop owned by this session, adopting an unowned one
     /// after a process restart. It never adopts a loop owned by another session.
     pub fn current(&self) -> Result<Option<LoopState>> {
-        let cached = lock(&self.current).clone();
+        let cached = lock(self.current.as_ref()).clone();
         if let Some(name) = cached {
             match self.load(&name, false)? {
                 Some(state)
@@ -866,6 +876,28 @@ impl Store {
         })
     }
 
+    /// Returns the model-facing Ralph tools bound to this store and queue.
+    ///
+    /// The queue is optional to support callers that only need the lifecycle
+    /// result. A live agent should pass an [`agent::Agent`] behind
+    /// [`SharedQueue`] so each iteration is delivered as a follow-up.
+    #[must_use]
+    pub fn tools(&self, queue: Option<SharedQueue>) -> Vec<agent::Tool> {
+        vec![self.start_tool(queue.clone()), self.done_tool(queue)]
+    }
+
+    /// Returns the model-facing tool that starts a Ralph loop.
+    #[must_use]
+    pub fn start_tool(&self, queue: Option<SharedQueue>) -> agent::Tool {
+        ralph_start(self.clone(), queue)
+    }
+
+    /// Returns the model-facing tool that advances a Ralph loop.
+    #[must_use]
+    pub fn done_tool(&self, queue: Option<SharedQueue>) -> agent::Tool {
+        ralph_done(self.clone(), queue)
+    }
+
     fn relative_task_file(&self, name: &str, archived: bool) -> String {
         let mut path = PathBuf::from(STORE_DIR).join(&self.workspace_key);
         if archived {
@@ -900,11 +932,11 @@ impl Store {
     }
 
     fn set_current(&self, name: Option<String>) {
-        *lock(&self.current) = name;
+        *lock(self.current.as_ref()) = name;
     }
 
     fn clear_current_if(&self, name: &str) {
-        let mut current = lock(&self.current);
+        let mut current = lock(self.current.as_ref());
         if current.as_deref() == Some(name) {
             *current = None;
         }
@@ -1120,7 +1152,7 @@ pub fn build_prompt(state: &LoopState, task_content: &str, is_reflection: bool) 
     let mut step = 1;
     if state.items_per_iteration > 0 {
         prompt.push_str(&format!(
-            "**THIS ITERATION: process approximately {} items, then advance the Ralph loop.**\n\n",
+            "**THIS ITERATION: process approximately {} items, then call ralph_done.**\n\n",
             state.items_per_iteration
         ));
         prompt.push_str(&format!(
@@ -1141,7 +1173,7 @@ pub fn build_prompt(state: &LoopState, task_content: &str, is_reflection: bool) 
     ));
     step += 1;
     prompt.push_str(&format!(
-        "{step}. Otherwise, advance the Ralph loop to proceed to the next iteration\n"
+        "{step}. Otherwise, call the ralph_done tool to proceed to the next iteration\n"
     ));
     prompt
 }
@@ -1158,7 +1190,7 @@ pub fn system_prompt_suffix(state: &LoopState) -> String {
         state.name, state.task_file
     );
     suffix.push_str(&format!(
-        "- Before doing work, reload {} from the agent configuration directory; if status is completed, ignore the stale prompt and do not advance the loop\n",
+        "- Before doing work, reload {} from the agent configuration directory; if status is completed, ignore the stale prompt and do not call ralph_done\n",
         state_file_from_task_file(&state.task_file)
     ));
     if state.items_per_iteration > 0 {
@@ -1173,7 +1205,7 @@ pub fn system_prompt_suffix(state: &LoopState) -> String {
     suffix.push_str(&format!(
         "- When FULLY COMPLETE and externally rerunnable: {COMPLETE_MARKER}\n"
     ));
-    suffix.push_str("- Otherwise, advance the Ralph loop to proceed to the next iteration");
+    suffix.push_str("- Otherwise, call the ralph_done tool to proceed to the next iteration");
     suffix
 }
 
@@ -1195,6 +1227,263 @@ pub fn has_complete_marker(message: &AssistantMessage) -> bool {
 /// Tests arbitrary plain text for the exact completion marker.
 pub fn contains_complete_marker(text: &str) -> bool {
     text.contains(COMPLETE_MARKER)
+}
+
+// ---------------------------------------------------------------------------
+// Agent tools
+// ---------------------------------------------------------------------------
+
+/// A thread-safe destination for Ralph's follow-up prompts.
+///
+/// Tools hold this behind an [`Arc`], rather than borrowing a runtime-owned
+/// queue, because [`agent::Tool`] executors must be `'static`, `Send`, and
+/// `Sync`. [`agent::Agent`] implements this trait directly.
+pub trait Queue: Send + Sync {
+    /// Enqueues a message for the next agent turn.
+    fn follow_up(&self, message: llm::Message);
+
+    /// Reports whether steering or follow-up work is already queued.
+    fn has_queued_messages(&self) -> bool;
+}
+
+/// An owned, shareable Ralph prompt queue.
+pub type SharedQueue = Arc<dyn Queue>;
+
+impl Queue for agent::Agent {
+    fn follow_up(&self, message: llm::Message) {
+        agent::Agent::follow_up(self, message);
+    }
+
+    fn has_queued_messages(&self) -> bool {
+        agent::Agent::has_queued_messages(self)
+    }
+}
+
+/// Returns the `ralph_start` model-facing agent tool.
+///
+/// The supplied store is cloned into the executor. Store clones share their
+/// current-loop cache, so a `ralph_done` tool built from the same store sees a
+/// loop started by this one.
+#[must_use]
+pub fn ralph_start(store: Store, queue: Option<SharedQueue>) -> agent::Tool {
+    let mut tool = agent::Tool::new(
+        START_TOOL_NAME,
+        "Start Ralph Loop",
+        "Start a long-running development loop with pacing and reflection controls. \
+         Use when the task needs multiple iterations or paced multi-step execution; \
+         avoid it for one-shot fixes. After starting, continue each finished iteration \
+         with ralph_done unless the completion marker has been emitted.",
+        start_tool_schema(),
+        move |_cancellation, _call_id, parameters, _on_update| {
+            execute_start_tool(&store, queue.as_ref(), &parameters)
+        },
+    );
+    // Both tools mutate the same persisted loop state and inspect the queue.
+    // Force a batch containing either tool to run in call order.
+    tool.execution_mode = Some(agent::ToolExecutionMode::Sequential);
+    tool
+}
+
+/// Returns the `ralph_done` model-facing agent tool.
+#[must_use]
+pub fn ralph_done(store: Store, queue: Option<SharedQueue>) -> agent::Tool {
+    let mut tool = agent::Tool::new(
+        DONE_TOOL_NAME,
+        "Ralph Iteration Done",
+        "Signal that the current Ralph loop iteration is complete and request the next one. \
+         Call this after making real progress. Do not call it when there is no active loop, \
+         when messages are already queued, or after emitting the completion marker.",
+        done_tool_schema(),
+        move |_cancellation, _call_id, _parameters, _on_update| {
+            execute_done_tool(&store, queue.as_ref())
+        },
+    );
+    tool.execution_mode = Some(agent::ToolExecutionMode::Sequential);
+    tool
+}
+
+fn start_tool_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Loop name, e.g. refactor-auth"
+            },
+            "taskContent": {
+                "type": "string",
+                "description": "Task in markdown with goals and a checklist"
+            },
+            "maxIterations": {
+                "type": "integer",
+                "description": "Maximum iterations (default 50)"
+            },
+            "itemsPerIteration": {
+                "type": "integer",
+                "description": "Suggest N checklist items per turn (0 = no limit)"
+            },
+            "reflectEvery": {
+                "type": "integer",
+                "description": "Reflect every N iterations (0 = never)"
+            }
+        },
+        "required": ["name", "taskContent"]
+    })
+}
+
+fn done_tool_schema() -> Value {
+    json!({"type": "object", "properties": {}})
+}
+
+fn execute_start_tool(
+    store: &Store,
+    queue: Option<&SharedQueue>,
+    parameters: &BTreeMap<String, Value>,
+) -> std::result::Result<agent::ToolResult, String> {
+    let name = required_tool_string(parameters, "name")?;
+    let task_content = required_tool_string(parameters, "taskContent")?;
+    let options = LoopOptions {
+        max_iterations: optional_tool_integer(parameters, "maxIterations")?,
+        items_per_iteration: optional_tool_integer(parameters, "itemsPerIteration")?,
+        reflect_every: optional_tool_integer(parameters, "reflectEvery")?,
+    };
+
+    match store.start(name, task_content, options) {
+        Ok(state) => {
+            if let Some(queue) = queue {
+                queue.follow_up(user_message(build_prompt(&state, task_content, false)));
+            }
+            Ok(agent::ToolResult::text(format!(
+                "Started loop {:?} (max {} iterations). Task file: {}",
+                state.name, state.max_iterations, state.task_file
+            )))
+        }
+        // A duplicate start is a no-op the model can recover from, rather
+        // than an execution failure that ends its tool batch.
+        Err(error @ RalphError::AlreadyActive(_)) => Ok(agent::ToolResult::text(error.to_string())),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn execute_done_tool(
+    store: &Store,
+    queue: Option<&SharedQueue>,
+) -> std::result::Result<agent::ToolResult, String> {
+    let Some(mut state) = store.current().map_err(|error| error.to_string())? else {
+        return Ok(agent::ToolResult::text(
+            "No active Ralph loop owned by this session.",
+        ));
+    };
+    if state.status != LoopStatus::Active {
+        return Ok(agent::ToolResult::text(
+            "No active Ralph loop owned by this session.",
+        ));
+    }
+
+    // A queued prompt already drives the next turn. Advancing in this batch
+    // would produce two prompts and skip an iteration's work.
+    if queue.is_some_and(|queue| queue.has_queued_messages()) {
+        return Ok(agent::ToolResult::text(
+            "Messages are already queued; skipping ralph_done.",
+        ));
+    }
+
+    let previous = state.iteration;
+    let advance = store
+        .advance(&mut state)
+        .map_err(|error| error.to_string())?;
+    if advance.done {
+        return Ok(agent::ToolResult {
+            content: vec![ContentBlock::text(format!(
+                "Max iterations ({}) reached; the loop has stopped.",
+                state.max_iterations
+            ))],
+            terminate: true,
+            ..agent::ToolResult::default()
+        });
+    }
+
+    let task_content = match store.read_task(&state) {
+        Ok(task_content) => task_content,
+        Err(error) => {
+            store
+                .pause(&mut state)
+                .map_err(|pause_error| pause_error.to_string())?;
+            return Err(format!(
+                "cannot read task file {}: {error}",
+                state.task_file
+            ));
+        }
+    };
+    if let Some(queue) = queue {
+        queue.follow_up(user_message(build_prompt(
+            &state,
+            &task_content,
+            advance.reflection,
+        )));
+    }
+    let reflection = advance
+        .reflection
+        .then_some(" (reflection checkpoint)")
+        .unwrap_or_default();
+    Ok(agent::ToolResult::text(format!(
+        "Iteration {previous} complete; iteration {} queued{reflection}.",
+        state.iteration
+    )))
+}
+
+fn required_tool_string<'a>(
+    parameters: &'a BTreeMap<String, Value>,
+    name: &str,
+) -> std::result::Result<&'a str, String> {
+    match parameters.get(name) {
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(format!("{name:?} must be a string")),
+        None => Err(format!("{name:?} is required")),
+    }
+}
+
+/// Parses the integer representation accepted by the agent's JSON-schema
+/// preparation so direct tool callers get the same validation behavior.
+fn optional_tool_integer(
+    parameters: &BTreeMap<String, Value>,
+    name: &str,
+) -> std::result::Result<i64, String> {
+    let Some(value) = parameters.get(name) else {
+        return Ok(0);
+    };
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(value) = value.as_u64() {
+        return i64::try_from(value).map_err(|_| format!("{name:?} must be an integer"));
+    }
+    if let Some(value) = value.as_f64()
+        && value.is_finite()
+        && value.fract() == 0.0
+        && (i64::MIN as f64..=i64::MAX as f64).contains(&value)
+    {
+        return Ok(value as i64);
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .parse::<i64>()
+            .map_err(|_| format!("{name:?} must be an integer"));
+    }
+    Err(format!("{name:?} must be an integer"))
+}
+
+fn user_message(text: impl Into<String>) -> llm::Message {
+    llm::Message::User(llm::UserMessage::text(text, now_millis()))
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 fn parse_start(arguments: &[String]) -> Result<RalphCommand> {
@@ -1513,7 +1802,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::{
+        collections::BTreeMap,
         fs,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1548,6 +1842,59 @@ mod tests {
             content: vec![ContentBlock::text(text)],
             ..AssistantMessage::default()
         }
+    }
+
+    #[derive(Default)]
+    struct TestQueue {
+        messages: Mutex<Vec<llm::Message>>,
+        pending: AtomicBool,
+    }
+
+    impl Queue for TestQueue {
+        fn follow_up(&self, message: llm::Message) {
+            lock(&self.messages).push(message);
+        }
+
+        fn has_queued_messages(&self) -> bool {
+            self.pending.load(Ordering::Acquire)
+        }
+    }
+
+    impl TestQueue {
+        fn prompts(&self) -> Vec<String> {
+            lock(&self.messages)
+                .iter()
+                .filter_map(|message| match message {
+                    llm::Message::User(message) => message.content.text().map(ToOwned::to_owned),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn set_pending(&self, pending: bool) {
+            self.pending.store(pending, Ordering::Release);
+        }
+    }
+
+    fn execute_agent_tool(
+        tool: agent::Tool,
+        parameters: BTreeMap<String, Value>,
+    ) -> std::result::Result<agent::ToolResult, String> {
+        (tool.execute)(
+            agent::CancellationToken::default(),
+            "test-call".to_owned(),
+            parameters,
+            Arc::new(|_| {}),
+        )
+    }
+
+    fn agent_tool_text(result: &agent::ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(ContentBlock::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1810,6 +2157,7 @@ mod tests {
             "STALE PROMPT GUARD",
             "process approximately 2 items",
             COMPLETE_MARKER,
+            "ralph_done",
         ] {
             assert!(prompt.contains(expected), "prompt omitted {expected:?}");
         }
@@ -1826,6 +2174,7 @@ mod tests {
                 .system_prompt
                 .contains("[RALPH LOOP - loop - Iteration 1/4]")
         );
+        assert!(prepared.system_prompt.contains("ralph_done"));
 
         let completed = store
             .prepare_next_turn(
@@ -1840,6 +2189,216 @@ mod tests {
         assert_eq!(state.status, LoopStatus::Completed);
         assert!(has_complete_marker(&text_assistant(COMPLETE_MARKER)));
         assert!(!has_complete_marker(&text_assistant("not yet")));
+    }
+
+    #[test]
+    fn agent_queue_forwards_follow_ups_to_agent() {
+        let agent = agent::Agent::new(agent::AgentOptions::default());
+        let queue: SharedQueue = Arc::new(agent.clone());
+
+        queue.follow_up(user_message("queued Ralph work"));
+
+        assert!(queue.has_queued_messages());
+        assert_eq!(agent.queued_message_count(), 1);
+    }
+
+    #[test]
+    fn ralph_start_tool_validates_parameters_queues_prompt_and_is_sequential() {
+        let (store, _root, _config, _workspace) = test_store("start-tool");
+        let queue = Arc::new(TestQueue::default());
+        let queue_handle: SharedQueue = queue.clone();
+        let tools = store.tools(Some(queue_handle));
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            [START_TOOL_NAME, DONE_TOOL_NAME]
+        );
+        assert!(tools.iter().all(|tool| {
+            tool.execution_mode == Some(agent::ToolExecutionMode::Sequential)
+                && tool.parameters.get("type") == Some(&Value::String("object".to_owned()))
+        }));
+
+        let start = tools
+            .iter()
+            .find(|tool| tool.name == START_TOOL_NAME)
+            .expect("start tool")
+            .clone();
+        assert!(
+            execute_agent_tool(start.clone(), BTreeMap::new())
+                .expect_err("name and task are required")
+                .contains("name")
+        );
+        assert!(
+            execute_agent_tool(
+                start.clone(),
+                BTreeMap::from([
+                    ("name".to_owned(), Value::String("loop".to_owned())),
+                    ("taskContent".to_owned(), Value::String("task".to_owned())),
+                    ("maxIterations".to_owned(), json!(1.5)),
+                ]),
+            )
+            .expect_err("fractional iteration limit must be rejected")
+            .contains("maxIterations")
+        );
+        assert!(
+            execute_agent_tool(
+                start.clone(),
+                BTreeMap::from([
+                    ("name".to_owned(), Value::String("loop".to_owned())),
+                    ("taskContent".to_owned(), Value::String("task".to_owned())),
+                    ("reflectEvery".to_owned(), json!(-1)),
+                ]),
+            )
+            .expect_err("negative reflection interval must be rejected")
+            .contains("reflect_every")
+        );
+
+        let result = execute_agent_tool(
+            start.clone(),
+            BTreeMap::from([
+                ("name".to_owned(), Value::String("refactor auth".to_owned())),
+                (
+                    "taskContent".to_owned(),
+                    Value::String("# Task\n- [ ] split handler".to_owned()),
+                ),
+                // Direct execution accepts the same integer string that the
+                // agent's schema preparation coerces before invoking a tool.
+                ("maxIterations".to_owned(), Value::String("4".to_owned())),
+            ]),
+        )
+        .expect("start tool");
+        assert_eq!(
+            agent_tool_text(&result),
+            format!(
+                "Started loop \"refactor_auth\" (max 4 iterations). Task file: {}",
+                store.task_file("refactor_auth", false).expect("task file")
+            )
+        );
+        assert_eq!(queue.prompts().len(), 1);
+        assert!(queue.prompts()[0].contains("RALPH LOOP: refactor_auth | Iteration 1/4"));
+        assert_eq!(
+            store
+                .load("refactor_auth", false)
+                .expect("load")
+                .expect("state")
+                .status,
+            LoopStatus::Active
+        );
+
+        let duplicate = execute_agent_tool(
+            start,
+            BTreeMap::from([
+                ("name".to_owned(), Value::String("refactor auth".to_owned())),
+                ("taskContent".to_owned(), Value::String("task".to_owned())),
+            ]),
+        )
+        .expect("duplicate start is a user-visible no-op");
+        assert!(agent_tool_text(&duplicate).contains("already active"));
+        assert_eq!(queue.prompts().len(), 1);
+    }
+
+    #[test]
+    fn ralph_done_tool_skips_queued_work_then_advances_and_queues() {
+        let (store, _root, _config, _workspace) = test_store("done-tool");
+        let queue = Arc::new(TestQueue::default());
+        let queue_handle: SharedQueue = queue.clone();
+        let start = ralph_start(store.clone(), Some(queue_handle.clone()));
+        let done = ralph_done(store.clone(), Some(queue_handle));
+        execute_agent_tool(
+            start,
+            BTreeMap::from([
+                ("name".to_owned(), Value::String("loop".to_owned())),
+                (
+                    "taskContent".to_owned(),
+                    Value::String("# Task\n- [ ] one".to_owned()),
+                ),
+                ("maxIterations".to_owned(), json!(5)),
+                ("reflectEvery".to_owned(), json!(1)),
+            ]),
+        )
+        .expect("start");
+
+        queue.set_pending(true);
+        let skipped = execute_agent_tool(done.clone(), BTreeMap::new()).expect("queued work");
+        assert_eq!(
+            agent_tool_text(&skipped),
+            "Messages are already queued; skipping ralph_done."
+        );
+        assert_eq!(
+            store
+                .load("loop", false)
+                .expect("load")
+                .expect("state")
+                .iteration,
+            1
+        );
+
+        queue.set_pending(false);
+        let advanced = execute_agent_tool(done, BTreeMap::new()).expect("advance");
+        assert_eq!(
+            agent_tool_text(&advanced),
+            "Iteration 1 complete; iteration 2 queued (reflection checkpoint)."
+        );
+        let prompts = queue.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("RALPH LOOP: loop | Iteration 2/5 | REFLECTION"));
+        assert!(prompts[1].contains("REFLECTION CHECKPOINT"));
+    }
+
+    #[test]
+    fn ralph_done_tool_handles_absent_maxed_and_unreadable_loops() {
+        let (store, _root, _config, _workspace) = test_store("done-terminal");
+        let no_active = execute_agent_tool(ralph_done(store.clone(), None), BTreeMap::new())
+            .expect("no active loop is a normal result");
+        assert_eq!(
+            agent_tool_text(&no_active),
+            "No active Ralph loop owned by this session."
+        );
+
+        execute_agent_tool(
+            ralph_start(store.clone(), None),
+            BTreeMap::from([
+                ("name".to_owned(), Value::String("maxed".to_owned())),
+                ("taskContent".to_owned(), Value::String("task".to_owned())),
+                ("maxIterations".to_owned(), json!(1)),
+            ]),
+        )
+        .expect("start maxed loop");
+        let terminal = execute_agent_tool(ralph_done(store.clone(), None), BTreeMap::new())
+            .expect("max iteration result");
+        assert!(terminal.terminate);
+        assert_eq!(
+            agent_tool_text(&terminal),
+            "Max iterations (1) reached; the loop has stopped."
+        );
+        assert_eq!(
+            store
+                .load("maxed", false)
+                .expect("load")
+                .expect("state")
+                .status,
+            LoopStatus::Completed
+        );
+
+        let missing = store
+            .start("missing-task", "task", LoopOptions::default())
+            .expect("start missing-task loop");
+        fs::remove_file(store.task_path(&missing.name, false).expect("task path"))
+            .expect("remove task");
+        let error = execute_agent_tool(ralph_done(store.clone(), None), BTreeMap::new())
+            .expect_err("missing task must pause rather than spin");
+        assert!(error.contains("cannot read task file"));
+        assert_eq!(
+            store
+                .load(&missing.name, false)
+                .expect("load")
+                .expect("state")
+                .status,
+            LoopStatus::Paused
+        );
     }
 
     #[test]

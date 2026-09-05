@@ -14,8 +14,7 @@ use std::{
 use crate::{
     agent,
     catalog::Catalog,
-    config, llm,
-    planner_runtime,
+    config, llm, planner_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,

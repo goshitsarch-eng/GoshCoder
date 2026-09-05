@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod aperture;
+pub mod aperture_mcp;
 pub mod bedrock;
 pub mod btw;
 pub mod catalog;
@@ -10,11 +11,11 @@ pub mod markdown;
 pub mod oauth;
 pub mod omni_cli;
 pub mod omniroute;
+pub mod planner_runtime;
+pub mod plannotator;
 pub mod prompts;
 pub mod provider_cli;
 pub mod providers;
-pub mod plannotator;
-pub mod planner_runtime;
 pub mod ralph;
 pub mod ralph_cli;
 pub mod resources;
@@ -450,10 +451,16 @@ fn event_loop(
                 Action::None => {}
                 Action::Quit => {
                     prepared.runtime.agent().abort();
+                    if let Some(planner) = prepared.planner.as_ref() {
+                        planner.abort_review();
+                    }
                     return Ok(());
                 }
                 Action::Abort => {
                     prepared.runtime.agent().abort();
+                    if let Some(planner) = prepared.planner.as_ref() {
+                        planner.abort_review();
+                    }
                     view.activity = "Aborting".to_owned();
                 }
                 Action::CycleModel { direction } => {
@@ -596,7 +603,7 @@ fn submit_interactive_input(
         }
     };
     if input.starts_with('/') {
-        return dispatch_runtime_slash_command(app, view, prepared, catalog, &input);
+        return dispatch_runtime_slash_command(app, view, prepared, catalog, turn_sender, &input);
     }
 
     let agent = prepared.runtime.agent().clone();
@@ -643,6 +650,7 @@ fn dispatch_runtime_slash_command(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
+    turn_sender: Sender<Result<(), String>>,
     input: &str,
 ) -> CommandDispatch {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
@@ -653,7 +661,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, compaction, OmniRoute, Aperture, and planner review commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, compaction, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -963,6 +971,79 @@ fn dispatch_runtime_slash_command(
             view.activity = format!("Planner: {}", phase.as_str());
             CommandDispatch::Handled
         }
+        "/planner-review" | "/plannotator-review" => {
+            let Some(planner) = prepared.planner.as_ref() else {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Planner is unavailable in this session. Reopen chat with planner support enabled.",
+                );
+                return CommandDispatch::Handled;
+            };
+            let workspace = planner.workspace_root().to_path_buf();
+            let target = rest.to_owned();
+            start_planner_review(
+                app,
+                view,
+                prepared,
+                turn_sender,
+                "Loading code review",
+                move || {
+                    planner_runtime::load_diff_review(workspace, &target)
+                        .map(|request| ("the code changes".to_owned(), request))
+                },
+            )
+        }
+        "/planner-annotate" | "/plannotator-annotate" => {
+            if rest.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "usage: /planner-annotate <target>",
+                );
+                return CommandDispatch::Handled;
+            }
+            let Some(planner) = prepared.planner.as_ref() else {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Planner is unavailable in this session. Reopen chat with planner support enabled.",
+                );
+                return CommandDispatch::Handled;
+            };
+            let workspace = planner.workspace_root().to_path_buf();
+            let target = rest.to_owned();
+            start_planner_review(
+                app,
+                view,
+                prepared,
+                turn_sender,
+                "Collecting annotation",
+                move || {
+                    let collector = plannotator::TextCollector::new(&workspace)
+                        .map_err(|error| error.to_string())?;
+                    let collected = collector
+                        .collect(&target)
+                        .map_err(|error| error.to_string())?;
+                    Ok((collected.feedback_subject, collected.review_request()))
+                },
+            )
+        }
+        "/planner-last" | "/plannotator-last" => {
+            let messages = prepared.runtime.agent().state().messages;
+            start_planner_review(
+                app,
+                view,
+                prepared,
+                turn_sender,
+                "Opening annotation",
+                move || {
+                    let collected = plannotator::collect_last_assistant_response(&messages)
+                        .map_err(|error| error.to_string())?;
+                    Ok((collected.feedback_subject, collected.review_request()))
+                },
+            )
+        }
         "/system" if rest.is_empty() => {
             append_view_message(
                 view,
@@ -1003,6 +1084,53 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+fn start_planner_review<F>(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    turn_sender: Sender<Result<(), String>>,
+    activity: &str,
+    request: F,
+) -> CommandDispatch
+where
+    F: FnOnce() -> Result<(String, plannotator::ReviewRequest), String> + Send + 'static,
+{
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Wait for the current response or Planner review to finish.",
+        );
+        return CommandDispatch::Handled;
+    }
+    let Some(planner) = prepared.planner.as_ref() else {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Planner is unavailable in this session. Reopen chat with planner support enabled.",
+        );
+        return CommandDispatch::Handled;
+    };
+    let review = planner.review_handle();
+    let agent = prepared.runtime.agent().clone();
+    view.turn_pending = true;
+    view.activity = activity.to_owned();
+    view.activity_since = Some(Instant::now());
+    thread::spawn(move || {
+        let result = request().and_then(|(subject, request)| {
+            let decision = review.review(&request).map_err(|error| error.to_string())?;
+            if let Some(feedback) = plannotator::review_feedback_prompt(&subject, &decision) {
+                agent.prompt(feedback).map_err(|error| error.to_string())
+            } else {
+                review.notify(format!("{subject} approved"));
+                Ok(())
+            }
+        });
+        let _ = turn_sender.send(result);
+    });
+    CommandDispatch::Handled
 }
 
 fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl Into<String>) {
@@ -1298,10 +1426,10 @@ fn runtime_sidebar(
         .as_ref()
         .map(|workspace| workspace.root().display().to_string())
         .unwrap_or_else(|| prepared.config.workdir.display().to_string());
-    let mode = prepared
-        .planner
-        .as_ref()
-        .map_or_else(|| "normal".to_owned(), planner_runtime::PlannerRuntime::status_line);
+    let mode = prepared.planner.as_ref().map_or_else(
+        || "normal".to_owned(),
+        planner_runtime::PlannerRuntime::status_line,
+    );
     let mut lines = vec![
         state::SidebarLine::title(name),
         state::SidebarLine::accent(format!("{}/{}", state.model.provider, state.model.id)),
@@ -1383,10 +1511,10 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
             compact_number(context_limit)
         )
     };
-    let planner = prepared
-        .planner
-        .as_ref()
-        .map_or_else(|| "Planner: unavailable".to_owned(), planner_runtime::PlannerRuntime::status_line);
+    let planner = prepared.planner.as_ref().map_or_else(
+        || "Planner: unavailable".to_owned(),
+        planner_runtime::PlannerRuntime::status_line,
+    );
     format!(
         "Session: {}\nModel: {}/{}\nThinking: {}\n{planner}\nContext: {context}\nActivity: {activity}\nStorage: {storage}",
         prepared

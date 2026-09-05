@@ -8,7 +8,12 @@
 use std::{
     collections::BTreeSet,
     fmt,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
     sync::{Arc, Mutex, MutexGuard},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -63,7 +68,49 @@ pub struct PlannerRuntime {
     workspace: Workspace,
     normal_tools: Vec<agent::Tool>,
     base_system_prompt: Arc<Mutex<String>>,
+    reviewer: Arc<dyn plannotator::Reviewer>,
+    notices: SessionNoticeSender,
+    review_cancellation: Arc<Mutex<Option<agent::CancellationToken>>>,
     _subscription: agent::Subscription,
+}
+
+/// Cloneable handle for a human planner review that runs off the terminal UI
+/// thread. Only one review is expected per session at a time.
+#[derive(Clone)]
+pub struct PlannerReviewHandle {
+    reviewer: Arc<dyn plannotator::Reviewer>,
+    notices: SessionNoticeSender,
+    cancellation: Arc<Mutex<Option<agent::CancellationToken>>>,
+}
+
+impl PlannerReviewHandle {
+    /// Opens the configured review surface and waits for a decision.
+    pub fn review(
+        &self,
+        request: &plannotator::ReviewRequest,
+    ) -> std::result::Result<plannotator::Decision, plannotator::ReviewError> {
+        let cancellation = agent::CancellationToken::default();
+        *lock(&self.cancellation) = Some(cancellation.clone());
+        let result = self.reviewer.review(&cancellation, request);
+        *lock(&self.cancellation) = None;
+        result
+    }
+
+    /// Cancels an open browser review, if any.
+    pub fn cancel(&self) -> bool {
+        let cancellation = lock(&self.cancellation).clone();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sends an outcome to the current UI or line-mode renderer.
+    pub fn notify(&self, message: impl Into<String>) {
+        self.notices.push("Planner", message);
+    }
 }
 
 impl PlannerRuntime {
@@ -82,12 +129,13 @@ impl PlannerRuntime {
         let notices = runtime.notice_sender();
         let initial = restored_state(runtime, &notices);
         let recorder = runtime.custom_recorder();
+        let reviewer: Arc<dyn plannotator::Reviewer> = Arc::new(plannotator::BrowserReviewer {
+            notify: Some(review_notice_callback(notices.clone())),
+            ..plannotator::BrowserReviewer::default()
+        });
         let manager = plannotator::Manager::new(
             workspace.root(),
-            Some(Arc::new(plannotator::BrowserReviewer {
-                notify: Some(review_notice_callback(notices.clone())),
-                ..plannotator::BrowserReviewer::default()
-            })),
+            Some(Arc::clone(&reviewer)),
             plannotator::Options {
                 initial,
                 on_change: Some(persistence_callback(recorder, notices.clone())),
@@ -114,6 +162,9 @@ impl PlannerRuntime {
             workspace,
             normal_tools,
             base_system_prompt,
+            reviewer,
+            notices,
+            review_cancellation: Arc::new(Mutex::new(None)),
             _subscription: subscription,
         };
         integration.sync_agent();
@@ -128,6 +179,25 @@ impl PlannerRuntime {
     /// Returns the current succinct state for a status bar.
     pub fn status_line(&self) -> String {
         self.manager.status_line()
+    }
+
+    /// Returns the workspace root used for planner files, diffs, and reviews.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.root()
+    }
+
+    /// Returns a cloneable UI-thread-safe browser review handle.
+    pub fn review_handle(&self) -> PlannerReviewHandle {
+        PlannerReviewHandle {
+            reviewer: Arc::clone(&self.reviewer),
+            notices: self.notices.clone(),
+            cancellation: Arc::clone(&self.review_cancellation),
+        }
+    }
+
+    /// Cancels an outstanding browser review, if one is open.
+    pub fn abort_review(&self) -> bool {
+        self.review_handle().cancel()
     }
 
     /// Toggles idle/planning and immediately applies its prompt and tool set.
@@ -316,16 +386,156 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+/// Loads the working-tree or a GitHub pull-request diff for `/planner-review`.
+///
+/// Command output is consumed concurrently and bounded while it is read, so a
+/// malformed repository or remote PR cannot make the terminal process retain
+/// an unbounded diff in memory.
+pub fn load_diff_review(
+    workspace: impl AsRef<Path>,
+    pull_request_url: &str,
+) -> std::result::Result<plannotator::ReviewRequest, String> {
+    let workspace = workspace.as_ref();
+    let target = pull_request_url.trim();
+    let diff = if target.is_empty() {
+        let unstaged = run_bounded_command(
+            Command::new("git")
+                .arg("diff")
+                .arg("--no-ext-diff")
+                .arg("--")
+                .current_dir(workspace),
+        )?;
+        if unstaged.trim().is_empty() {
+            run_bounded_command(
+                Command::new("git")
+                    .arg("diff")
+                    .arg("--cached")
+                    .arg("--no-ext-diff")
+                    .arg("--")
+                    .current_dir(workspace),
+            )?
+        } else {
+            unstaged
+        }
+    } else if target.starts_with("https://") || target.starts_with("http://") {
+        run_bounded_command(
+            Command::new("gh")
+                .arg("pr")
+                .arg("diff")
+                .arg(target)
+                .current_dir(workspace),
+        )?
+    } else {
+        return Err("usage: /planner-review [GitHub PR URL]".to_owned());
+    };
+    plannotator::diff_review_request(&diff).map_err(|error| error.to_string())
+}
+
+const REVIEW_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn run_bounded_command(command: &mut Command) -> std::result::Result<String, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start review diff command: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "capture review diff stdout".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "capture review diff stderr".to_owned())?;
+    let stdout = thread::spawn(move || read_bounded(stdout, plannotator::MAX_REVIEW_DIFF_BYTES));
+    let stderr = thread::spawn(move || read_bounded(stderr, plannotator::MAX_REVIEW_DIFF_BYTES));
+
+    let deadline = Instant::now() + REVIEW_COMMAND_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("review diff command timed out".to_owned());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("wait for review diff command: {error}"));
+            }
+        }
+    };
+    let stdout = stdout
+        .join()
+        .map_err(|_| "read review diff stdout worker panicked".to_owned())?
+        .map_err(|error| format!("read review diff stdout: {error}"))?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| "read review diff stderr worker panicked".to_owned())?
+        .map_err(|error| format!("read review diff stderr: {error}"))?;
+    let status = status?;
+    if stdout.truncated || stderr.truncated {
+        return Err(format!(
+            "review diff exceeds the {}-byte limit",
+            plannotator::MAX_REVIEW_DIFF_BYTES
+        ));
+    }
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr.bytes).trim().to_owned();
+        let suffix = (!stderr.is_empty()).then(|| format!(": {stderr}"));
+        return Err(format!(
+            "load review diff failed with status {}{}",
+            status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
+            suffix.unwrap_or_default()
+        ));
+    }
+    String::from_utf8(stdout.bytes).map_err(|error| format!("review diff is not UTF-8: {error}"))
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<BoundedOutput> {
+    let mut output = BoundedOutput {
+        bytes: Vec::with_capacity(limit.min(64 * 1024)),
+        truncated: false,
+    };
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        let remaining = limit.saturating_sub(output.bytes.len());
+        if remaining < count {
+            output.bytes.extend_from_slice(&buffer[..remaining]);
+            output.truncated = true;
+        } else {
+            output.bytes.extend_from_slice(&buffer[..count]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use super::*;
     use crate::{llm, session::SessionOptions};
+    use serde_json::json;
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -367,20 +577,41 @@ mod tests {
         )
         .expect("attach");
 
-        assert!(!runtime
-            .agent()
-            .state()
-            .tools
-            .iter()
-            .any(|tool| tool.name == plannotator::SUBMIT_TOOL_NAME));
+        assert!(
+            !runtime
+                .agent()
+                .state()
+                .tools
+                .iter()
+                .any(|tool| tool.name == plannotator::SUBMIT_TOOL_NAME)
+        );
         assert_eq!(integration.toggle(), plannotator::Phase::Planning);
         let state = runtime.agent().state();
-        assert!(state
+        assert!(
+            state
+                .tools
+                .iter()
+                .any(|tool| tool.name == plannotator::SUBMIT_TOOL_NAME)
+        );
+        assert!(!state.tools.iter().any(|tool| tool.name == "bash"));
+        assert!(
+            state
+                .system_prompt
+                .contains(plannotator::PLANNING_PROMPT.trim())
+        );
+        let write = state
             .tools
             .iter()
-            .any(|tool| tool.name == plannotator::SUBMIT_TOOL_NAME));
-        assert!(!state.tools.iter().any(|tool| tool.name == "bash"));
-        assert!(state.system_prompt.contains(plannotator::PLANNING_PROMPT.trim()));
+            .find(|tool| tool.name == "write")
+            .expect("write tool");
+        let error = (write.execute)(
+            agent::CancellationToken::default(),
+            "write-call".to_owned(),
+            BTreeMap::from([("path".to_owned(), json!("src/main.rs"))]),
+            Arc::new(|_| {}),
+        )
+        .expect_err("planning gate must block a source write");
+        assert!(error.contains("writes and edits are limited"));
 
         let restored = runtime.restored();
         assert_eq!(
@@ -399,5 +630,18 @@ mod tests {
         drop(integration);
         runtime.close().expect("close");
         fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn review_output_reader_keeps_a_bounded_prefix_and_drains_the_rest() {
+        let output = read_bounded(b"abcdef".as_slice(), 3).expect("read");
+        assert_eq!(output.bytes, b"abc");
+        assert!(output.truncated);
+    }
+
+    #[test]
+    fn planner_review_requires_an_omitted_or_github_url_target() {
+        let error = load_diff_review(".", "not-a-url").expect_err("reject target");
+        assert_eq!(error, "usage: /planner-review [GitHub PR URL]");
     }
 }

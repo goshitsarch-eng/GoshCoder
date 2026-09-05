@@ -28,7 +28,7 @@ use std::{
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 use uuid::Uuid;
@@ -2623,8 +2623,9 @@ mod tests {
         path::PathBuf,
         process,
         sync::{
+            Mutex,
             atomic::{AtomicUsize, Ordering},
-            mpsc, Mutex,
+            mpsc,
         },
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -2792,19 +2793,25 @@ mod tests {
         );
         assert_eq!(document.headings.len(), 1);
         assert_eq!(document.headings[0].text, "Plan");
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.display == "#include <stdio.h>"
-                && line.kind == ReviewLineKind::Paragraph));
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.kind == ReviewLineKind::Numbered));
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.kind == ReviewLineKind::Task { completed: true }));
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.display == "#include <stdio.h>"
+                    && line.kind == ReviewLineKind::Paragraph)
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewLineKind::Numbered)
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewLineKind::Task { completed: true })
+        );
     }
 
     #[test]
@@ -2818,18 +2825,24 @@ mod tests {
         assert_eq!(document.lines[2].indent, 1);
         assert_eq!(document.lines[3].kind, ReviewLineKind::Numbered);
         assert_eq!(document.lines[3].indent, 2);
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.kind == ReviewLineKind::DiffAdd));
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.kind == ReviewLineKind::DiffRemove));
-        assert!(document
-            .lines
-            .iter()
-            .any(|line| line.kind == ReviewLineKind::DiffHunk));
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewLineKind::DiffAdd)
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewLineKind::DiffRemove)
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .any(|line| line.kind == ReviewLineKind::DiffHunk)
+        );
     }
 
     #[test]
@@ -2858,15 +2871,21 @@ mod tests {
             planner.before_tool_call(&tool_call("write", Some("plans/a.md"))),
             None
         );
-        assert!(planner
-            .before_tool_call(&tool_call("bash", None))
-            .is_some_and(|result| result.block));
-        assert!(planner
-            .before_tool_call(&tool_call("edit", Some("main.rs")))
-            .is_some_and(|result| result.block));
-        assert!(planner
-            .before_tool_call(&tool_call("write", None))
-            .is_some_and(|result| result.block));
+        assert!(
+            planner
+                .before_tool_call(&tool_call("bash", None))
+                .is_some_and(|result| result.block)
+        );
+        assert!(
+            planner
+                .before_tool_call(&tool_call("edit", Some("main.rs")))
+                .is_some_and(|result| result.block)
+        );
+        assert!(
+            planner
+                .before_tool_call(&tool_call("write", None))
+                .is_some_and(|result| result.block)
+        );
         assert!(!planner.is_plan_path_allowed("../escape.md"));
         assert!(!planner.is_plan_path_allowed("/tmp/escape.md"));
         assert!(!planner.is_plan_path_allowed("PLAN.txt"));
@@ -2951,11 +2970,13 @@ mod tests {
         assert!(missing.text.contains("checklist"));
         assert_eq!(planner.state().phase, Phase::Planning);
         root.write("empty.md", " \n");
-        assert!(planner
-            .submit(&agent::CancellationToken::default(), "empty.md")
-            .expect("empty response")
-            .text
-            .contains("empty"));
+        assert!(
+            planner
+                .submit(&agent::CancellationToken::default(), "empty.md")
+                .expect("empty response")
+                .text
+                .contains("empty")
+        );
     }
 
     #[test]
@@ -2970,9 +2991,11 @@ mod tests {
         let response = planner
             .submit(&agent::CancellationToken::default(), "PLAN.md")
             .expect("model-facing size rejection");
-        assert!(response
-            .text
-            .contains(&format!("plan exceeds {MAX_PLAN_BYTES} bytes")));
+        assert!(
+            response
+                .text
+                .contains(&format!("plan exceeds {MAX_PLAN_BYTES} bytes"))
+        );
         assert_eq!(planner.state().phase, Phase::Planning);
     }
 
@@ -3251,9 +3274,11 @@ mod tests {
         root.write("PLAN.md", "- [ ] work\n");
         let planner = manager(&root, None);
         planner.enter();
-        assert!(planner
-            .prompt("base")
-            .contains("[PLANNER - PLANNING PHASE]"));
+        assert!(
+            planner
+                .prompt("base")
+                .contains("[PLANNER - PLANNING PHASE]")
+        );
         approved_plan(&planner, "PLAN.md");
         let update = planner.prepare_next_turn("base", &assistant("still working"));
         assert_eq!(update.tool_access, ToolAccess::Executing);
@@ -3282,9 +3307,11 @@ mod tests {
         )
         .expect("tool execution");
         assert_eq!(result.details, Some(json!({"approved": true})));
-        assert!(result.content[0]
-            .plain_text()
-            .is_some_and(|text| text.contains("Plan approved")));
+        assert!(
+            result.content[0]
+                .plain_text()
+                .is_some_and(|text| text.contains("Plan approved"))
+        );
     }
 
     #[test]
@@ -3378,8 +3405,7 @@ mod tests {
             None
         );
         assert_eq!(
-            review_feedback_prompt("the change", &Decision::default())
-                .expect("denial prompt"),
+            review_feedback_prompt("the change", &Decision::default()).expect("denial prompt"),
             "Planner review of the change was denied. Address this feedback:\n\nthe change was denied without notes."
         );
         assert!(diff_review_request("diff --git a/a b/a").is_ok());
