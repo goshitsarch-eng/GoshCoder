@@ -16,8 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde_json::Value;
-
 use crate::{
     agent, llm, plannotator,
     session::{SessionCustomRecorder, SessionNoticeSender, SessionRuntime},

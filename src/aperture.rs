@@ -642,9 +642,11 @@ pub fn gateway_url(base_url: &str) -> String {
 /// Returns the OpenAI-shaped `/v1` endpoint for a configured gateway.
 pub fn provider_base_url(base_url: &str) -> String {
     let gateway = gateway_url(base_url);
-    (!gateway.is_empty())
-        .then(|| format!("{gateway}/v1"))
-        .unwrap_or_default()
+    if gateway.is_empty() {
+        String::new()
+    } else {
+        format!("{gateway}/v1")
+    }
 }
 
 fn trim_gateway_suffix(value: &str) -> String {
@@ -1588,6 +1590,7 @@ pub fn build_dedicated_models(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_default_model(
     provider: &GatewayProvider,
     model_id: &str,
@@ -1608,16 +1611,22 @@ fn build_default_model(
         cost,
         compat,
     } = metadata;
-    let name = (!name.is_empty())
-        .then_some(name)
-        .unwrap_or_else(|| model_id.to_owned());
-    let input = (!input.is_empty())
-        .then_some(input)
-        .unwrap_or_else(|| vec!["text".to_owned()]);
-    let context_window = (context_window != 0)
-        .then_some(context_window)
-        .unwrap_or(128_000);
-    let max_tokens = (max_tokens != 0).then_some(max_tokens).unwrap_or(8_192);
+    let name = if name.is_empty() {
+        model_id.to_owned()
+    } else {
+        name
+    };
+    let input = if input.is_empty() {
+        vec!["text".to_owned()]
+    } else {
+        input
+    };
+    let context_window = if context_window == 0 {
+        128_000
+    } else {
+        context_window
+    };
+    let max_tokens = if max_tokens == 0 { 8_192 } else { max_tokens };
     llm::Model {
         id: qualify_model_id(&provider.id, api, model_id),
         name,
@@ -2087,10 +2096,11 @@ where
         .then(|| cache.catalog_models(&build_catalog_key(&gateway, &resolved)))
         .flatten()
         .unwrap_or_default();
-    let routes = resolved
-        .proxy_enabled
-        .then(|| plan_proxy_routes(&resolved, &cache.gateway, native_info))
-        .unwrap_or_default();
+    let routes = if resolved.proxy_enabled {
+        plan_proxy_routes(&resolved, &cache.gateway, native_info)
+    } else {
+        BTreeMap::new()
+    };
     ApertureState {
         configured: true,
         resolved,

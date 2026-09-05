@@ -29,6 +29,7 @@ pub enum AgentError {
     EmptyTranscript,
     CannotContinue(String),
     ResetWhileRunning,
+    CompactWhileRunning,
 }
 
 impl fmt::Display for AgentError {
@@ -43,6 +44,9 @@ impl fmt::Display for AgentError {
             }
             Self::ResetWhileRunning => {
                 formatter.write_str("agent is already processing; wait for completion before resetting")
+            }
+            Self::CompactWhileRunning => {
+                formatter.write_str("agent is already processing; wait for completion before compacting")
             }
         }
     }
@@ -200,6 +204,8 @@ pub struct InitialState {
     pub thinking_level: llm::ThinkingLevel,
     pub tools: Vec<Tool>,
     pub messages: Vec<llm::Message>,
+    /// Metadata for the compaction marker at the start of `messages`.
+    pub compactions: Vec<CompactionInfo>,
 }
 
 impl Default for InitialState {
@@ -210,6 +216,7 @@ impl Default for InitialState {
             thinking_level: llm::THINKING_OFF.to_owned(),
             tools: Vec::new(),
             messages: Vec::new(),
+            compactions: Vec::new(),
         }
     }
 }
@@ -244,6 +251,8 @@ pub struct State {
     pub thinking_level: llm::ThinkingLevel,
     pub tools: Vec<Tool>,
     pub messages: Vec<llm::Message>,
+    /// Persisted context-compaction metadata for the visible marker.
+    pub compactions: Vec<CompactionInfo>,
     pub is_streaming: bool,
     pub streaming_message: Option<llm::Message>,
     pub pending_tool_calls: Vec<String>,
@@ -264,7 +273,18 @@ pub enum EventKind {
     ToolExecutionEnd,
     ModelChange,
     ThinkingLevelChange,
+    ContextCompacted,
     TranscriptReset,
+}
+
+/// Metadata carried with a durable transcript compaction event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionInfo {
+    pub summary: String,
+    pub tokens_before: u64,
+    pub cost_before: f64,
+    pub retained_messages: usize,
+    pub timestamp: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +292,8 @@ pub struct Event {
     pub kind: EventKind,
     pub message: Option<llm::Message>,
     pub messages: Vec<llm::Message>,
+    pub kept: Vec<llm::Message>,
+    pub compaction: Option<CompactionInfo>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments: BTreeMap<String, Value>,
@@ -289,6 +311,8 @@ impl Event {
             kind,
             message: None,
             messages: Vec::new(),
+            kept: Vec::new(),
+            compaction: None,
             tool_call_id: String::new(),
             tool_name: String::new(),
             arguments: BTreeMap::new(),
@@ -325,6 +349,12 @@ pub struct Agent {
 
 struct AgentInner {
     state: Mutex<InnerState>,
+    /// Serializes durable lifecycle mutations with beginning a new run.
+    ///
+    /// A recorder must observe a compaction/reset before any subsequently
+    /// recorded prompt, or the persisted branch diverges from the live
+    /// transcript. The actual request runs without this lock.
+    lifecycle: Mutex<()>,
     idle: Condvar,
     listeners: Mutex<BTreeMap<usize, Listener>>,
     next_listener_id: AtomicUsize,
@@ -341,6 +371,7 @@ struct InnerState {
     thinking_level: llm::ThinkingLevel,
     tools: Vec<Tool>,
     messages: Vec<llm::Message>,
+    compactions: Vec<CompactionInfo>,
     streaming_message: Option<llm::Message>,
     pending_tool_calls: BTreeSet<String>,
     error_message: String,
@@ -368,6 +399,7 @@ impl Agent {
                     thinking_level: initial.thinking_level,
                     tools: initial.tools,
                     messages: initial.messages,
+                    compactions: initial.compactions,
                     streaming_message: None,
                     pending_tool_calls: BTreeSet::new(),
                     error_message: String::new(),
@@ -375,6 +407,7 @@ impl Agent {
                     steering: Vec::new(),
                     follow_ups: Vec::new(),
                 }),
+                lifecycle: Mutex::new(()),
                 idle: Condvar::new(),
                 listeners: Mutex::new(BTreeMap::new()),
                 next_listener_id: AtomicUsize::new(1),
@@ -395,6 +428,7 @@ impl Agent {
             thinking_level: state.thinking_level.clone(),
             tools: state.tools.clone(),
             messages: state.messages.clone(),
+            compactions: state.compactions.clone(),
             is_streaming: state.cancellation.is_some(),
             streaming_message: state.streaming_message.clone(),
             pending_tool_calls: state.pending_tool_calls.iter().cloned().collect(),
@@ -449,8 +483,22 @@ impl Agent {
         lock(&self.inner.state).tools = tools;
     }
 
-    pub fn set_messages(&self, messages: Vec<llm::Message>) {
-        lock(&self.inner.state).messages = messages;
+    /// Replaces both context messages and their retained compaction metadata.
+    ///
+    /// This is intentionally event-free because it is used while restoring a
+    /// session before its recorder begins accepting lifecycle events.
+    pub fn set_context(&self, messages: Vec<llm::Message>, compactions: Vec<CompactionInfo>) {
+        let mut state = lock(&self.inner.state);
+        state.messages = messages;
+        state.compactions = compactions;
+    }
+
+    /// Returns the responder backing this agent.
+    ///
+    /// Internal services such as context compaction use this to create an
+    /// isolated, unrecorded helper turn without changing the live transcript.
+    pub fn responder(&self) -> AssistantResponder {
+        Arc::clone(&self.inner.responder)
     }
 
     pub fn steer(&self, message: llm::Message) {
@@ -507,12 +555,14 @@ impl Agent {
     }
 
     pub fn reset_with_reason(&self, reason: impl Into<String>) -> Result<()> {
+        let _lifecycle = lock(&self.inner.lifecycle);
         {
             let mut state = lock(&self.inner.state);
             if state.cancellation.is_some() {
                 return Err(AgentError::ResetWhileRunning);
             }
             state.messages.clear();
+            state.compactions.clear();
             state.steering.clear();
             state.follow_ups.clear();
             state.streaming_message = None;
@@ -521,6 +571,40 @@ impl Agent {
         }
         let mut event = Event::kind(EventKind::TranscriptReset);
         event.reason = reason.into();
+        self.emit(event);
+        Ok(())
+    }
+
+    /// Replaces the transcript with a summary marker and retained messages.
+    ///
+    /// The change is emitted as a single lifecycle event so session recorders
+    /// can persist the exact cut rather than replaying the discarded prefix on
+    /// the next resume. Like reset, compaction is refused during a live turn.
+    pub fn compact(
+        &self,
+        marker: llm::Message,
+        kept: Vec<llm::Message>,
+        info: CompactionInfo,
+    ) -> Result<()> {
+        let _lifecycle = lock(&self.inner.lifecycle);
+        {
+            let mut state = lock(&self.inner.state);
+            if state.cancellation.is_some() {
+                return Err(AgentError::CompactWhileRunning);
+            }
+            let mut compacted = Vec::with_capacity(kept.len() + 1);
+            compacted.push(marker.clone());
+            compacted.extend(kept.iter().cloned());
+            state.messages = compacted;
+            state.compactions = vec![info.clone()];
+            state.streaming_message = None;
+            state.pending_tool_calls.clear();
+            state.error_message.clear();
+        }
+        let mut event = Event::kind(EventKind::ContextCompacted);
+        event.message = Some(marker);
+        event.kept = kept;
+        event.compaction = Some(info);
         self.emit(event);
         Ok(())
     }
@@ -560,6 +644,7 @@ impl Agent {
 
     fn run(&self, initial_messages: Vec<llm::Message>) -> Result<()> {
         let cancellation = {
+            let _lifecycle = lock(&self.inner.lifecycle);
             let mut state = lock(&self.inner.state);
             if state.cancellation.is_some() {
                 return Err(AgentError::Busy);
@@ -1271,5 +1356,52 @@ mod tests {
                 .iter()
                 .any(|message| message.text_preview() == "next")
         );
+    }
+
+    #[test]
+    fn compaction_replaces_transcript_and_emits_its_durable_cut() {
+        let kept = vec![llm::Message::User(llm::UserMessage::text(
+            "latest request",
+            3,
+        ))];
+        let marker = llm::Message::User(llm::UserMessage::text(
+            "<conversation-summary>\nolder work\n</conversation-summary>",
+            4,
+        ));
+        let info = CompactionInfo {
+            summary: "older work".to_owned(),
+            tokens_before: 1_000,
+            cost_before: 1.5,
+            retained_messages: kept.len(),
+            timestamp: 4,
+        };
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                messages: vec![
+                    llm::Message::User(llm::UserMessage::text("old request", 1)),
+                    llm::Message::Assistant(Box::new(assistant_text("old reply"))),
+                    kept[0].clone(),
+                ],
+                ..InitialState::default()
+            },
+            ..AgentOptions::default()
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&events);
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event));
+
+        agent
+            .compact(marker.clone(), kept.clone(), info.clone())
+            .expect("compact");
+
+        let mut expected = vec![marker];
+        expected.extend(kept.clone());
+        assert_eq!(agent.state().messages, expected);
+        let events = lock(&events);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::ContextCompacted);
+        assert_eq!(events[0].kept, kept);
+        assert_eq!(events[0].compaction.as_ref(), Some(&info));
     }
 }

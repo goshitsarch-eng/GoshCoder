@@ -13,6 +13,7 @@
 //! remains the hard upper bound while a read is blocked in the transport.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
     fmt,
@@ -399,7 +400,7 @@ impl McpClient {
 
         let mut response = match request.send() {
             Ok(response) => response,
-            Err(error) if cancellation.is_cancelled() => return Err(McpError::Cancelled),
+            Err(_error) if cancellation.is_cancelled() => return Err(McpError::Cancelled),
             Err(error) => return Err(McpError::Request(error)),
         };
         ensure_not_cancelled(cancellation)?;
@@ -920,9 +921,10 @@ fn read_limited<R: Read, C: Cancellation + ?Sized>(
     while bytes.len() < maximum {
         ensure_not_cancelled(cancellation)?;
         let remaining = maximum - bytes.len();
-        let read = match reader.read(&mut buffer[..remaining.min(buffer.len())]) {
+        let chunk_len = remaining.min(buffer.len());
+        let read = match reader.read(&mut buffer[..chunk_len]) {
             Ok(read) => read,
-            Err(error) if cancellation.is_cancelled() => return Err(McpError::Cancelled),
+            Err(_error) if cancellation.is_cancelled() => return Err(McpError::Cancelled),
             Err(error) => return Err(McpError::ResponseRead(error)),
         };
         if read == 0 {
@@ -1028,20 +1030,20 @@ fn clip_utf8(value: &str, limit: usize) -> &str {
 
 fn decode_json_rpc_response(payload: &[u8], expected_id: Option<u64>) -> Result<Value> {
     let (decoded, diagnostic_payload) = match serde_json::from_slice::<Value>(payload) {
-        Ok(value) => (value, payload),
+        Ok(value) => (value, Cow::Borrowed(payload)),
         Err(_) => {
             let Some(sse_payload) = extract_sse_data(payload) else {
                 return Err(invalid_json_error(payload));
             };
             let decoded = serde_json::from_slice::<Value>(&sse_payload)
                 .map_err(|_| invalid_json_error(&sse_payload))?;
-            (decoded, sse_payload.as_slice())
+            (decoded, Cow::Owned(sse_payload))
         }
     };
 
     let object = decoded
         .as_object()
-        .ok_or_else(|| invalid_json_error(diagnostic_payload))?;
+        .ok_or_else(|| invalid_json_error(diagnostic_payload.as_ref()))?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(McpError::Protocol(
             "MCP response did not declare JSON-RPC 2.0".to_owned(),
@@ -1382,6 +1384,37 @@ mod tests {
     }
 
     #[test]
+    fn preserves_rpc_diagnostics_and_observes_cancellation_before_dispatch() {
+        let rpc_error = decode_json_rpc_response(
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"connector unavailable"}}"#,
+            Some(2),
+        )
+        .expect_err("JSON-RPC error must be returned");
+        assert_eq!(
+            rpc_error.to_string(),
+            "MCP error: connector unavailable (code -32001)"
+        );
+        let invalid = decode_json_rpc_response(b"not JSON", Some(2))
+            .expect_err("invalid JSON must be returned");
+        assert_eq!(
+            invalid.to_string(),
+            "MCP response is not valid JSON: not JSON"
+        );
+
+        struct Cancelled;
+        impl Cancellation for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                true
+            }
+        }
+        let client = McpClient::new("http://127.0.0.1:1").expect("build client");
+        assert!(matches!(
+            client.initialize_with(&Cancelled),
+            Err(McpError::Cancelled)
+        ));
+    }
+
+    #[test]
     fn agent_result_is_utf8_bounded_and_preserves_overflow() {
         let complete = "é".repeat(MAX_CONNECTOR_OUTPUT_BYTES);
         let result = call_result_to_agent_result(
@@ -1409,6 +1442,72 @@ mod tests {
             complete
         );
         fs::remove_file(path).expect("remove overflow file");
+    }
+
+    #[test]
+    fn gateway_tool_becomes_an_executable_agent_tool() {
+        let (base_url, requests, worker) = test_server(vec![
+            rpc_response(
+                1,
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+                false,
+                Some("session-456"),
+            ),
+            response(202, "", &[]),
+            rpc_response(
+                2,
+                json!({"content": [{"type": "text", "text": "created"}]}),
+                false,
+                None,
+            ),
+        ]);
+        let session = McpSession::new(&base_url).expect("initialize session");
+        let tool = gateway_tool_to_agent_tool(
+            session,
+            GatewayTool {
+                name: "github_create_issue".to_owned(),
+                description: String::new(),
+                input_schema: json!({"type": "array"}),
+            },
+        )
+        .expect("create agent tool");
+        assert_eq!(
+            tool.description,
+            "Aperture connector tool: github_create_issue"
+        );
+        assert_eq!(tool.parameters, json!({"type": "object", "properties": {}}));
+
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let updates_for_callback = Arc::clone(&updates);
+        let on_update: agent::ToolUpdate = Arc::new(move |update| {
+            updates_for_callback
+                .lock()
+                .expect("updates lock")
+                .push(update);
+        });
+        let result = (tool.execute)(
+            agent::CancellationToken::default(),
+            "tool-call-1".to_owned(),
+            BTreeMap::from([("title".to_owned(), Value::String("Issue".to_owned()))]),
+            on_update,
+        )
+        .expect("execute agent tool");
+        assert_eq!(result.content[0].plain_text(), Some("created"));
+        assert_eq!(updates.lock().expect("updates lock").len(), 1);
+
+        let captured = (0..3)
+            .map(|_| requests.recv().expect("captured request"))
+            .collect::<Vec<_>>();
+        worker.join().expect("server worker");
+        assert_eq!(captured[2].body["method"], "tools/call");
+        assert_eq!(
+            captured[2].body["params"]["name"],
+            Value::String("github_create_issue".to_owned())
+        );
+        assert_eq!(
+            captured[2].body["params"]["arguments"]["title"],
+            Value::String("Issue".to_owned())
+        );
     }
 
     #[test]

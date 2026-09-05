@@ -363,6 +363,12 @@ impl SessionRuntime {
                 thinking_level,
                 tools: options.tools.clone(),
                 messages: opened.restored.messages.clone(),
+                compactions: opened
+                    .restored
+                    .compactions
+                    .iter()
+                    .map(compaction_info)
+                    .collect(),
             },
             responder: options.responder.clone(),
             steering_mode: options.steering_mode,
@@ -402,7 +408,15 @@ impl SessionRuntime {
             options.model_is_explicit,
             &mut model_notices,
         );
-        agent.set_messages(opened.restored.messages.clone());
+        agent.set_context(
+            opened.restored.messages.clone(),
+            opened
+                .restored
+                .compactions
+                .iter()
+                .map(compaction_info)
+                .collect(),
+        );
         agent.set_model(model);
         agent.set_thinking_level(restored_thinking(&options, &opened));
         Self::finish_open(
@@ -598,33 +612,14 @@ impl SessionRuntime {
     /// Writes a compaction marker and its retained messages in pi-compatible
     /// order, then flushes the completed cut.
     ///
-    /// The current Rust agent has no compaction event/API. A future compaction
-    /// implementation can call this after it replaces the in-memory context;
-    /// until then the regular agent-event bridge handles every event it emits.
+    /// Normal callers should prefer [`agent::Agent::compact`], whose lifecycle
+    /// event reaches the same recorder automatically.
     pub fn record_compaction(
         &self,
         summary: CompactionSummary,
         retained: &[llm::Message],
     ) -> Result<()> {
-        self.recorder.mutate(|writer| {
-            let mut first_kept_entry_id = String::new();
-            for (index, message) in retained.iter().enumerate() {
-                let id = writer.append(Entry::message(message)?)?;
-                if index == 0 {
-                    first_kept_entry_id = id;
-                }
-            }
-            let details = compaction_details_value(&summary)?;
-            writer.append(Entry {
-                kind: sessionlog::TYPE_COMPACTION.to_owned(),
-                summary: summary.summary,
-                first_kept_entry_id,
-                tokens_before: summary.tokens_before,
-                details: Some(details),
-                ..Entry::default()
-            })?;
-            writer.sync()
-        })
+        self.recorder.append_compaction(summary, retained)
     }
 
     /// Lists only user-message branch boundaries, because continuing from the
@@ -678,7 +673,8 @@ impl SessionRuntime {
             writer.sync()
         })?;
         let restored = self.restored();
-        self.agent.set_messages(restored.messages);
+        let compactions = restored.compactions.iter().map(compaction_info).collect();
+        self.agent.set_context(restored.messages, compactions);
         Ok(target)
     }
 
@@ -835,9 +831,10 @@ impl SessionRuntime {
             restored.thinking_level.clone()
         };
 
-        // Set the transcript before the swap. `set_messages` is intentionally
+        // Set the transcript before the swap. `set_context` is intentionally
         // event-free, so the current writer cannot receive duplicate entries.
-        self.agent.set_messages(restored.messages);
+        let compactions = restored.compactions.iter().map(compaction_info).collect();
+        self.agent.set_context(restored.messages, compactions);
         let handle = SessionHandle {
             id: writer.id().to_owned(),
             path: writer.path().to_path_buf(),
@@ -1285,6 +1282,39 @@ impl Recorder {
         self.mutate(|writer| writer.append(entry))
     }
 
+    fn append_compaction(
+        &self,
+        summary: CompactionSummary,
+        retained: &[llm::Message],
+    ) -> Result<()> {
+        self.mutate(|writer| {
+            // The marker refers to an entry that already exists, so retained
+            // messages are appended immediately before it. `context_path`
+            // then reconstructs exactly summary + retained messages.
+            let mut first_kept_entry_id = String::new();
+            for (index, message) in retained.iter().enumerate() {
+                let id = writer.append(Entry::message(message)?)?;
+                if index == 0 {
+                    first_kept_entry_id = id;
+                }
+            }
+            let details = compaction_details_value(&summary)?;
+            writer.append(Entry {
+                kind: sessionlog::TYPE_COMPACTION.to_owned(),
+                summary: summary.summary,
+                first_kept_entry_id,
+                tokens_before: summary.tokens_before,
+                details: Some(details),
+                ..Entry::default()
+            })?;
+            writer.sync()
+        })
+    }
+
+    fn append_compaction_best_effort(&self, summary: CompactionSummary, retained: &[llm::Message]) {
+        let _ = self.append_compaction(summary, retained);
+    }
+
     fn mutate<T>(&self, operation: impl FnOnce(&mut Writer) -> sessionlog::Result<T>) -> Result<T> {
         let (result, report) = {
             let mut state = lock(&self.state);
@@ -1415,6 +1445,20 @@ fn bridge_agent_event(recorder: &Recorder, event: agent::Event) {
             thinking_level: event.thinking_level,
             ..Entry::default()
         }),
+        agent::EventKind::ContextCompacted => {
+            if let Some(info) = event.compaction.as_ref() {
+                recorder.append_compaction_best_effort(
+                    CompactionSummary {
+                        summary: info.summary.clone(),
+                        tokens_before: info.tokens_before,
+                        cost_before: info.cost_before,
+                        retained_messages: info.retained_messages,
+                        timestamp: info.timestamp,
+                    },
+                    &event.kept,
+                );
+            }
+        }
         agent::EventKind::TranscriptReset => recorder.append_best_effort(Entry {
             kind: sessionlog::TYPE_TRANSCRIPT_RESET.to_owned(),
             reason: if event.reason.is_empty() {
@@ -1517,6 +1561,16 @@ fn compaction_summary_from_entry(entry: &Entry) -> CompactionSummary {
         } else {
             timestamp_millis(&entry.timestamp)
         },
+    }
+}
+
+fn compaction_info(summary: &CompactionSummary) -> agent::CompactionInfo {
+    agent::CompactionInfo {
+        summary: summary.summary.clone(),
+        tokens_before: summary.tokens_before,
+        cost_before: summary.cost_before,
+        retained_messages: summary.retained_messages,
+        timestamp: summary.timestamp,
     }
 }
 
@@ -1984,6 +2038,53 @@ mod tests {
         );
         assert_eq!(restored.messages[1].text_preview(), "kept answer");
         close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_compaction_event_persists_the_same_live_context_cut() {
+        let root = temp_root("agent-compaction");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("old question").expect("old prompt");
+        runtime
+            .agent()
+            .prompt("latest question")
+            .expect("latest prompt");
+        let retained = runtime.agent().state().messages[2..].to_vec();
+        runtime
+            .agent()
+            .compact(
+                llm::Message::User(llm::UserMessage::text(
+                    "<conversation-summary>\nOld work\n</conversation-summary>",
+                    3,
+                )),
+                retained.clone(),
+                agent::CompactionInfo {
+                    summary: "Old work".to_owned(),
+                    tokens_before: 42,
+                    cost_before: 1.25,
+                    retained_messages: retained.len(),
+                    timestamp: 3,
+                },
+            )
+            .expect("compact live agent");
+        let id = runtime.id().expect("id");
+        close(&mut runtime);
+
+        let mut reopened_options = options(&root, &cwd);
+        reopened_options.selection = SessionSelection::Session(id);
+        let mut reopened = SessionRuntime::open(reopened_options).expect("reopen");
+        let restored = reopened.restored();
+        assert_eq!(restored.messages.len(), retained.len() + 1);
+        assert!(
+            restored.messages[0]
+                .text_preview()
+                .contains("<conversation-summary>")
+        );
+        assert_eq!(&restored.messages[1..], retained.as_slice());
+        assert_eq!(restored.compactions[0].cost_before, 1.25);
+        close(&mut reopened);
         let _ = fs::remove_dir_all(root);
     }
 

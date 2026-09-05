@@ -4,6 +4,7 @@ pub mod aperture_mcp;
 pub mod bedrock;
 pub mod btw;
 pub mod catalog;
+pub mod compaction;
 pub mod computeruse;
 pub mod config;
 pub mod llm;
@@ -68,9 +69,10 @@ Usage:
   goshcoder version                  Print the version
 
 The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
-model, and credential CLIs are active. `run` supports the OpenAI, Anthropic,
-and Bedrock provider protocols; remaining provider extensions and interactive
-commands are still being migrated from the previous implementation.
+model, credential, and context-compaction foundations are active. `run`
+supports the OpenAI, Anthropic, and Bedrock provider protocols; remaining
+provider extensions and interactive commands are still being migrated from the
+previous implementation.
 "#;
 
 fn main() {
@@ -161,6 +163,7 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     });
 
+    let _ = compaction::maybe_auto_compact(&agent)?;
     agent.prompt(prompt)?;
     prepared.runtime.sync()?;
     if !quiet {
@@ -229,6 +232,21 @@ fn render_run_event<Out: Write, Err: Write>(
                             message.usage.input, message.usage.output, message.usage.cost.total
                         ),
                         color
+                    )
+                )?;
+            }
+        }
+        agent::EventKind::ContextCompacted => {
+            if let Some(info) = event.compaction.as_ref() {
+                writeln!(
+                    stderr,
+                    "{}",
+                    dim(
+                        &format!(
+                            "context compacted: {} tokens → summary + {} recent messages",
+                            info.tokens_before, info.retained_messages
+                        ),
+                        color,
                     )
                 )?;
             }
@@ -559,6 +577,20 @@ fn drain_interactive_events(
                 view.activity = "Ready".to_owned();
                 view.activity_since = None;
             }
+            agent::EventKind::ContextCompacted => {
+                if let Some(info) = event.compaction {
+                    view.activity = "Context compacted".to_owned();
+                    view.activity_since = None;
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!(
+                            "Context compacted: {} tokens → summary + {} recent messages.",
+                            info.tokens_before, info.retained_messages
+                        ),
+                    );
+                }
+            }
             agent::EventKind::TurnStart
             | agent::EventKind::TurnEnd
             | agent::EventKind::MessageStart
@@ -629,7 +661,13 @@ fn submit_interactive_input(
     view.activity_since = Some(Instant::now());
     app.streaming = true;
     thread::spawn(move || {
-        let result = agent.prompt(input).map_err(|error| error.to_string());
+        let result = compaction::maybe_auto_compact(&agent)
+            .and_then(|_| {
+                agent
+                    .prompt(input)
+                    .map_err(compaction::CompactionError::Agent)
+            })
+            .map_err(|error| error.to_string());
         let _ = turn_sender.send(result);
     });
     CommandDispatch::NotCommand
@@ -661,7 +699,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, compaction, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1025,7 +1063,8 @@ fn dispatch_runtime_slash_command(
                     let collected = collector
                         .collect(&target)
                         .map_err(|error| error.to_string())?;
-                    Ok((collected.feedback_subject, collected.review_request()))
+                    let request = collected.review_request();
+                    Ok((collected.feedback_subject, request))
                 },
             )
         }
@@ -1040,9 +1079,32 @@ fn dispatch_runtime_slash_command(
                 move || {
                     let collected = plannotator::collect_last_assistant_response(&messages)
                         .map_err(|error| error.to_string())?;
-                    Ok((collected.feedback_subject, collected.review_request()))
+                    let request = collected.review_request();
+                    Ok((collected.feedback_subject, request))
                 },
             )
+        }
+        "/compact" => {
+            if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Wait for the current response before compacting.",
+                );
+                return CommandDispatch::Handled;
+            }
+            let agent = prepared.runtime.agent().clone();
+            let instructions = rest.to_owned();
+            view.turn_pending = true;
+            view.activity = "Compacting context".to_owned();
+            view.activity_since = Some(Instant::now());
+            thread::spawn(move || {
+                let result = compaction::compact(&agent, &instructions)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = turn_sender.send(result);
+            });
+            CommandDispatch::Handled
         }
         "/system" if rest.is_empty() => {
             append_view_message(
@@ -1205,11 +1267,16 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
     let mut result = Vec::new();
     for message in messages {
         match message {
-            llm::Message::User(user) => result.push(Message {
-                role: MessageRole::User,
-                text: user_message_text(user),
-                ..Message::default()
-            }),
+            llm::Message::User(user) => {
+                if compaction::is_summary_message(message) {
+                    continue;
+                }
+                result.push(Message {
+                    role: MessageRole::User,
+                    text: user_message_text(user),
+                    ..Message::default()
+                });
+            }
             llm::Message::Assistant(assistant) => {
                 let mut thinking = String::new();
                 let mut text = String::new();
@@ -1398,14 +1465,7 @@ fn runtime_sidebar(
             .saturating_div(limit)
             .min(100) as u8
     };
-    let cost = state
-        .messages
-        .iter()
-        .filter_map(|message| match message {
-            llm::Message::Assistant(message) => Some(message.usage.cost.total),
-            llm::Message::User(_) | llm::Message::ToolResult(_) => None,
-        })
-        .sum::<f64>();
+    let cost = compaction::conversation_cost(&state.messages, &state.compactions);
     let name = prepared
         .runtime
         .name()
@@ -1657,6 +1717,8 @@ mod tests {
             kind,
             message: None,
             messages: Vec::new(),
+            kept: Vec::new(),
+            compaction: None,
             tool_call_id: String::new(),
             tool_name: String::new(),
             arguments: BTreeMap::new(),
