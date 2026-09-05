@@ -1,6 +1,7 @@
 pub mod config;
 pub mod llm;
 pub mod sessionlog;
+pub mod sessions;
 mod state;
 mod ui;
 
@@ -32,12 +33,12 @@ Usage:
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
   goshcoder ralph <subcommand>       Manage Ralph loops
-  goshcoder sessions <subcommand>    Manage saved sessions
+  goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
-The Ratatui frontend is active. Runtime, provider, persistence, and extension
-features are being migrated from the previous implementation.
+The Ratatui frontend and persistent-session CLI are active. Provider, agent,
+tool, and extension runtimes are being migrated from the previous implementation.
 "#;
 
 fn main() {
@@ -58,6 +59,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             print!("{USAGE}");
             Ok(())
         }
+        Some("sessions") => sessions::command(&args[1..]),
         Some("chat") | None => run_interactive(),
         Some(argument) if argument.starts_with('-') => run_interactive(),
         Some(command) => Err(format!(
