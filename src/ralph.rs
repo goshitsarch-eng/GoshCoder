@@ -2094,7 +2094,7 @@ mod tests {
 
     #[test]
     fn session_ownership_pause_resume_and_status_are_scoped() {
-        let (owner, _root, config, workspace) = test_store("ownership");
+        let (owner, _root, _config, workspace) = test_store("ownership");
         let mut state = owner
             .start("loop", "task", LoopOptions::default())
             .expect("start");
