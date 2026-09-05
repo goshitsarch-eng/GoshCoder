@@ -4,6 +4,7 @@ pub mod config;
 pub mod llm;
 pub mod markdown;
 pub mod prompts;
+pub mod provider_cli;
 pub mod ralph;
 pub mod ralph_cli;
 pub mod resources;
@@ -45,8 +46,9 @@ Usage:
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
-The Ratatui frontend and persistent-session CLI are active. Provider, agent,
-tool, and extension runtimes are being migrated from the previous implementation.
+The Ratatui frontend, persistent-session, prompt, Ralph, provider, model, and
+credential CLIs are active. Provider protocols, agent/tool runtime, and
+extension integrations are still being migrated from the previous implementation.
 "#;
 
 fn main() {
@@ -67,6 +69,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             print!("{USAGE}");
             Ok(())
         }
+        Some("providers") => provider_cli::providers_command(),
+        Some("models") => provider_cli::models_command(&args[1..]),
+        Some("auth") => provider_cli::auth_command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),
