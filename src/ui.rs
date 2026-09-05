@@ -277,7 +277,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, lines: &[SidebarLine]) {
     frame.render_widget(sidebar, area);
 }
 
-fn fit_sidebar<'a>(lines: &'a [SidebarLine], height: usize) -> Vec<&'a SidebarLine> {
+fn fit_sidebar(lines: &[SidebarLine], height: usize) -> Vec<&SidebarLine> {
     if height == 0 || lines.len() <= height {
         return lines.iter().collect();
     }
@@ -606,7 +606,7 @@ fn sanitize(text: &str) -> String {
     while let Some(character) = characters.next() {
         if character == '\u{1b}' && characters.peek() == Some(&'[') {
             characters.next();
-            while let Some(parameter) = characters.next() {
+            for parameter in characters.by_ref() {
                 if ('@'..='~').contains(&parameter) {
                     break;
                 }
