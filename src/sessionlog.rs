@@ -929,10 +929,10 @@ impl Store {
     ) -> Result<Writer> {
         let (tree, header, report) = self.load(&source.path)?;
         let path = tree.path(at);
-        if path.is_empty() && at.is_some() {
-            return Err(SessionError::MissingEntry(
-                at.expect("checked above").to_owned(),
-            ));
+        if path.is_empty()
+            && let Some(at) = at
+        {
+            return Err(SessionError::MissingEntry(at.to_owned()));
         }
         let target_cwd = target_cwd.as_ref();
         let target_cwd = if target_cwd.as_os_str().is_empty() {
@@ -1231,19 +1231,21 @@ impl Writer {
         }
         self.closed = true;
         let mut first_error = None;
-        if let Some(mut file) = self.file.take() {
-            if !self.read_only && self.degraded.is_none() {
-                if let Err(error) = file.flush().and_then(|()| file.sync_all()) {
-                    first_error = Some(SessionError::Io(error));
-                }
-            }
+        if let Some(mut file) = self.file.take()
+            && !self.read_only
+            && self.degraded.is_none()
+            && let Err(error) = file.flush().and_then(|()| file.sync_all())
+        {
+            first_error = Some(SessionError::Io(error));
         }
-        if !self.read_only && !self.keep && !self.tree.has_assistant_message() {
-            if let Err(error) = fs::remove_file(&self.path) {
-                if error.kind() != io::ErrorKind::NotFound && first_error.is_none() {
-                    first_error = Some(SessionError::Io(error));
-                }
-            }
+        if !self.read_only
+            && !self.keep
+            && !self.tree.has_assistant_message()
+            && let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+            && first_error.is_none()
+        {
+            first_error = Some(SessionError::Io(error));
         }
         self.claim.take();
         first_error.map_or(Ok(()), Err)
@@ -1827,5 +1829,213 @@ mod tests {
             assert!(validate_session_id(id).is_err(), "{id:?} was accepted");
         }
         validate_session_id("session_1.2-3").expect("safe identifier");
+    }
+
+    #[test]
+    fn attach_repairs_torn_tails_and_refuses_a_second_writer() {
+        let root = temp_root("attach");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        writer.append(user("question")).expect("append user");
+        writer
+            .append(assistant("answer"))
+            .expect("append assistant");
+        let path = writer.path().to_path_buf();
+
+        let error = store.attach(&path).expect_err("second writer is refused");
+        assert!(matches!(error, SessionError::Busy(_)));
+        writer.close().expect("close first writer");
+
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(br#"{"type":"mess"#))
+            .expect("append torn tail");
+
+        let (mut recovered, report) = store.attach(&path).expect("attach repaired session");
+        assert!(report.repaired_tail);
+        recovered.append(user("after crash")).expect("append again");
+        recovered.close().expect("close recovered writer");
+
+        let (tree, _, report) = store.load(&path).expect("reload");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(report.skipped_lines, 0);
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn legacy_sessions_migrate_in_memory_and_fork_to_v3() {
+        let root = temp_root("legacy");
+        let store = Store::new(root.join("sessions"));
+        let legacy = root.join("legacy.jsonl");
+        fs::create_dir_all(&root).expect("make root");
+        fs::write(
+            &legacy,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"legacy\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/legacy\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"before\",\"timestamp\":1}}\n",
+                "{\"type\":\"compaction\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"summary\":\"summary\",\"firstKeptEntryIndex\":1}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:00:03.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"after\"}],\"timestamp\":2}}\n"
+            ),
+        )
+        .expect("write legacy fixture");
+
+        let (tree, header, report) = store.load(&legacy).expect("load legacy");
+        assert!(report.migrated);
+        assert_eq!(report.source_version, 1);
+        assert_eq!(header.version, FORMAT_VERSION);
+        assert!(tree.all().iter().all(|entry| !entry.id.is_empty()));
+        assert!(
+            tree.all()
+                .iter()
+                .find(|entry| entry.kind == TYPE_COMPACTION)
+                .is_some_and(|entry| !entry.first_kept_entry_id.is_empty())
+        );
+        assert!(matches!(
+            store.attach(&legacy),
+            Err(SessionError::LegacyFormat(1))
+        ));
+
+        let source = store.describe(&legacy, false).expect("describe legacy");
+        let mut fork = store
+            .fork(&source, None, root.join("workspace"))
+            .expect("fork migrated session");
+        let fork_path = fork.path().to_path_buf();
+        fork.append(user("continuing")).expect("append fork");
+        fork.close().expect("close fork");
+
+        let (forked, header, report) = store.load(&fork_path).expect("load fork");
+        assert!(!report.migrated);
+        assert_eq!(header.version, FORMAT_VERSION);
+        assert_eq!(header.parent_session.as_deref(), Some("legacy"));
+        assert_eq!(forked.len(), 4);
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn v2_hook_messages_are_renamed_for_current_message_decoders() {
+        let root = temp_root("v2");
+        let store = Store::new(root.join("sessions"));
+        let path = root.join("v2.jsonl");
+        fs::create_dir_all(&root).expect("make root");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"version\":2,\"id\":\"v2\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/legacy\"}\n",
+                "{\"type\":\"message\",\"id\":\"message\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"hookMessage\",\"content\":\"injected\"}}\n"
+            ),
+        )
+        .expect("write v2 fixture");
+
+        let (tree, _, report) = store.load(&path).expect("load v2");
+        assert!(report.migrated);
+        assert_eq!(
+            tree.all()[0]
+                .message
+                .as_ref()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("custom")
+        );
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn listing_resolution_and_read_only_open_preserve_session_access() {
+        let root = temp_root("listing");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+
+        let mut first = store
+            .create_with_id(&workspace, None, "a1234567-first")
+            .expect("create first");
+        first
+            .append(assistant("first answer"))
+            .expect("append first");
+        first.close().expect("close first");
+
+        let mut second = store
+            .create_with_id(&workspace, None, "a1234567-second")
+            .expect("create second");
+        second
+            .append(assistant("second answer"))
+            .expect("append second");
+        second.close().expect("close second");
+
+        let sessions = store
+            .list(
+                &workspace,
+                ListOptions {
+                    with_text: true,
+                    ..ListOptions::default()
+                },
+            )
+            .expect("list");
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.search_text.contains("answer"))
+        );
+        let ids = short_ids(&sessions);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"a1234567-fir".to_owned()));
+        assert!(ids.contains(&"a1234567-sec".to_owned()));
+        assert!(matches!(
+            store.resolve(&workspace, "a1234567"),
+            Err(SessionError::Ambiguous(_))
+        ));
+
+        let resolved = store
+            .resolve(&workspace, "a1234567-first")
+            .expect("resolve exact");
+        let (mut reader, _) = store.open(&resolved.path).expect("open read only");
+        assert!(reader.read_only());
+        assert!(matches!(
+            reader.append(user("nope")),
+            Err(SessionError::ReadOnly)
+        ));
+        reader.close().expect("close reader");
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn fork_keeps_reachable_labels_and_moves_the_write_head_to_conversation() {
+        let root = temp_root("fork");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(&workspace).expect("create");
+        let first = writer.append(user("question")).expect("append question");
+        writer.append(assistant("answer")).expect("append answer");
+        let label = "remember this".to_owned();
+        writer
+            .append(Entry {
+                kind: TYPE_LABEL.to_owned(),
+                target_id: first.clone(),
+                label: Some(label.clone()),
+                ..Entry::default()
+            })
+            .expect("append label");
+        let source_path = writer.path().to_path_buf();
+        writer.close().expect("close source");
+
+        let source = store
+            .describe(&source_path, false)
+            .expect("describe source");
+        let fork = store.fork(&source, None, &workspace).expect("fork");
+        let fork_path = fork.path().to_path_buf();
+        let tree = fork.snapshot();
+        assert_eq!(tree.label(&first), Some(label.as_str()));
+        assert_ne!(
+            tree.leaf()
+                .and_then(|leaf| tree.entry(leaf))
+                .map(|entry| entry.kind.as_str()),
+            Some(TYPE_LABEL)
+        );
+        drop(fork);
+
+        let (tree, _, _) = store.load(&fork_path).expect("reload fork");
+        assert_eq!(tree.label(&first), Some(label.as_str()));
+        fs::remove_dir_all(root).expect("clean test root");
     }
 }
