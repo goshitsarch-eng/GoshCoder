@@ -428,6 +428,7 @@ fn sidebar_line(line: &SidebarLine) -> Line<'static> {
     }
 }
 
+#[cfg(test)]
 fn transcript_lines(
     messages: &[Message],
     width: u16,
