@@ -26,6 +26,8 @@ const MINUTE_FORMAT: &[FormatItem<'static>] =
 const SECOND_FORMAT: &[FormatItem<'static>] =
     format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
 
+type ParsedStoreOptions<'arguments> = (Option<PathBuf>, &'arguments [String]);
+
 pub fn command(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (sessions_dir, args) = parse_store_options(args)?;
     let cwd = std::env::current_dir()?;
@@ -39,7 +41,7 @@ pub fn command(args: &[String]) -> Result<(), Box<dyn Error>> {
 ///
 /// `sessions --sessions-dir <path> list` must target the same custom root as
 /// a chat session opened with `-sessions-dir <path>`.
-fn parse_store_options(args: &[String]) -> Result<(Option<PathBuf>, &[String]), Box<dyn Error>> {
+fn parse_store_options(args: &[String]) -> Result<ParsedStoreOptions<'_>, Box<dyn Error>> {
     let mut sessions_dir = None;
     let mut index = 0;
     while let Some(argument) = args.get(index) {
