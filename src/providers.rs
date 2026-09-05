@@ -6769,7 +6769,7 @@ mod tests {
         let payload = serde_json::from_slice::<Value>(&request.body).expect("request JSON");
 
         assert_eq!(request.target, "/v1/chat/completions");
-        assert_eq!(payload["model"], "route-model");
+        assert_eq!(payload["model"], "openai/route-model");
         assert_eq!(
             request.headers.get("referer").map(String::as_str),
             Some(aperture::APERTURE_REFERER)
