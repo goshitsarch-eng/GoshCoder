@@ -347,11 +347,19 @@ mod tests {
 
     #[test]
     fn setup_hints_explain_environment_oauth_and_ambient_providers() {
+        let aperture_root = std::env::temp_dir().join(format!(
+            "goshcoder-provider-cli-hints-{}",
+            std::process::id()
+        ));
         let catalog = Catalog::with_environment(
             Some(Arc::new(CredentialStore::in_memory())),
             Arc::new(|_| None),
         )
-        .expect("catalog");
+        .expect("catalog")
+        .with_aperture_paths(
+            aperture_root.join("aperture.json"),
+            aperture_root.join("aperture-cache.json"),
+        );
         assert!(
             provider_setup_hint(&catalog.provider("openai").expect("OpenAI"))
                 .contains("OPENAI_API_KEY")
@@ -372,11 +380,19 @@ mod tests {
         credentials
             .put("openai", Credential::api_key("secret"))
             .expect("store credential");
+        let aperture_root = std::env::temp_dir().join(format!(
+            "goshcoder-provider-cli-models-{}",
+            std::process::id()
+        ));
         let catalog = Catalog::with_environment(
             Some(credentials),
             Arc::new(|name| (name == "UNUSED").then_some("unused".to_owned())),
         )
-        .expect("catalog");
+        .expect("catalog")
+        .with_aperture_paths(
+            aperture_root.join("aperture.json"),
+            aperture_root.join("aperture-cache.json"),
+        );
         assert_eq!(
             catalog
                 .configured_provider_ids()

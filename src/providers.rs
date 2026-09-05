@@ -6677,12 +6677,24 @@ mod tests {
             ),
             ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
         ]);
+        let aperture_root = std::env::temp_dir().join(format!(
+            "goshcoder-catalog-isolated-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
         let catalog = Arc::new(
             catalog::Catalog::with_environment(
                 None,
                 Arc::new(move |name| environment.get(name).cloned()),
             )
-            .expect("catalog"),
+            .expect("catalog")
+            .with_aperture_paths(
+                aperture_root.join("aperture.json"),
+                aperture_root.join("aperture-cache.json"),
+            ),
         );
         let mut request_model = catalog
             .provider("google-vertex")

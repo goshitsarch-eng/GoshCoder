@@ -2800,6 +2800,70 @@ mod tests {
     }
 
     #[test]
+    fn aperture_catalog_state_reloads_after_a_gateway_sync() {
+        let configuration = aperture::Config {
+            base_url: "http://aperture.test".to_owned(),
+            onboarding_done: Some(true),
+            dedicated: Some(aperture::DedicatedConfig {
+                enabled: Some(true),
+                ..aperture::DedicatedConfig::default()
+            }),
+            ..aperture::Config::default()
+        };
+        let catalog_key = aperture::build_catalog_key(
+            &aperture::gateway_url(&configuration.base_url),
+            &configuration.resolve(),
+        );
+        let (catalog, root) = aperture_catalog(
+            &[],
+            &configuration,
+            &aperture::Cache {
+                catalog_key: catalog_key.clone(),
+                ..aperture::Cache::default()
+            },
+        );
+        assert!(
+            catalog
+                .provider(aperture::DEDICATED_PROVIDER_ID)
+                .expect("dedicated provider")
+                .models()
+                .is_empty()
+        );
+
+        let cache = aperture::Cache {
+            catalog_key,
+            models: vec![aperture::CachedModel {
+                model: llm::Model {
+                    id: "openai/fresh-model".to_owned(),
+                    name: "Fresh model".to_owned(),
+                    api: "openai-completions".to_owned(),
+                    provider: aperture::DEDICATED_PROVIDER_ID.to_owned(),
+                    base_url: "http://aperture.test/v1".to_owned(),
+                    ..llm::Model::default()
+                },
+                raw_compat: None,
+            }],
+            ..aperture::Cache::default()
+        };
+        aperture::save_cache(root.join("extensions").join("aperture-cache.json"), &cache)
+            .expect("refresh Aperture cache");
+
+        catalog.reload_aperture_state();
+        assert_eq!(
+            catalog
+                .provider(aperture::DEDICATED_PROVIDER_ID)
+                .expect("reloaded dedicated provider")
+                .models()
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>(),
+            vec!["openai/fresh-model"]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn aperture_proxy_routes_filter_models_and_supply_gateway_auth() {
         let template = test_catalog(&[])
             .provider("openai")
@@ -3227,6 +3291,7 @@ mod tests {
                 .is_ambient()
         );
 
+        let aperture_root = test_directory("vertex-aperture");
         let vertex = Catalog::with_environment_and_file_exists(
             None,
             test_environment(&[
@@ -3236,7 +3301,11 @@ mod tests {
             ]),
             Arc::new(|path| path == Path::new("/test/adc.json")),
         )
-        .expect("catalog");
+        .expect("catalog")
+        .with_aperture_paths(
+            aperture_root.join("aperture.json"),
+            aperture_root.join("aperture-cache.json"),
+        );
         assert!(
             vertex
                 .resolve_auth("google-vertex")
@@ -3309,12 +3378,17 @@ mod tests {
                 Credential::oauth("access", "refresh", i64::MAX),
             )
             .expect("store OAuth credential");
+        let aperture_root = test_directory("stored-oauth-aperture");
         let catalog = Catalog::with_environment_and_file_exists(
             Some(store),
             test_environment(&[("ANTHROPIC_API_KEY", "ambient-key")]),
             Arc::new(|_| false),
         )
-        .expect("catalog");
+        .expect("catalog")
+        .with_aperture_paths(
+            aperture_root.join("aperture.json"),
+            aperture_root.join("aperture-cache.json"),
+        );
         let auth = catalog
             .resolve_auth("anthropic")
             .expect("resolve auth")

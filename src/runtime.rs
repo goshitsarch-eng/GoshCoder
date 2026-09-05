@@ -987,15 +987,6 @@ mod tests {
 
     #[test]
     fn coding_sessions_register_native_web_search_in_the_prompt_and_tool_set() {
-        let catalog = Catalog::with_environment(
-            None,
-            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
-        )
-        .expect("catalog");
-        let model_id = catalog
-            .provider("openai")
-            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
-            .expect("OpenAI model");
         let directory = std::env::temp_dir().join(format!(
             "goshcoder-runtime-web-search-{}-{}",
             std::process::id(),
@@ -1005,6 +996,19 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).expect("workspace");
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+        .with_aperture_paths(
+            directory.join("aperture.json"),
+            directory.join("aperture-cache.json"),
+        );
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
 
         let mut prepared = prepare_session(
             &catalog,
@@ -1030,15 +1034,6 @@ mod tests {
 
     #[test]
     fn enabled_ralph_tools_survive_planner_tool_rebuilds() {
-        let catalog = Catalog::with_environment(
-            None,
-            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
-        )
-        .expect("catalog");
-        let model_id = catalog
-            .provider("openai")
-            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
-            .expect("OpenAI model");
         let directory = std::env::temp_dir().join(format!(
             "goshcoder-runtime-ralph-{}-{}",
             std::process::id(),
@@ -1048,6 +1043,19 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).expect("workspace");
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+        .with_aperture_paths(
+            directory.join("aperture.json"),
+            directory.join("aperture-cache.json"),
+        );
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
 
         let mut prepared = prepare_session(
             &catalog,
