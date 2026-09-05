@@ -2283,7 +2283,7 @@ fn consume_openai_completions(
                 })
                 .unwrap_or_default();
             let id = value_string(call, "id").unwrap_or_default();
-            if let Entry::Vacant(entry) = tool_calls.entry(key.clone()) {
+            if let Entry::Vacant(entry) = tool_calls.entry(key) {
                 let content_index = emitter.start_tool(id, name)?;
                 entry.insert(OpenAiToolState {
                     content_index,
