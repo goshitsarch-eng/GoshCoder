@@ -4,6 +4,7 @@ pub mod aperture_cli;
 pub mod aperture_mcp;
 pub mod bedrock;
 pub mod btw;
+pub mod btw_runtime;
 pub mod catalog;
 pub mod compaction;
 pub mod computeruse;
@@ -572,6 +573,9 @@ fn line_interactive_loop(
             );
             if view.turn_pending {
                 match turn_receiver.recv() {
+                    Ok(result) if view.pending_btw_thread.is_some() => {
+                        let _ = finish_pending_btw(&mut view, prepared, result);
+                    }
                     Ok(Ok(())) => {
                         view.turn_pending = false;
                         view.activity = "Ready".to_owned();
@@ -642,6 +646,8 @@ struct InteractiveView {
     recent_tool: String,
     activity_since: Option<Instant>,
     turn_pending: bool,
+    pending_btw_thread: Option<String>,
+    pending_btw_turn_start: Option<usize>,
 }
 
 impl Default for InteractiveView {
@@ -652,6 +658,8 @@ impl Default for InteractiveView {
             recent_tool: String::new(),
             activity_since: None,
             turn_pending: false,
+            pending_btw_thread: None,
+            pending_btw_turn_start: None,
         }
     }
 }
@@ -678,7 +686,7 @@ fn event_loop(
     }
 
     loop {
-        drain_interactive_events(&mut view, &prepared.runtime, &agent_events, &turn_results);
+        drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
         refresh_runtime_app(&mut app, prepared, &view);
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
@@ -689,6 +697,9 @@ fn event_loop(
             Event::Key(key) if key.kind != KeyEventKind::Release => match app.handle_key(key) {
                 Action::None => {}
                 Action::Quit => {
+                    if let Some(thread) = view.pending_btw_thread.as_deref() {
+                        let _ = prepared.btw.cancel(thread);
+                    }
                     prepared.runtime.agent().abort();
                     if let Some(planner) = prepared.planner.as_ref() {
                         planner.abort_review();
@@ -696,6 +707,9 @@ fn event_loop(
                     return Ok(());
                 }
                 Action::Abort => {
+                    if let Some(thread) = view.pending_btw_thread.as_deref() {
+                        let _ = prepared.btw.cancel(thread);
+                    }
                     prepared.runtime.agent().abort();
                     if let Some(planner) = prepared.planner.as_ref() {
                         planner.abort_review();
@@ -764,7 +778,7 @@ fn event_loop(
 
 fn drain_interactive_events(
     view: &mut InteractiveView,
-    runtime: &session::SessionRuntime,
+    prepared: &runtime::PreparedSession,
     agent_events: &Receiver<agent::Event>,
     turn_results: &Receiver<Result<(), String>>,
 ) {
@@ -823,18 +837,87 @@ fn drain_interactive_events(
         }
     }
     while let Ok(result) = turn_results.try_recv() {
+        if finish_pending_btw(view, prepared, result) {
+            continue;
+        }
         view.turn_pending = false;
         if let Err(error) = result {
             append_view_message(view, MessageRole::Error, error);
         }
     }
-    for notice in runtime.drain_notices() {
+    for notice in prepared.runtime.drain_notices() {
         append_view_message(
             view,
             MessageRole::Notice,
             format!("{}: {}", notice.kind, notice.text),
         );
     }
+}
+
+/// Turns a completed asynchronous side-thread request into a visible
+/// transcript card. It returns false for ordinary agent/planner work so the
+/// caller can retain its existing completion behavior.
+fn finish_pending_btw(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    result: Result<(), String>,
+) -> bool {
+    let Some(thread_id) = view.pending_btw_thread.take() else {
+        return false;
+    };
+    let turn_index = view.pending_btw_turn_start.take();
+    view.turn_pending = false;
+    view.activity_since = None;
+    match result {
+        Err(error) => {
+            view.activity = "BTW side thread failed".to_owned();
+            append_view_message(view, MessageRole::Error, error);
+        }
+        Ok(()) => match prepared.btw.thread(&thread_id) {
+            Err(error) => {
+                view.activity = "BTW side thread failed".to_owned();
+                append_view_message(view, MessageRole::Error, error.to_string());
+            }
+            Ok(thread) => match turn_index.and_then(|index| thread.turns.get(index)) {
+                Some(turn) if turn.kind == btw::TurnKind::Answered => {
+                    view.activity = format!("BTW {} answered", thread.id);
+                    append_view_message(
+                        view,
+                        MessageRole::Assistant,
+                        format!("BTW · {}\n{}", thread.id, turn.answer),
+                    );
+                }
+                Some(turn) if turn.kind == btw::TurnKind::Error => {
+                    view.activity = "BTW side thread failed".to_owned();
+                    append_view_message(
+                        view,
+                        MessageRole::Error,
+                        format!("BTW · {}\n{}", thread.id, turn.answer),
+                    );
+                }
+                Some(_) => {
+                    view.activity = "BTW side thread completed".to_owned();
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!(
+                            "BTW · {} completed without a displayable answer.",
+                            thread.id
+                        ),
+                    );
+                }
+                None => {
+                    view.activity = "BTW side thread cancelled".to_owned();
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!("BTW · {} was cancelled.", thread.id),
+                    );
+                }
+            },
+        },
+    }
+    true
 }
 
 fn submit_interactive_input(
@@ -1037,6 +1120,258 @@ fn dispatch_ralph_slash_command(
     CommandDispatch::Handled
 }
 
+/// Handles independent, in-memory side discussions without adding their turns
+/// to the main session transcript.
+fn dispatch_btw_slash_command(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    turn_sender: Sender<Result<(), String>>,
+    rest: &str,
+) -> CommandDispatch {
+    let (action, argument) = split_prompt_action(rest);
+    match action.to_ascii_lowercase().as_str() {
+        "" | "list" => {
+            append_view_message(view, MessageRole::Command, list_btw_threads(prepared));
+        }
+        "resume" => {
+            let (thread_id, question) = split_prompt_action(argument);
+            if thread_id.is_empty() || question.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "usage: /btw resume <thread-id> <question>",
+                );
+            } else if let Err(error) = prepared.btw.resume_thread(thread_id) {
+                append_view_message(view, MessageRole::Error, error.to_string());
+            } else {
+                report_btw_selection_warnings(view, prepared);
+                start_btw_question(
+                    app,
+                    view,
+                    prepared,
+                    turn_sender,
+                    thread_id.to_owned(),
+                    question.to_owned(),
+                );
+            }
+        }
+        "bring" => {
+            let (thread_id, scope) = split_prompt_action(argument);
+            if thread_id.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "usage: /btw bring <thread-id> [latest|all|from:N]",
+                );
+            } else {
+                match btw::parse_bring_selection(scope)
+                    .map_err(|error| error.to_string())
+                    .and_then(|scope| {
+                        prepared
+                            .btw
+                            .bring_to_main(thread_id, scope)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(output) => append_view_message(view, MessageRole::Command, output.text),
+                    Err(error) => append_view_message(view, MessageRole::Error, error),
+                }
+            }
+        }
+        "settings" => dispatch_btw_settings(view, prepared, argument),
+        _ => {
+            let state = prepared.runtime.agent().state();
+            let created = prepared.btw.create_thread(&state);
+            for warning in &created.selection.warnings {
+                append_view_message(view, MessageRole::Notice, warning.clone());
+            }
+            start_btw_question(
+                app,
+                view,
+                prepared,
+                turn_sender,
+                created.thread.id,
+                rest.trim().to_owned(),
+            );
+        }
+    }
+    CommandDispatch::Handled
+}
+
+fn list_btw_threads(prepared: &runtime::PreparedSession) -> String {
+    let mut lines = vec![
+        "BTW side threads (in memory only):".to_owned(),
+        "  /btw <question>                  start a fresh side thread".to_owned(),
+        "  /btw resume <id> <question>      continue one".to_owned(),
+        "  /btw bring <id> [latest|all|from:N]  show side context".to_owned(),
+        "  /btw settings [level|remember]   view/change preferences".to_owned(),
+    ];
+    for summary in prepared.btw.list_threads() {
+        lines.push(format!(
+            "  {}  {} question(s)  {}",
+            summary.id, summary.questions, summary.title
+        ));
+    }
+    lines.join("\n")
+}
+
+fn dispatch_btw_settings(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    argument: &str,
+) {
+    let (setting, value) = split_prompt_action(argument);
+    if setting.is_empty() {
+        let settings = prepared.btw.read_settings();
+        if settings.kind == btw::SettingsKind::Invalid {
+            append_view_message(view, MessageRole::Error, settings.reason);
+            return;
+        }
+        let model = if settings.settings.model.is_empty() {
+            "current session model"
+        } else {
+            &settings.settings.model
+        };
+        let thinking = if settings.settings.thinking_level.is_empty() {
+            "current session level"
+        } else {
+            &settings.settings.thinking_level
+        };
+        append_view_message(
+            view,
+            MessageRole::Command,
+            format!(
+                "pi-btw settings ({})\n  model: {model}\n  thinking: {thinking}\n  remember changes: {}",
+                prepared.btw.settings_path().display(),
+                settings.settings.effective_remember()
+            ),
+        );
+        return;
+    }
+
+    let patch = match setting.to_ascii_lowercase().as_str() {
+        "remember" => match value.to_ascii_lowercase().as_str() {
+            "on" | "true" => btw::SettingsPatch {
+                remember_thinking_level_changes: btw::SettingChange::Set(true),
+                ..btw::SettingsPatch::default()
+            },
+            "off" | "false" => btw::SettingsPatch {
+                remember_thinking_level_changes: btw::SettingChange::Set(false),
+                ..btw::SettingsPatch::default()
+            },
+            _ => {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "usage: /btw settings remember <on|off>",
+                );
+                return;
+            }
+        },
+        "model" => {
+            if value.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "usage: /btw settings model <provider/model>",
+                );
+                return;
+            }
+            btw::SettingsPatch {
+                model: btw::SettingChange::Set(value.to_owned()),
+                ..btw::SettingsPatch::default()
+            }
+        }
+        level if value.is_empty() => btw::SettingsPatch {
+            thinking_level: btw::SettingChange::Set(level.to_owned()),
+            ..btw::SettingsPatch::default()
+        },
+        _ => {
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "usage: /btw settings [level|remember <on|off>|model <provider/model>]",
+            );
+            return;
+        }
+    };
+    match prepared.btw.update_settings(patch) {
+        Ok(_) => {
+            view.activity = "BTW settings saved".to_owned();
+            append_view_message(view, MessageRole::Notice, "BTW settings saved.");
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+}
+
+fn report_btw_selection_warnings(view: &mut InteractiveView, prepared: &runtime::PreparedSession) {
+    let state = prepared.runtime.agent().state();
+    for warning in prepared.btw.resolve_selection(&state).warnings {
+        append_view_message(view, MessageRole::Notice, warning);
+    }
+}
+
+fn start_btw_question(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    turn_sender: Sender<Result<(), String>>,
+    thread_id: String,
+    question: String,
+) {
+    if question.trim().is_empty() {
+        append_view_message(view, MessageRole::Error, "a BTW question cannot be empty");
+        return;
+    }
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Wait for the active response before opening /btw.",
+        );
+        return;
+    }
+    let turns_before = match prepared.btw.thread(&thread_id) {
+        Ok(thread) => thread.turns.len(),
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.to_string());
+            return;
+        }
+    };
+    let queued = match prepared.btw.enqueue_prompt(&thread_id, question) {
+        Ok(status) => status,
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.to_string());
+            return;
+        }
+    };
+    if queued.running {
+        append_view_message(
+            view,
+            MessageRole::Notice,
+            format!("Queued side question for {}.", queued.thread_id),
+        );
+        return;
+    }
+
+    let side_runtime = prepared.btw.clone();
+    let state = prepared.runtime.agent().state();
+    let worker_thread_id = thread_id.clone();
+    view.pending_btw_thread = Some(thread_id);
+    view.pending_btw_turn_start = Some(turns_before);
+    view.turn_pending = true;
+    view.activity = "BTW side thread is answering".to_owned();
+    view.activity_since = Some(Instant::now());
+    thread::spawn(move || {
+        let result = match side_runtime.run_next(&state, &worker_thread_id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("BTW side thread did not have a queued question".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = turn_sender.send(result);
+    });
+}
+
 /// Executes slash commands that can be served without leaving the fullscreen
 /// Ratatui program. Commands with an unavailable integration report that fact
 /// in the transcript rather than pretending they changed runtime state.
@@ -1052,7 +1387,12 @@ fn dispatch_runtime_slash_command(
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
     match command {
-        "/exit" | "/quit" => CommandDispatch::Quit,
+        "/exit" | "/quit" => {
+            if let Some(thread) = view.pending_btw_thread.as_deref() {
+                let _ = prepared.btw.cancel(thread);
+            }
+            CommandDispatch::Quit
+        }
         "/help" | "/?" => {
             append_view_message(
                 view,
@@ -1398,6 +1738,7 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
+        "/btw" => dispatch_btw_slash_command(app, view, prepared, turn_sender, rest),
         "/prompt" | "/prompts" => dispatch_prompt_slash_command(view, prepared, rest, fullscreen),
         "/ralph" => dispatch_ralph_slash_command(app, view, prepared, turn_sender, rest),
         "/planner" | "/plannator" | "/plannotator" => {

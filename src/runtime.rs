@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    agent,
+    agent, btw_runtime,
     catalog::Catalog,
     config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
@@ -95,6 +95,8 @@ pub struct Invocation {
 
 /// An initialized session plus the objects whose lifetime must outlast tools.
 pub struct PreparedSession {
+    /// Session-local, in-memory side discussion runtime used by `/btw`.
+    pub btw: btw_runtime::Runtime,
     /// Session-owned Ralph integration. It is dropped before the agent runtime
     /// so its post-turn subscription always unregisters cleanly.
     pub ralph: Option<ralph_runtime::RalphRuntime>,
@@ -543,6 +545,11 @@ pub fn prepare_session(
     )?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let btw = btw_runtime::Runtime::with_catalog(
+        runtime.agent().responder(),
+        catalog.clone(),
+        btw_runtime::Options::default(),
+    );
     let ralph_store = config
         .enable_ralph
         .then(|| ralph::Store::for_workspace(&cwd, format!("cli-{}", std::process::id())));
@@ -590,6 +597,7 @@ pub fn prepare_session(
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
     Ok(PreparedSession {
+        btw,
         ralph,
         planner,
         runtime,
