@@ -3,7 +3,6 @@
 use std::{
     error::Error,
     io::{self, BufRead, IsTerminal, Read, Write},
-    path::Path,
     time::Duration,
 };
 
@@ -74,9 +73,10 @@ fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
         },
         transport,
     )?;
+    let message = result.render();
     config::ensure_agent_dir()?;
     CredentialStore::default_file().put("omni", Credential::api_key(result.credential_to_store))?;
-    println!("{}", result.render());
+    println!("{message}");
     Ok(())
 }
 
@@ -135,7 +135,7 @@ impl omniroute::HttpTransport for ReqwestTransport {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        let mut response = builder
+        let response = builder
             .send()
             .map_err(|_| omniroute::HttpTransportError::new("request failed"))?;
         let status = response.status().as_u16();
@@ -163,8 +163,7 @@ mod tests {
             body: None,
         };
         let transport = ReqwestTransport::new(Duration::from_millis(1)).expect("transport");
-        let error = transport
-            .execute(request)
+        let error = omniroute::HttpTransport::execute(&transport, request)
             .expect_err("connection should fail");
         assert_eq!(error.message(), "request failed");
     }
