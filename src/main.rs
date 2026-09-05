@@ -943,8 +943,10 @@ fn line_interactive_loop(
         if input.starts_with('/') {
             let mut app = App::new();
             app.streaming = prepared.runtime.agent().state().is_streaming;
-            let mut view = InteractiveView::default();
-            view.line_claude_tui = Some(claude_tui);
+            let mut view = InteractiveView {
+                line_claude_tui: Some(claude_tui),
+                ..InteractiveView::default()
+            };
             let (turn_sender, turn_receiver) = mpsc::channel();
             let prior_claude_tui = claude_tui;
             let outcome = dispatch_runtime_slash_command(
