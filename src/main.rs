@@ -424,11 +424,7 @@ fn event_loop(
     let mut view = InteractiveView::default();
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
-            append_view_message(
-                &mut view,
-                MessageRole::Notice,
-                format!("{}: {}", notice.kind, notice.text),
-            );
+            append_view_message(&mut view, MessageRole::Notice, notice);
         }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
             append_view_message(&mut view, MessageRole::Notice, banner);
@@ -566,7 +562,7 @@ fn drain_interactive_events(
             append_view_message(view, MessageRole::Error, error);
         }
     }
-    for notice in runtime::drain_notices() {
+    for notice in runtime.drain_notices() {
         append_view_message(
             view,
             MessageRole::Notice,
@@ -1428,8 +1424,7 @@ fn cycle_interactive_model(
         .iter()
         .position(|model| model.provider == state.model.provider && model.id == state.model.id);
     let next = match (current, direction < 0) {
-        (Some(index), true) if index > 0 => index - 1,
-        (Some(0), true) => models.len() - 1,
+        (Some(index), true) => (index + models.len() - 1) % models.len(),
         (Some(index), false) => (index + 1) % models.len(),
         (None, _) => 0,
     };
