@@ -35,7 +35,7 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, catalog, llm, stream};
+use crate::{agent, bedrock, catalog, llm, stream};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -54,6 +54,7 @@ pub enum ProviderProtocol {
     OpenAiCompletions,
     OpenAiResponses,
     AnthropicMessages,
+    BedrockConverseStream,
 }
 
 impl ProviderProtocol {
@@ -62,6 +63,7 @@ impl ProviderProtocol {
             API_OPENAI_COMPLETIONS => Ok(Self::OpenAiCompletions),
             API_OPENAI_RESPONSES => Ok(Self::OpenAiResponses),
             API_ANTHROPIC_MESSAGES => Ok(Self::AnthropicMessages),
+            bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
     }
@@ -71,6 +73,9 @@ impl ProviderProtocol {
             Self::OpenAiCompletions => "chat/completions",
             Self::OpenAiResponses => "responses",
             Self::AnthropicMessages => "v1/messages",
+            Self::BedrockConverseStream => {
+                unreachable!("Bedrock uses its own signed request builder")
+            }
         }
     }
 }
@@ -196,6 +201,7 @@ pub type Result<T> = std::result::Result<T, ProviderAdapterError>;
 pub struct ProviderCredentials {
     api_key: Option<String>,
     headers: BTreeMap<String, Option<String>>,
+    environment: BTreeMap<String, String>,
 }
 
 impl ProviderCredentials {
@@ -203,6 +209,7 @@ impl ProviderCredentials {
         Self {
             api_key: Some(api_key.into()),
             headers: BTreeMap::new(),
+            environment: BTreeMap::new(),
         }
     }
 
@@ -235,6 +242,7 @@ impl ProviderCredentials {
         Self {
             api_key: resolved.auth().api_key().map(str::to_owned),
             headers: resolved.effective_headers().clone(),
+            environment: resolved.auth().environment().clone(),
         }
     }
 }
@@ -412,6 +420,9 @@ impl ProviderResponderFactory {
         options: agent::RequestOptions,
         credentials: ProviderCredentials,
     ) -> stream::AssistantMessageEventStream {
+        if model.api == bedrock::API_BEDROCK_CONVERSE_STREAM {
+            return self.stream_bedrock_with_credentials(model, context, options, credentials);
+        }
         let events =
             stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
                 .expect("validated provider event buffer capacity");
@@ -426,6 +437,51 @@ impl ProviderResponderFactory {
                 factory.run_stream(&model, &context, options, credentials, &mut emitter)
             {
                 let _ = emitter.fail(error, &cancellation);
+            }
+        });
+        events
+    }
+
+    fn stream_bedrock_with_credentials(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+    ) -> stream::AssistantMessageEventStream {
+        let bedrock_cancellation = bedrock::BedrockCancellation::default();
+        let agent_cancellation = options.cancellation.clone();
+        let reasoning = options.thinking_level;
+        let events = bedrock::stream_bedrock_simple(
+            model.clone(),
+            context.clone(),
+            bedrock::BedrockSimpleOptions {
+                request: bedrock::BedrockOptions {
+                    api_key: credentials.api_key,
+                    headers: credentials.headers,
+                    timeout: self.config.request_timeout,
+                    max_retries: self.config.max_retries,
+                    max_retry_delay: bedrock_retry_delay_limit(self.config.retry_delay_limit),
+                    environment: credentials.environment,
+                    cancellation: Some(bedrock_cancellation.clone()),
+                    ..bedrock::BedrockOptions::default()
+                },
+                reasoning: Some(reasoning),
+                thinking_budgets: None,
+            },
+        );
+
+        // Bedrock owns its blocking HTTP reader, so translate the agent's
+        // cancellation token on a short polling interval while preserving the
+        // protocol adapter's bounded socket timeout.
+        let monitor = events.clone();
+        thread::spawn(move || {
+            while !monitor.is_closed() {
+                if agent_cancellation.is_cancelled() {
+                    bedrock_cancellation.cancel();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
             }
         });
         events
@@ -451,6 +507,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::AnthropicMessages => {
                 build_anthropic_messages_request(model, context, &options)
             }
+            ProviderProtocol::BedrockConverseStream => {
+                unreachable!("Bedrock is dispatched before the generic HTTP adapter")
+            }
         }?;
         let response = self.send_streaming_request(
             protocol,
@@ -470,6 +529,9 @@ impl ProviderResponderFactory {
             }
             ProviderProtocol::AnthropicMessages => {
                 consume_anthropic_messages(response, model, &options.cancellation, emitter)?
+            }
+            ProviderProtocol::BedrockConverseStream => {
+                unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
         }
         ensure_not_cancelled(&options.cancellation)?;
@@ -612,6 +674,14 @@ fn wait_for_retry(
     }
 }
 
+fn bedrock_retry_delay_limit(limit: stream::RetryDelayLimit) -> Option<Duration> {
+    match limit {
+        stream::RetryDelayLimit::Default => None,
+        stream::RetryDelayLimit::Unlimited => Some(Duration::ZERO),
+        stream::RetryDelayLimit::Maximum(delay) => Some(delay),
+    }
+}
+
 fn protocol_endpoint(model: &llm::Model, protocol: ProviderProtocol) -> Result<Url> {
     if model.base_url.trim().is_empty() {
         return Err(ProviderAdapterError::MissingBaseUrl);
@@ -692,6 +762,9 @@ fn build_request_headers(
                 Some("2023-06-01".to_owned()),
             );
         }
+        ProviderProtocol::BedrockConverseStream => {
+            unreachable!("Bedrock uses its own signed request builder")
+        }
     }
 
     let api_key = credentials.api_key_value().unwrap_or_default();
@@ -712,6 +785,9 @@ fn build_request_headers(
                     Some(api_key.to_owned()),
                 );
             }
+            ProviderProtocol::BedrockConverseStream => {
+                unreachable!("Bedrock uses its own signed request builder")
+            }
         }
     }
 
@@ -730,6 +806,9 @@ fn build_request_headers(
             has_authorization
         }
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
+        ProviderProtocol::BedrockConverseStream => {
+            unreachable!("Bedrock uses its own signed request builder")
+        }
     };
     if !authenticated {
         if ambient {
@@ -3248,10 +3327,14 @@ mod tests {
     }
 
     fn http_response(status: u16, body: &str) -> Vec<u8> {
-        http_response_with_headers(status, body, &[])
+        http_response_bytes(status, body.as_bytes(), &[])
     }
 
     fn http_response_with_headers(status: u16, body: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        http_response_bytes(status, body.as_bytes(), headers)
+    }
+
+    fn http_response_bytes(status: u16, body: &[u8], headers: &[(&str, &str)]) -> Vec<u8> {
         let reason = match status {
             200 => "OK",
             429 => "Too Many Requests",
@@ -3269,7 +3352,7 @@ mod tests {
         }
         response.push_str("\r\n");
         let mut bytes = response.into_bytes();
-        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(body);
         bytes
     }
 
@@ -3343,6 +3426,67 @@ mod tests {
                 constrained_sampling: None,
             }],
         }
+    }
+
+    fn bedrock_frame(event_type: &str, payload: &str) -> Vec<u8> {
+        bedrock::encode_event_stream_message(
+            &BTreeMap::from([
+                (":message-type".to_owned(), "event".to_owned()),
+                (":event-type".to_owned(), event_type.to_owned()),
+                (":content-type".to_owned(), "application/json".to_owned()),
+            ]),
+            payload.as_bytes(),
+        )
+        .expect("encode Bedrock frame")
+    }
+
+    #[test]
+    fn bedrock_converse_stream_uses_the_native_signed_protocol_adapter() {
+        let body = [
+            bedrock_frame("messageStart", r#"{"role":"assistant"}"#),
+            bedrock_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"text":"Hello from Bedrock"}}"#,
+            ),
+            bedrock_frame("contentBlockStop", r#"{"contentBlockIndex":0}"#),
+            bedrock_frame("messageStop", r#"{"stopReason":"end_turn"}"#),
+            bedrock_frame(
+                "metadata",
+                r#"{"usage":{"inputTokens":12,"outputTokens":3,"totalTokens":15}}"#,
+            ),
+        ]
+        .concat();
+        let (base_url, requests, server) = test_server(vec![http_response_bytes(
+            200,
+            &body,
+            &[("Content-Type", "application/vnd.amazon.eventstream")],
+        )]);
+        let mut request_model = model(bedrock::API_BEDROCK_CONVERSE_STREAM, base_url);
+        request_model.provider = "amazon-bedrock".to_owned();
+        let response = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Bedrock response");
+        let request = requests.recv().expect("captured Bedrock request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(request.target, "/model/test-model/converse-stream");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-key")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(
+            response
+                .content
+                .first()
+                .and_then(llm::ContentBlock::plain_text),
+            Some("Hello from Bedrock")
+        );
+        assert_eq!(response.usage.total_tokens, 15);
     }
 
     #[test]

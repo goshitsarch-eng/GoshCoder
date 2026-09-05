@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod bedrock;
 pub mod btw;
 pub mod catalog;
 pub mod computeruse;
