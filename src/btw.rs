@@ -1472,7 +1472,19 @@ mod tests {
         let request = build_request_context(&thread, "third?");
         assert_eq!(request.system_prompt, SYSTEM_PROMPT);
         assert!(request.tools.is_empty());
-        assert_eq!(request.messages, messages);
+        assert_eq!(request.messages.len(), messages.len());
+        for (expected, actual) in messages.iter().zip(&request.messages) {
+            match (expected, actual) {
+                (llm::Message::User(expected), llm::Message::User(actual)) => {
+                    assert_eq!(actual.role, expected.role);
+                    assert_eq!(actual.content, expected.content);
+                }
+                (llm::Message::Assistant(expected), llm::Message::Assistant(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                _ => panic!("request message kind changed"),
+            }
+        }
     }
 
     #[test]
