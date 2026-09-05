@@ -80,16 +80,15 @@ pub(crate) fn replay_response(
     }
 
     if !prose.is_empty() {
-        let content_index = emitter.start_text("")?;
-        emitter.append_text(content_index, &prose)?;
-        emitter.end_text(content_index)?;
+        emitter.replay_text(&prose)?;
     }
     for call in &calls {
-        let content_index = emitter.start_tool(&next_tool_call_id(), &call.name)?;
-        emitter.set_tool_arguments(content_index, call.arguments.clone())?;
-        let arguments = serde_json::to_string(&call.arguments)?;
-        emitter.tool_delta(content_index, &arguments)?;
-        emitter.end_tool(content_index)?;
+        emitter.replay_tool(llm::ToolCall {
+            id: next_tool_call_id(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            ..llm::ToolCall::default()
+        })?;
     }
 
     emitter.message.stop_reason = match response.stop_reason.as_str() {
@@ -170,7 +169,8 @@ pub(crate) fn parse_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>, Vec<
 fn parse_tool_call(body: &str, calls: &mut Vec<ParsedToolCall>, problems: &mut Vec<String>) {
     #[derive(Deserialize)]
     struct RawToolCall {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
         #[serde(default)]
         arguments: Value,
     }
@@ -185,7 +185,8 @@ fn parse_tool_call(body: &str, calls: &mut Vec<ParsedToolCall>, problems: &mut V
             return;
         }
     };
-    if raw.name.is_empty() {
+    let name = raw.name.unwrap_or_default();
+    if name.is_empty() {
         problems.push(format!(
             "tool_call missing a string \"name\": {}",
             truncate(body, 200)
@@ -197,10 +198,7 @@ fn parse_tool_call(body: &str, calls: &mut Vec<ParsedToolCall>, problems: &mut V
         Value::String(arguments) => serde_json::from_str(&arguments).unwrap_or_default(),
         _ => BTreeMap::new(),
     };
-    calls.push(ParsedToolCall {
-        name: raw.name,
-        arguments,
-    });
+    calls.push(ParsedToolCall { name, arguments });
 }
 
 fn strip_optional_fence(body: &str) -> &str {
@@ -394,6 +392,17 @@ mod tests {
                 arguments: BTreeMap::from([("command".to_owned(), json!("pwd"))]),
             }]
         );
+    }
+
+    #[test]
+    fn parser_removes_invalid_blocks_and_reports_a_repair_problem() {
+        let (prose, calls, problems) =
+            parse_tool_calls("before <tool_call>{\"arguments\":{}}</tool_call> after");
+
+        assert_eq!(prose, "before  after");
+        assert!(calls.is_empty());
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("missing a string"));
     }
 
     #[test]

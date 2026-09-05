@@ -17,6 +17,7 @@
 //! - Google Generative AI (`google-generative-ai`)
 //! - Google Vertex AI (`google-vertex`)
 //! - Mistral Conversations (`mistral-conversations`)
+//! - OmniRoute text-protocol tools (`omni-prompt-tools`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
 //! JSON parser, retry classification, token accounting, and normalized
@@ -4000,6 +4001,36 @@ impl MessageEmitter {
         Ok(index)
     }
 
+    /// Replays an already-complete text block while retaining a stable
+    /// snapshot for every event. Prompt-protocol adapters need this shape
+    /// because their hidden provider response is buffered before publication.
+    pub(crate) fn replay_text(&mut self, content: &str) -> Result<()> {
+        let content_index = self.message.content.len();
+        self.message
+            .content
+            .push(llm::ContentBlock::Text(llm::TextContent {
+                text: content.to_owned(),
+                ..llm::TextContent::default()
+            }));
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_START.to_owned(),
+            content_index: Some(content_index),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_DELTA.to_owned(),
+            content_index: Some(content_index),
+            delta: content.to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_END.to_owned(),
+            content_index: Some(content_index),
+            content: content.to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        })
+    }
+
     pub(crate) fn append_text(&mut self, index: usize, delta: &str) -> Result<()> {
         match self.message.content.get_mut(index) {
             Some(llm::ContentBlock::Text(text)) => text.text.push_str(delta),
@@ -4167,6 +4198,33 @@ impl MessageEmitter {
             ..stream::AssistantMessageEvent::default()
         })?;
         Ok(index)
+    }
+
+    /// Replays an already-complete tool call without exposing a mutable
+    /// partial tool block to event consumers.
+    pub(crate) fn replay_tool(&mut self, call: llm::ToolCall) -> Result<()> {
+        let arguments = serde_json::to_string(&call.arguments)?;
+        let content_index = self.message.content.len();
+        self.message
+            .content
+            .push(llm::ContentBlock::ToolCall(call.clone()));
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_START.to_owned(),
+            content_index: Some(content_index),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_DELTA.to_owned(),
+            content_index: Some(content_index),
+            delta: arguments,
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_END.to_owned(),
+            content_index: Some(content_index),
+            tool_call: Some(call),
+            ..stream::AssistantMessageEvent::default()
+        })
     }
 
     fn set_tool_metadata(
@@ -6380,6 +6438,13 @@ mod tests {
             .find(|event| event.event_type == stream::EVENT_TEXT_START)
             .expect("text start event");
         let partial = text_start.partial.as_ref().expect("text start snapshot");
+        assert_eq!(
+            partial
+                .content
+                .first()
+                .and_then(llm::ContentBlock::plain_text),
+            Some("I will inspect it.")
+        );
         assert!(
             partial
                 .content
