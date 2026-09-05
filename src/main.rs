@@ -34,7 +34,7 @@ pub mod webaccess;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Write},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -359,17 +359,8 @@ fn bold(text: &str, color: bool) -> String {
 
 fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let invocation = runtime::parse_chat(arguments)?;
-    if !invocation.config.fullscreen {
-        return Err(io::Error::other(
-            "line-mode chat is still being migrated; omit -fullscreen=false to use the Ratatui frontend",
-        )
-        .into());
-    }
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        return Err(io::Error::other(
-            "interactive chat requires a terminal; use `goshcoder run` for pipeable requests",
-        )
-        .into());
+    if !invocation.config.fullscreen || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return run_line_interactive(invocation);
     }
 
     let quiet = invocation.config.quiet;
@@ -430,6 +421,186 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     terminal_cleanup?;
     session_cleanup?;
     result
+}
+
+/// Runs the pipe-friendly chat fallback used when the alternate-screen
+/// Ratatui frontend was explicitly disabled or cannot safely own the terminal.
+///
+/// It deliberately shares the live session, responder, slash-command
+/// dispatcher, compaction, and event renderer with fullscreen chat. The only
+/// difference is presentation: prompts and command notices are line-oriented.
+fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn Error>> {
+    let quiet = invocation.config.quiet;
+    let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    let responder = providers::assistant_responder_from_catalog(
+        Arc::clone(&catalog),
+        providers::ProviderConfig::default(),
+    )?;
+    let mut prepared = runtime::prepare_session(
+        catalog.as_ref(),
+        invocation.config,
+        Some(responder),
+        Vec::new(),
+    )?;
+    let agent = prepared.runtime.agent().clone();
+    let render_lock = Arc::new(Mutex::new(()));
+    let color = color_enabled();
+    let _render_subscription = agent.subscribe({
+        let render_lock = Arc::clone(&render_lock);
+        move |event| {
+            let _guard = render_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut stdout = io::stdout().lock();
+            let mut stderr = io::stderr().lock();
+            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+        }
+    });
+
+    let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet);
+    let close_result = prepared.runtime.close();
+    result?;
+    close_result?;
+    Ok(())
+}
+
+fn line_interactive_loop(
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    quiet: bool,
+) -> Result<(), Box<dyn Error>> {
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    if !quiet {
+        for notice in runtime::drain_session_notices(&prepared.runtime) {
+            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+        }
+        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
+            eprintln!("{}", dim(&banner, color_enabled()));
+        }
+        if interactive {
+            let state = prepared.runtime.agent().state();
+            eprintln!(
+                "{}",
+                dim(
+                    &format!(
+                        "goshcoder {} · {}/{} · /help for commands",
+                        build_version(),
+                        state.model.provider,
+                        state.model.id
+                    ),
+                    color_enabled()
+                )
+            );
+        }
+    }
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        if interactive {
+            let mut stderr = io::stderr().lock();
+            write!(stderr, "\n> ")?;
+            stderr.flush()?;
+        }
+        if reader.read_line(&mut raw)? == 0 {
+            if interactive {
+                eprintln!();
+            }
+            break;
+        }
+
+        let input = raw.trim();
+        if input.is_empty() {
+            continue;
+        }
+        let input = match runtime::expand_resource_input(&prepared.resources, input) {
+            Ok(Some(expanded)) => expanded,
+            Ok(None) => input.to_owned(),
+            Err(error) => {
+                eprintln!("error: {error}");
+                continue;
+            }
+        };
+
+        if input.starts_with('/') {
+            let mut app = App::new();
+            app.streaming = prepared.runtime.agent().state().is_streaming;
+            let mut view = InteractiveView::default();
+            let (turn_sender, turn_receiver) = mpsc::channel();
+            let outcome = dispatch_runtime_slash_command(
+                &mut app,
+                &mut view,
+                prepared,
+                catalog,
+                turn_sender,
+                &input,
+            );
+            if view.turn_pending {
+                match turn_receiver.recv() {
+                    Ok(Ok(())) => {
+                        view.turn_pending = false;
+                        view.activity = "Ready".to_owned();
+                    }
+                    Ok(Err(error)) => {
+                        view.turn_pending = false;
+                        append_view_message(&mut view, MessageRole::Error, error);
+                    }
+                    Err(_) => {
+                        view.turn_pending = false;
+                        append_view_message(
+                            &mut view,
+                            MessageRole::Error,
+                            "interactive command worker stopped unexpectedly",
+                        );
+                    }
+                }
+            }
+            render_line_view(&mut view);
+            if matches!(outcome, CommandDispatch::Quit) {
+                break;
+            }
+        } else {
+            if let Err(error) = prepared.sync_extensions() {
+                eprintln!("error: {error}");
+                continue;
+            }
+            if let Err(error) = compaction::maybe_auto_compact(prepared.runtime.agent()) {
+                eprintln!("error: {error}");
+                continue;
+            }
+            if let Err(error) = prepared.runtime.agent().prompt(input) {
+                eprintln!("error: {error}");
+            }
+        }
+
+        prepared.runtime.sync()?;
+        for notice in runtime::drain_session_notices(&prepared.runtime) {
+            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+        }
+    }
+    Ok(())
+}
+
+fn render_line_view(view: &mut InteractiveView) {
+    let notices = std::mem::take(&mut view.notices);
+    let had_notices = !notices.is_empty();
+    for message in notices {
+        match message.role {
+            MessageRole::Error => eprintln!("error: {}", message.text),
+            MessageRole::Command | MessageRole::Notice => eprintln!("{}", message.text),
+            MessageRole::User
+            | MessageRole::Assistant
+            | MessageRole::Thinking
+            | MessageRole::Tool => {
+                eprintln!("{}", message.text)
+            }
+        }
+    }
+    if !had_notices && view.activity != "Ready" {
+        eprintln!("{}", view.activity);
+    }
 }
 
 struct InteractiveView {
