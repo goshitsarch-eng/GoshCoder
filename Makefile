@@ -140,10 +140,11 @@ dist: clean-dist
 		cp "$(TARGET_DIR)/dist/$$target/release/$(BINARY)$$ext" "$$out/$(BINARY)$$ext" || exit 1; \
 		cp README.md NOTICE LICENSE "$$out/"; \
 		sh scripts/collect-licenses.sh "$$target" "$$out/licenses" || exit 1; \
+		base=$$(basename "$$out"); \
 		if [ "$$os" = "windows" ]; then \
-			(cd dist && zip -qr "$$(basename "$$out").zip" "$$(basename "$$out)"); \
+			(cd dist && zip -qr "$$base.zip" "$$base"); \
 		else \
-			(cd dist && tar czf "$$(basename "$$out").tar.gz" "$$(basename "$$out)"); \
+			(cd dist && tar czf "$$base.tar.gz" "$$base"); \
 		fi; \
 		rm -rf "$$out"; \
 	done
