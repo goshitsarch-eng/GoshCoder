@@ -7364,7 +7364,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_variants_include_google_vertex_azure_and_codex_responses() {
+    fn protocol_variants_include_google_vertex_azure_codex_and_omni_prompt_tools() {
         assert_eq!(
             ProviderProtocol::from_api(API_GOOGLE_GENERATIVE_AI).expect("Google protocol"),
             ProviderProtocol::GoogleGenerativeAi
@@ -7380,6 +7380,11 @@ mod tests {
         assert_eq!(
             ProviderProtocol::from_api(API_OPENAI_CODEX_RESPONSES).expect("Codex protocol"),
             ProviderProtocol::OpenAiCodexResponses
+        );
+        assert_eq!(
+            ProviderProtocol::from_api(omni_prompt_tools::API_OMNI_PROMPT_TOOLS)
+                .expect("OmniRoute prompt-tools adapter"),
+            ProviderProtocol::OmniPromptTools
         );
     }
 
