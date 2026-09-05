@@ -87,7 +87,8 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         Some("backup") => {
             let output = arguments.get(1).map(PathBuf::from);
-            let path = backup(&paths, output.as_deref())?;
+            let (path, warnings) = backup_at(&paths, output.as_deref())?;
+            print_warnings(&warnings);
             eprintln!("backed up prompts to {}", path.display());
             println!("{}", path.display());
             Ok(())
@@ -105,7 +106,7 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     .collect(),
                 ..RestoreOptions::default()
             };
-            let (archive, outcomes) = restore(&paths, Path::new(archive), &options)?;
+            let (archive, outcomes) = restore_at(&paths, Path::new(archive), &options)?;
             print_warnings(&archive.warnings);
             if !archive.manifest.tool.is_empty() && archive.manifest.tool != "goshcoder" {
                 eprintln!(
@@ -131,9 +132,16 @@ fn collect(paths: &ResourcePaths) -> Result<PromptCollection, Box<dyn Error>> {
     )?)
 }
 
-fn backup(paths: &ResourcePaths, requested: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+/// Writes a prompt archive and returns discovery warnings alongside its path.
+///
+/// The output is deliberately returned rather than printed so an interactive
+/// frontend can show it inside its transcript instead of corrupting an
+/// alternate-screen terminal.
+pub fn backup_at(
+    paths: &ResourcePaths,
+    requested: Option<&Path>,
+) -> Result<(PathBuf, Vec<String>), Box<dyn Error>> {
     let collection = collect(paths)?;
-    print_warnings(&collection.warnings);
     if collection.prompts.is_empty() {
         return Err(command_error("there are no saved prompts to back up"));
     }
@@ -164,10 +172,12 @@ fn backup(paths: &ResourcePaths, requested: Option<&Path>) -> Result<PathBuf, Bo
         return Err(Box::new(error));
     }
     drop(file);
-    Ok(path)
+    Ok((path, collection.warnings))
 }
 
-fn restore(
+/// Reads and safely restores a prompt archive without prescribing terminal
+/// output. Both the standalone CLI and the Ratatui frontend use this path.
+pub fn restore_at(
     paths: &ResourcePaths,
     archive_path: &Path,
     options: &RestoreOptions,
@@ -212,7 +222,9 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn describe_restore(outcomes: &[RestoreOutcome]) -> Vec<String> {
+/// Produces the user-facing summary shared by the CLI and interactive prompt
+/// command.
+pub fn describe_restore(outcomes: &[RestoreOutcome]) -> Vec<String> {
     let mut restored = 0;
     let mut skipped = 0;
     let mut lines = Vec::with_capacity(outcomes.len() + 1);
@@ -301,10 +313,12 @@ mod tests {
         .expect("save project prompt");
 
         let archive_path = root.0.join("prompts.tar.gz");
-        let archive_path = backup(&source, Some(&archive_path)).expect("write backup");
+        let (archive_path, warnings) =
+            backup_at(&source, Some(&archive_path)).expect("write backup");
+        assert!(warnings.is_empty());
         let destination = paths(&root, "destination");
         let (decoded, outcomes) =
-            restore(&destination, &archive_path, &RestoreOptions::default()).expect("restore");
+            restore_at(&destination, &archive_path, &RestoreOptions::default()).expect("restore");
 
         assert_eq!(decoded.manifest.prompts, 2);
         assert_eq!(

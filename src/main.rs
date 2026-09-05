@@ -515,7 +515,7 @@ fn line_interactive_loop(
         if input.is_empty() {
             continue;
         }
-        let input = match runtime::expand_resource_input(&prepared.resources, input) {
+        let input = match prepared.expand_resource_input(input) {
             Ok(Some(expanded)) => expanded,
             Ok(None) => input.to_owned(),
             Err(error) => {
@@ -536,6 +536,7 @@ fn line_interactive_loop(
                 catalog,
                 turn_sender,
                 &input,
+                false,
             );
             if view.turn_pending {
                 match turn_receiver.recv() {
@@ -814,7 +815,7 @@ fn submit_interactive_input(
     follow_up: bool,
 ) -> CommandDispatch {
     app.record_submission(&input);
-    let input = match runtime::expand_resource_input(&prepared.resources, &input) {
+    let input = match prepared.expand_resource_input(&input) {
         Ok(Some(expanded)) => expanded,
         Ok(None) => input,
         Err(error) => {
@@ -823,7 +824,15 @@ fn submit_interactive_input(
         }
     };
     if input.starts_with('/') {
-        return dispatch_runtime_slash_command(app, view, prepared, catalog, turn_sender, &input);
+        return dispatch_runtime_slash_command(
+            app,
+            view,
+            prepared,
+            catalog,
+            turn_sender,
+            &input,
+            true,
+        );
     }
 
     let agent = prepared.runtime.agent().clone();
@@ -1006,6 +1015,7 @@ fn dispatch_runtime_slash_command(
     catalog: &catalog::Catalog,
     turn_sender: Sender<Result<(), String>>,
     input: &str,
+    fullscreen: bool,
 ) -> CommandDispatch {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
@@ -1015,7 +1025,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, BTW, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1298,20 +1308,15 @@ fn dispatch_runtime_slash_command(
             CommandDispatch::Handled
         }
         "/resources" => {
-            let resources = &prepared.resources;
+            let resources = prepared.resources();
             append_view_message(
                 view,
                 MessageRole::Command,
-                format!(
-                    "Context files: {}\nPrompt templates: {}\nSkills: {}\nWarnings: {}",
-                    resources.context_files.len(),
-                    resources.templates.len(),
-                    resources.skills.len(),
-                    resources.warnings.len()
-                ),
+                resources.report(&prepared.resource_paths).render(),
             );
             CommandDispatch::Handled
         }
+        "/prompt" | "/prompts" => dispatch_prompt_slash_command(view, prepared, rest, fullscreen),
         "/ralph" => dispatch_ralph_slash_command(app, view, prepared, turn_sender, rest),
         "/planner" | "/plannator" | "/plannotator" => {
             match prepared.toggle_planner() {
@@ -1457,6 +1462,344 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+/// Handles `/prompt` and its compatibility alias without writing directly to
+/// the terminal. This keeps prompt management usable in both line mode and
+/// the Ratatui alternate screen.
+fn dispatch_prompt_slash_command(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let result = prompt_slash_command(prepared, rest, fullscreen);
+    match result {
+        Ok(output) if !output.is_empty() => append_view_message(view, MessageRole::Command, output),
+        Ok(_) => {}
+        Err(error) => append_view_message(view, MessageRole::Error, error),
+    }
+    CommandDispatch::Handled
+}
+
+fn prompt_slash_command(
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> Result<String, String> {
+    let (action, argument) = split_prompt_action(rest);
+    match action {
+        "" | "list" => prompt_list(prepared),
+        "save" => prompt_save(prepared, argument),
+        "rm" | "remove" | "delete" => prompt_remove(prepared, argument),
+        "edit" => prompt_edit(prepared, argument, fullscreen),
+        "backup" => prompt_backup(prepared, argument),
+        "restore" => prompt_restore(prepared, argument),
+        action => Err(format!(
+            "unknown /prompt action {action:?}; use list, save, edit, rm, backup or restore"
+        )),
+    }
+}
+
+fn split_prompt_action(input: &str) -> (&str, &str) {
+    let input = input.trim();
+    let Some(index) = input.find(char::is_whitespace) else {
+        return (input, "");
+    };
+    (&input[..index], input[index..].trim())
+}
+
+fn prompt_list(prepared: &runtime::PreparedSession) -> Result<String, String> {
+    let resources = prepared.resources();
+    if resources.templates.is_empty() {
+        return Ok(
+            "no saved prompts; /prompt save <name> stores the last thing you asked".to_owned(),
+        );
+    }
+    Ok(resources
+        .templates
+        .iter()
+        .map(|template| {
+            let description = (!template.description.is_empty())
+                .then(|| format!("  {}", template.description))
+                .unwrap_or_default();
+            format!(
+                "/{}{}\n    {}",
+                template.name,
+                description,
+                template.path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn prompt_save(prepared: &runtime::PreparedSession, argument: &str) -> Result<String, String> {
+    let (first, after_first) = split_prompt_action(argument);
+    let (scope, name_and_body) = match first {
+        "--project" | "-project" => (resources::PromptScope::Workspace, after_first),
+        _ => (resources::PromptScope::User, argument.trim()),
+    };
+    let (name, inline) = split_prompt_action(name_and_body);
+    if name.is_empty() {
+        return Err("/prompt save needs a name, e.g. /prompt save review".to_owned());
+    }
+
+    let captured = inline.trim().is_empty();
+    let body = if captured {
+        last_user_prompt(&prepared.runtime.agent().state().messages).ok_or_else(|| {
+            "there is no previous message to save; pass the text after the name".to_owned()
+        })?
+    } else {
+        inline.to_owned()
+    };
+    let resources = prepared.resources();
+    let save = resources::save_template(
+        &prepared.resource_paths,
+        name,
+        &body,
+        resources::SaveTemplateOptions {
+            scope,
+            reserved_names: reserved_prompt_names(&resources),
+            literal: captured,
+            ..resources::SaveTemplateOptions::default()
+        },
+    )
+    .map_err(|error| match error {
+        resources::ResourceError::TemplateExists { .. } => {
+            format!("{error}; /prompt rm {name} first if you meant to replace it")
+        }
+        _ => error.to_string(),
+    })?;
+    prepared
+        .reload_templates()
+        .map_err(|error| format!("saved /{name}, but could not reload prompts: {error}"))?;
+
+    let mut lines = vec![format!("saved /{name} to {}", save.path.display())];
+    if captured && resources::has_placeholders(&body) {
+        lines.push(
+            "the captured text contains $ placeholders; they were escaped so it expands exactly as written"
+                .to_owned(),
+        );
+    }
+    if let Some(shadowed_by) = save.shadowed_by {
+        lines.push(format!(
+            "note: /{name} already resolves to {}, which takes precedence",
+            shadowed_by.display()
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn prompt_remove(prepared: &runtime::PreparedSession, argument: &str) -> Result<String, String> {
+    let (name, scope) = parse_prompt_scope(argument);
+    if name.is_empty() {
+        return Err("/prompt rm needs a name".to_owned());
+    }
+    let removed = resources::remove_template(&prepared.resource_paths, &name, scope)
+        .map_err(|error| error.to_string())?;
+    prepared.reload_templates().map_err(|error| {
+        format!(
+            "removed {}, but could not reload prompts: {error}",
+            removed.path.display()
+        )
+    })?;
+    let mut message = format!("removed {}", removed.path.display());
+    if removed.removed_symbolic_link {
+        message.push_str("\nnote: removed the symbolic link itself, not its target");
+    }
+    Ok(message)
+}
+
+fn prompt_edit(
+    prepared: &runtime::PreparedSession,
+    argument: &str,
+    fullscreen: bool,
+) -> Result<String, String> {
+    let (name, _) = parse_prompt_scope(argument);
+    if name.is_empty() {
+        return Err("/prompt edit needs a name".to_owned());
+    }
+    let resources = prepared.resources();
+    let template = resources
+        .find_template(&name)
+        .ok_or_else(|| format!("no prompt named {name:?}; /prompt list shows what is saved"))?;
+    let path = template.path.clone();
+    let editor = ["VISUAL", "EDITOR"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let Some(editor) = editor else {
+        return Ok(format!(
+            "set $EDITOR to edit in place; the file is {}",
+            path.display()
+        ));
+    };
+    if fullscreen {
+        return Ok(format!(
+            "edit it outside the app: {editor} {}",
+            path.display()
+        ));
+    }
+    let mut fields = editor.split_whitespace();
+    let program = fields
+        .next()
+        .ok_or_else(|| "$EDITOR does not contain an executable".to_owned())?;
+    let status = std::process::Command::new(program)
+        .args(fields)
+        .arg(&path)
+        .status()
+        .map_err(|error| format!("run {editor}: {error}"))?;
+    if !status.success() {
+        return Err(format!("run {editor}: exited with {status}"));
+    }
+    prepared
+        .reload_templates()
+        .map_err(|error| format!("edited /{name}, but could not reload prompts: {error}"))?;
+    Ok(format!("reloaded /{name}"))
+}
+
+fn prompt_backup(prepared: &runtime::PreparedSession, argument: &str) -> Result<String, String> {
+    let output = (!argument.trim().is_empty()).then(|| std::path::Path::new(argument.trim()));
+    let (path, warnings) =
+        prompts::backup_at(&prepared.resource_paths, output).map_err(|error| error.to_string())?;
+    let mut lines = warnings
+        .into_iter()
+        .map(|warning| format!("warning: {warning}"))
+        .collect::<Vec<_>>();
+    lines.push(format!("backed up prompts to {}", path.display()));
+    Ok(lines.join("\n"))
+}
+
+fn prompt_restore(prepared: &runtime::PreparedSession, argument: &str) -> Result<String, String> {
+    let (archive_path, flags) = split_prompt_action(argument);
+    if archive_path.is_empty() {
+        return Err("/prompt restore needs an archive path".to_owned());
+    }
+    let options = resources::RestoreOptions {
+        overwrite: flags
+            .split_whitespace()
+            .any(|flag| matches!(flag, "--overwrite" | "-overwrite")),
+        dry_run: flags
+            .split_whitespace()
+            .any(|flag| matches!(flag, "--dry-run" | "-dry-run")),
+        reserved_names: reserved_prompt_names(&prepared.resources()),
+        ..resources::RestoreOptions::default()
+    };
+    let (archive, outcomes) = prompts::restore_at(
+        &prepared.resource_paths,
+        std::path::Path::new(archive_path),
+        &options,
+    )
+    .map_err(|error| error.to_string())?;
+    prepared
+        .reload_templates()
+        .map_err(|error| format!("restored prompts, but could not reload them: {error}"))?;
+
+    let mut lines = archive
+        .warnings
+        .into_iter()
+        .map(|warning| format!("warning: {warning}"))
+        .collect::<Vec<_>>();
+    if !archive.manifest.tool.is_empty() && archive.manifest.tool != "goshcoder" {
+        lines.push(format!(
+            "note: this archive was written by {}",
+            archive.manifest.tool
+        ));
+    }
+    lines.extend(prompts::describe_restore(&outcomes));
+    Ok(lines.join("\n"))
+}
+
+fn parse_prompt_scope(argument: &str) -> (String, resources::PromptScope) {
+    let mut scope = resources::PromptScope::User;
+    let mut name = String::new();
+    for field in argument.split_whitespace() {
+        match field {
+            "--project" | "-project" => scope = resources::PromptScope::Workspace,
+            "--user" | "-user" => scope = resources::PromptScope::User,
+            _ if name.is_empty() => name = field.to_owned(),
+            _ => {}
+        }
+    }
+    (name, scope)
+}
+
+fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
+    let mut names = [
+        "exit",
+        "quit",
+        "help",
+        "?",
+        "model",
+        "login",
+        "logout",
+        "omni",
+        "aperture",
+        "aperture:onboarding",
+        "aperture:settings",
+        "btw",
+        "thinking",
+        "system",
+        "tools",
+        "messages",
+        "status",
+        "sidebar",
+        "session",
+        "tree",
+        "fork",
+        "label",
+        "clone",
+        "export",
+        "import",
+        "prompt",
+        "prompts",
+        "sessions",
+        "resume",
+        "name",
+        "hotkeys",
+        "steer",
+        "followup",
+        "queue",
+        "clear",
+        "new",
+        "compact",
+        "reload",
+        "resources",
+        "ralph",
+        "planner",
+        "plannator",
+        "plannotator",
+        "planner-review",
+        "plannotator-review",
+        "planner-annotate",
+        "plannotator-annotate",
+        "planner-last",
+        "plannotator-last",
+        "use-claude-code-tui",
+        "use-default-tui",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    names.extend(
+        resources
+            .skills
+            .iter()
+            .map(|skill| format!("skill:{}", skill.name)),
+    );
+    names.into_iter().collect()
+}
+
+fn last_user_prompt(messages: &[llm::Message]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        let llm::Message::User(user) = message else {
+            return None;
+        };
+        let text = user_message_text(user).trim().to_owned();
+        (!text.is_empty()).then_some(text)
+    })
 }
 
 fn start_planner_review<F>(
@@ -2054,6 +2397,60 @@ mod tests {
     fn help_and_version_are_non_interactive() {
         assert!(USAGE.contains("Ratatui"));
         assert!(env!("CARGO_PKG_VERSION").starts_with("0."));
+    }
+
+    #[test]
+    fn prompt_command_parsing_preserves_inline_text_and_scopes() {
+        assert_eq!(
+            split_prompt_action("save review   inspect the parser carefully"),
+            ("save", "review   inspect the parser carefully")
+        );
+        assert_eq!(split_prompt_action("  list  "), ("list", ""));
+        assert_eq!(
+            parse_prompt_scope("review --project"),
+            ("review".to_owned(), resources::PromptScope::Workspace)
+        );
+        assert_eq!(
+            parse_prompt_scope("--user review"),
+            ("review".to_owned(), resources::PromptScope::User)
+        );
+    }
+
+    #[test]
+    fn prompt_names_reserve_all_builtin_and_skill_commands() {
+        let resources = resources::ResourceSet {
+            skills: vec![resources::Skill {
+                name: "deploy".to_owned(),
+                description: "Deploy safely".to_owned(),
+                path: std::path::PathBuf::from("/tmp/deploy/SKILL.md"),
+                body: String::new(),
+                disable_model_invocation: false,
+            }],
+            ..resources::ResourceSet::default()
+        };
+        let names = reserved_prompt_names(&resources);
+        for name in [
+            "model",
+            "prompt",
+            "aperture:onboarding",
+            "plannotator-review",
+            "skill:deploy",
+        ] {
+            assert!(names.iter().any(|reserved| reserved == name), "{name}");
+        }
+    }
+
+    #[test]
+    fn prompt_capture_uses_the_last_nonempty_user_message() {
+        let messages = vec![
+            llm::Message::User(llm::UserMessage::text("first", 1)),
+            llm::Message::Assistant(Box::new(llm::AssistantMessage::default())),
+            llm::Message::User(llm::UserMessage::text("  final request  ", 2)),
+        ];
+        assert_eq!(
+            last_user_prompt(&messages),
+            Some("final request".to_owned())
+        );
     }
 
     #[test]

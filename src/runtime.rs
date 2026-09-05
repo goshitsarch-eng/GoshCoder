@@ -8,7 +8,7 @@
 use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -104,11 +104,37 @@ pub struct PreparedSession {
     pub runtime: SessionRuntime,
     pub workspace: Option<Workspace>,
     pub resource_paths: ResourcePaths,
-    pub resources: ResourceSet,
+    resources: Mutex<ResourceSet>,
     pub config: SessionConfig,
 }
 
 impl PreparedSession {
+    /// Returns a consistent snapshot of the resources currently available to
+    /// this session. Resource changes are serialized so a slash command can
+    /// save a prompt while the terminal event loop continues to inspect it.
+    pub fn resources(&self) -> ResourceSet {
+        lock_resources(&self.resources).clone()
+    }
+
+    /// Expands a prompt template or Agent Skill from the current resource
+    /// snapshot.
+    pub fn expand_resource_input(&self, input: &str) -> Result<Option<String>> {
+        expand_resource_input(&lock_resources(&self.resources), input)
+    }
+
+    /// Re-reads only prompt templates after a prompt-management operation.
+    ///
+    /// Template changes do not alter the active system prompt or tool set, so
+    /// this is safe while an agent turn is in progress and does not disturb
+    /// extension state.
+    pub fn reload_templates(&self) -> Result<ResourceSet> {
+        let mut resources = lock_resources(&self.resources);
+        let updated = resources::reload_templates(&resources, &self.resource_paths)
+            .map_err(|error| RuntimeError::Resource(error.to_string()))?;
+        *resources = updated.clone();
+        Ok(updated)
+    }
+
     /// Synchronizes the active extension layers before a new model request.
     pub fn sync_extensions(&self) -> Result<()> {
         if let Some(ralph) = self.ralph.as_ref() {
@@ -528,7 +554,7 @@ pub fn prepare_session(
         runtime,
         workspace,
         resource_paths,
-        resources,
+        resources: Mutex::new(resources),
         config,
     })
 }
@@ -623,6 +649,12 @@ pub fn expand_resource_input(resources: &ResourceSet, input: &str) -> Result<Opt
             Ok(Some(text))
         }
     }
+}
+
+fn lock_resources(resources: &Mutex<ResourceSet>) -> std::sync::MutexGuard<'_, ResourceSet> {
+    resources
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Builds the short status text shown after opening a session.
