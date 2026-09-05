@@ -210,8 +210,7 @@ pub fn is_summary_message(message: &llm::Message) -> bool {
     let llm::Message::User(message) = message else {
         return false;
     };
-    let text = user_text(message);
-    text.trim_start().starts_with(SUMMARY_OPEN) && text.contains(SUMMARY_CLOSE)
+    previous_summary_text(message).is_some()
 }
 
 /// Computes accumulated usage, including a persisted compaction prefix.
@@ -259,7 +258,10 @@ pub fn serialize_messages(messages: &[llm::Message]) -> String {
 /// Serializes one message in the loss-bounded summary-source format.
 pub fn serialize_message(message: &llm::Message) -> String {
     match message {
-        llm::Message::User(message) => format!("[User]: {}", user_text(message)),
+        llm::Message::User(message) => previous_summary_text(message).map_or_else(
+            || format!("[User]: {}", user_text(message)),
+            |summary| format!("[Previous conversation summary]: {summary}"),
+        ),
         llm::Message::Assistant(message) => serialize_assistant(message),
         llm::Message::ToolResult(message) => serialize_tool_result(message),
     }
@@ -318,7 +320,13 @@ fn serialize_tool_result(message: &llm::ToolResultMessage) -> String {
     format!("[Tool result {}]: {content}", message.tool_name)
 }
 
-fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
+/// Uses the same context-usage source as the legacy client.
+///
+/// Before a compaction, a provider-reported assistant token count is the best
+/// available measurement. Once a summary marker is present, it no longer
+/// describes the rewritten context, so use the full compaction serialization
+/// instead. Keeping this public lets the status UI and auto-compaction agree.
+pub fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
     if messages.iter().any(is_summary_message) {
         return estimate_messages_tokens(messages);
     }
@@ -383,6 +391,13 @@ fn user_text(message: &llm::UserMessage) -> String {
             .collect::<Vec<_>>()
             .join(" "),
     }
+}
+
+fn previous_summary_text(message: &llm::UserMessage) -> Option<String> {
+    let text = user_text(message);
+    let after_open = text.trim_start().strip_prefix(SUMMARY_OPEN)?;
+    let (summary, _) = after_open.split_once(SUMMARY_CLOSE)?;
+    Some(summary.trim().to_owned())
 }
 
 fn generate_summary(
@@ -510,6 +525,32 @@ mod tests {
         let serialized = serialize_message(&message);
         assert!(serialized.contains("characters truncated"));
         assert!(serialized.is_char_boundary(serialized.len()));
+    }
+
+    #[test]
+    fn recompact_serialization_labels_prior_summary_without_its_context_wrapper() {
+        let marker = summary_message("previous decisions", 1);
+
+        assert_eq!(
+            serialize_message(&marker),
+            "[Previous conversation summary]: previous decisions"
+        );
+    }
+
+    #[test]
+    fn measured_tokens_switches_to_full_serialization_after_compaction() {
+        let mut measured = assistant("response");
+        if let llm::Message::Assistant(message) = &mut measured {
+            message.usage.total_tokens = 99;
+        }
+        let messages = vec![user("request"), measured.clone()];
+        assert_eq!(measured_context_tokens(&messages), 99);
+
+        let compacted = vec![summary_message("prior work", 1), measured];
+        assert_eq!(
+            measured_context_tokens(&compacted),
+            estimate_messages_tokens(&compacted)
+        );
     }
 
     #[test]

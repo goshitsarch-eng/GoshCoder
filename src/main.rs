@@ -2582,18 +2582,12 @@ fn runtime_sidebar(
     state: &agent::State,
     view: &InteractiveView,
 ) -> Vec<state::SidebarLine> {
-    let context = llm::Context {
-        system_prompt: state.system_prompt.clone(),
-        messages: state.messages.clone(),
-        tools: state.tools.iter().map(agent::Tool::llm_tool).collect(),
-    };
-    let estimate = stream::estimate_context_tokens(&context);
+    let context_tokens = compaction::measured_context_tokens(&state.messages);
     let limit = state.model.context_window;
     let percent = if limit == 0 {
         0
     } else {
-        estimate
-            .tokens
+        context_tokens
             .saturating_mul(100)
             .saturating_div(limit)
             .min(100) as u8
@@ -2632,11 +2626,11 @@ fn runtime_sidebar(
         state::SidebarLine::section("Context"),
         state::SidebarLine::progress(percent),
         state::SidebarLine::meta(if limit == 0 {
-            format!("{} tokens", compact_number(estimate.tokens))
+            format!("{} tokens", compact_number(context_tokens))
         } else {
             format!(
                 "{} / {} tokens",
-                compact_number(estimate.tokens),
+                compact_number(context_tokens),
                 compact_number(limit)
             )
         }),
@@ -2678,12 +2672,7 @@ fn runtime_sidebar(
 
 fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String {
     let state = prepared.runtime.agent().state();
-    let context = llm::Context {
-        system_prompt: state.system_prompt.clone(),
-        messages: state.messages.clone(),
-        tools: state.tools.iter().map(agent::Tool::llm_tool).collect(),
-    };
-    let estimate = stream::estimate_context_tokens(&context);
+    let context_tokens = compaction::measured_context_tokens(&state.messages);
     let storage = if prepared.runtime.recording() {
         prepared.runtime.id().map_or_else(
             || "recording".to_owned(),
@@ -2696,11 +2685,11 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
     };
     let context_limit = state.model.context_window;
     let context = if context_limit == 0 {
-        format!("{} tokens", compact_number(estimate.tokens))
+        format!("{} tokens", compact_number(context_tokens))
     } else {
         format!(
             "{} / {} tokens",
-            compact_number(estimate.tokens),
+            compact_number(context_tokens),
             compact_number(context_limit)
         )
     };
