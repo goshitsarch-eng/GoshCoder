@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod llm;
 pub mod markdown;
+pub mod prompts;
 pub mod ralph;
 pub mod resources;
 pub mod session;
@@ -65,6 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Some("sessions") => sessions::command(&args[1..]),
+        Some("prompts") => prompts::command(&args[1..]),
         Some("chat") | None => run_interactive(),
         Some(argument) if argument.starts_with('-') => run_interactive(),
         Some(command) => Err(format!(
