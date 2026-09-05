@@ -365,10 +365,10 @@ static SIDEBAR_ELLIPSIS: SidebarLine = SidebarLine {
 
 fn sidebar_line(line: &SidebarLine) -> Line<'static> {
     let value = sanitize(&line.value);
-    if matches!(line.kind, SidebarKind::Meta) && value.is_empty() {
+    if matches!(&line.kind, SidebarKind::Meta) && value.is_empty() {
         return Line::from(Span::styled("  …", Style::default().fg(MUTED)));
     }
-    match line.kind {
+    match &line.kind {
         SidebarKind::Title | SidebarKind::Section => Line::from(Span::styled(
             format!("  {}", value),
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -395,7 +395,7 @@ fn sidebar_line(line: &SidebarLine) -> Line<'static> {
         )),
         SidebarKind::Progress(percent) => {
             let cells = 24usize;
-            let filled = min(cells, cells * percent as usize / 100);
+            let filled = min(cells, cells * *percent as usize / 100);
             Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled("━".repeat(filled), Style::default().fg(ACCENT)),
@@ -403,24 +403,31 @@ fn sidebar_line(line: &SidebarLine) -> Line<'static> {
             ])
         }
         SidebarKind::Todo { complete } => {
-            let marker = if complete { "☑" } else { "☐" };
-            let color = if complete { GREEN } else { MUTED };
+            let marker = if *complete { "☑" } else { "☐" };
+            let color = if *complete { GREEN } else { MUTED };
             Line::from(vec![
                 Span::styled(format!("  {marker} "), Style::default().fg(color)),
                 Span::styled(
                     value,
-                    Style::default().fg(if complete { MUTED } else { TEXT }),
+                    Style::default().fg(if *complete { MUTED } else { TEXT }),
                 ),
             ])
         }
         SidebarKind::File { status } => {
             let (prefix, color) = match status {
-                FileStatus::Added | FileStatus::Untracked => ("A ", GREEN),
-                FileStatus::Modified => ("M ", AMBER),
-                FileStatus::Deleted => ("D ", RED),
+                FileStatus::Raw(status) => {
+                    let color = if status.contains('?') || status.contains('A') {
+                        GREEN
+                    } else if status.contains('D') {
+                        RED
+                    } else {
+                        AMBER
+                    };
+                    (status.clone(), color)
+                }
             };
             Line::from(vec![
-                Span::styled(format!("  {prefix}"), Style::default().fg(color)),
+                Span::styled(format!("  {prefix:<2} "), Style::default().fg(color)),
                 Span::styled(truncate_left(&value, 32), Style::default().fg(MUTED)),
             ])
         }

@@ -41,8 +41,9 @@ pub mod webaccess;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, BufRead, IsTerminal, Write},
-    process::Command,
+    io::{self, BufRead, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -87,6 +88,11 @@ supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
 the remaining provider extensions and interactive commands are still being
 migrated from the previous implementation.
 "#;
+
+const SIDEBAR_GIT_TIMEOUT: Duration = Duration::from_secs(2);
+const SIDEBAR_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SIDEBAR_GIT_MAX_OUTPUT_BYTES: usize = 1 << 20;
+const SIDEBAR_GIT_MAX_CHANGES: usize = 50;
 
 fn main() {
     if let Err(error) = run() {
@@ -790,6 +796,22 @@ struct InteractiveView {
     pending_btw_turn_start: Option<usize>,
     resume_sessions: Option<Vec<sessionlog::SessionInfo>>,
     resume_scan: Option<Receiver<Result<Vec<sessionlog::SessionInfo>, String>>>,
+    git_status: Option<SidebarGitInfo>,
+    git_status_root: Option<PathBuf>,
+    git_status_scan: Option<Receiver<SidebarGitInfo>>,
+    git_status_last_requested: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SidebarGitInfo {
+    branch: Option<String>,
+    changes: Vec<SidebarGitChange>,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarGitChange {
+    status: state::FileStatus,
+    path: String,
 }
 
 impl Default for InteractiveView {
@@ -805,6 +827,10 @@ impl Default for InteractiveView {
             pending_btw_turn_start: None,
             resume_sessions: None,
             resume_scan: None,
+            git_status: None,
+            git_status_root: None,
+            git_status_scan: None,
+            git_status_last_requested: None,
         }
     }
 }
@@ -3029,6 +3055,140 @@ fn refresh_resume_palette(
     });
 }
 
+fn refresh_sidebar_git(view: &mut InteractiveView, workspace: &Path) {
+    if view.git_status_root.as_deref() != Some(workspace) {
+        view.git_status = None;
+        view.git_status_root = Some(workspace.to_path_buf());
+        view.git_status_scan = None;
+        view.git_status_last_requested = None;
+    }
+
+    let completed_scan =
+        view.git_status_scan
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+            });
+    if let Some(result) = completed_scan {
+        view.git_status_scan = None;
+        if let Some(result) = result {
+            view.git_status = Some(result);
+        }
+    }
+
+    let refresh_due = view
+        .git_status_last_requested
+        .is_none_or(|requested| requested.elapsed() >= SIDEBAR_GIT_REFRESH_INTERVAL);
+    if view.git_status_scan.is_none() && refresh_due {
+        let workspace = workspace.to_path_buf();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(scan_sidebar_git(&workspace));
+        });
+        view.git_status_scan = Some(receiver);
+        view.git_status_last_requested = Some(Instant::now());
+    }
+}
+
+fn scan_sidebar_git(workspace: &Path) -> SidebarGitInfo {
+    let mut command = Command::new("git");
+    command
+        .args(["status", "--short", "--branch", "--untracked-files=normal"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return SidebarGitInfo::default();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return SidebarGitInfo::default();
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut output = Vec::with_capacity(SIDEBAR_GIT_MAX_OUTPUT_BYTES);
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if output.len() < SIDEBAR_GIT_MAX_OUTPUT_BYTES => {
+                    let remaining = SIDEBAR_GIT_MAX_OUTPUT_BYTES - output.len();
+                    output.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Ok(_) => {}
+            }
+        }
+        let _ = sender.send(output);
+    });
+
+    let deadline = Instant::now() + SIDEBAR_GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break None,
+        }
+    };
+    let output = receiver
+        .recv_timeout(Duration::from_millis(250))
+        .unwrap_or_default();
+    if !status.is_some_and(|status| status.success()) {
+        return SidebarGitInfo::default();
+    }
+    parse_sidebar_git_status(&String::from_utf8_lossy(&output))
+}
+
+fn parse_sidebar_git_status(output: &str) -> SidebarGitInfo {
+    let mut info = SidebarGitInfo::default();
+    for (index, line) in output.lines().enumerate() {
+        if index == 0
+            && let Some(branch) = line.strip_prefix("## ")
+        {
+            let branch = branch.split_once("...").map_or(branch, |(name, _)| name);
+            info.branch = Some(if branch.starts_with("HEAD ") {
+                "detached HEAD".to_owned()
+            } else {
+                branch.to_owned()
+            });
+            continue;
+        }
+        let Some((status, path)) = parse_sidebar_git_change(line) else {
+            continue;
+        };
+        if info.changes.len() >= SIDEBAR_GIT_MAX_CHANGES {
+            continue;
+        }
+        info.changes.push(SidebarGitChange {
+            status: state::FileStatus::Raw(status),
+            path,
+        });
+    }
+    info
+}
+
+fn parse_sidebar_git_change(line: &str) -> Option<(String, String)> {
+    if line.len() < 3 {
+        return None;
+    }
+    let status = line[..2].trim().to_owned();
+    let path = line[3..]
+        .trim()
+        .split_once(" -> ")
+        .map_or_else(|| line[3..].trim(), |(_, renamed)| renamed)
+        .trim_matches('"')
+        .replace('\\', "/");
+    (!path.is_empty()).then_some((status, path))
+}
+
 fn resume_picker_suggestions(
     sessions: &[sessionlog::SessionInfo],
     query: &str,
@@ -3173,6 +3333,7 @@ fn refresh_runtime_app(
         state.model.id
     );
     app.status = interactive_status(view, app.streaming);
+    refresh_sidebar_git(view, &sidebar_workspace_path(prepared));
     app.sidebar = runtime_sidebar(prepared, &state, view);
 }
 
@@ -3423,11 +3584,7 @@ fn runtime_sidebar(
     } else {
         "not recording".to_owned()
     };
-    let cwd = prepared
-        .workspace
-        .as_ref()
-        .map(|workspace| workspace.root().display().to_string())
-        .unwrap_or_else(|| prepared.config.workdir.display().to_string());
+    let cwd = sidebar_workspace_path(prepared).display().to_string();
     let planner_state = prepared
         .planner
         .as_ref()
@@ -3487,14 +3644,49 @@ fn runtime_sidebar(
                 .map(|item| state::SidebarLine::todo(item.completed, item.text)),
         );
     }
+    if let Some(git) = view.git_status.as_ref()
+        && !git.changes.is_empty()
+    {
+        lines.extend([
+            state::SidebarLine::blank(),
+            state::SidebarLine::section("Modified Files"),
+        ]);
+        for (index, change) in git.changes.iter().enumerate() {
+            if index >= 10 {
+                lines.push(state::SidebarLine::meta(format!(
+                    "… {} more files",
+                    git.changes.len() - index
+                )));
+                break;
+            }
+            lines.push(state::SidebarLine::file(
+                change.status.clone(),
+                change.path.clone(),
+            ));
+        }
+    }
+    let branch = view
+        .git_status
+        .as_ref()
+        .and_then(|git| git.branch.as_deref())
+        .unwrap_or("not a git repo");
     lines.extend([
         state::SidebarLine::blank(),
         state::SidebarLine::section("Workspace"),
+        state::SidebarLine::meta(branch),
         state::SidebarLine::path(cwd),
         state::SidebarLine::blank(),
         state::SidebarLine::brand(format!("● GoshCoder v{}", ui_version())),
     ]);
     lines
+}
+
+fn sidebar_workspace_path(prepared: &runtime::PreparedSession) -> PathBuf {
+    prepared
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root().to_path_buf())
+        .unwrap_or_else(|| prepared.config.workdir.clone())
 }
 
 fn planner_sidebar_details(
@@ -4432,6 +4624,40 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn sidebar_git_status_keeps_branch_rename_and_porcelain_state() {
+        let info = parse_sidebar_git_status(
+            "## feature/sidebar...origin/feature/sidebar [ahead 1]\n\
+             MM src/main.rs\n\
+             ?? notes.txt\n\
+             R  old name.rs -> new name.rs\n",
+        );
+
+        assert_eq!(info.branch.as_deref(), Some("feature/sidebar"));
+        assert_eq!(info.changes.len(), 3);
+        assert_eq!(
+            info.changes[0].status,
+            state::FileStatus::Raw("MM".to_owned())
+        );
+        assert_eq!(info.changes[0].path, "src/main.rs");
+        assert_eq!(
+            info.changes[1].status,
+            state::FileStatus::Raw("??".to_owned())
+        );
+        assert_eq!(
+            info.changes[2].status,
+            state::FileStatus::Raw("R".to_owned())
+        );
+        assert_eq!(info.changes[2].path, "new name.rs");
+    }
+
+    #[test]
+    fn sidebar_git_status_labels_detached_heads() {
+        let info = parse_sidebar_git_status("## HEAD (detached at 1234567)\n");
+
+        assert_eq!(info.branch.as_deref(), Some("detached HEAD"));
     }
 
     #[test]

@@ -103,10 +103,8 @@ pub struct SidebarLine {
     pub value: String,
 }
 
-// The sidebar accepts every status rendered by the previous terminal UI; the
-// early Ratatui shell only populates the fields it currently owns.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// The sidebar accepts every status rendered by the previous terminal UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SidebarKind {
     Title,
     Section,
@@ -121,13 +119,11 @@ pub enum SidebarKind {
     Blank,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Untracked,
+    /// The two-column porcelain status from Git, retained verbatim so staged,
+    /// renamed, conflicted, and mixed states do not lose information.
+    Raw(String),
 }
 
 impl App {
@@ -915,6 +911,13 @@ impl SidebarLine {
     pub fn todo(complete: bool, value: impl Into<String>) -> Self {
         Self {
             kind: SidebarKind::Todo { complete },
+            value: value.into(),
+        }
+    }
+
+    pub fn file(status: FileStatus, value: impl Into<String>) -> Self {
+        Self {
+            kind: SidebarKind::File { status },
             value: value.into(),
         }
     }
