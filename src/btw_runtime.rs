@@ -624,6 +624,7 @@ impl Runtime {
                 agent::RequestOptions {
                     cancellation,
                     thinking_level,
+                    thinking_budgets: None,
                     session_id,
                     assistant_event_listener: None,
                 },

@@ -201,9 +201,9 @@ The built-in catalog covers all bundled models across nine wire protocols:
 
 The live Rust responder currently supports `openai-completions`,
 `anthropic-messages`, `openai-responses`, `azure-openai-responses`,
-`openai-codex-responses`, and `bedrock-converse-stream`. Google Generative AI,
-Google Vertex, and Mistral Conversations are still being migrated before the Go
-implementation is retired.
+`openai-codex-responses`, `google-generative-ai`, and
+`bedrock-converse-stream`. Google Vertex and Mistral Conversations are still
+being migrated before the Go implementation is retired.
 
 Model data is generated from the pi reference into `catalog.json`, which is
 replaced wholesale on every regeneration. Two hand-maintained files sit beside

@@ -187,6 +187,7 @@ pub type AssistantEventListener =
 pub struct RequestOptions {
     pub cancellation: CancellationToken,
     pub thinking_level: llm::ThinkingLevel,
+    pub thinking_budgets: Option<llm::ThinkingBudgets>,
     pub session_id: String,
     /// Streaming responders call this for each normalized provider event.
     /// Responders that only return a completed message can leave it unused.
@@ -199,6 +200,7 @@ impl fmt::Debug for RequestOptions {
             .debug_struct("RequestOptions")
             .field("cancellation", &self.cancellation)
             .field("thinking_level", &self.thinking_level)
+            .field("thinking_budgets", &self.thinking_budgets)
             .field("session_id", &self.session_id)
             .field(
                 "has_assistant_event_listener",
@@ -839,6 +841,7 @@ impl Agent {
                 RequestOptions {
                     cancellation: cancellation.clone(),
                     thinking_level,
+                    thinking_budgets: None,
                     session_id: self.inner.session_id.clone(),
                     assistant_event_listener: Some(assistant_event_listener),
                 },

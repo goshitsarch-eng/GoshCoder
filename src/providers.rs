@@ -14,6 +14,7 @@
 //! - Azure OpenAI Responses (`azure-openai-responses`)
 //! - OpenAI Codex Responses (`openai-codex-responses`)
 //! - Anthropic Messages (`anthropic-messages`)
+//! - Google Generative AI (`google-generative-ai`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
 //! JSON parser, retry classification, token accounting, and normalized
@@ -25,7 +26,10 @@ use std::{
     error::Error,
     fmt,
     io::Read,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -45,15 +49,19 @@ pub const API_OPENAI_RESPONSES: &str = "openai-responses";
 pub const API_AZURE_OPENAI_RESPONSES: &str = "azure-openai-responses";
 pub const API_OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
+pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
 
 const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const DEFAULT_GOOGLE_GENERATIVE_AI_BASE_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta";
 const CODEX_JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const AZURE_MANAGED_HOST_SUFFIXES: &[&str] = &[
     ".openai.azure.com",
     ".cognitiveservices.azure.com",
     ".ai.azure.com",
 ];
+static GOOGLE_TOOL_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// The maximum request attempts after the initial request that callers may
 /// configure.  A bounded value prevents a bad configuration from creating an
@@ -70,6 +78,7 @@ pub enum ProviderProtocol {
     AzureOpenAiResponses,
     OpenAiCodexResponses,
     AnthropicMessages,
+    GoogleGenerativeAi,
     BedrockConverseStream,
 }
 
@@ -81,6 +90,7 @@ impl ProviderProtocol {
             API_AZURE_OPENAI_RESPONSES => Ok(Self::AzureOpenAiResponses),
             API_OPENAI_CODEX_RESPONSES => Ok(Self::OpenAiCodexResponses),
             API_ANTHROPIC_MESSAGES => Ok(Self::AnthropicMessages),
+            API_GOOGLE_GENERATIVE_AI => Ok(Self::GoogleGenerativeAi),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
@@ -93,6 +103,9 @@ impl ProviderProtocol {
             Self::AzureOpenAiResponses => "responses",
             Self::OpenAiCodexResponses => "codex/responses",
             Self::AnthropicMessages => "v1/messages",
+            Self::GoogleGenerativeAi => {
+                unreachable!("Google uses a model-scoped GenerateContent endpoint")
+            }
             Self::BedrockConverseStream => {
                 unreachable!("Bedrock uses its own signed request builder")
             }
@@ -490,6 +503,7 @@ impl ProviderResponderFactory {
         let bedrock_cancellation = bedrock::BedrockCancellation::default();
         let agent_cancellation = options.cancellation.clone();
         let reasoning = options.thinking_level;
+        let thinking_budgets = options.thinking_budgets;
         let events = bedrock::stream_bedrock_simple(
             model.clone(),
             context.clone(),
@@ -505,7 +519,7 @@ impl ProviderResponderFactory {
                     ..bedrock::BedrockOptions::default()
                 },
                 reasoning: Some(reasoning),
-                thinking_budgets: None,
+                thinking_budgets,
             },
         );
 
@@ -545,6 +559,7 @@ impl ProviderResponderFactory {
             ProviderProtocol::OpenAiCompletions
             | ProviderProtocol::OpenAiResponses
             | ProviderProtocol::AnthropicMessages
+            | ProviderProtocol::GoogleGenerativeAi
             | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
         };
         let payload = match protocol {
@@ -570,6 +585,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::AnthropicMessages => {
                 build_anthropic_messages_request(model, context, &options)
             }
+            ProviderProtocol::GoogleGenerativeAi => Ok(build_google_generate_content_request(
+                model, context, &options,
+            )),
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
@@ -611,6 +629,9 @@ impl ProviderResponderFactory {
             )?,
             ProviderProtocol::AnthropicMessages => {
                 consume_anthropic_messages(response, model, &options.cancellation, emitter)?
+            }
+            ProviderProtocol::GoogleGenerativeAi => {
+                consume_google_generate_content(response, model, &options.cancellation, emitter)?
             }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
@@ -777,6 +798,9 @@ fn protocol_endpoint(
         ProviderProtocol::OpenAiCodexResponses => {
             return codex_responses_endpoint(&model.base_url);
         }
+        ProviderProtocol::GoogleGenerativeAi => {
+            return google_generate_content_endpoint(model);
+        }
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder");
         }
@@ -796,6 +820,24 @@ fn protocol_endpoint(
 fn append_endpoint_suffix(endpoint: &mut Url, suffix: &str) {
     let prefix = endpoint.path().trim_end_matches('/');
     endpoint.set_path(&format!("{prefix}/{suffix}"));
+}
+
+fn google_generate_content_endpoint(model: &llm::Model) -> Result<Url> {
+    let base_url = if model.base_url.trim().is_empty() {
+        DEFAULT_GOOGLE_GENERATIVE_AI_BASE_URL
+    } else {
+        model.base_url.trim()
+    };
+    let mut endpoint = Url::parse(base_url).map_err(|_| ProviderAdapterError::InvalidBaseUrl)?;
+    if endpoint.host_str().is_none() {
+        return Err(ProviderAdapterError::InvalidBaseUrl);
+    }
+    append_endpoint_suffix(
+        &mut endpoint,
+        &format!("models/{}:streamGenerateContent", model.id),
+    );
+    endpoint.set_query(Some("alt=sse"));
+    Ok(endpoint)
 }
 
 fn azure_openai_responses_endpoint(
@@ -1001,7 +1043,8 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCompletions
         | ProviderProtocol::OpenAiResponses
         | ProviderProtocol::AzureOpenAiResponses
-        | ProviderProtocol::OpenAiCodexResponses => {
+        | ProviderProtocol::OpenAiCodexResponses
+        | ProviderProtocol::GoogleGenerativeAi => {
             set_header_override(
                 &mut overrides,
                 "accept".to_owned(),
@@ -1028,14 +1071,18 @@ fn build_request_headers(
     let api_key = credentials.api_key_value().unwrap_or_default();
     let ambient = api_key == catalog::AUTHENTICATED_SENTINEL;
     match protocol {
-        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses
+        ProviderProtocol::AzureOpenAiResponses
+        | ProviderProtocol::OpenAiCodexResponses
+        | ProviderProtocol::GoogleGenerativeAi
             if ambient =>
         {
             return Err(ProviderAdapterError::AmbientCredentialsUnsupported {
                 provider: model.provider.clone(),
             });
         }
-        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses
+        ProviderProtocol::AzureOpenAiResponses
+        | ProviderProtocol::OpenAiCodexResponses
+        | ProviderProtocol::GoogleGenerativeAi
             if api_key.is_empty() =>
         {
             return Err(ProviderAdapterError::MissingApiKey {
@@ -1061,6 +1108,13 @@ fn build_request_headers(
                 set_header_override(
                     &mut overrides,
                     "x-api-key".to_owned(),
+                    Some(api_key.to_owned()),
+                );
+            }
+            ProviderProtocol::GoogleGenerativeAi => {
+                set_header_override(
+                    &mut overrides,
+                    "x-goog-api-key".to_owned(),
                     Some(api_key.to_owned()),
                 );
             }
@@ -1144,6 +1198,7 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCompletions
         | ProviderProtocol::OpenAiResponses
         | ProviderProtocol::AnthropicMessages
+        | ProviderProtocol::GoogleGenerativeAi
         | ProviderProtocol::BedrockConverseStream => {}
     }
 
@@ -1154,7 +1209,9 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
             has_authorization
         }
-        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => true,
+        ProviderProtocol::AzureOpenAiResponses
+        | ProviderProtocol::OpenAiCodexResponses
+        | ProviderProtocol::GoogleGenerativeAi => true,
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
@@ -1521,6 +1578,678 @@ fn openai_user_content(content: &llm::UserContent, supports_images: bool) -> Val
                 .collect(),
         ),
     }
+}
+
+/// Builds the REST payload for Gemini's model-scoped
+/// `streamGenerateContent` endpoint.
+///
+/// Unlike the Google SDK, the REST endpoint expects generation settings at
+/// the top level (or nested in `generationConfig`), not an SDK `config`
+/// object. Keeping this shape here makes proxy endpoints work too.
+fn build_google_generate_content_request(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: &agent::RequestOptions,
+) -> Value {
+    let mut body = Map::new();
+    body.insert(
+        "contents".to_owned(),
+        Value::Array(google_contents(model, context)),
+    );
+    if !context.system_prompt.is_empty() {
+        body.insert(
+            "systemInstruction".to_owned(),
+            json!({"parts": [{"text": context.system_prompt}]}),
+        );
+    }
+    if !context.tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(google_function_tools(&context.tools)),
+        );
+        if google_uses_validated_tool_mode(model, &context.tools) {
+            body.insert(
+                "toolConfig".to_owned(),
+                json!({"functionCallingConfig": {"mode": "VALIDATED"}}),
+            );
+        }
+    }
+
+    let mut generation_config = Map::new();
+    if let Some(max_tokens) = requested_max_tokens(model, context) {
+        generation_config.insert(
+            "maxOutputTokens".to_owned(),
+            Value::Number(max_tokens.into()),
+        );
+    }
+    if let Some(thinking_config) = google_thinking_config(
+        model,
+        &options.thinking_level,
+        options.thinking_budgets.as_ref(),
+    ) {
+        generation_config.insert("thinkingConfig".to_owned(), thinking_config);
+    }
+    if !generation_config.is_empty() {
+        body.insert(
+            "generationConfig".to_owned(),
+            Value::Object(generation_config),
+        );
+    }
+    Value::Object(body)
+}
+
+fn google_function_tools(tools: &[llm::Tool]) -> Vec<Value> {
+    let declarations = tools
+        .iter()
+        .map(|tool| {
+            let mut declaration = Map::from_iter([
+                ("name".to_owned(), Value::String(tool.name.clone())),
+                (
+                    "description".to_owned(),
+                    Value::String(tool.description.clone()),
+                ),
+            ]);
+            if !tool.parameters.is_null() {
+                declaration.insert("parametersJsonSchema".to_owned(), tool.parameters.clone());
+            }
+            Value::Object(declaration)
+        })
+        .collect::<Vec<_>>();
+    vec![json!({"functionDeclarations": declarations})]
+}
+
+fn google_uses_validated_tool_mode(model: &llm::Model, tools: &[llm::Tool]) -> bool {
+    let supports_strict = google_supports_strict_tool_sampling(&model.id);
+    for tool in tools {
+        // The source client treats an unsupported `strict: "require"` hint
+        // as a best-effort request for Google models that lack VALIDATED mode.
+        if matches!(
+            requested_json_schema_strict(tool, supports_strict),
+            Ok(Some(true))
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn google_contents(model: &llm::Model, context: &llm::Context) -> Vec<Value> {
+    let requires_tool_call_id = google_requires_tool_call_id(&model.id);
+    let mut contents = Vec::new();
+    for message in transform_google_messages(&context.messages, model) {
+        match message {
+            llm::Message::User(user) => {
+                let parts = google_user_parts(&user.content, model.supports_images());
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "user", "parts": parts}));
+                }
+            }
+            llm::Message::Assistant(assistant)
+                if matches!(
+                    assistant.stop_reason.as_str(),
+                    stream::STOP_ERROR | stream::STOP_ABORTED
+                ) => {}
+            llm::Message::Assistant(assistant) => {
+                let parts = google_assistant_parts(model, &assistant, requires_tool_call_id);
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "model", "parts": parts}));
+                }
+            }
+            llm::Message::ToolResult(result) => {
+                google_append_tool_result(&mut contents, model, &result, requires_tool_call_id);
+            }
+        }
+    }
+    contents
+}
+
+/// Replays history in the form accepted by Gemini and Google-hosted models.
+///
+/// This is intentionally separate from the OpenAI-shaped conversion: Google
+/// thought signatures are opaque, only valid for an identical source model,
+/// and Google requires a complete function-response sequence.
+fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> Vec<llm::Message> {
+    let image_aware = messages
+        .iter()
+        .cloned()
+        .map(|message| downgrade_google_message_images(message, model))
+        .collect::<Vec<_>>();
+    let mut tool_call_ids = BTreeMap::new();
+    let mut transformed = Vec::with_capacity(image_aware.len());
+
+    for message in image_aware {
+        match message {
+            llm::Message::Assistant(assistant) => {
+                let same_model = assistant.provider == model.provider
+                    && assistant.api == model.api
+                    && assistant.model == model.id;
+                let mut copy = (*assistant).clone();
+                copy.content = copy
+                    .content
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        llm::ContentBlock::Thinking(thinking) => {
+                            if thinking.redacted {
+                                return same_model.then_some(llm::ContentBlock::Thinking(thinking));
+                            }
+                            if same_model && !thinking.thinking_signature.is_empty() {
+                                return Some(llm::ContentBlock::Thinking(thinking));
+                            }
+                            if thinking.thinking.trim().is_empty() {
+                                return None;
+                            }
+                            if same_model {
+                                Some(llm::ContentBlock::Thinking(thinking))
+                            } else {
+                                Some(llm::ContentBlock::text(thinking.thinking))
+                            }
+                        }
+                        llm::ContentBlock::ToolCall(mut tool_call) => {
+                            if !same_model {
+                                tool_call.thought_signature.clear();
+                                if google_requires_tool_call_id(&model.id) {
+                                    let normalized = google_normalize_tool_call_id(&tool_call.id);
+                                    if normalized != tool_call.id {
+                                        tool_call_ids
+                                            .insert(tool_call.id.clone(), normalized.clone());
+                                        tool_call.id = normalized;
+                                    }
+                                }
+                            }
+                            Some(llm::ContentBlock::ToolCall(tool_call))
+                        }
+                        other => Some(other),
+                    })
+                    .collect();
+                transformed.push(llm::Message::Assistant(Box::new(copy)));
+            }
+            llm::Message::ToolResult(tool_result) => {
+                let mut copy = (*tool_result).clone();
+                if let Some(normalized) = tool_call_ids.get(&copy.tool_call_id) {
+                    copy.tool_call_id = normalized.clone();
+                }
+                transformed.push(llm::Message::ToolResult(Box::new(copy)));
+            }
+            other => transformed.push(other),
+        }
+    }
+
+    let mut result = Vec::with_capacity(transformed.len());
+    let mut pending_tool_calls = Vec::<llm::ToolCall>::new();
+    let mut existing_tool_results = BTreeSet::<String>::new();
+    for message in transformed {
+        match message {
+            llm::Message::Assistant(assistant) => {
+                flush_missing_google_tool_results(
+                    &mut result,
+                    &mut pending_tool_calls,
+                    &mut existing_tool_results,
+                );
+                if matches!(
+                    assistant.stop_reason.as_str(),
+                    stream::STOP_ERROR | stream::STOP_ABORTED
+                ) {
+                    continue;
+                }
+                let tool_calls = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        llm::ContentBlock::ToolCall(tool_call) => Some(tool_call.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if !tool_calls.is_empty() {
+                    pending_tool_calls = tool_calls;
+                    existing_tool_results.clear();
+                }
+                result.push(llm::Message::Assistant(assistant));
+            }
+            llm::Message::ToolResult(tool_result) => {
+                existing_tool_results.insert(tool_result.tool_call_id.clone());
+                result.push(llm::Message::ToolResult(tool_result));
+            }
+            llm::Message::User(user) => {
+                flush_missing_google_tool_results(
+                    &mut result,
+                    &mut pending_tool_calls,
+                    &mut existing_tool_results,
+                );
+                result.push(llm::Message::User(user));
+            }
+        }
+    }
+    flush_missing_google_tool_results(
+        &mut result,
+        &mut pending_tool_calls,
+        &mut existing_tool_results,
+    );
+    result
+}
+
+fn downgrade_google_message_images(message: llm::Message, model: &llm::Model) -> llm::Message {
+    if model.supports_images() {
+        return message;
+    }
+    match message {
+        llm::Message::User(mut user) => {
+            if let llm::UserContent::Blocks(blocks) = user.content {
+                user.content = llm::UserContent::Blocks(google_replace_images_with_placeholder(
+                    blocks,
+                    "(image omitted: model does not support images)",
+                ));
+            }
+            llm::Message::User(user)
+        }
+        llm::Message::ToolResult(tool_result) => {
+            let mut copy = (*tool_result).clone();
+            copy.content = google_replace_images_with_placeholder(
+                copy.content,
+                "(tool image omitted: model does not support images)",
+            );
+            llm::Message::ToolResult(Box::new(copy))
+        }
+        other => other,
+    }
+}
+
+fn google_replace_images_with_placeholder(
+    blocks: Vec<llm::ContentBlock>,
+    placeholder: &str,
+) -> Vec<llm::ContentBlock> {
+    let mut output = Vec::with_capacity(blocks.len());
+    let mut previous_was_placeholder = false;
+    for block in blocks {
+        if matches!(block, llm::ContentBlock::Image(_)) {
+            if !previous_was_placeholder {
+                output.push(llm::ContentBlock::text(placeholder));
+            }
+            previous_was_placeholder = true;
+            continue;
+        }
+        previous_was_placeholder =
+            matches!(&block, llm::ContentBlock::Text(text) if text.text == placeholder);
+        output.push(block);
+    }
+    output
+}
+
+fn flush_missing_google_tool_results(
+    result: &mut Vec<llm::Message>,
+    pending_tool_calls: &mut Vec<llm::ToolCall>,
+    existing_tool_results: &mut BTreeSet<String>,
+) {
+    for tool_call in pending_tool_calls.drain(..) {
+        if !existing_tool_results.contains(&tool_call.id) {
+            result.push(llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: tool_call.id,
+                tool_name: tool_call.name,
+                content: vec![llm::ContentBlock::text("No result provided")],
+                is_error: true,
+                timestamp: now_millis(),
+                ..llm::ToolResultMessage::default()
+            })));
+        }
+    }
+    existing_tool_results.clear();
+}
+
+fn google_normalize_tool_call_id(id: &str) -> String {
+    id.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect()
+}
+
+fn google_user_parts(content: &llm::UserContent, supports_images: bool) -> Vec<Value> {
+    match content {
+        llm::UserContent::Text(text) => vec![google_text_part(text, false, None)],
+        llm::UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                llm::ContentBlock::Text(text) => Some(google_text_part(&text.text, false, None)),
+                llm::ContentBlock::Image(image) if supports_images => Some(json!({
+                    "inlineData": {"mimeType": image.mime_type, "data": image.data}
+                })),
+                llm::ContentBlock::Image(_)
+                | llm::ContentBlock::Thinking(_)
+                | llm::ContentBlock::ToolCall(_) => None,
+            })
+            .collect(),
+    }
+}
+
+fn google_assistant_parts(
+    model: &llm::Model,
+    assistant: &llm::AssistantMessage,
+    requires_tool_call_id: bool,
+) -> Vec<Value> {
+    let same_model = assistant.provider == model.provider && assistant.model == model.id;
+    let mut parts = Vec::new();
+    for block in &assistant.content {
+        match block {
+            llm::ContentBlock::Text(text) => {
+                let signature = google_replay_signature(same_model, &text.text_signature);
+                if text.text.trim().is_empty() && signature.is_none() {
+                    continue;
+                }
+                parts.push(google_text_part(&text.text, false, signature));
+            }
+            llm::ContentBlock::Thinking(thinking) if same_model => {
+                let signature = google_replay_signature(same_model, &thinking.thinking_signature);
+                if thinking.thinking.trim().is_empty() && signature.is_none() {
+                    continue;
+                }
+                parts.push(google_text_part(&thinking.thinking, true, signature));
+            }
+            llm::ContentBlock::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
+                parts.push(google_text_part(&thinking.thinking, false, None));
+            }
+            llm::ContentBlock::ToolCall(call) => {
+                let id = google_replay_tool_call_id(requires_tool_call_id, &call.id);
+                let mut function_call = Map::from_iter([
+                    ("name".to_owned(), Value::String(call.name.clone())),
+                    (
+                        "args".to_owned(),
+                        Value::Object(
+                            call.arguments
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                                .collect(),
+                        ),
+                    ),
+                ]);
+                if let Some(id) = id {
+                    function_call.insert("id".to_owned(), Value::String(id));
+                }
+                let mut part =
+                    Map::from_iter([("functionCall".to_owned(), Value::Object(function_call))]);
+                if let Some(signature) =
+                    google_replay_signature(same_model, &call.thought_signature)
+                {
+                    part.insert("thoughtSignature".to_owned(), Value::String(signature));
+                }
+                parts.push(Value::Object(part));
+            }
+            llm::ContentBlock::Image(_) | llm::ContentBlock::Thinking(_) => {}
+        }
+    }
+    parts
+}
+
+fn google_append_tool_result(
+    contents: &mut Vec<Value>,
+    model: &llm::Model,
+    result: &llm::ToolResultMessage,
+    requires_tool_call_id: bool,
+) {
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+    for block in &result.content {
+        match block {
+            llm::ContentBlock::Text(content) => text.push(content.text.as_str()),
+            llm::ContentBlock::Image(image) if model.supports_images() => {
+                images.push(json!({
+                    "inlineData": {"mimeType": image.mime_type, "data": image.data}
+                }));
+            }
+            llm::ContentBlock::Image(_)
+            | llm::ContentBlock::Thinking(_)
+            | llm::ContentBlock::ToolCall(_) => {}
+        }
+    }
+    let text = text.join("\n");
+    let response_value = if text.is_empty() && !images.is_empty() {
+        "(see attached image)".to_owned()
+    } else {
+        text
+    };
+    let mut response = Map::new();
+    response.insert(
+        if result.is_error {
+            "error".to_owned()
+        } else {
+            "output".to_owned()
+        },
+        Value::String(response_value),
+    );
+    let mut function_response = Map::from_iter([
+        ("name".to_owned(), Value::String(result.tool_name.clone())),
+        ("response".to_owned(), Value::Object(response)),
+    ]);
+    if requires_tool_call_id {
+        function_response.insert("id".to_owned(), Value::String(result.tool_call_id.clone()));
+    }
+    let nests_images = google_supports_multimodal_function_response(&model.id);
+    if nests_images && !images.is_empty() {
+        function_response.insert("parts".to_owned(), Value::Array(images.clone()));
+    }
+    let part = Value::Object(Map::from_iter([(
+        "functionResponse".to_owned(),
+        Value::Object(function_response),
+    )]));
+
+    let mut merged = false;
+    if let Some(previous) = contents.last_mut()
+        && previous.get("role").and_then(Value::as_str) == Some("user")
+        && previous
+            .get_mut("parts")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|parts| {
+                let has_function_response = parts
+                    .iter()
+                    .any(|part| part.get("functionResponse").is_some());
+                if has_function_response {
+                    parts.push(part.clone());
+                }
+                has_function_response
+            })
+    {
+        merged = true;
+    }
+    if !merged {
+        contents.push(json!({"role": "user", "parts": [part]}));
+    }
+    if !nests_images && !images.is_empty() {
+        let mut image_turn = vec![google_text_part("Tool result image:", false, None)];
+        image_turn.extend(images);
+        contents.push(json!({"role": "user", "parts": image_turn}));
+    }
+}
+
+fn google_text_part(text: &str, thought: bool, signature: Option<String>) -> Value {
+    let mut part = Map::from_iter([("text".to_owned(), Value::String(text.to_owned()))]);
+    if thought {
+        part.insert("thought".to_owned(), Value::Bool(true));
+    }
+    if let Some(signature) = signature {
+        part.insert("thoughtSignature".to_owned(), Value::String(signature));
+    }
+    Value::Object(part)
+}
+
+fn google_replay_signature(same_model: bool, signature: &str) -> Option<String> {
+    (same_model && google_valid_thought_signature(signature)).then(|| signature.to_owned())
+}
+
+fn google_valid_thought_signature(signature: &str) -> bool {
+    !signature.is_empty()
+        && signature.len().is_multiple_of(4)
+        && base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .is_ok()
+}
+
+fn google_replay_tool_call_id(requires_tool_call_id: bool, id: &str) -> Option<String> {
+    requires_tool_call_id.then(|| id.to_owned())
+}
+
+fn google_requires_tool_call_id(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.starts_with("claude-")
+        || model_id.starts_with("gpt-oss-")
+        || google_gemini_major_version(&model_id).is_some_and(|version| version >= 3)
+}
+
+fn google_supports_multimodal_function_response(model_id: &str) -> bool {
+    google_gemini_major_version(&model_id.to_ascii_lowercase()).is_none_or(|version| version >= 3)
+}
+
+fn google_supports_strict_tool_sampling(model_id: &str) -> bool {
+    google_gemini_major_version(&model_id.to_ascii_lowercase()).is_some_and(|version| version >= 3)
+}
+
+fn google_gemini_major_version(model_id: &str) -> Option<u32> {
+    let model_id = model_id.to_ascii_lowercase();
+    let version = model_id
+        .strip_prefix("gemini-live-")
+        .or_else(|| model_id.strip_prefix("gemini-"))?
+        .split('-')
+        .next()?
+        .split('.')
+        .next()?;
+    version.parse().ok()
+}
+
+fn google_thinking_config(
+    model: &llm::Model,
+    requested: &str,
+    custom_budgets: Option<&llm::ThinkingBudgets>,
+) -> Option<Value> {
+    if !model.reasoning {
+        return None;
+    }
+    let level = stream::clamp_thinking_level(model, requested);
+    if level == llm::THINKING_OFF {
+        return Some(Value::Object(google_disabled_thinking_config(&model.id)));
+    }
+    let level = stream::clamp_reasoning_level(&level);
+    let mut config = Map::from_iter([("includeThoughts".to_owned(), Value::Bool(true))]);
+    if google_uses_thinking_level(&model.id) {
+        config.insert(
+            "thinkingLevel".to_owned(),
+            Value::String(google_thinking_level(&model.id, &level).to_owned()),
+        );
+    } else {
+        config.insert(
+            "thinkingBudget".to_owned(),
+            Value::Number(google_thinking_budget(model, &level, custom_budgets).into()),
+        );
+    }
+    Some(Value::Object(config))
+}
+
+fn google_uses_thinking_level(model_id: &str) -> bool {
+    google_is_gemini_three_pro(model_id)
+        || google_is_gemini_three_flash(model_id)
+        || google_is_gemma_four(model_id)
+}
+
+fn google_disabled_thinking_config(model_id: &str) -> Map<String, Value> {
+    if google_is_gemini_three_pro(model_id) {
+        return Map::from_iter([("thinkingLevel".to_owned(), Value::String("LOW".to_owned()))]);
+    }
+    if google_is_gemini_three_flash(model_id) || google_is_gemma_four(model_id) {
+        return Map::from_iter([(
+            "thinkingLevel".to_owned(),
+            Value::String("MINIMAL".to_owned()),
+        )]);
+    }
+    Map::from_iter([("thinkingBudget".to_owned(), Value::Number(0.into()))])
+}
+
+fn google_thinking_level<'a>(model_id: &str, level: &'a str) -> &'a str {
+    if google_is_gemini_three_pro(model_id) {
+        return match level {
+            llm::THINKING_MINIMAL | llm::THINKING_LOW => "LOW",
+            _ => "HIGH",
+        };
+    }
+    if google_is_gemma_four(model_id) {
+        return match level {
+            llm::THINKING_MINIMAL | llm::THINKING_LOW => "MINIMAL",
+            _ => "HIGH",
+        };
+    }
+    match level {
+        llm::THINKING_MINIMAL => "MINIMAL",
+        llm::THINKING_LOW => "LOW",
+        llm::THINKING_MEDIUM => "MEDIUM",
+        _ => "HIGH",
+    }
+}
+
+fn google_thinking_budget(
+    model: &llm::Model,
+    level: &str,
+    custom_budgets: Option<&llm::ThinkingBudgets>,
+) -> i64 {
+    if let Some(budget) =
+        custom_budgets.and_then(|budgets| google_custom_thinking_budget(budgets, level))
+    {
+        return i64::from(budget);
+    }
+    let id = model.id.to_ascii_lowercase();
+    match () {
+        _ if id.contains("2.5-pro") => google_budget_for_level(level, 128, 2_048, 8_192, 32_768),
+        _ if id.contains("2.5-flash-lite") => {
+            google_budget_for_level(level, 512, 2_048, 8_192, 24_576)
+        }
+        _ if id.contains("2.5-flash") => google_budget_for_level(level, 128, 2_048, 8_192, 24_576),
+        _ => -1,
+    }
+}
+
+fn google_custom_thinking_budget(budgets: &llm::ThinkingBudgets, level: &str) -> Option<u32> {
+    let budget = match level {
+        llm::THINKING_MINIMAL => budgets.minimal,
+        llm::THINKING_LOW => budgets.low,
+        llm::THINKING_MEDIUM => budgets.medium,
+        _ => budgets.high,
+    };
+    budget.filter(|budget| *budget != 0)
+}
+
+fn google_budget_for_level(level: &str, minimal: i64, low: i64, medium: i64, high: i64) -> i64 {
+    match level {
+        llm::THINKING_MINIMAL => minimal,
+        llm::THINKING_LOW => low,
+        llm::THINKING_MEDIUM => medium,
+        _ => high,
+    }
+}
+
+fn google_is_gemini_three_pro(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    let Some(version) = model_id.strip_prefix("gemini-") else {
+        return false;
+    };
+    version.strip_prefix('3').is_some_and(|rest| {
+        rest.starts_with("-pro") || rest.starts_with(".") && rest.contains("-pro")
+    })
+}
+
+fn google_is_gemini_three_flash(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.strip_prefix("gemini-").is_some_and(|version| {
+        version.strip_prefix('3').is_some_and(|rest| {
+            rest.starts_with("-flash") || rest.starts_with(".") && rest.contains("-flash")
+        })
+    }) || matches!(
+        model_id.as_str(),
+        "gemini-flash-latest" | "gemini-flash-lite-latest"
+    )
+}
+
+fn google_is_gemma_four(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.contains("gemma-4") || model_id.contains("gemma4")
 }
 
 fn build_openai_responses_request(
@@ -2965,6 +3694,18 @@ impl MessageEmitter {
         Ok(())
     }
 
+    fn set_tool_thought_signature(&mut self, index: usize, signature: &str) -> Result<()> {
+        let Some(llm::ContentBlock::ToolCall(call)) = self.message.content.get_mut(index) else {
+            return Err(ProviderAdapterError::Protocol(
+                "tool thought signature did not match a tool-call content block".to_owned(),
+            ));
+        };
+        if !signature.is_empty() {
+            call.thought_signature = signature.to_owned();
+        }
+        Ok(())
+    }
+
     fn set_tool_arguments(
         &mut self,
         index: usize,
@@ -3403,6 +4144,235 @@ fn consume_openai_completions(
         ));
     }
     Ok(())
+}
+
+fn consume_google_generate_content(
+    response: Response,
+    _model: &llm::Model,
+    cancellation: &agent::CancellationToken,
+    emitter: &mut MessageEmitter,
+) -> Result<()> {
+    let mut reader = stream::SseReader::new(response);
+    let mut text_index = None;
+    let mut thinking_index = None;
+    let mut used_tool_call_ids = BTreeSet::new();
+    let mut saw_finish_reason = false;
+
+    while let Some(event) = reader.next_event()? {
+        ensure_not_cancelled(cancellation)?;
+        let data = event.data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            continue;
+        }
+        let chunk = serde_json::from_str::<Value>(data)?;
+        if emitter.message.response_id.is_empty()
+            && let Some(response_id) =
+                value_string(&chunk, "responseId").filter(|response_id| !response_id.is_empty())
+        {
+            emitter.message.response_id = response_id.to_owned();
+        }
+        if let Some(usage) = chunk.get("usageMetadata") {
+            apply_google_usage(&mut emitter.message.usage, usage);
+        }
+
+        let Some(candidate) = chunk
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+        else {
+            continue;
+        };
+        if let Some(reason) =
+            value_string(candidate, "finishReason").filter(|reason| !reason.is_empty())
+        {
+            saw_finish_reason = true;
+            emitter.message.raw_stop_reason = reason.to_owned();
+            let (stop_reason, error_message) = map_google_stop_reason(reason);
+            emitter.message.stop_reason = stop_reason;
+            emitter.message.error_message = if error_message.is_empty() {
+                String::new()
+            } else {
+                format!("provider stopped with: {reason}")
+            };
+        }
+        let Some(parts) = candidate
+            .get("content")
+            .and_then(Value::as_object)
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+
+        for part in parts {
+            let signature = value_string(part, "thoughtSignature").unwrap_or_default();
+            if let Some(text) = value_string(part, "text") {
+                let thinking = part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                google_append_stream_text(
+                    emitter,
+                    &mut text_index,
+                    &mut thinking_index,
+                    text,
+                    thinking,
+                    signature,
+                )?;
+            }
+            let Some(function_call) = value_object(part, "functionCall") else {
+                continue;
+            };
+            google_finish_stream_block(emitter, &mut text_index, &mut thinking_index)?;
+            let name = function_call
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requested_id = function_call
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let id = google_stream_tool_call_id(name, requested_id, &mut used_tool_call_ids);
+            let arguments = btree_arguments(function_call.get("args").and_then(Value::as_object));
+            let content_index = emitter.start_tool(&id, name)?;
+            emitter.set_tool_arguments(content_index, arguments.clone())?;
+            emitter.set_tool_thought_signature(content_index, signature)?;
+            let serialized = Value::Object(
+                arguments
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
+            .to_string();
+            emitter.tool_delta(content_index, &serialized)?;
+            emitter.end_tool(content_index)?;
+        }
+    }
+
+    google_finish_stream_block(emitter, &mut text_index, &mut thinking_index)?;
+    if !saw_finish_reason {
+        return Err(ProviderAdapterError::Protocol(
+            "Google stream ended without finishReason".to_owned(),
+        ));
+    }
+    if emitter.message.stop_reason == stream::STOP_STOP
+        && emitter
+            .message
+            .content
+            .iter()
+            .any(|block| matches!(block, llm::ContentBlock::ToolCall(_)))
+    {
+        emitter.message.stop_reason = stream::STOP_TOOL_USE.to_owned();
+    }
+    if emitter.message.stop_reason == stream::STOP_ERROR {
+        return Err(ProviderAdapterError::Protocol(
+            emitter.message.error_message.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn google_append_stream_text(
+    emitter: &mut MessageEmitter,
+    text_index: &mut Option<usize>,
+    thinking_index: &mut Option<usize>,
+    delta: &str,
+    thinking: bool,
+    signature: &str,
+) -> Result<()> {
+    if thinking {
+        if let Some(index) = text_index.take() {
+            emitter.end_text(index)?;
+        }
+        let index = match *thinking_index {
+            Some(index) => index,
+            None => {
+                let index = emitter.start_thinking("", "", false)?;
+                *thinking_index = Some(index);
+                index
+            }
+        };
+        emitter.append_thinking(index, delta)?;
+        if !signature.is_empty() {
+            emitter.set_thinking_signature(index, signature.to_owned())?;
+        }
+    } else {
+        if let Some(index) = thinking_index.take() {
+            emitter.end_thinking(index)?;
+        }
+        let index = match *text_index {
+            Some(index) => index,
+            None => {
+                let index = emitter.start_text("")?;
+                *text_index = Some(index);
+                index
+            }
+        };
+        emitter.append_text(index, delta)?;
+        if !signature.is_empty() {
+            emitter.set_text_signature(index, signature.to_owned())?;
+        }
+    }
+    Ok(())
+}
+
+fn google_finish_stream_block(
+    emitter: &mut MessageEmitter,
+    text_index: &mut Option<usize>,
+    thinking_index: &mut Option<usize>,
+) -> Result<()> {
+    if let Some(index) = text_index.take() {
+        emitter.end_text(index)?;
+    }
+    if let Some(index) = thinking_index.take() {
+        emitter.end_thinking(index)?;
+    }
+    Ok(())
+}
+
+fn google_stream_tool_call_id(name: &str, requested: &str, used: &mut BTreeSet<String>) -> String {
+    if !requested.is_empty() && requested != "null" && used.insert(requested.to_owned()) {
+        return requested.to_owned();
+    }
+    let name = if name.is_empty() { "tool" } else { name };
+    loop {
+        let sequence = GOOGLE_TOOL_CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let generated = format!("{name}_{}_{}", now_millis(), sequence);
+        if used.insert(generated.clone()) {
+            return generated;
+        }
+    }
+}
+
+fn apply_google_usage(usage: &mut llm::Usage, raw: &Value) {
+    let prompt = value_u64(raw, "promptTokenCount").unwrap_or_default();
+    let cached = value_u64(raw, "cachedContentTokenCount").unwrap_or_default();
+    let output = value_u64(raw, "candidatesTokenCount").unwrap_or_default();
+    let thinking = value_u64(raw, "thoughtsTokenCount").unwrap_or(0);
+    usage.input = prompt.saturating_sub(cached);
+    usage.output = output.saturating_add(thinking);
+    usage.cache_read = cached;
+    usage.cache_write = 0;
+    usage.reasoning = Some(thinking);
+    usage.total_tokens = value_u64(raw, "totalTokenCount").unwrap_or_default();
+}
+
+fn map_google_stop_reason(raw: &str) -> (String, String) {
+    match raw.to_ascii_uppercase().as_str() {
+        "STOP" => (stream::STOP_STOP.to_owned(), String::new()),
+        "MAX_TOKENS" => (stream::STOP_LENGTH.to_owned(), String::new()),
+        "MALFORMED_FUNCTION_CALL" => (
+            stream::STOP_ERROR.to_owned(),
+            "Google stopped due to a malformed function call".to_owned(),
+        ),
+        other => (
+            stream::STOP_ERROR.to_owned(),
+            format!("Google finishReason: {other}"),
+        ),
+    }
 }
 
 enum ResponsesSlot {
@@ -4621,6 +5591,7 @@ mod tests {
                 API_ANTHROPIC_MESSAGES => "anthropic".to_owned(),
                 API_AZURE_OPENAI_RESPONSES => "azure-openai-responses".to_owned(),
                 API_OPENAI_CODEX_RESPONSES => "openai-codex".to_owned(),
+                API_GOOGLE_GENERATIVE_AI => "google".to_owned(),
                 _ => "openai".to_owned(),
             },
             base_url,
@@ -4643,6 +5614,7 @@ mod tests {
         agent::RequestOptions {
             cancellation,
             thinking_level: llm::THINKING_HIGH.to_owned(),
+            thinking_budgets: None,
             session_id: "session-1".to_owned(),
             assistant_event_listener: None,
         }
@@ -4898,6 +5870,310 @@ mod tests {
     }
 
     #[test]
+    fn google_generate_content_serialization_and_sse_decoding_preserve_thoughts_and_tools() {
+        let body = "data: {\"responseId\":\"google_1\",\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Considering \",\"thoughtSignature\":\"c2ln\"},{\"text\":\"sunny\"},{\"functionCall\":{\"name\":\"weather\",\"id\":\"call_1\",\"args\":{\"city\":\"Paris\"}},\"thoughtSignature\":\"c2ln\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":2,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":4,\"totalTokenCount\":17}}\n\n";
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut request_model = model(API_GOOGLE_GENERATIVE_AI, base_url);
+        request_model.id = "gemini-3-pro".to_owned();
+        request_model.reasoning = true;
+        let observed_events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&observed_events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            event_log
+                .lock()
+                .expect("Google event log lock")
+                .push(event.event_type);
+        }));
+        let response = factory(0)
+            .respond(&request_model, &text_context(), request_options)
+            .expect("Google response");
+        let request = requests.recv().expect("captured Google request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(
+            request.target,
+            "/models/gemini-3-pro:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request.headers.get("x-goog-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("Google JSON body");
+        assert_eq!(sent["systemInstruction"]["parts"][0]["text"], "be concise");
+        assert_eq!(sent["contents"][0]["role"], "user");
+        assert_eq!(sent["contents"][0]["parts"][0]["text"], "weather?");
+        assert_eq!(
+            sent["tools"][0]["functionDeclarations"][0]["name"],
+            "weather"
+        );
+        assert_eq!(sent["generationConfig"]["maxOutputTokens"], 4096);
+        assert_eq!(
+            sent["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+        assert_eq!(response.response_id, "google_1");
+        assert_eq!(response.usage.input, 8);
+        assert_eq!(response.usage.output, 7);
+        assert_eq!(response.usage.cache_read, 2);
+        assert_eq!(response.usage.total_tokens, 17);
+        assert_eq!(response.usage.reasoning, Some(4));
+        let llm::ContentBlock::Thinking(thinking) = &response.content[0] else {
+            panic!("expected Google thought content");
+        };
+        assert_eq!(thinking.thinking, "Considering ");
+        assert_eq!(thinking.thinking_signature, "c2ln");
+        assert_eq!(response.content[1].plain_text(), Some("sunny"));
+        let llm::ContentBlock::ToolCall(call) = &response.content[2] else {
+            panic!("expected Google function call");
+        };
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.name, "weather");
+        assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+        assert_eq!(call.thought_signature, "c2ln");
+        assert_eq!(
+            *observed_events.lock().expect("Google event log lock"),
+            vec![
+                stream::EVENT_START.to_owned(),
+                stream::EVENT_THINKING_START.to_owned(),
+                stream::EVENT_THINKING_DELTA.to_owned(),
+                stream::EVENT_THINKING_END.to_owned(),
+                stream::EVENT_TEXT_START.to_owned(),
+                stream::EVENT_TEXT_DELTA.to_owned(),
+                stream::EVENT_TEXT_END.to_owned(),
+                stream::EVENT_TOOLCALL_START.to_owned(),
+                stream::EVENT_TOOLCALL_DELTA.to_owned(),
+                stream::EVENT_TOOLCALL_END.to_owned(),
+                stream::EVENT_DONE.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn google_generate_content_replays_signatures_tool_results_and_strict_tools() {
+        let mut context = text_context();
+        context
+            .messages
+            .push(llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                api: API_GOOGLE_GENERATIVE_AI.to_owned(),
+                provider: "google".to_owned(),
+                model: "gemini-3-pro".to_owned(),
+                stop_reason: stream::STOP_TOOL_USE.to_owned(),
+                content: vec![
+                    llm::ContentBlock::Thinking(llm::ThinkingContent {
+                        thinking: "reasoning".to_owned(),
+                        thinking_signature: "c2ln".to_owned(),
+                        ..llm::ThinkingContent::default()
+                    }),
+                    llm::ContentBlock::ToolCall(llm::ToolCall {
+                        id: "call_1".to_owned(),
+                        name: "weather".to_owned(),
+                        arguments: BTreeMap::from([("city".to_owned(), json!("Paris"))]),
+                        thought_signature: "c2ln".to_owned(),
+                        ..llm::ToolCall::default()
+                    }),
+                ],
+                ..llm::AssistantMessage::default()
+            })));
+        context
+            .messages
+            .push(llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: "call_1".to_owned(),
+                tool_name: "weather".to_owned(),
+                content: vec![llm::ContentBlock::text("18 C")],
+                timestamp: 2,
+                ..llm::ToolResultMessage::default()
+            })));
+        context.tools[0].constrained_sampling =
+            Some(json!({"type": "json_schema", "strict": "require"}));
+
+        let mut request_model = model(
+            API_GOOGLE_GENERATIVE_AI,
+            "https://generativelanguage.googleapis.com/v1beta".to_owned(),
+        );
+        request_model.id = "gemini-3-pro".to_owned();
+        request_model.reasoning = true;
+        let body = build_google_generate_content_request(
+            &request_model,
+            &context,
+            &options(agent::CancellationToken::default()),
+        );
+
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(body["contents"][1]["parts"][0]["thought"], true);
+        assert_eq!(body["contents"][1]["parts"][0]["thoughtSignature"], "c2ln");
+        assert_eq!(
+            body["contents"][1]["parts"][1]["functionCall"]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["id"],
+            "call_1"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["response"]["output"],
+            "18 C"
+        );
+        assert_eq!(
+            body["toolConfig"]["functionCallingConfig"]["mode"],
+            "VALIDATED"
+        );
+
+        request_model.id = "gemini-2.5-pro".to_owned();
+        let non_strict = build_google_generate_content_request(
+            &request_model,
+            &context,
+            &options(agent::CancellationToken::default()),
+        );
+        assert!(non_strict.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn google_history_transform_downgrades_images_and_remaps_cross_model_tool_ids() {
+        let source_call = llm::ToolCall {
+            id: "call with spaces!".to_owned(),
+            name: "weather".to_owned(),
+            arguments: BTreeMap::from([("city".to_owned(), json!("Paris"))]),
+            thought_signature: "c2ln".to_owned(),
+            ..llm::ToolCall::default()
+        };
+        let messages = vec![
+            llm::Message::User(llm::UserMessage {
+                role: "user".to_owned(),
+                content: llm::UserContent::Blocks(vec![
+                    llm::ContentBlock::text("Look"),
+                    llm::ContentBlock::Image(llm::ImageContent {
+                        data: "image-data".to_owned(),
+                        mime_type: "image/png".to_owned(),
+                    }),
+                ]),
+                timestamp: 1,
+            }),
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                api: API_OPENAI_COMPLETIONS.to_owned(),
+                provider: "openai".to_owned(),
+                model: "other-model".to_owned(),
+                stop_reason: stream::STOP_TOOL_USE.to_owned(),
+                content: vec![
+                    llm::ContentBlock::Thinking(llm::ThinkingContent {
+                        thinking: "cross-model thought".to_owned(),
+                        thinking_signature: "c2ln".to_owned(),
+                        ..llm::ThinkingContent::default()
+                    }),
+                    llm::ContentBlock::ToolCall(source_call),
+                ],
+                ..llm::AssistantMessage::default()
+            })),
+            llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: "call with spaces!".to_owned(),
+                tool_name: "weather".to_owned(),
+                content: vec![llm::ContentBlock::text("sunny")],
+                timestamp: 2,
+                ..llm::ToolResultMessage::default()
+            })),
+        ];
+        let request_model = llm::Model {
+            id: "gemini-3-pro".to_owned(),
+            api: API_GOOGLE_GENERATIVE_AI.to_owned(),
+            provider: "google".to_owned(),
+            input: vec!["text".to_owned()],
+            ..llm::Model::default()
+        };
+
+        let transformed = transform_google_messages(&messages, &request_model);
+        let llm::Message::User(user) = &transformed[0] else {
+            panic!("expected transformed user message");
+        };
+        let llm::UserContent::Blocks(parts) = &user.content else {
+            panic!("expected block user content");
+        };
+        assert_eq!(
+            parts[1].plain_text(),
+            Some("(image omitted: model does not support images)")
+        );
+        let llm::Message::Assistant(assistant) = &transformed[1] else {
+            panic!("expected transformed assistant message");
+        };
+        assert_eq!(
+            assistant.content[0].plain_text(),
+            Some("cross-model thought")
+        );
+        let llm::ContentBlock::ToolCall(call) = &assistant.content[1] else {
+            panic!("expected transformed tool call");
+        };
+        assert_eq!(call.id, "call_with_spaces_");
+        assert!(call.thought_signature.is_empty());
+        let llm::Message::ToolResult(result) = &transformed[2] else {
+            panic!("expected transformed tool result");
+        };
+        assert_eq!(result.tool_call_id, "call_with_spaces_");
+    }
+
+    #[test]
+    fn google_endpoint_usage_and_stop_helpers_match_google_wire_behavior() {
+        let endpoint = google_generate_content_endpoint(&llm::Model {
+            id: "gemini-2.5-pro".to_owned(),
+            ..llm::Model::default()
+        })
+        .expect("default Google endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        let mut usage = llm::Usage::default();
+        apply_google_usage(
+            &mut usage,
+            &json!({
+                "promptTokenCount": 3,
+                "cachedContentTokenCount": 9,
+                "candidatesTokenCount": 2,
+                "thoughtsTokenCount": 1,
+                "totalTokenCount": 12,
+            }),
+        );
+        assert_eq!(usage.input, 0);
+        assert_eq!(usage.output, 3);
+        assert_eq!(usage.cache_read, 9);
+        assert_eq!(usage.total_tokens, 12);
+        assert_eq!(map_google_stop_reason("STOP").0, stream::STOP_STOP);
+        assert_eq!(map_google_stop_reason("MAX_TOKENS").0, stream::STOP_LENGTH);
+        assert_eq!(map_google_stop_reason("SAFETY").0, stream::STOP_ERROR);
+
+        let mut request_model = llm::Model {
+            id: "gemini-2.5-pro".to_owned(),
+            reasoning: true,
+            max_tokens: 512,
+            ..llm::Model::default()
+        };
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.thinking_budgets = Some(llm::ThinkingBudgets {
+            high: Some(999),
+            ..llm::ThinkingBudgets::default()
+        });
+        let body = build_google_generate_content_request(
+            &request_model,
+            &llm::Context::default(),
+            &request_options,
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            999
+        );
+        request_model.id = "gemini-3-pro".to_owned();
+        let body = build_google_generate_content_request(
+            &request_model,
+            &llm::Context::default(),
+            &request_options,
+        );
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+    }
+
+    #[test]
     fn retry_is_bounded_and_pre_request_cancellation_becomes_aborted_message() {
         let success = concat!(
             "data: {\"id\":\"chat_retry\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -4939,7 +6215,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_variants_include_azure_and_codex_responses() {
+    fn protocol_variants_include_google_azure_and_codex_responses() {
+        assert_eq!(
+            ProviderProtocol::from_api(API_GOOGLE_GENERATIVE_AI).expect("Google protocol"),
+            ProviderProtocol::GoogleGenerativeAi
+        );
         assert_eq!(
             ProviderProtocol::from_api(API_AZURE_OPENAI_RESPONSES).expect("Azure protocol"),
             ProviderProtocol::AzureOpenAiResponses
