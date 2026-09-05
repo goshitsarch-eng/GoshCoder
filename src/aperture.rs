@@ -1305,7 +1305,7 @@ fn finish_sync(
     models_dev: Option<&ModelsDevCatalog>,
 ) -> Result<SyncResult> {
     let mut result = SyncResult {
-        gateway: gateway_providers.clone(),
+        gateway: gateway_providers.to_vec(),
         ..SyncResult::default()
     };
 
