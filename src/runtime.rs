@@ -14,7 +14,7 @@ use std::{
 use crate::{
     agent, aperture_runtime, btw_runtime,
     catalog::Catalog,
-    config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -98,6 +98,11 @@ pub struct PreparedSession {
     /// Background Aperture refresh and connector integration for this session.
     /// Retaining it keeps startup cancellation coupled to the session lifetime.
     pub aperture: Option<aperture_runtime::ApertureRuntime>,
+    /// Lazily started local desktop MCP server, when available on Linux.
+    ///
+    /// This owner closes the child process when the containing session ends;
+    /// the agent's `mcp` tool holds a clone for individual requests.
+    desktop: Option<DesktopMcpRuntime>,
     /// Session-local, in-memory side discussion runtime used by `/btw`.
     pub btw: btw_runtime::Runtime,
     /// Session-owned Ralph integration. It is dropped before the agent runtime
@@ -112,6 +117,33 @@ pub struct PreparedSession {
     resources: Mutex<ResourceSet>,
     explicit_system_prompt: Mutex<String>,
     pub config: SessionConfig,
+}
+
+/// Session-owned lifecycle for the local `computer-use-linux` MCP server.
+///
+/// The server is deliberately not started during session construction. Its
+/// `McpSession` starts it on first tool use, but retaining this owner lets us
+/// reliably terminate that child when the coding session is dropped.
+struct DesktopMcpRuntime {
+    session: computeruse::McpSession,
+}
+
+impl DesktopMcpRuntime {
+    fn new(binary: PathBuf) -> Self {
+        Self {
+            session: computeruse::McpSession::new(binary),
+        }
+    }
+
+    fn tool(&self) -> agent::Tool {
+        computeruse::agent_tool(self.session.clone())
+    }
+}
+
+impl Drop for DesktopMcpRuntime {
+    fn drop(&mut self) {
+        self.session.close();
+    }
 }
 
 impl PreparedSession {
@@ -532,8 +564,12 @@ pub fn prepare_session(
         .filter(|_| config.enable_tools)
         .map(Workspace::all)
         .unwrap_or_default();
+    let (desktop, desktop_notices) = desktop_mcp_runtime(config.enable_tools, config.quiet);
     if config.enable_tools {
         tools.push(native_web_search_tool(catalog)?);
+    }
+    if let Some(desktop) = desktop.as_ref() {
+        tools.push(desktop.tool());
     }
     tools.extend(extra_tools);
     let tool_names = tools.iter().map(|tool| tool.name.as_str());
@@ -548,6 +584,10 @@ pub fn prepare_session(
     )?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let notices = runtime.notice_sender();
+    for notice in desktop_notices {
+        notices.push(computeruse::PACKAGE_NAME, notice);
+    }
     let btw = btw_runtime::Runtime::with_catalog(
         runtime.agent().responder(),
         catalog.clone(),
@@ -611,6 +651,7 @@ pub fn prepare_session(
 
     Ok(PreparedSession {
         aperture,
+        desktop,
         btw,
         ralph,
         planner,
@@ -621,6 +662,66 @@ pub fn prepare_session(
         explicit_system_prompt: Mutex::new(config.system_prompt.clone()),
         config,
     })
+}
+
+fn desktop_mcp_runtime(
+    enable_tools: bool,
+    quiet: bool,
+) -> (Option<DesktopMcpRuntime>, Vec<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        return desktop_mcp_runtime_from_binary(
+            enable_tools,
+            quiet,
+            computeruse::find_binary(),
+            config::mcp_config_path(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (enable_tools, quiet);
+        (None, Vec::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_mcp_runtime_from_binary(
+    enable_tools: bool,
+    quiet: bool,
+    binary: Option<PathBuf>,
+    mcp_config_path: PathBuf,
+) -> (Option<DesktopMcpRuntime>, Vec<String>) {
+    if !enable_tools {
+        return (None, Vec::new());
+    }
+    let Some(binary) = binary else {
+        return (
+            None,
+            vec![format!(
+                "{} binary not found. {}",
+                computeruse::SERVER_NAME,
+                computeruse::INSTALL_HINT
+            )],
+        );
+    };
+
+    let mut notices = Vec::new();
+    match computeruse::ensure_server_entry(&mcp_config_path, &binary) {
+        Ok(computeruse::EnsureResult::Updated) if !quiet => {
+            notices.push(format!(
+                "MCP server configured at {}",
+                mcp_config_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            notices.push(format!(
+                "failed to configure MCP server at {}: {error}",
+                mcp_config_path.display()
+            ));
+        }
+    }
+    (Some(DesktopMcpRuntime::new(binary)), notices)
 }
 
 /// Builds the native cited web-search tool with fresh OpenAI/Codex credential
@@ -874,6 +975,69 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_mcp_runtime_registers_the_proxy_and_shared_mcp_entry() {
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-desktop-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary directory");
+        let binary = directory.join("computer-use-linux");
+        let mcp_config = directory.join("mcp.json");
+        std::fs::write(&binary, "#!/bin/sh\n").expect("binary placeholder");
+
+        let (desktop, notices) =
+            desktop_mcp_runtime_from_binary(true, false, Some(binary.clone()), mcp_config.clone());
+        let desktop = desktop.expect("desktop runtime");
+        assert_eq!(desktop.tool().name, "mcp");
+        assert_eq!(
+            notices,
+            vec![format!("MCP server configured at {}", mcp_config.display())]
+        );
+
+        let configuration: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mcp_config).expect("read mcp config"))
+                .expect("valid mcp config");
+        assert_eq!(
+            configuration["mcpServers"][computeruse::SERVER_NAME]["command"],
+            binary.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            configuration["mcpServers"][computeruse::SERVER_NAME]["args"],
+            serde_json::json!(["mcp"])
+        );
+
+        drop(desktop);
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_mcp_runtime_warns_only_when_tools_are_enabled_and_binary_is_missing() {
+        let config = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-missing-desktop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let (disabled, disabled_notices) =
+            desktop_mcp_runtime_from_binary(false, false, None, config.clone());
+        assert!(disabled.is_none());
+        assert!(disabled_notices.is_empty());
+
+        let (missing, notices) = desktop_mcp_runtime_from_binary(true, true, None, config);
+        assert!(missing.is_none());
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains(computeruse::INSTALL_HINT));
     }
 
     #[test]
