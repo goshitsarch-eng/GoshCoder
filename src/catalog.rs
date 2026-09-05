@@ -2198,7 +2198,7 @@ impl Catalog {
             if definition.supports_oauth
                 && let Some(store) = &self.credentials
                 && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
-                && stored.kind() == CredentialKind::OAuth
+                && *stored.kind() == CredentialKind::OAuth
                 && let Ok(Some(auth)) = self.resolve_stored_oauth(provider_id)
             {
                 return Ok(Some(auth));
