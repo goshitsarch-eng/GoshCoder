@@ -56,6 +56,7 @@ pub enum ApertureError {
     ConfigTooLarge,
     CacheTooLarge,
     GatewayResponseTooLarge,
+    GatewayNotConfigured,
     InvalidConfig(serde_json::Error),
     InvalidCache(serde_json::Error),
     InvalidGatewayResponse(String),
@@ -93,6 +94,9 @@ impl fmt::Display for ApertureError {
                     "aperture response exceeds {MAX_RESPONSE_BYTES} bytes"
                 )
             }
+            Self::GatewayNotConfigured => formatter.write_str(
+                "Aperture gateway URL is not configured; run `goshcoder aperture onboarding`",
+            ),
             Self::InvalidConfig(source) => write!(formatter, "invalid aperture config: {source}"),
             Self::InvalidCache(source) => write!(formatter, "invalid aperture cache: {source}"),
             Self::InvalidGatewayResponse(message) => {
@@ -131,6 +135,7 @@ impl StdError for ApertureError {
             | Self::ConfigTooLarge
             | Self::CacheTooLarge
             | Self::GatewayResponseTooLarge
+            | Self::GatewayNotConfigured
             | Self::InvalidGatewayResponse(_)
             | Self::ToolNotFound(_)
             | Self::ToolAlreadyPinned(_)
@@ -1130,6 +1135,17 @@ pub struct Cache {
     pub gateway: Vec<GatewaySnapshot>,
 }
 
+/// The outcome of one gateway catalog refresh.
+///
+/// A successful refresh always persists its gateway snapshot, even when the
+/// dedicated provider is disabled and therefore produces no dedicated models.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SyncResult {
+    pub models: Vec<llm::Model>,
+    pub gateway: Vec<GatewayProvider>,
+    pub warnings: Vec<String>,
+}
+
 impl Cache {
     /// Returns cached dedicated models only when their complete catalog
     /// identity matches the active configuration.
@@ -1211,6 +1227,150 @@ pub fn save_cache(path: impl AsRef<Path>, cache: &Cache) -> Result<()> {
         return Err(ApertureError::CacheTooLarge);
     }
     atomic_private_write(path.as_ref(), &bytes, "write aperture cache")
+}
+
+/// Refreshes the gateway model snapshot and persists it for catalog routing.
+///
+/// This mirrors the Go integration's shared sync path. Gateway and
+/// models.dev metadata are fetched only for this refresh; callers can use
+/// [`sync_with_models_dev`] to inject metadata when they already have it or
+/// when deterministic tests must avoid a network request.
+pub fn sync(
+    configuration: &Config,
+    cache_path: impl AsRef<Path>,
+    catalog_models: &[llm::Model],
+) -> Result<SyncResult> {
+    let (resolved, gateway, openai_base, gateway_providers) = fetch_sync_inputs(configuration)?;
+    let models_dev = resolved
+        .dedicated_enabled
+        .then(fetch_models_dev_catalog)
+        .flatten();
+    finish_sync(
+        &resolved,
+        cache_path.as_ref(),
+        catalog_models,
+        &gateway,
+        &openai_base,
+        &gateway_providers,
+        models_dev.as_ref(),
+    )
+}
+
+/// Refreshes and persists Aperture state with optional pre-fetched models.dev
+/// metadata.
+///
+/// The dedicated catalog's static metadata and proxy URL inference always
+/// come from `catalog_models`; models.dev is only a best-effort enrichment
+/// layer. This makes background session refreshes and explicit CLI syncs use
+/// exactly the same persistence rules.
+pub fn sync_with_models_dev(
+    configuration: &Config,
+    cache_path: impl AsRef<Path>,
+    catalog_models: &[llm::Model],
+    models_dev: Option<&ModelsDevCatalog>,
+) -> Result<SyncResult> {
+    let (resolved, gateway, openai_base, gateway_providers) = fetch_sync_inputs(configuration)?;
+    finish_sync(
+        &resolved,
+        cache_path.as_ref(),
+        catalog_models,
+        &gateway,
+        &openai_base,
+        &gateway_providers,
+        models_dev,
+    )
+}
+
+fn fetch_sync_inputs(
+    configuration: &Config,
+) -> Result<(Resolved, String, String, Vec<GatewayProvider>)> {
+    let resolved = configuration.resolve();
+    let gateway = gateway_url(&resolved.base_url);
+    let openai_base = provider_base_url(&resolved.base_url);
+    if gateway.is_empty() || openai_base.is_empty() {
+        return Err(ApertureError::GatewayNotConfigured);
+    }
+    let gateway_providers = GatewayClient::new(&gateway)?.providers()?;
+    Ok((resolved, gateway, openai_base, gateway_providers))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_sync(
+    resolved: &Resolved,
+    cache_path: &Path,
+    catalog_models: &[llm::Model],
+    gateway: &str,
+    openai_base: &str,
+    gateway_providers: &[GatewayProvider],
+    models_dev: Option<&ModelsDevCatalog>,
+) -> Result<SyncResult> {
+    let mut result = SyncResult {
+        gateway: gateway_providers.clone(),
+        ..SyncResult::default()
+    };
+
+    if resolved.dedicated_enabled {
+        let overrides = resolved
+            .dedicated_providers
+            .iter()
+            .filter(|provider| provider.enabled && !provider.api.is_empty())
+            .map(|provider| (provider.id.clone(), provider.api.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let built = build_dedicated_models(
+            &filter_dedicated_providers(gateway_providers, resolved),
+            gateway,
+            openai_base,
+            catalog_models,
+            models_dev,
+            &overrides,
+        );
+        result.models = built.models;
+        result.warnings.extend(built.warnings);
+    }
+
+    if resolved.proxy_enabled {
+        result
+            .warnings
+            .extend(proxy_override_warnings(resolved, gateway_providers));
+        let missing = missing_models_summary(resolved, gateway_providers, catalog_models);
+        if !missing.is_empty() {
+            result.warnings.push(missing);
+        }
+    }
+
+    let cache = new_cache(
+        build_catalog_key(gateway, resolved),
+        &result.models,
+        gateway_providers,
+    );
+    save_cache(cache_path, &cache)?;
+    Ok(result)
+}
+
+/// Fetches optional models.dev metadata without making gateway setup depend on
+/// the public service. Any failure produces `None`, matching the Go client's
+/// best-effort enrichment behavior.
+pub fn fetch_models_dev_catalog() -> Option<ModelsDevCatalog> {
+    const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+    const MODELS_DEV_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(MODELS_DEV_TIMEOUT)
+        .build()
+        .ok()?;
+    let mut response = client.get(MODELS_DEV_URL).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut payload = Vec::new();
+    (&mut response)
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
+        .ok()?;
+    if payload.len() > MAX_RESPONSE_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&payload).ok()
 }
 
 fn now_millis() -> i64 {

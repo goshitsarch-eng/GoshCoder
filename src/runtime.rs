@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    agent, btw_runtime,
+    agent, aperture_runtime, btw_runtime,
     catalog::Catalog,
     config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
@@ -95,6 +95,9 @@ pub struct Invocation {
 
 /// An initialized session plus the objects whose lifetime must outlast tools.
 pub struct PreparedSession {
+    /// Background Aperture refresh and connector integration for this session.
+    /// Retaining it keeps startup cancellation coupled to the session lifetime.
+    pub aperture: Option<aperture_runtime::ApertureRuntime>,
     /// Session-local, in-memory side discussion runtime used by `/btw`.
     pub btw: btw_runtime::Runtime,
     /// Session-owned Ralph integration. It is dropped before the agent runtime
@@ -595,8 +598,19 @@ pub fn prepare_session(
         })
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
+    let aperture_tool_installer: aperture_runtime::ToolInstaller = planner
+        .as_ref()
+        .map(planner_runtime::PlannerRuntime::tool_installer)
+        .unwrap_or_else(|| aperture_runtime::agent_tool_installer(runtime.agent().clone()));
+    let aperture = aperture_runtime::ApertureRuntime::start(
+        catalog.clone(),
+        runtime.notice_sender(),
+        config.enable_tools,
+        aperture_tool_installer,
+    );
 
     Ok(PreparedSession {
+        aperture,
         btw,
         ralph,
         planner,

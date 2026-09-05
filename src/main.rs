@@ -2,6 +2,7 @@ pub mod agent;
 pub mod aperture;
 pub mod aperture_cli;
 pub mod aperture_mcp;
+pub mod aperture_runtime;
 pub mod bedrock;
 pub mod btw;
 pub mod btw_runtime;

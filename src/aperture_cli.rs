@@ -8,18 +8,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, BufRead, IsTerminal, Read, Write},
+    io::{self, BufRead, IsTerminal, Write},
     path::Path,
     time::Duration,
 };
 
-use reqwest::blocking::Client;
 use url::Url;
 
 use crate::{aperture, aperture_mcp, catalog::Catalog, config, llm};
 
-const MODELS_DEV_URL: &str = "https://models.dev/api.json";
-const MODELS_DEV_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTOR_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTOR_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTOR_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,13 +49,6 @@ enum Subcommand {
 struct IndexedChoice {
     id: String,
     label: String,
-}
-
-#[derive(Clone, Debug, Default)]
-struct SyncResult {
-    models: Vec<llm::Model>,
-    gateway: Vec<aperture::GatewayProvider>,
-    warnings: Vec<String>,
 }
 
 /// Executes `goshcoder aperture [subcommand]`.
@@ -944,26 +934,9 @@ fn sync_command() -> CliResult<String> {
 fn sync_configuration(
     configuration: &aperture::Config,
     cache_path: &Path,
-) -> CliResult<SyncResult> {
+) -> CliResult<aperture::SyncResult> {
     let local_models = all_catalog_models()?;
-    let resolved = configuration.resolve();
-    let gateway = gateway_from_resolved(&resolved)?;
-    let gateway_providers = fetch_gateway_providers(&gateway)?;
-    // The public metadata fetch is best-effort and deliberately occurs only
-    // after the configured gateway has answered. An offline gateway therefore
-    // fails fast without an unrelated external request.
-    let models_dev = resolved
-        .dedicated_enabled
-        .then(fetch_models_dev_catalog)
-        .flatten();
-    finish_sync(
-        configuration,
-        cache_path,
-        &local_models,
-        &gateway,
-        &gateway_providers,
-        models_dev.as_ref(),
-    )
+    aperture::sync(configuration, cache_path, &local_models).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -972,79 +945,12 @@ fn sync_configuration_with_metadata(
     cache_path: &Path,
     local_models: &[llm::Model],
     models_dev: Option<&aperture::ModelsDevCatalog>,
-) -> CliResult<SyncResult> {
-    let resolved = configuration.resolve();
-    let gateway = gateway_from_resolved(&resolved)?;
-    let gateway_providers = fetch_gateway_providers(&gateway)?;
-    finish_sync(
-        configuration,
-        cache_path,
-        local_models,
-        &gateway,
-        &gateway_providers,
-        models_dev,
-    )
+) -> CliResult<aperture::SyncResult> {
+    aperture::sync_with_models_dev(configuration, cache_path, local_models, models_dev)
+        .map_err(Into::into)
 }
 
-fn finish_sync(
-    configuration: &aperture::Config,
-    cache_path: &Path,
-    local_models: &[llm::Model],
-    gateway: &str,
-    gateway_providers: &[aperture::GatewayProvider],
-    models_dev: Option<&aperture::ModelsDevCatalog>,
-) -> CliResult<SyncResult> {
-    let resolved = configuration.resolve();
-    let mut result = SyncResult {
-        gateway: gateway_providers.to_vec(),
-        ..SyncResult::default()
-    };
-
-    if resolved.dedicated_enabled {
-        let overrides = resolved
-            .dedicated_providers
-            .iter()
-            .filter(|provider| provider.enabled && !provider.api.is_empty())
-            .map(|provider| (provider.id.clone(), provider.api.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let built = aperture::build_dedicated_models(
-            &aperture::filter_dedicated_providers(gateway_providers, &resolved),
-            gateway,
-            &aperture::provider_base_url(&resolved.base_url),
-            local_models,
-            models_dev,
-            &overrides,
-        );
-        result.models = built.models;
-        result.warnings.extend(built.warnings);
-    }
-
-    if resolved.proxy_enabled {
-        result.warnings.extend(aperture::proxy_override_warnings(
-            &resolved,
-            gateway_providers,
-        ));
-        let missing = aperture::missing_models_summary(&resolved, gateway_providers, local_models);
-        if !missing.is_empty() {
-            result.warnings.push(missing);
-        }
-    }
-
-    let cache = aperture::new_cache(
-        aperture::build_catalog_key(gateway, &resolved),
-        &result.models,
-        gateway_providers,
-    );
-    aperture::save_cache(cache_path, &cache).map_err(|error| {
-        command_error(format!(
-            "save Aperture cache: {}",
-            display_value(&error.to_string(), MAX_DISPLAY_BYTES)
-        ))
-    })?;
-    Ok(result)
-}
-
-fn render_sync_result(result: &SyncResult) -> String {
+fn render_sync_result(result: &aperture::SyncResult) -> String {
     let mut lines = vec![format!(
         "Synchronized {} Aperture models from {} gateway provider(s). They are available under /model immediately.",
         result.models.len(),
@@ -1055,23 +961,6 @@ fn render_sync_result(result: &SyncResult) -> String {
     }
     append_omitted(&mut lines, result.warnings.len(), "sync warning");
     lines.join("\n")
-}
-
-fn fetch_models_dev_catalog() -> Option<aperture::ModelsDevCatalog> {
-    let client = Client::builder().timeout(MODELS_DEV_TIMEOUT).build().ok()?;
-    let mut response = client.get(MODELS_DEV_URL).send().ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let mut payload = Vec::new();
-    (&mut response)
-        .take((aperture::MAX_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut payload)
-        .ok()?;
-    if payload.len() > aperture::MAX_RESPONSE_BYTES {
-        return None;
-    }
-    serde_json::from_slice(&payload).ok()
 }
 
 fn all_catalog_models() -> CliResult<Vec<llm::Model>> {

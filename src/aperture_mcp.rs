@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::agent;
+use crate::{agent, aperture};
 
 /// The Streamable HTTP MCP protocol version supported by Aperture.
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -729,6 +729,474 @@ where
         }
     }
     Ok(agent_tools)
+}
+
+/// The model-facing Aperture connector surface registered for one live MCP
+/// session. Pinned tools preserve their gateway schemas; discovery tools keep
+/// every other gateway tool out of the model context until it is needed.
+pub struct ConnectorAgentToolSet {
+    pub tools: Vec<agent::Tool>,
+    pub missing_pins: Vec<String>,
+}
+
+/// Builds the complete connector tool surface for an initialized MCP session.
+///
+/// This is the executable counterpart of
+/// [`aperture::build_connector_tool_set`]. It mirrors the previous runtime:
+/// stale pins are reported but harmless, pinned tools are first-class, and
+/// the four discovery tools expose only unpinned gateway tools.
+pub fn build_connector_agent_tools(
+    resolved: &aperture::Resolved,
+    connectors: &[aperture::ConnectorInfo],
+    tools: &[GatewayTool],
+    session: McpSession,
+) -> Result<ConnectorAgentToolSet> {
+    let aperture::ConnectorToolSet {
+        pinned_tools,
+        proxied_tools,
+        visible_connectors,
+        missing_pins,
+        discovery_enabled,
+    } = aperture::build_connector_tool_set(resolved, connectors, tools);
+    let mut registered = gateway_tools_to_agent_tools(session.clone(), pinned_tools)?;
+
+    if discovery_enabled {
+        append_unique_agent_tools(
+            &mut registered,
+            [
+                connector_list_tool(visible_connectors.clone(), proxied_tools.clone()),
+                connector_tool_search_tool(proxied_tools.clone(), visible_connectors.clone()),
+                connector_tool_describe_tool(proxied_tools.clone()),
+                connector_tool_call_tool(proxied_tools, session),
+            ],
+        );
+    }
+
+    Ok(ConnectorAgentToolSet {
+        tools: registered,
+        missing_pins,
+    })
+}
+
+fn append_unique_agent_tools<I>(tools: &mut Vec<agent::Tool>, additions: I)
+where
+    I: IntoIterator<Item = agent::Tool>,
+{
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    tools.extend(
+        additions
+            .into_iter()
+            .filter(|tool| names.insert(tool.name.clone())),
+    );
+}
+
+fn connector_list_tool(
+    connectors: Vec<aperture::ConnectorInfo>,
+    tools: Vec<GatewayTool>,
+) -> agent::Tool {
+    let counts = connector_tool_counts(&tools);
+    agent::Tool::new(
+        aperture::DISCOVERY_TOOL_NAMES[0],
+        "Connector List",
+        "List all available Aperture connectors and their metadata. Use this to discover which connectors are configured and how many tools each exposes.",
+        json!({"type": "object", "properties": {}}),
+        move |_cancellation, _tool_call_id, _arguments, _on_update| {
+            if connectors.is_empty() {
+                return Ok(agent::ToolResult::text(
+                    "No connectors are currently configured.",
+                ));
+            }
+
+            let lines = connectors
+                .iter()
+                .map(|connector| {
+                    let display = if connector.provider.is_empty() {
+                        &connector.id
+                    } else {
+                        &connector.provider
+                    };
+                    let description = truncate_description(&connector.description, 80);
+                    let description = if description.is_empty() {
+                        "(no description)".to_owned()
+                    } else {
+                        description
+                    };
+                    let status = if connector.status.is_empty() {
+                        "unknown"
+                    } else {
+                        connector.status.as_str()
+                    };
+                    let count = counts.get(&connector.id).copied().unwrap_or_default();
+                    let plural = if count == 1 { "" } else { "s" };
+                    format!(
+                        "- **{display}** (`{}`): {description} — {count} tool{plural} — {status}",
+                        connector.id
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(agent::ToolResult::text(format!(
+                "{} connector(s) available:\n\n{}",
+                connectors.len(),
+                lines.join("\n")
+            )))
+        },
+    )
+}
+
+fn connector_tool_search_tool(
+    tools: Vec<GatewayTool>,
+    connectors: Vec<aperture::ConnectorInfo>,
+) -> agent::Tool {
+    let known_connector_ids = connectors
+        .into_iter()
+        .map(|connector| connector.id.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    agent::Tool::new(
+        aperture::DISCOVERY_TOOL_NAMES[1],
+        "Connector Tool Search",
+        "Search for available tools from Aperture connectors by name or description. Use this when you need to find a tool to accomplish a task but don't know its exact name. Pass an empty query to list all tools.",
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query to match tool names or descriptions. Use * or leave empty to list all."
+                },
+                "limit": {
+                    "type": "number",
+                    "description": "Maximum results to return (default 15)"
+                },
+                "connector": {
+                    "type": "string",
+                    "description": "Filter to a specific connector, e.g. 'github' or 'aperture'"
+                }
+            }
+        }),
+        move |_cancellation, _tool_call_id, arguments, _on_update| {
+            let query = connector_string_argument(&arguments, "query").to_ascii_lowercase();
+            let connector = connector_string_argument(&arguments, "connector");
+            let limit = connector_limit_argument(&arguments);
+            let connector_lower = connector.to_ascii_lowercase();
+            let prefix = (!connector_lower.is_empty()).then(|| format!("{connector_lower}_"));
+
+            let mut matches = tools
+                .iter()
+                .filter(|tool| {
+                    prefix
+                        .as_ref()
+                        .is_none_or(|prefix| tool.name.to_ascii_lowercase().starts_with(prefix))
+                })
+                .filter(|tool| {
+                    query.is_empty()
+                        || query == "*"
+                        || tool.name.to_ascii_lowercase().contains(&query)
+                        || tool.description.to_ascii_lowercase().contains(&query)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() > limit {
+                matches.truncate(limit);
+            }
+
+            if matches.is_empty() {
+                let mut message = "No tools found".to_owned();
+                if !query.is_empty() {
+                    message.push_str(&format!(" matching {query:?}"));
+                }
+                if !connector.is_empty() {
+                    message.push_str(&format!(" from connector {connector:?}"));
+                }
+                message.push_str(". Use aperture_connector_list to see available connectors.");
+                return Ok(agent::ToolResult::text(message));
+            }
+
+            if !connector.is_empty() {
+                return Ok(agent::ToolResult::text(
+                    matches
+                        .iter()
+                        .map(|tool| connector_tool_bullet(tool))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
+
+            let mut groups = BTreeMap::<String, Vec<&GatewayTool>>::new();
+            for tool in matches {
+                let candidate = aperture::connector_id_from_tool_name(&tool.name);
+                let group = if known_connector_ids.contains(&candidate.to_ascii_lowercase()) {
+                    candidate
+                } else {
+                    "other".to_owned()
+                };
+                groups.entry(group).or_default().push(tool);
+            }
+            let mut groups = groups.into_iter().collect::<Vec<_>>();
+            groups.sort_by(
+                |(left, _), (right, _)| match (left.as_str(), right.as_str()) {
+                    ("other", "other") => std::cmp::Ordering::Equal,
+                    ("other", _) => std::cmp::Ordering::Greater,
+                    (_, "other") => std::cmp::Ordering::Less,
+                    _ => left.cmp(right),
+                },
+            );
+
+            let mut lines = Vec::new();
+            for (connector, group_tools) in groups {
+                lines.push(format!("### {connector} ({})", group_tools.len()));
+                lines.extend(group_tools.iter().map(|tool| connector_tool_bullet(tool)));
+                lines.push(String::new());
+            }
+            while lines.last().is_some_and(String::is_empty) {
+                lines.pop();
+            }
+            Ok(agent::ToolResult::text(lines.join("\n")))
+        },
+    )
+}
+
+fn connector_tool_describe_tool(tools: Vec<GatewayTool>) -> agent::Tool {
+    agent::Tool::new(
+        aperture::DISCOVERY_TOOL_NAMES[2],
+        "Connector Tool Describe",
+        "Get the full description and parameter schema for a specific connector tool. Call this before aperture_connector_tool_call to understand what arguments the tool expects.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Name of the connector tool to describe"
+                }
+            },
+            "required": ["tool"]
+        }),
+        move |_cancellation, _tool_call_id, arguments, _on_update| {
+            let tool_name = connector_string_argument(&arguments, "tool");
+            let Some(tool) = tools.iter().find(|tool| tool.name == tool_name) else {
+                return Ok(agent::ToolResult::text(format!(
+                    "Tool {tool_name:?} not found. Use aperture_connector_tool_search to find available tools."
+                )));
+            };
+            let description = if tool.description.is_empty() {
+                "(no description)"
+            } else {
+                tool.description.as_str()
+            };
+            Ok(agent::ToolResult::text(format!(
+                "### {}\n{}\n\n**Parameters:**\n```\n{}\n```",
+                tool.name,
+                description,
+                format_input_schema(&tool.input_schema)
+            )))
+        },
+    )
+}
+
+fn connector_tool_call_tool(tools: Vec<GatewayTool>, session: McpSession) -> agent::Tool {
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    agent::Tool::new(
+        aperture::DISCOVERY_TOOL_NAMES[3],
+        "Connector Tool Call",
+        "Execute a connector tool by name with JSON arguments. Call aperture_connector_tool_describe first to see the required parameters. The args field must be a valid JSON object string matching the tool's schema.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Name of the connector tool to execute"
+                },
+                "args": {
+                    "type": "string",
+                    "description": "Arguments as a JSON object string. Call aperture_connector_tool_describe first to see the expected schema. Omit if the tool takes no arguments."
+                }
+            },
+            "required": ["tool"]
+        }),
+        move |cancellation, _tool_call_id, arguments, on_update| {
+            let tool_name = connector_string_argument(&arguments, "tool");
+            if !tool_names.contains(&tool_name) {
+                return Ok(agent::ToolResult::text(format!(
+                    "Tool {tool_name:?} not found. Use aperture_connector_tool_search to find available tools."
+                )));
+            }
+
+            let raw_arguments = connector_string_argument(&arguments, "args");
+            let raw_arguments = if raw_arguments.is_empty() {
+                "{}"
+            } else {
+                raw_arguments.as_str()
+            };
+            let parsed = match serde_json::from_str::<Value>(raw_arguments) {
+                Ok(Value::Object(arguments)) => arguments,
+                Ok(_) => {
+                    return Ok(invalid_connector_arguments(
+                        &tool_name,
+                        "must be a JSON object",
+                    ));
+                }
+                Err(error) => {
+                    return Ok(invalid_connector_arguments(&tool_name, &error.to_string()));
+                }
+            };
+
+            on_update(agent::ToolResult::text(format!("Calling {tool_name}...")));
+            let result = session
+                .call_tool_with(&cancellation, &tool_name, parsed)
+                .map_err(|error| error.to_string())?;
+            call_result_to_agent_result(&tool_name, result).map_err(|error| error.to_string())
+        },
+    )
+}
+
+fn invalid_connector_arguments(tool_name: &str, reason: &str) -> agent::ToolResult {
+    agent::ToolResult::text(format!(
+        "Invalid args JSON: {reason}. Use aperture_connector_tool_describe({tool_name:?}) to see the expected schema."
+    ))
+}
+
+fn connector_tool_counts(tools: &[GatewayTool]) -> BTreeMap<String, usize> {
+    tools.iter().fold(BTreeMap::new(), |mut counts, tool| {
+        *counts
+            .entry(aperture::connector_id_from_tool_name(&tool.name))
+            .or_default() += 1;
+        counts
+    })
+}
+
+fn connector_string_argument(arguments: &BTreeMap<String, Value>, name: &str) -> String {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn connector_limit_argument(arguments: &BTreeMap<String, Value>) -> usize {
+    arguments
+        .get("limit")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.min(usize::MAX as f64) as usize)
+        .filter(|value| *value > 0)
+        .unwrap_or(15)
+}
+
+fn connector_tool_bullet(tool: &GatewayTool) -> String {
+    let description = truncate_description(&tool.description, 100);
+    let description = if description.is_empty() {
+        "(no description)".to_owned()
+    } else {
+        description
+    };
+    format!("- `{}`: {description}", tool.name)
+}
+
+fn truncate_description(description: &str, maximum: usize) -> String {
+    let flattened = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flattened.len() <= maximum {
+        return flattened;
+    }
+    if maximum <= 3 {
+        return clip_utf8(&flattened, maximum).to_owned();
+    }
+    format!("{}...", clip_utf8(&flattened, maximum - 3))
+}
+
+fn format_input_schema(schema: &Value) -> String {
+    let Some(schema) = schema.as_object() else {
+        return "(no parameters)".to_owned();
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return "(no parameters)".to_owned();
+    };
+    if properties.is_empty() {
+        return "(no parameters)".to_owned();
+    }
+
+    let required = required_schema_keys(schema);
+    properties
+        .iter()
+        .map(|(name, property)| format_schema_property(name, property, required.contains(name), 0))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_schema_property(name: &str, schema: &Value, required: bool, indent: usize) -> String {
+    let object = schema.as_object();
+    let kind = object
+        .and_then(|schema| schema.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("any");
+    let description = object
+        .and_then(|schema| schema.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut type_text = kind.to_owned();
+    if let Some(values) = object
+        .and_then(|schema| schema.get("enum"))
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty())
+    {
+        type_text = format!(
+            "enum({})",
+            values
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+        );
+    } else if kind == "array"
+        && let Some(item_kind) = object
+            .and_then(|schema| schema.get("items"))
+            .and_then(Value::as_object)
+            .and_then(|items| items.get("type"))
+            .and_then(Value::as_str)
+    {
+        type_text = format!("array<{item_kind}>");
+    }
+
+    let requirement = if required { "required" } else { "optional" };
+    let prefix = "  ".repeat(indent);
+    let mut line = format!("{prefix}- `{name}` ({type_text}, {requirement})");
+    if !description.is_empty() {
+        line.push_str(": ");
+        line.push_str(description);
+    }
+
+    if kind == "object"
+        && let Some(properties) = object
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+    {
+        let nested_required = required_schema_keys(object.expect("object was checked"));
+        let mut lines = vec![line];
+        lines.extend(properties.iter().map(|(nested_name, nested_schema)| {
+            format_schema_property(
+                nested_name,
+                nested_schema,
+                nested_required.contains(nested_name),
+                indent + 1,
+            )
+        }));
+        return lines.join("\n");
+    }
+    line
+}
+
+fn required_schema_keys(schema: &Map<String, Value>) -> BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Converts a tool call result to the current agent result shape.
@@ -1507,6 +1975,170 @@ mod tests {
         assert_eq!(
             captured[2].body["params"]["arguments"]["title"],
             Value::String("Issue".to_owned())
+        );
+    }
+
+    #[test]
+    fn connector_agent_tools_keep_pins_and_expose_discovery_workflow() {
+        let (base_url, requests, worker) = test_server(vec![
+            rpc_response(
+                1,
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+                false,
+                Some("session-connectors"),
+            ),
+            response(202, "", &[]),
+            rpc_response(
+                2,
+                json!({"content": [{"type": "text", "text": "search complete"}]}),
+                false,
+                None,
+            ),
+        ]);
+        let session = McpSession::new(&base_url).expect("initialize session");
+        let resolved = aperture::Resolved {
+            connectors_enabled: true,
+            discovery_tools: true,
+            pinned_tools: vec![
+                aperture::PinnedConnectorTool {
+                    connector_id: "github".to_owned(),
+                    tool_name: "github_create_issue".to_owned(),
+                },
+                aperture::PinnedConnectorTool {
+                    connector_id: "github".to_owned(),
+                    tool_name: "github_stale_pin".to_owned(),
+                },
+            ],
+            ..aperture::Resolved::default()
+        };
+        let tools = vec![
+            GatewayTool {
+                name: "github_create_issue".to_owned(),
+                description: "Create an issue".to_owned(),
+                input_schema: json!({"type": "object", "properties": {"title": {"type": "string"}}}),
+            },
+            GatewayTool {
+                name: "github_search".to_owned(),
+                description: "Search repositories".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Terms to search"}
+                    },
+                    "required": ["query"]
+                }),
+            },
+        ];
+        let connector_tools = build_connector_agent_tools(
+            &resolved,
+            &[aperture::ConnectorInfo {
+                id: "github".to_owned(),
+                provider: "GitHub".to_owned(),
+                description: "Source control".to_owned(),
+                status: "connected".to_owned(),
+                ..aperture::ConnectorInfo::default()
+            }],
+            &tools,
+            session,
+        )
+        .expect("build connector tools");
+        assert_eq!(
+            connector_tools.missing_pins,
+            vec!["github_stale_pin".to_owned()]
+        );
+        assert_eq!(
+            connector_tools
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "github_create_issue",
+                "aperture_connector_list",
+                "aperture_connector_tool_search",
+                "aperture_connector_tool_describe",
+                "aperture_connector_tool_call",
+            ]
+        );
+
+        let update: agent::ToolUpdate = Arc::new(|_| {});
+        let invoke = |name: &str, arguments: BTreeMap<String, Value>| {
+            let tool = connector_tools
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("connector tool");
+            (tool.execute)(
+                agent::CancellationToken::default(),
+                "tool-call".to_owned(),
+                arguments,
+                Arc::clone(&update),
+            )
+            .expect("execute connector tool")
+        };
+
+        let listed = invoke("aperture_connector_list", BTreeMap::new());
+        assert!(
+            listed.content[0]
+                .plain_text()
+                .expect("list text")
+                .contains("**GitHub** (`github`): Source control — 1 tool — connected")
+        );
+        let searched = invoke(
+            "aperture_connector_tool_search",
+            BTreeMap::from([("query".to_owned(), Value::String("search".to_owned()))]),
+        );
+        assert_eq!(
+            searched.content[0].plain_text(),
+            Some("### github (1)\n- `github_search`: Search repositories")
+        );
+        let described = invoke(
+            "aperture_connector_tool_describe",
+            BTreeMap::from([("tool".to_owned(), Value::String("github_search".to_owned()))]),
+        );
+        assert!(
+            described.content[0]
+                .plain_text()
+                .expect("describe text")
+                .contains("- `query` (string, required): Terms to search")
+        );
+        let invalid = invoke(
+            "aperture_connector_tool_call",
+            BTreeMap::from([
+                ("tool".to_owned(), Value::String("github_search".to_owned())),
+                ("args".to_owned(), Value::String("[]".to_owned())),
+            ]),
+        );
+        assert!(
+            invalid.content[0]
+                .plain_text()
+                .expect("invalid args text")
+                .starts_with("Invalid args JSON:")
+        );
+        let called = invoke(
+            "aperture_connector_tool_call",
+            BTreeMap::from([
+                ("tool".to_owned(), Value::String("github_search".to_owned())),
+                (
+                    "args".to_owned(),
+                    Value::String(r#"{"query":"ratatui"}"#.to_owned()),
+                ),
+            ]),
+        );
+        assert_eq!(called.content[0].plain_text(), Some("search complete"));
+
+        let captured = (0..3)
+            .map(|_| requests.recv().expect("captured request"))
+            .collect::<Vec<_>>();
+        worker.join().expect("server worker");
+        assert_eq!(captured[2].body["method"], "tools/call");
+        assert_eq!(
+            captured[2].body["params"]["name"],
+            Value::String("github_search".to_owned())
+        );
+        assert_eq!(
+            captured[2].body["params"]["arguments"]["query"],
+            Value::String("ratatui".to_owned())
         );
     }
 

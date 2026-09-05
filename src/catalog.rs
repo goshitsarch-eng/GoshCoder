@@ -2056,6 +2056,18 @@ impl Catalog {
         state
     }
 
+    /// Returns the configuration location used for this catalog's Aperture
+    /// state. Runtime integrations use this rather than process-global paths
+    /// so embedded and test catalogs keep their gateway state isolated.
+    pub fn aperture_config_path(&self) -> PathBuf {
+        self.aperture_paths.config.clone()
+    }
+
+    /// Returns the cache location used for this catalog's Aperture state.
+    pub fn aperture_cache_path(&self) -> PathBuf {
+        self.aperture_paths.cache.clone()
+    }
+
     fn build_aperture_state(&self) -> aperture::ApertureState {
         let Ok(configuration) = aperture::load_config(&self.aperture_paths.config) else {
             return aperture::ApertureState::default();
