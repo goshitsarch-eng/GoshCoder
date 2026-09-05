@@ -8,6 +8,7 @@
 use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
     tools::Workspace,
+    webaccess,
 };
 
 /// The command path that supplied a shared session configuration.
@@ -408,6 +410,9 @@ pub fn prepare_session(
         .filter(|_| config.enable_tools)
         .map(Workspace::all)
         .unwrap_or_default();
+    if config.enable_tools {
+        tools.push(native_web_search_tool(catalog)?);
+    }
     tools.extend(extra_tools);
     let tool_names = tools.iter().map(|tool| tool.name.as_str());
     let system_prompt = resources.build_system_prompt(&config.system_prompt, &cwd, tool_names);
@@ -422,6 +427,67 @@ pub fn prepare_session(
         resources,
         config,
     })
+}
+
+/// Builds the native cited web-search tool with fresh OpenAI/Codex credential
+/// lookup for every call. The closure owns a clone of the catalog rather than
+/// a session-construction borrow, so the tool can remain live for the whole
+/// agent session and observe credentials added after startup.
+fn native_web_search_tool(catalog: &Catalog) -> Result<agent::Tool> {
+    let catalog = Arc::new(catalog.clone());
+    let resolve_openai: webaccess::ResolveOpenAIAuth = Arc::new(move |cancellation| {
+        if cancellation.is_cancelled() {
+            return Err("web search was cancelled".to_owned());
+        }
+
+        let mut lookup_failed = false;
+        for provider_id in ["openai-codex", "openai"] {
+            match catalog.resolve_auth(provider_id) {
+                Ok(Some(auth)) if !auth.is_ambient() => {
+                    let Some(api_key) = auth
+                        .api_key()
+                        .map(str::trim)
+                        .filter(|api_key| !api_key.is_empty())
+                    else {
+                        continue;
+                    };
+                    return Ok(Some(webaccess::OpenAIAuth {
+                        provider: provider_id.to_owned(),
+                        api_key: api_key.to_owned(),
+                        model: web_search_model(&catalog, provider_id),
+                        headers: auth.headers().clone(),
+                    }));
+                }
+                Ok(_) => {}
+                // Catalog errors originate in credential/config lookup. Keep
+                // the model-visible result generic so this boundary cannot
+                // accidentally expose a secret-bearing error string.
+                Err(_) => lookup_failed = true,
+            }
+        }
+
+        if lookup_failed {
+            Err("resolve OpenAI web-search credentials failed".to_owned())
+        } else {
+            Ok(None)
+        }
+    });
+    let service = webaccess::Service::new(Some(resolve_openai))
+        .map_err(|error| RuntimeError::Resource(format!("initialize web search: {error}")))?;
+    Ok(service.tool())
+}
+
+fn web_search_model(catalog: &Catalog, provider_id: &str) -> String {
+    if catalog
+        .model(provider_id, webaccess::DEFAULT_SEARCH_MODEL)
+        .is_some()
+    {
+        return webaccess::DEFAULT_SEARCH_MODEL.to_owned();
+    }
+    catalog
+        .provider(provider_id)
+        .and_then(|provider| provider.models().last().map(|model| model.id))
+        .unwrap_or_else(|| webaccess::DEFAULT_SEARCH_MODEL.to_owned())
 }
 
 /// Applies a model change after resolving the exact catalog reference.
@@ -720,5 +786,48 @@ mod tests {
     fn short_ids_do_not_split_utf8() {
         assert_eq!(short_id("你好世界"), "你好");
         assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn coding_sessions_register_native_web_search_in_the_prompt_and_tool_set() {
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog");
+        let model = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last())
+            .expect("OpenAI model");
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-web-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("workspace");
+
+        let mut prepared = prepare_session(
+            &catalog,
+            SessionConfig {
+                model_ref: format!("openai/{}", model.id),
+                workdir: directory.clone(),
+                enable_tools: true,
+                no_session: true,
+                ..SessionConfig::default()
+            },
+            None,
+            Vec::new(),
+        )
+        .expect("prepare coding session");
+        let state = prepared.runtime.agent().state();
+
+        assert!(state.tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(state.system_prompt.contains("web_search"));
+
+        prepared.runtime.close().expect("close session");
+        std::fs::remove_dir_all(directory).expect("remove workspace");
     }
 }

@@ -21,6 +21,7 @@ mod state;
 pub mod stream;
 pub mod tools;
 mod ui;
+pub mod webaccess;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

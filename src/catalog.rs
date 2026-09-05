@@ -1909,6 +1909,11 @@ impl ResolvedModel {
 }
 
 /// Provider collection backed by the embedded catalog and optional auth store.
+///
+/// Clones share the credential store and read-only catalog data. This allows
+/// request-scoped tools to resolve current credentials without retaining a
+/// borrow of a session constructor.
+#[derive(Clone)]
 pub struct Catalog {
     data: &'static BuiltinData,
     credentials: Option<Arc<CredentialStore>>,
