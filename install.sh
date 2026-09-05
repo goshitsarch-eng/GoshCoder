@@ -5,8 +5,8 @@
 #
 # By default this downloads the latest published release for your platform and
 # verifies its SHA-256 against the signed checksums file before installing. If
-# no release is published yet it falls back to building from source, which needs
-# a Go toolchain. Re-running the script upgrades an existing installation.
+# no release is published yet it falls back to building from source with the
+# stable Rust toolchain. Re-running the script upgrades an existing installation.
 #
 # Options (also settable as environment variables):
 #   --dir <path>       install location            (GOSHCODER_INSTALL_DIR)
@@ -17,7 +17,6 @@ set -eu
 
 REPO="goshitsarch-eng/goshcoder"
 BINARY="goshcoder"
-GO_MIN="1.26.6"
 
 INSTALL_DIR="${GOSHCODER_INSTALL_DIR:-}"
 VERSION="${GOSHCODER_VERSION:-latest}"
@@ -91,17 +90,10 @@ detect_platform() {
 choose_install_dir() {
 	[ -n "$INSTALL_DIR" ] && return 0
 
-	# Prefer a user-writable location already on PATH so the installer never
-	# needs root and the binary is runnable without a profile edit.
-	gobin=""
-	gopath_bin=""
-	if have go; then
-		gobin=$(go env GOBIN 2>/dev/null || true)
-		gopath=$(go env GOPATH 2>/dev/null || true)
-		[ -n "$gopath" ] && gopath_bin="$gopath/bin"
-	fi
-
-	for candidate in "${GOBIN:-}" "$gobin" "$HOME/.local/bin" "$gopath_bin"; do
+	# Prefer Cargo's user bin directory or another user-writable location
+	# already on PATH so installation never needs root.
+	cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+	for candidate in "$cargo_home/bin" "$HOME/.local/bin"; do
 		[ -n "$candidate" ] || continue
 		case ":$PATH:" in
 			*":$candidate:"*) INSTALL_DIR="$candidate"; return 0 ;;
@@ -208,17 +200,11 @@ install_from_release() {
 # source build
 # ---------------------------------------------------------------------------
 
-version_ge() { # version_ge <have> <want>
-	[ "$1" = "$2" ] && return 0
-	lower=$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)
-	[ "$lower" = "$2" ]
-}
-
 install_from_source() {
-	have go || die "building from source needs Go $GO_MIN or newer; install it from https://go.dev/dl/"
+	have cargo || die "building from source needs Rust stable; install it from https://rustup.rs/"
 
 	srcdir=""
-	if [ -f "./go.mod" ] && grep -q '^module goshcoder' ./go.mod 2>/dev/null; then
+	if [ -f "./Cargo.toml" ] && grep -q '^name = "goshcoder"' ./Cargo.toml 2>/dev/null; then
 		srcdir="$(pwd)"
 		info "building from the checkout in $srcdir"
 	else
@@ -229,39 +215,14 @@ install_from_source() {
 			die "could not clone https://github.com/$REPO.git"
 	fi
 
-	# The requirement is whatever go.mod actually states, read from the tree
-	# being built rather than from a constant here that can drift away from it.
-	required=$(sed -n 's/^go \([0-9][0-9.]*\).*/\1/p' "$srcdir/go.mod" 2>/dev/null | head -1)
-	[ -n "$required" ] || required="$GO_MIN"
-	gover=$(go env GOVERSION 2>/dev/null | sed 's/^go//; s/[^0-9.].*$//')
-
-	if [ -n "$gover" ] && ! version_ge "$gover" "$required"; then
-		# go.mod states a hard minimum, not a preference: an older toolchain
-		# refuses the build outright. Go resolves this itself when it is allowed
-		# to, so ask it to -- GOTOOLCHAIN is exported for this build only, which
-		# also overrides a distribution that pinned it to "local".
-		info "Go $gover is older than the $required this project requires"
-		info "fetching the Go $required toolchain (set GOTOOLCHAIN=local to refuse)"
-		GOTOOLCHAIN="go${required}+auto"
-		export GOTOOLCHAIN
-	fi
-
 	info "compiling (this takes a minute)"
 	ver=$(cd "$srcdir" && git describe --tags --dirty --match 'v*' 2>/dev/null ||
 		printf '0.5.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
-	commit=$(cd "$srcdir" && git rev-parse HEAD 2>/dev/null || echo '')
-	date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	if ! ( cd "$srcdir" && CGO_ENABLED=0 go build -trimpath \
-		-ldflags "-s -w -X main.Version=$ver -X main.Commit=$commit -X main.BuildDate=$date" \
-		-o "$TMPDIR_CREATED/$BINARY" ./cmd/goshcoder ); then
-		if [ -n "$gover" ] && ! version_ge "$gover" "$required"; then
-			die "build failed: this needs Go $required and $gover is installed.
-  Either install Go $required from https://go.dev/dl/, or allow Go to fetch it
-  by running this installer without GOTOOLCHAIN=local in the environment."
-		fi
-		die "build failed"
+	if ! ( cd "$srcdir" && CARGO_TARGET_DIR="$TMPDIR_CREATED/cargo-target" \
+		GOSHCODER_VERSION="$ver" cargo build --release --locked --bin "$BINARY" ); then
+		die "build failed; ensure the stable Rust toolchain selected by rust-toolchain.toml is installed"
 	fi
-	SOURCE_BINARY="$TMPDIR_CREATED/$BINARY"
+	SOURCE_BINARY="$TMPDIR_CREATED/cargo-target/release/$BINARY"
 }
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,10 @@
 # GoshCoder
 
-**GoshCoder is a derivative work, not an original one.** It is a Go
+**GoshCoder is a derivative work, not an original one.** It is a Rust
 reimplementation of [pi](https://github.com/earendil-works/pi) — Mario
 Zechner's TypeScript coding agent — and the design it is good at is pi's.
 Its interactive interface is built with
-[Bubble Tea](https://github.com/charmbracelet/bubbletea) and
-[Lip Gloss](https://github.com/charmbracelet/lipgloss).
+[Ratatui](https://ratatui.rs/) and Crossterm.
 
 [Relationship to pi](#relationship-to-pi) explains what that means in
 practice. [`NOTICE`](NOTICE) credits every project adapted here, and
@@ -35,7 +34,7 @@ What that means concretely:
 - **Where it differs, it says so.** See [Deviations from pi](#deviations-from-pi)
   for the list, and [Known gaps](#known-gaps) for what is not implemented.
 
-Several pi extensions are reimplemented here as native Go built-ins rather
+Several pi extensions are reimplemented here as native Rust built-ins rather
 than loaded as npm packages. Each is an adaptation with no upstream code
 bundled, and each is credited with its author, repository and licence in
 [`NOTICE`](NOTICE) — see [Extensions](#extensions).
@@ -67,15 +66,14 @@ location, `--version <tag>` to pin a release, `--from-source` to always compile,
 
 **From a checkout**
 
-Requires Go 1.26.6 or newer; earlier 1.26 patch releases carry standard-library
-vulnerabilities that `govulncheck` reports as reachable from this tree. The
-installers fetch that toolchain through Go's own mechanism when the installed
-one is older, so `GOTOOLCHAIN=local` is the only setting that will stop them.
+Requires the current stable Rust toolchain. `rust-toolchain.toml` selects it
+for Cargo and rustup, while the installers build source releases with the same
+toolchain.
 
 ```sh
 make build      # stamped binary in bin/
 make install    # and onto your PATH
-make check      # the full gate: gofmt, vet, staticcheck, race tests, govulncheck
+make check      # the Rust gate: rustfmt, cargo check, Clippy, and tests
 ```
 
 `make help` lists every target. `make dist` cross-compiles release archives for
@@ -178,24 +176,21 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 
 | Package | Contents |
 | --- | --- |
-| `internal/llm` | Wire protocols, message types, event stream, retry, partial-JSON |
-| `internal/llm/catalog` | Provider catalog, model data, credential store, auth resolution |
-| `internal/agent` | Agent loop: turns, tool execution, hooks, steering and follow-up queues |
-| `internal/tools` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
-| `internal/webaccess` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
-| `internal/omniroute` | OmniRoute setup, public catalog synchronization, and metadata normalization |
-| `internal/aperture` | Tailscale Aperture gateway: config and migrations, dedicated catalog, proxy routing, connector tools |
-| `internal/computeruse` | computer-use-linux desktop control: binary discovery, mcp.json upkeep, stdio MCP client, `mcp` tool |
-| `internal/btw` | Ephemeral context-aware side threads and settings |
-| `internal/ralph` | Long-running iterative development loops |
-| `internal/plannotator` | Native Planner mode, browser approval/annotations, and checklist progress |
-| `internal/claudetui` | Claude-style cards and session information rendering |
-| `internal/tui` | Bubble Tea view renderer, responsive transcript, palette, composer, and sidebar |
-| `internal/sessionlog` | pi-compatible v3 session files: codec, entry tree, writer, store |
-| `internal/lockfile` | Cross-process advisory lock with a heartbeat and stale recovery |
-| `internal/atomicfile` | Staged temp-file write with an atomic rename |
-| `internal/config` | On-disk paths |
-| `cmd/goshcoder` | CLI |
+| `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
+| `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
+| `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
+| `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
+| `src/webaccess.rs` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
+| `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
+| `src/{aperture,aperture_mcp}.rs` | Tailscale Aperture core, routing, cache, and connector MCP client |
+| `src/computeruse.rs` | computer-use-linux discovery, mcp.json upkeep, stdio MCP client, and `mcp` tool |
+| `src/btw.rs` | Ephemeral context-aware side threads and settings |
+| `src/{ralph,ralph_runtime,ralph_cli}.rs` | Durable iterative development loops |
+| `src/{plannotator,planner_runtime}.rs` | Native Planner mode, browser approval, annotations, and checklist progress |
+| `src/{session,sessionlog,sessions}.rs` | pi-compatible v3 sessions, lifecycle, tree, and command adapter |
+| `src/{resources,prompts}.rs` | Local context, skills, templates, and portable prompt archives |
+| `src/{state,ui,markdown}.rs` | Ratatui state, responsive rendering, composer, sidebar, and Markdown |
+| `src/main.rs` | CLI dispatch and interactive Ratatui runtime |
 
 ## Provider coverage
 
@@ -203,6 +198,11 @@ The built-in catalog covers all bundled models across nine wire protocols:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
+
+The live Rust responder currently supports `openai-completions`,
+`anthropic-messages`, `openai-responses`, `azure-openai-responses`,
+`openai-codex-responses`, `google-generative-ai`, and
+`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`.
 
 Model data is generated from the pi reference into `catalog.json`, which is
 replaced wholesale on every regeneration. Two hand-maintained files sit beside
@@ -242,7 +242,8 @@ is recorded in [`NOTICE`](NOTICE).
 
   Set `provider` to `auto`, `openai`, `exa`, or `kagi`; `auto` reuses an
   OpenAI/Codex login when suitable and otherwise works without a key through
-  Exa. This is a native Go port of the search tool, not an npm plugin runtime.
+  Exa. This is a native Rust adaptation of the search tool, not an npm plugin
+  runtime.
   The package's `fetch_content`, `get_search_content`, `source_check`, browser
   curator, video/PDF handling, and providers not listed above are not ported.
 - [`omniroute-agent-extension`](https://github.com/md-riaz/omniroute-agent-extension)
@@ -272,7 +273,9 @@ is recorded in [`NOTICE`](NOTICE).
   Mustier — **Ralph** (native adaptation): persistent iterative loops and
   completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
-  the model to start a loop. `/ralph` opens loop controls in the command palette.
+  the model to start a loop. Loop state is kept in the workspace-local
+  `.ralph/` directory so existing Go and pi-ralph-wiggum loops remain
+  discoverable. `/ralph` opens loop controls in the command palette.
 - **Planner** (native adaptation of
   [`@plannotator/pi-extension`](https://github.com/backnotprop/plannotator) by
   the Plannotator contributors): `/planner`,
@@ -362,8 +365,8 @@ is recorded in [`NOTICE`](NOTICE).
   `/use-claude-code-tui` to switch back. The fullscreen layout is fixed for the
   lifetime of the process.
 
-The visual extensions are implemented by GoshCoder's lightweight, Crush-inspired
-Bubble Tea TUI rather than pi's TypeScript runtime. Type `/` to open the command
+The visual extensions are implemented by GoshCoder's Ratatui terminal UI rather
+than pi's TypeScript runtime. Type `/` to open the command
 palette; arrows select an item, Tab completes it, and Enter accepts it. `/model`
 opens a searchable picker containing models from authenticated providers, while
 `/thinking` contains only levels supported by the active model. The composer
@@ -407,8 +410,9 @@ boundary matters:
   system prompt. Your own `SYSTEM.md` in the agent directory takes precedence,
   and a workspace one is reported in `/resources` rather than applied silently.
   Treat it like any other executable content in a repository you did not write.
-- **Filesystem tools** are confined to the workspace with `os.Root`, so symlink
-  and rename races cannot escape it. The `bash` tool runs with your privileges;
+- **Filesystem tools** are confined to the workspace by Rust path and symlink
+  validation, so symlink and rename races cannot escape it. The `bash` tool
+  runs with your privileges;
   planning mode removes it and independently blocks shell execution.
 - **Credentials** live in `auth.json` (mode 0600) and are never echoed to the
   terminal. Concurrent sessions coordinate through a heartbeat lock file so a
@@ -439,8 +443,8 @@ loss, because the containing directory is not fsynced. That matches every other
 durable write in this repository. A session torn mid-append loses only the
 partial entry; the rest of the file loads normally.
 
-`make check` runs `govulncheck`; keep the Go toolchain patched and rerun it for
-release builds.
+CI and release builds run `cargo audit`; keep the Rust toolchain patched and
+rerun the gate before releases.
 
 ## Known gaps
 
@@ -462,7 +466,7 @@ Documented at the top of each ported file. The notable ones:
 
 - **Compat plumbing.** pi keys `model.compat` by API; here per-API compat
   structs travel on the options struct.
-- **No SDKs.** Provider requests are hand-rolled `net/http` plus an SSE reader
+- **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
   Code, xAI, and Meta. Every one of them also accepts an API key, so a
@@ -484,7 +488,7 @@ Documented at the top of each ported file. The notable ones:
     PKCE and the device flow replace one. `GOSHCODER_XAI_OAUTH_CLIENT_ID` and
     `GOSHCODER_META_OAUTH_CLIENT_ID` override them for an account registered
     against a different application.
-- **Interface.** Interactive chat uses a Bubble Tea alternate-screen TUI with a
+- **Interface.** Interactive chat uses a Ratatui alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
   Redirected input/output automatically falls back to the pipeable line-oriented
@@ -508,8 +512,8 @@ Documented at the top of each ported file. The notable ones:
 ## Development
 
 ```sh
-make check          # what CI runs: gofmt, vet, staticcheck, race tests, govulncheck
-make tools          # install staticcheck and govulncheck first, if needed
+make check          # rustfmt, cargo check, Clippy, and Rust tests
+make tools          # install cargo-audit, cargo-llvm-cov, and cargo-zigbuild
 ```
 
 Individual targets: `make test`, `make test-race`, `make cover`, `make lint`,
@@ -522,8 +526,8 @@ GitHub Actions runs the same gate on Linux, macOS, and Windows, cross-compiles
 every release target, and exercises both installer scripts -- including a
 round-trip that serves real release archives over HTTP and drives the
 installer's actual download path, so the Makefile and the installers cannot
-drift apart into a release that 404s. Filesystem tools use Go's
-`os.Root` confinement, planning mode disables shell execution, local callback
+drift apart into a release that 404s. Filesystem tools use Rust workspace
+confinement, planning mode disables shell execution, local callback
 servers bind only to loopback, and network, disk, and subprocess inputs have
 explicit resource limits.
 
@@ -536,7 +540,7 @@ git clone https://github.com/earendil-works/pi reference/pi
 ```
 
 Read the TypeScript before porting anything, and name the file you read in a
-comment at the top of the Go file. That comment is what lets the next person
+comment at the top of the Rust file. That comment is what lets the next person
 check a port against its original instead of guessing at intent.
 
 ## License

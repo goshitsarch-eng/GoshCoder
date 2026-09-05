@@ -1,82 +1,129 @@
 #!/bin/sh
-# Collect the licence text of every Go module linked into the binary.
+# Collect licence text for Rust crates included in a release archive.
 #
-# A Go binary statically links its dependencies, and MIT and BSD alike require
-# the copyright notice to accompany the software. A release archive carrying
-# only GoshCoder's own LICENSE is therefore missing notices it is obliged to
-# ship. go.sum cannot stand in for them: it records module versions and
-# integrity hashes, not licence texts, and the builder's module cache is not
-# part of the archive.
+# Cargo.lock records checksums and SPDX expressions but does not contain the
+# notices that must accompany the binary. Cargo metadata identifies the exact
+# resolved dependency graph; each package's registry source contains its
+# declared licence file or a conventional top-level licence notice.
 #
-# Only modules that survive into the build are collected -- the list comes from
-# `go list -deps` for the target platform rather than from go.mod -- so a
-# platform-specific dependency is included exactly where it is linked and
-# nowhere else.
+# A crate with no discoverable notice fails the build. Shipping an archive with
+# unknown terms would be a release defect, not a warning.
 #
-# A dependency with no discoverable licence fails the build. Shipping one whose
-# terms are unknown is the failure this script exists to prevent, and a warning
-# nobody reads would not prevent it.
-#
-# Usage: collect-licenses.sh <goos> <goarch> <destdir>
+# Usage: collect-licenses.sh <rust-target> <destdir>
 set -eu
 
-goos="$1"
-goarch="$2"
-dest="$3"
-
+target="$1"
+dest="$2"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$dest"
 
-GOOS="$goos" GOARCH="$goarch" go list -deps \
-	-f '{{if .Module}}{{.Module.Path}}|{{.Module.Version}}|{{.Module.Dir}}{{end}}' \
-	./cmd/goshcoder | sort -u >"$work/modules"
-
-# Read from a file rather than a pipe: a pipeline runs the loop in a subshell,
-# where a recorded failure could not escape to the check below.
-while IFS='|' read -r path version dir; do
-	# The main module is the thing being licensed rather than a dependency,
-	# and the standard library ships with the toolchain, not in the archive.
-	[ -n "$path" ] || continue
-	[ -n "$dir" ] || continue
-	[ "$path" != "goshcoder" ] || continue
-
-	find "$dir" -maxdepth 1 -type f \
-		\( -iname 'LICENSE*' -o -iname 'LICENCE*' -o -iname 'COPYING*' \
-		-o -iname 'NOTICE*' \) >"$work/found"
-
-	if [ ! -s "$work/found" ]; then
-		# A few modules declare their terms in a README and ship no licence
-		# file. Those are recorded by hand under license-exceptions, so the
-		# notice in the archive is a decision somebody made and can audit
-		# rather than something this script inferred from prose.
-		exception="$(dirname "$0")/license-exceptions/$path"
-		if [ -d "$exception" ]; then
-			find "$exception" -maxdepth 1 -type f >"$work/found"
-		fi
-	fi
-
-	if [ ! -s "$work/found" ]; then
-		echo "collect-licenses: no licence file for $path in $dir" >&2
-		printf '%s\n' "$path" >>"$work/missing"
-		continue
-	fi
-
-	mkdir -p "$dest/$path"
-	while IFS= read -r candidate; do
-		cp "$candidate" "$dest/$path/$(basename "$candidate")"
-	done <"$work/found"
-	printf '%s %s\n' "$path" "$version" >>"$work/index"
-done <"$work/modules"
-
-if [ -f "$work/missing" ]; then
-	echo "collect-licenses: refusing to build an archive with unlicensed dependencies" >&2
+command -v python3 >/dev/null 2>&1 || {
+	echo "collect-licenses: Python 3 is required to read Cargo metadata" >&2
 	exit 1
-fi
+}
 
-{
-	echo "Third-party Go modules linked into this build ($goos/$goarch)."
-	echo "Each module's licence text is alongside it in this directory."
-	echo
-	sort -u "$work/index"
-} >"$dest/modules.txt"
+cargo metadata --format-version 1 --locked --filter-platform "$target" >"$work/metadata.json"
+
+python3 - "$work/metadata.json" "$dest" "$target" <<'PY'
+import json
+import pathlib
+import re
+import shutil
+import sys
+
+metadata_path = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+target = sys.argv[3]
+metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+packages = {package["id"]: package for package in metadata["packages"]}
+resolve = metadata.get("resolve") or {}
+root = resolve.get("root")
+nodes = {node["id"]: node for node in resolve.get("nodes", [])}
+
+if not root:
+    raise SystemExit("collect-licenses: Cargo metadata did not identify a root package")
+
+reachable = set()
+pending = [root]
+while pending:
+    package_id = pending.pop()
+    if package_id in reachable:
+        continue
+    reachable.add(package_id)
+    node = nodes.get(package_id, {})
+    pending.extend(node.get("dependencies", []))
+
+notice_names = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*")
+missing = []
+index = []
+exceptions_root = pathlib.Path("scripts/license-exceptions")
+
+for package_id in sorted(reachable):
+    if package_id == root:
+        continue
+    package = packages.get(package_id)
+    if package is None:
+        missing.append(f"{package_id} (missing metadata)")
+        continue
+
+    package_root = pathlib.Path(package["manifest_path"]).parent
+    candidates = []
+    declared = package.get("license_file")
+    if declared:
+        declared_path = pathlib.Path(declared)
+        if not declared_path.is_absolute():
+            declared_path = package_root / declared_path
+        if declared_path.is_file():
+            candidates.append(declared_path)
+    if not candidates:
+        for pattern in notice_names:
+            candidates.extend(path for path in package_root.glob(pattern) if path.is_file())
+    if not candidates:
+        exception = exceptions_root / package["name"]
+        if exception.is_dir():
+            candidates.extend(path for path in exception.iterdir() if path.is_file())
+    if not candidates and package.get("license", "").strip() == "MIT":
+        # A few workspace-published crates declare plain SPDX MIT but omit a
+        # copied notice file from the crate archive. Pair the standard text
+        # with package metadata below rather than silently omitting the crate.
+        standard_mit = exceptions_root / "MIT" / "LICENSE"
+        if standard_mit.is_file():
+            candidates.append(standard_mit)
+    candidates = sorted(set(candidates))
+    if not candidates:
+        missing.append(f'{package["name"]} {package["version"]} ({package_root})')
+        continue
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f'{package["name"]}-{package["version"]}')
+    crate_destination = destination / safe_name
+    crate_destination.mkdir(parents=True, exist_ok=True)
+    for candidate in candidates:
+        shutil.copy2(candidate, crate_destination / candidate.name)
+    source = package.get("source") or "path"
+    authors = ", ".join(package.get("authors", [])) or "not included in Cargo metadata"
+    (crate_destination / "PACKAGE.txt").write_text(
+        f'package: {package["name"]}\n'
+        f'version: {package["version"]}\n'
+        f'license: {package.get("license") or "not declared"}\n'
+        f'authors: {authors}\n'
+        f'source: {source}\n',
+        encoding="utf-8",
+    )
+    index.append(f'{package["name"]} {package["version"]} {source}')
+
+if missing:
+    for package in missing:
+        print(f"collect-licenses: no licence file for {package}", file=sys.stderr)
+    raise SystemExit(
+        "collect-licenses: refusing to build an archive with unlicensed dependencies"
+    )
+
+(destination / "modules.txt").write_text(
+    "Third-party Rust crates resolved for this build "
+    f"({target}).\nEach crate's licence text is alongside it in this directory.\n\n"
+    + "\n".join(index)
+    + "\n",
+    encoding="utf-8",
+)
+PY

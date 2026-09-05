@@ -1,157 +1,150 @@
-# GoshCoder build and release automation.
+# GoshCoder Rust build and release automation.
 #
-# `make` builds a stamped binary into bin/. `make install` puts it on PATH.
-# `make check` is the gate that CI runs and that should pass before any commit.
+# `make` builds a stamped Rust binary into bin/. `make check` is the same
+# formatting, lint, test, and advisory gate used by CI.
 
 SHELL := /bin/sh
-GO ?= go
+CARGO ?= cargo
 BIN_DIR ?= bin
 BINARY := goshcoder
-PKG := ./cmd/goshcoder
-
-# Minimum toolchain. Earlier Go 1.26 patch releases carry standard-library
-# vulnerabilities that govulncheck reports as reachable from this tree.
-GO_MIN_VERSION := 1.26.6
+TARGET_DIR ?= $(CURDIR)/target
 
 # A tagged build reports the tag; an untagged one reports the development
-# version with the short revision appended, so no build ever claims to be a
-# release it is not.
+# revision, so a local binary never claims to be a published release.
 VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
 	|| printf '0.5.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
-COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null)
 
 # Release archives are named without the tag's leading "v", which is what both
-# installers derive from the release tag. Naming them with it made every
-# published archive undownloadable by install.sh and install.ps1.
+# installers derive from a release tag.
 DIST_VERSION := $(VERSION:v%=%)
-BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-LDFLAGS := -s -w \
-	-X main.Version=$(VERSION) \
-	-X main.Commit=$(COMMIT) \
-	-X main.BuildDate=$(BUILD_DATE)
-
-# Platforms produced by `make dist`.
+# Platforms produced by `make dist`. cargo-zigbuild supplies the native C
+# toolchains required to link Rust targets from the release builder.
 PLATFORMS := \
 	linux/amd64 linux/arm64 \
 	darwin/amd64 darwin/arm64 \
 	windows/amd64 windows/arm64
 
-INSTALL_DIR ?= $(if $(GOBIN),$(GOBIN),$(shell $(GO) env GOPATH)/bin)
+INSTALL_DIR ?= $(if $(CARGO_INSTALL_ROOT),$(CARGO_INSTALL_ROOT)/bin,$(HOME)/.cargo/bin)
 
 .PHONY: all build install uninstall run clean check fmt fmt-check vet test test-race \
-        test-hermetic cover lint vuln tools dist dist-name checksums help
+        test-hermetic cover lint vuln tools dist dist-name checksums clean-dist help
 
 all: build
 
-## build: compile a stamped binary into bin/
+## build: compile a release Rust binary into bin/
 build:
-	@mkdir -p $(BIN_DIR)
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/$(BINARY) $(PKG)
+	@mkdir -p "$(BIN_DIR)"
+	CARGO_TARGET_DIR="$(TARGET_DIR)" GOSHCODER_VERSION="$(VERSION)" \
+		$(CARGO) build --release --locked --bin "$(BINARY)"
+	@cp "$(TARGET_DIR)/release/$(BINARY)" "$(BIN_DIR)/$(BINARY)"
 	@echo "built $(BIN_DIR)/$(BINARY) ($(VERSION))"
 
 ## install: build and copy the binary onto PATH
 install: build
-	@mkdir -p '$(INSTALL_DIR)'
-	@cp $(BIN_DIR)/$(BINARY) '$(INSTALL_DIR)/$(BINARY)'
+	@mkdir -p "$(INSTALL_DIR)"
+	@cp "$(BIN_DIR)/$(BINARY)" "$(INSTALL_DIR)/$(BINARY)"
 	@echo "installed $(INSTALL_DIR)/$(BINARY)"
-	@command -v $(BINARY) >/dev/null 2>&1 || \
+	@command -v "$(BINARY)" >/dev/null 2>&1 || \
 		echo "warning: $(INSTALL_DIR) is not on PATH; add it to your shell profile"
 
 ## uninstall: remove the installed binary
 uninstall:
-	@rm -f '$(INSTALL_DIR)/$(BINARY)'
+	@rm -f "$(INSTALL_DIR)/$(BINARY)"
 	@echo "removed $(INSTALL_DIR)/$(BINARY)"
 
 ## run: build and start an interactive session
 run: build
-	@$(BIN_DIR)/$(BINARY)
+	@"$(BIN_DIR)/$(BINARY)"
 
-## check: the full gate - format, vet, lint, tests with the race detector, vulns
-check: fmt-check vet lint test-race test-hermetic vuln
+## check: the full Rust formatting, check, lint, test, and advisory gate
+check: fmt-check vet lint test test-hermetic vuln
 	@echo "all checks passed"
 
-## fmt: rewrite sources with gofmt
+## fmt: rewrite Rust sources with rustfmt
 fmt:
-	$(GO) fmt ./...
+	$(CARGO) fmt --all
 
-## fmt-check: fail if any file is not gofmt-clean
+## fmt-check: fail if Rust sources are not rustfmt-clean
 fmt-check:
-	@unformatted=$$(gofmt -l ./cmd ./internal); \
-	if [ -n "$$unformatted" ]; then \
-		echo "gofmt needed:"; echo "$$unformatted"; exit 1; \
-	fi
+	$(CARGO) fmt --all -- --check
 
-## vet: run the full go vet analyser set
+## vet: type-check all Rust targets without producing a release binary
 vet:
-	$(GO) vet -all ./...
+	CARGO_TARGET_DIR="$(TARGET_DIR)" $(CARGO) check --workspace --all-targets --locked
 
-## test: run the test suite
+## test: run all Rust unit and integration tests
 test:
-	$(GO) test -count=1 ./...
+	CARGO_TARGET_DIR="$(TARGET_DIR)" $(CARGO) test --workspace --all-targets --locked
 
-## test-race: run the test suite under the race detector
-test-race:
-	$(GO) test -race -count=1 ./...
+## test-race: compatibility alias; Rust's ownership model removes Go's race flag
+test-race: test
 
-## test-hermetic: prove the suite ignores ambient provider credentials
-#
-# The tests must not read the developer's real AWS credentials. Running with
-# obviously-wrong values set catches any test that silently inherits them.
+## test-hermetic: prove tests ignore ambient provider credentials
 test-hermetic:
 	AWS_ACCESS_KEY_ID=hermeticity-probe \
 	AWS_SECRET_ACCESS_KEY=hermeticity-probe \
 	AWS_REGION=hermeticity-probe \
 	AWS_PROFILE=hermeticity-probe \
-		$(GO) test -count=1 ./...
+		CARGO_TARGET_DIR="$(TARGET_DIR)" $(CARGO) test --workspace --all-targets --locked
 
-## cover: write a coverage profile and print the per-package summary
+## cover: run coverage when cargo-llvm-cov is installed
 cover:
-	$(GO) test -count=1 -coverprofile=coverage.out ./...
-	$(GO) tool cover -func=coverage.out | tail -1
+	@if command -v cargo-llvm-cov >/dev/null 2>&1; then \
+		CARGO_TARGET_DIR="$(TARGET_DIR)" cargo llvm-cov --workspace --all-targets; \
+	else \
+		echo "cargo-llvm-cov is not installed; run 'make tools'"; \
+	fi
 
-## tools: install the optional external analysers into GOPATH/bin
+## tools: install current Rust audit, coverage, and cross-build tools
 tools:
-	$(GO) install honnef.co/go/tools/cmd/staticcheck@latest
-	$(GO) install golang.org/x/vuln/cmd/govulncheck@latest
+	$(CARGO) install cargo-audit --locked
+	$(CARGO) install cargo-llvm-cov --locked
+	$(CARGO) install cargo-zigbuild --locked
 
-## lint: run staticcheck (skipped with a warning when not installed)
+## lint: fail on every Clippy warning for every Rust target
 lint:
-	@if command -v staticcheck >/dev/null 2>&1; then \
-		staticcheck ./...; \
-	elif [ -x "$$($(GO) env GOPATH)/bin/staticcheck" ]; then \
-		"$$($(GO) env GOPATH)/bin/staticcheck" ./...; \
-	else \
-		echo "staticcheck not installed; run 'make tools'"; \
-	fi
+	CARGO_TARGET_DIR="$(TARGET_DIR)" $(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-## vuln: run govulncheck (skipped with a warning when not installed)
+## vuln: check Cargo.lock against RustSec advisories when cargo-audit is installed
 vuln:
-	@if command -v govulncheck >/dev/null 2>&1; then \
-		govulncheck ./...; \
-	elif [ -x "$$($(GO) env GOPATH)/bin/govulncheck" ]; then \
-		"$$($(GO) env GOPATH)/bin/govulncheck" ./...; \
+	@if command -v cargo-audit >/dev/null 2>&1; then \
+		cargo audit; \
 	else \
-		echo "govulncheck not installed; run 'make tools'"; \
+		echo "cargo-audit is not installed; run 'make tools'"; \
 	fi
 
-## dist: cross-compile release archives for every supported platform
+## dist: cross-compile signed-release archive contents for every platform
 dist: clean-dist
+	@command -v cargo-zigbuild >/dev/null 2>&1 || { \
+		echo "cargo-zigbuild is required for cross-platform releases; run 'make tools'"; exit 1; \
+	}
 	@mkdir -p dist
 	@for platform in $(PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
+		case "$$platform" in \
+			linux/amd64) target=x86_64-unknown-linux-musl ;; \
+			linux/arm64) target=aarch64-unknown-linux-musl ;; \
+			darwin/amd64) target=x86_64-apple-darwin ;; \
+			darwin/arm64) target=aarch64-apple-darwin ;; \
+			windows/amd64) target=x86_64-pc-windows-gnu ;; \
+			windows/arm64) target=aarch64-pc-windows-gnu ;; \
+			*) echo "unsupported release platform $$platform" >&2; exit 1 ;; \
+		esac; \
 		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
 		out="dist/$(BINARY)_$(DIST_VERSION)_$${os}_$${arch}"; \
 		echo "building $$out$$ext"; \
+		CARGO_TARGET_DIR="$(TARGET_DIR)/dist" GOSHCODER_VERSION="$(VERSION)" \
+			$(CARGO) zigbuild --release --locked --target "$$target" --bin "$(BINARY)" || exit 1; \
 		mkdir -p "$$out"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
-			$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o "$$out/$(BINARY)$$ext" $(PKG) || exit 1; \
+		cp "$(TARGET_DIR)/dist/$$target/release/$(BINARY)$$ext" "$$out/$(BINARY)$$ext" || exit 1; \
 		cp README.md NOTICE LICENSE "$$out/"; \
-		sh scripts/collect-licenses.sh "$$os" "$$arch" "$$out/licenses" || exit 1; \
+		sh scripts/collect-licenses.sh "$$target" "$$out/licenses" || exit 1; \
+		base=$$(basename "$$out"); \
 		if [ "$$os" = "windows" ]; then \
-			(cd dist && zip -qr "$$(basename $$out).zip" "$$(basename $$out)"); \
+			(cd dist && zip -qr "$$base.zip" "$$base"); \
 		else \
-			(cd dist && tar czf "$$(basename $$out).tar.gz" "$$(basename $$out)"); \
+			(cd dist && tar czf "$$base.tar.gz" "$$base"); \
 		fi; \
 		rm -rf "$$out"; \
 	done
@@ -161,22 +154,20 @@ dist: clean-dist
 dist-name:
 	@printf '%s_%s_%s_%s\n' '$(BINARY)' '$(DIST_VERSION)' "$${OS:-linux}" "$${ARCH:-amd64}"
 
-## checksums: write SHA-256 sums for the built archives
+## checksums: write SHA-256 sums for release archives
 checksums:
-	@cd dist && (sha256sum * 2>/dev/null || shasum -a 256 *) > checksums.txt.tmp \
-		&& grep -v checksums.txt < checksums.txt.tmp > checksums.txt \
-		&& rm -f checksums.txt.tmp
+	@cd dist && (sha256sum *.tar.gz *.zip 2>/dev/null || shasum -a 256 *.tar.gz *.zip) \
+		| awk '$$2 != "checksums.txt" && $$2 != "*checksums.txt"' > checksums.txt
 	@echo "wrote dist/checksums.txt"
 
-.PHONY: clean-dist
 clean-dist:
-	@rm -rf dist
+	@rm -rf dist "$(TARGET_DIR)/dist"
 
 ## clean: remove build output
 clean: clean-dist
-	@rm -rf $(BIN_DIR) coverage.out
+	@rm -rf "$(BIN_DIR)" "$(TARGET_DIR)" coverage.out
 	@echo "cleaned"
 
 ## help: list available targets
 help:
-	@grep -hE '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /' | sort
+	@awk '/^## / { sub(/^## /, "  "); print }' $(MAKEFILE_LIST) | sort

@@ -13,6 +13,9 @@ bin/
 go.work
 go.work.sum
 
+# Rust workspace
+/target/
+
 # Local scratch
 .tmp/
 
