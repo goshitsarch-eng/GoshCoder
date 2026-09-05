@@ -91,6 +91,8 @@ pub struct App {
     resume_suggestions_loading: bool,
     resource_suggestions: Vec<Suggestion>,
     resource_suggestions_query: Option<String>,
+    ralph_commands_available: bool,
+    planner_commands_available: bool,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -176,6 +178,8 @@ impl App {
             resume_suggestions_loading: false,
             resource_suggestions: Vec::new(),
             resource_suggestions_query: None,
+            ralph_commands_available: true,
+            planner_commands_available: true,
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -183,6 +187,10 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
+        if !self.ralph_commands_available && nested_command_query(&self.input, "/ralph ").is_some()
+        {
+            return Vec::new();
+        }
         if let Some(query) = model_query(&self.input) {
             return if self.model_suggestions_query.as_deref() == Some(query) {
                 self.model_suggestions.clone()
@@ -219,12 +227,29 @@ impl App {
             };
         }
         let mut suggestions = suggestions_for(&self.input);
+        suggestions.retain(|suggestion| self.root_command_available(&suggestion.label));
         if let Some(query) = resource_query(&self.input)
             && self.resource_suggestions_query.as_deref() == Some(query)
         {
             suggestions.extend(self.resource_suggestions.clone());
         }
         suggestions
+    }
+
+    /// Makes optional extension commands visible only when their session
+    /// runtime is loaded, matching the former fullscreen command palette.
+    pub fn set_command_availability(&mut self, ralph: bool, planner: bool) {
+        if self.ralph_commands_available == ralph && self.planner_commands_available == planner {
+            return;
+        }
+        self.ralph_commands_available = ralph;
+        self.planner_commands_available = planner;
+        self.selected_suggestion = 0;
+    }
+
+    fn root_command_available(&self, name: &str) -> bool {
+        (name != "/ralph" || self.ralph_commands_available)
+            && (!name.starts_with("/planner") || self.planner_commands_available)
     }
 
     /// Reports whether the composer is requesting the asynchronous session
@@ -1306,6 +1331,24 @@ mod tests {
                 execute: false,
             }]
         );
+    }
+
+    #[test]
+    fn optional_extension_commands_are_hidden_when_unavailable() {
+        let mut app = App::new();
+        app.set_command_availability(false, false);
+
+        app.set_input("/");
+        let root = app
+            .suggestions()
+            .into_iter()
+            .map(|suggestion| suggestion.label)
+            .collect::<Vec<_>>();
+        assert!(!root.iter().any(|command| command == "/ralph"));
+        assert!(!root.iter().any(|command| command.starts_with("/planner")));
+
+        app.set_input("/ralph ");
+        assert!(app.suggestions().is_empty());
     }
 
     #[test]

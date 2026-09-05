@@ -3307,6 +3307,7 @@ fn refresh_runtime_app(
 ) {
     let state = prepared.runtime.agent().state();
     let model_reference = format!("{}/{}", state.model.provider, state.model.id);
+    app.set_command_availability(prepared.ralph.is_some(), prepared.planner.is_some());
     app.refresh_model_suggestions(&model_reference, |query| {
         model_picker_suggestions(catalog, &state.model, query)
     });
