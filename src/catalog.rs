@@ -10,7 +10,7 @@
 //! changes to `main.rs`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fmt,
@@ -36,7 +36,7 @@ use std::os::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::{Map, Value};
 
-use crate::{config, llm};
+use crate::{config, llm, oauth};
 
 const CATALOG_JSON: &str = include_str!("../internal/llm/catalog/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../internal/llm/catalog/catalog_extra.json");
@@ -116,6 +116,10 @@ pub enum CatalogError {
         model_id: String,
         provider_ids: Vec<String>,
     },
+    OAuthClientUnavailable,
+    OAuthRefreshFailed {
+        provider_id: String,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -178,6 +182,13 @@ impl fmt::Display for CatalogError {
                 formatter,
                 "model {model_id:?} is ambiguous; qualify it as one of {}",
                 provider_ids.join(", ")
+            ),
+            Self::OAuthClientUnavailable => {
+                formatter.write_str("could not initialize the OAuth client")
+            }
+            Self::OAuthRefreshFailed { provider_id } => write!(
+                formatter,
+                "OAuth credential for {provider_id:?} could not be refreshed; run `goshcoder auth login {provider_id}`"
             ),
         }
     }
@@ -1919,6 +1930,8 @@ pub struct Catalog {
     credentials: Option<Arc<CredentialStore>>,
     environment: EnvironmentLookup,
     file_exists: FileExists,
+    oauth_client: Arc<oauth::OAuthClient>,
+    oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl Catalog {
@@ -1953,16 +1966,26 @@ impl Catalog {
         environment: EnvironmentLookup,
         file_exists: FileExists,
     ) -> Result<Self, CatalogError> {
+        let oauth_client =
+            oauth::OAuthClient::system().map_err(|_| CatalogError::OAuthClientUnavailable)?;
         Ok(Self {
             data: builtin_data()?,
             credentials,
             environment,
             file_exists,
+            oauth_client: Arc::new(oauth_client),
+            oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
     pub fn credentials(&self) -> Option<&CredentialStore> {
         self.credentials.as_deref()
+    }
+
+    /// Clears a cached OAuth-refresh failure after an interactive login
+    /// updates the credential store. Clones of this catalog share the cache.
+    pub fn clear_oauth_refresh_failure(&self, provider_id: &str) {
+        lock_unpoisoned(&self.oauth_refresh_failures).remove(provider_id);
     }
 
     /// Returns every statically known provider ID in lexical order.
@@ -2086,11 +2109,9 @@ impl Catalog {
                     ));
                 }
                 CredentialKind::OAuth => {
-                    // TODO: Port OAuth access-token use, expiry checks, and
-                    // refresh/login flows. A stored OAuth credential owns
-                    // the provider, so do not silently fall back to an
-                    // ambient API key while OAuth is unimplemented.
-                    return Ok(None);
+                    // An OAuth credential owns its provider. Do not silently
+                    // fall back to an ambient API key if refresh fails.
+                    return self.resolve_stored_oauth(provider_id);
                 }
                 CredentialKind::Other(_) => return Ok(None),
             }
@@ -2100,6 +2121,47 @@ impl Catalog {
             return Ok(None);
         }
         Ok(self.build_api_key_auth(definition, None, ""))
+    }
+
+    fn resolve_stored_oauth(&self, provider_id: &str) -> Result<Option<Auth>, CatalogError> {
+        let Some(provider) = oauth::OAuthProviderId::parse(provider_id) else {
+            return Ok(None);
+        };
+        let Some(store) = self.credentials.as_deref() else {
+            return Ok(None);
+        };
+        if lock_unpoisoned(&self.oauth_refresh_failures).contains(provider_id) {
+            return Err(CatalogError::OAuthRefreshFailed {
+                provider_id: provider_id.to_owned(),
+            });
+        }
+
+        let environment = oauth::CatalogEnvironment::new(Arc::clone(&self.environment));
+        let cancellation = oauth::CancellationToken::new();
+        match self
+            .oauth_client
+            .resolve_stored_oauth(provider, store, &environment, &cancellation)
+        {
+            Ok(Some(auth)) => {
+                self.clear_oauth_refresh_failure(provider_id);
+                let (api_key, headers, source) = auth.into_parts();
+                let auth = match api_key {
+                    Some(api_key) => Auth::with_api_key(api_key, BTreeMap::new(), headers, source),
+                    None => Auth::without_api_key(BTreeMap::new(), headers, source),
+                };
+                Ok(Some(auth))
+            }
+            Ok(None) => {
+                self.clear_oauth_refresh_failure(provider_id);
+                Ok(None)
+            }
+            Err(_) => {
+                lock_unpoisoned(&self.oauth_refresh_failures).insert(provider_id.to_owned());
+                Err(CatalogError::OAuthRefreshFailed {
+                    provider_id: provider_id.to_owned(),
+                })
+            }
+        }
     }
 
     fn build_api_key_auth(
@@ -2829,7 +2891,7 @@ mod tests {
     }
 
     #[test]
-    fn stored_oauth_does_not_fall_back_until_oauth_is_ported() {
+    fn stored_oauth_is_resolved_without_falling_back_to_ambient_auth() {
         let store = Arc::new(CredentialStore::in_memory());
         store
             .put(
@@ -2843,12 +2905,12 @@ mod tests {
             Arc::new(|_| false),
         )
         .expect("catalog");
-        assert!(
-            catalog
-                .resolve_auth("anthropic")
-                .expect("resolve auth")
-                .is_none()
-        );
+        let auth = catalog
+            .resolve_auth("anthropic")
+            .expect("resolve auth")
+            .expect("stored OAuth auth");
+        assert_eq!(auth.source(), "OAuth");
+        assert_eq!(auth.api_key(), Some("access"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     io::{self, BufRead, IsTerminal, Write},
+    sync::Arc,
 };
 
 use crossterm::{
@@ -12,7 +13,7 @@ use crossterm::{
 
 use crate::{
     catalog::{Catalog, Credential, CredentialStore, Provider},
-    config,
+    config, oauth,
 };
 
 /// Executes `goshcoder providers`.
@@ -112,9 +113,32 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if catalog.provider(provider_id).is_none() {
                 return Err(command_error(format!("unknown provider {provider_id:?}")));
             }
-            Err(command_error(
-                "OAuth login has not yet been migrated; use `goshcoder auth set <provider>` with an API key where supported",
-            ))
+            let Some(provider) = oauth::OAuthProviderId::parse(provider_id) else {
+                return Err(command_error(format!(
+                    "{provider_id:?} does not support OAuth login; use `goshcoder auth set {provider_id}`"
+                )));
+            };
+            if oauth::metadata_for(provider).flow_support == oauth::OAuthFlowSupport::MetadataOnly {
+                return Err(command_error(format!(
+                    "no OAuth login flow is available for {provider_id:?}; use `goshcoder auth set {provider_id}`"
+                )));
+            }
+            config::ensure_agent_dir()?;
+            let client = oauth::OAuthClient::system()?;
+            let cancellation = oauth::CancellationToken::new();
+            client.login_and_persist(
+                provider,
+                &store,
+                Arc::new(TerminalOAuthInteraction),
+                &oauth::ProcessEnvironment,
+                &cancellation,
+            )?;
+            catalog.clear_oauth_refresh_failure(provider_id);
+            println!(
+                "Logged in to {provider_id} with OAuth; credentials are stored in {}",
+                config::auth_path().display()
+            );
+            Ok(())
         }
         "logout" => {
             let Some(provider_id) = arguments.get(1) else {
@@ -128,6 +152,83 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "unknown auth subcommand {subcommand:?}"
         ))),
     }
+}
+
+/// Blocking CLI presentation for the provider-neutral OAuth flow.
+///
+/// Browser and device authorization remain owned by `oauth`; this adapter only
+/// renders their safe instructions and turns a user selection or pasted
+/// redirect into the value expected by the selected provider.
+struct TerminalOAuthInteraction;
+
+impl oauth::OAuthInteraction for TerminalOAuthInteraction {
+    fn prompt(&self, prompt: oauth::OAuthPrompt) -> oauth::Result<String> {
+        prompt.cancellation.check()?;
+        eprintln!();
+        eprintln!("{}", prompt.message);
+        for (index, option) in prompt.options.iter().enumerate() {
+            if option.description.is_empty() {
+                eprintln!("  {}. {}", index + 1, option.label);
+            } else {
+                eprintln!("  {}. {} — {}", index + 1, option.label, option.description);
+            }
+        }
+        if prompt.placeholder.is_empty() {
+            eprint!("> ");
+        } else {
+            eprint!("{}: ", prompt.placeholder);
+        }
+        io::stderr()
+            .flush()
+            .map_err(|error| oauth::OAuthError::Callback(format!("write prompt: {error}")))?;
+
+        let mut input = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .map_err(|error| oauth::OAuthError::Callback(format!("read prompt: {error}")))?;
+        prompt.cancellation.check()?;
+        let input = input.trim().to_owned();
+        if prompt.kind == oauth::OAuthPromptKind::Select {
+            return Ok(select_oauth_option(&input, &prompt.options));
+        }
+        Ok(input)
+    }
+
+    fn notify(&self, event: oauth::OAuthEvent) {
+        match event.kind {
+            oauth::OAuthEventKind::AuthorizationUrl => {
+                if let Some(url) = event.authorization_url {
+                    eprintln!("Open this URL to continue login:\n{url}");
+                }
+                if !event.instructions.is_empty() {
+                    eprintln!("{}", event.instructions);
+                }
+            }
+            oauth::OAuthEventKind::DeviceCode => {
+                eprintln!(
+                    "Open {} and enter code {} (expires in {} minutes).",
+                    event.verification_uri,
+                    event.user_code,
+                    event.expires_in_seconds.div_ceil(60)
+                );
+            }
+            oauth::OAuthEventKind::Info | oauth::OAuthEventKind::Progress => {
+                if !event.message.is_empty() {
+                    eprintln!("{}", event.message);
+                }
+            }
+        }
+    }
+}
+
+fn select_oauth_option(input: &str, options: &[oauth::OAuthPromptOption]) -> String {
+    if let Ok(index) = input.parse::<usize>()
+        && let Some(option) = index.checked_sub(1).and_then(|index| options.get(index))
+    {
+        return option.id.clone();
+    }
+    input.to_owned()
 }
 
 fn print_models(provider: &Provider) {
@@ -287,5 +388,24 @@ mod tests {
                 .expect("resolve auth")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn oauth_numbered_selections_resolve_to_provider_method_ids() {
+        let options = vec![
+            oauth::OAuthPromptOption {
+                id: "browser".to_owned(),
+                label: "Browser".to_owned(),
+                description: String::new(),
+            },
+            oauth::OAuthPromptOption {
+                id: "device_code".to_owned(),
+                label: "Device code".to_owned(),
+                description: String::new(),
+            },
+        ];
+        assert_eq!(select_oauth_option("2", &options), "device_code");
+        assert_eq!(select_oauth_option("browser", &options), "browser");
+        assert_eq!(select_oauth_option("3", &options), "3");
     }
 }

@@ -5,6 +5,7 @@ pub mod computeruse;
 pub mod config;
 pub mod llm;
 pub mod markdown;
+pub mod oauth;
 pub mod omni_cli;
 pub mod omniroute;
 pub mod prompts;
