@@ -5,12 +5,15 @@
 //! Rust runtime incrementally grows strongly typed protocol support.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error as StdError,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::mpsc,
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime},
 };
 
 #[cfg(unix)]
@@ -43,6 +46,27 @@ pub const TYPE_LABEL: &str = "label";
 pub const TYPE_SESSION_INFO: &str = "session_info";
 pub const TYPE_TRANSCRIPT_RESET: &str = "transcript_reset";
 
+const LOCK_HEARTBEAT: Duration = Duration::from_secs(2);
+const LOCK_STALE: Duration = Duration::from_secs(20);
+const MAX_SEARCH_TEXT_BYTES: usize = 64 << 10;
+const SHORT_ID_LENGTH: usize = 8;
+
+/// Best-effort information about the process currently holding a session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LockOwner {
+    pub pid: Option<u32>,
+    pub since: Option<SystemTime>,
+}
+
+impl fmt::Display for LockOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.pid {
+            Some(pid) => write!(formatter, "pid {pid}"),
+            None => formatter.write_str("another process"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     Io(io::Error),
@@ -57,6 +81,11 @@ pub enum SessionError {
     EntryTooLarge(usize),
     SessionTooLarge(u64),
     MissingEntry(String),
+    Busy(LockOwner),
+    NotFound(String),
+    Ambiguous(String),
+    ReadOnly,
+    Degraded(String),
     Closed,
 }
 
@@ -86,7 +115,7 @@ impl fmt::Display for SessionError {
             Self::LegacyFormat(version) => {
                 write!(
                     formatter,
-                    "sessionlog: legacy session format v{version} has not been migrated yet"
+                    "sessionlog: legacy session format v{version} must be forked before it can be continued"
                 )
             }
             Self::EntryTooLarge(bytes) => write!(
@@ -98,6 +127,26 @@ impl fmt::Display for SessionError {
                 "sessionlog: session of {bytes} bytes exceeds the {MAX_SESSION_BYTES}-byte limit"
             ),
             Self::MissingEntry(id) => write!(formatter, "sessionlog: no entry {id} to branch from"),
+            Self::Busy(owner) => {
+                write!(
+                    formatter,
+                    "sessionlog: session is open in another process (held by {owner})"
+                )
+            }
+            Self::NotFound(reference) => {
+                write!(
+                    formatter,
+                    "sessionlog: no matching session for {reference:?}"
+                )
+            }
+            Self::Ambiguous(reference) => {
+                write!(
+                    formatter,
+                    "sessionlog: session id prefix {reference:?} matches more than one session"
+                )
+            }
+            Self::ReadOnly => write!(formatter, "sessionlog: session is open read-only"),
+            Self::Degraded(reason) => write!(formatter, "sessionlog: recording stopped: {reason}"),
             Self::Closed => write!(formatter, "sessionlog: writer is closed"),
         }
     }
@@ -264,6 +313,10 @@ impl Entry {
     }
 
     pub fn decode(line: &[u8]) -> Result<Self> {
+        Self::decode_with_id(line, true)
+    }
+
+    fn decode_with_id(line: &[u8], require_id: bool) -> Result<Self> {
         let entry: Self = serde_json::from_slice(line)?;
         if entry.kind.is_empty() {
             return Err(SessionError::InvalidEntry("type is missing".to_owned()));
@@ -273,7 +326,7 @@ impl Entry {
                 "is a second session header".to_owned(),
             ));
         }
-        if entry.id.is_empty() {
+        if require_id && entry.id.is_empty() {
             return Err(SessionError::InvalidEntry("id is missing".to_owned()));
         }
         Ok(entry)
@@ -341,6 +394,10 @@ impl Tree {
 
     pub fn entry(&self, id: &str) -> Option<&Entry> {
         self.entries.get(id)
+    }
+
+    fn entry_mut(&mut self, id: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(id)
     }
 
     pub fn raw(&self, id: &str) -> Option<&[u8]> {
@@ -459,7 +516,135 @@ pub struct LoadReport {
     pub warnings: Vec<String>,
     pub repaired_tail: bool,
     pub unterminated_tail: bool,
+    /// This session was read from an older pi format and upgraded in memory.
+    /// The source file is never rewritten.
+    pub migrated: bool,
     pub source_version: u32,
+}
+
+/// In-memory migration for pre-v3 pi session files. Older files are never
+/// rewritten: callers can inspect or fork them, but must not append in place.
+struct Migrator {
+    version: u32,
+    previous: Option<String>,
+    taken: HashSet<String>,
+    pending_compaction_index: HashMap<String, usize>,
+    entry_index: Vec<String>,
+}
+
+impl Migrator {
+    fn new(version: u32) -> Self {
+        Self {
+            version,
+            previous: None,
+            taken: HashSet::new(),
+            pending_compaction_index: HashMap::new(),
+            entry_index: Vec::new(),
+        }
+    }
+
+    fn needed(&self) -> bool {
+        self.version < FORMAT_VERSION
+    }
+
+    fn apply(&mut self, entry: &mut Entry, raw: &[u8]) {
+        if self.version < 2 {
+            if entry.id.is_empty() {
+                let id = new_unique_entry_id(|candidate| self.taken.contains(candidate));
+                self.taken.insert(id.clone());
+                entry.id = id.clone();
+                entry.parent_id = self.previous.clone();
+                self.previous = Some(id.clone());
+
+                if entry.kind == TYPE_COMPACTION
+                    && let Ok(Value::Object(fields)) = serde_json::from_slice::<Value>(raw)
+                    && let Some(index) = fields
+                        .get("firstKeptEntryIndex")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                {
+                    self.pending_compaction_index.insert(id.clone(), index);
+                }
+                self.entry_index.push(id);
+            } else {
+                self.taken.insert(entry.id.clone());
+                self.previous = Some(entry.id.clone());
+                self.entry_index.push(entry.id.clone());
+            }
+        }
+
+        if self.version < 3 && entry.kind == TYPE_MESSAGE {
+            rename_legacy_message_role(&mut entry.message);
+        }
+    }
+
+    fn finish(self, tree: &mut Tree) {
+        for (id, index) in self.pending_compaction_index {
+            // v1 counts the header as index zero.
+            let Some(target) = index.checked_sub(1) else {
+                continue;
+            };
+            let Some(first_kept_entry_id) = self.entry_index.get(target) else {
+                continue;
+            };
+            if let Some(entry) = tree.entry_mut(&id) {
+                entry.first_kept_entry_id = first_kept_entry_id.clone();
+            }
+        }
+    }
+}
+
+fn rename_legacy_message_role(message: &mut Option<Value>) {
+    let Some(Value::Object(fields)) = message else {
+        return;
+    };
+    if fields.get("role").and_then(Value::as_str) == Some("hookMessage") {
+        fields.insert("role".to_owned(), Value::String("custom".to_owned()));
+    }
+}
+
+struct ReadLine {
+    bytes: Vec<u8>,
+    consumed: u64,
+    complete: bool,
+    too_large: bool,
+}
+
+fn read_line_bounded(reader: &mut impl BufRead, limit: usize) -> io::Result<ReadLine> {
+    let mut bytes = Vec::new();
+    let mut consumed = 0_u64;
+    let mut complete = false;
+
+    loop {
+        let (take, ends_line, retained) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                break;
+            }
+            let newline = buffer.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(buffer.len(), |index| index + 1);
+            let available = limit.saturating_add(1).saturating_sub(bytes.len());
+            (
+                take,
+                newline.is_some(),
+                buffer[..take.min(available)].to_vec(),
+            )
+        };
+        bytes.extend_from_slice(&retained);
+        consumed += take as u64;
+        reader.consume(take);
+        if ends_line {
+            complete = true;
+            break;
+        }
+    }
+
+    Ok(ReadLine {
+        too_large: bytes.len() > limit,
+        bytes,
+        consumed,
+        complete,
+    })
 }
 
 /// A root collection of pi-compatible sessions.
@@ -514,13 +699,25 @@ impl Store {
             filename_stamp(&header.timestamp),
             id
         ));
+        let claim = claim(&path)?;
         let mut options = OpenOptions::new();
         options.write(true).append(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&path)?;
-        let header_line = header.encode()?;
-        file.write_all(&header_line)?;
+        let header_line = match header.encode() {
+            Ok(header_line) => header_line,
+            Err(error) => {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = file.write_all(&header_line) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error.into());
+        }
         Ok(Writer {
             file: Some(file),
             path,
@@ -528,101 +725,388 @@ impl Store {
             tree: Tree::new(),
             size: header_line.len() as u64,
             keep: false,
+            claim: Some(claim),
+            read_only: false,
+            degraded: None,
+            closed: false,
         })
     }
 
     pub fn load(&self, path: impl AsRef<Path>) -> Result<(Tree, Header, LoadReport)> {
         let path = path.as_ref();
-        let metadata = fs::metadata(path)?;
-        if metadata.len() > MAX_SESSION_BYTES {
-            return Err(SessionError::SessionTooLarge(metadata.len()));
-        }
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Err(SessionError::EmptySession);
-        }
-        let header = Header::decode(trim_line(&line))?;
-        if header.version < FORMAT_VERSION {
-            return Err(SessionError::LegacyFormat(header.version));
-        }
-        let mut report = LoadReport {
-            source_version: header.version,
-            ..LoadReport::default()
-        };
-        let mut tree = Tree::new();
-        let mut last_added = None::<String>;
-        let mut line_number = 1usize;
+        let mut file = File::open(path)?;
+        let (tree, header, report, _) = read_into(&mut file, path)?;
+        Ok((tree, header, report))
+    }
 
-        loop {
-            line.clear();
-            let bytes = reader.read_until(b'\n', &mut line)?;
-            if bytes == 0 {
-                break;
+    /// Opens an existing v3 session for append while holding its on-disk
+    /// claim. A pre-v3 session can be read or forked, but cannot safely be
+    /// appended in place because its generated identities are not durable.
+    pub fn attach(&self, path: impl AsRef<Path>) -> Result<(Writer, LoadReport)> {
+        let path = path.as_ref();
+        let claim = claim(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let (tree, header, mut report, offset) = read_into(&mut file, path)?;
+        if report.migrated {
+            return Err(SessionError::LegacyFormat(report.source_version));
+        }
+
+        let current_size = file.metadata()?.len();
+        if current_size > offset {
+            file.set_len(offset)?;
+            report.repaired_tail = true;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut size = offset;
+        if report.unterminated_tail {
+            file.write_all(b"\n")?;
+            size += 1;
+        }
+
+        Ok((
+            Writer {
+                file: Some(file),
+                path: path.to_path_buf(),
+                header,
+                tree,
+                size,
+                keep: false,
+                claim: Some(claim),
+                read_only: false,
+                degraded: None,
+                closed: false,
+            },
+            report,
+        ))
+    }
+
+    /// Opens a session for read-only inspection without claiming it.
+    pub fn open(&self, path: impl AsRef<Path>) -> Result<(Writer, LoadReport)> {
+        let path = path.as_ref();
+        let (tree, header, report) = self.load(path)?;
+        let size = fs::metadata(path)?.len();
+        Ok((
+            Writer {
+                file: None,
+                path: path.to_path_buf(),
+                header,
+                tree,
+                size,
+                keep: true,
+                claim: None,
+                read_only: true,
+                degraded: None,
+                closed: false,
+            },
+            report,
+        ))
+    }
+
+    /// Lists sessions belonging to one workspace by default, or every known
+    /// workspace when `all_workspaces` is selected.
+    pub fn list(&self, cwd: impl AsRef<Path>, options: ListOptions) -> Result<Vec<SessionInfo>> {
+        let cwd = cwd.as_ref();
+        let target_cwd = absolute_path(cwd).to_string_lossy().into_owned();
+        let directories = if options.all_workspaces {
+            match fs::read_dir(&self.root) {
+                Ok(entries) => entries
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .file_type()
+                            .ok()
+                            .filter(|kind| kind.is_dir())
+                            .map(|_| entry.path())
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error.into()),
             }
-            line_number += 1;
-            if line.len() > MAX_ENTRY_BYTES {
-                report.skipped_lines += 1;
-                report.warnings.push(format!(
-                    "line {line_number} exceeds the {MAX_ENTRY_BYTES}-byte entry limit and was skipped"
-                ));
-                continue;
-            }
-            let complete = line.ends_with(b"\n");
-            let raw = trim_line(&line);
-            if raw.is_empty() {
-                continue;
-            }
-            let mut entry = match Entry::decode(raw) {
-                Ok(entry) => entry,
-                Err(error) if !complete => {
-                    report.repaired_tail = true;
-                    report.warnings.push(format!(
-                        "line {line_number} is an unterminated malformed tail and was ignored: {error}"
-                    ));
-                    break;
-                }
-                Err(error) => {
-                    report.skipped_lines += 1;
-                    report
-                        .warnings
-                        .push(format!("line {line_number} was skipped: {error}"));
+        } else {
+            vec![self.directory(cwd)]
+        };
+
+        let mut sessions = Vec::new();
+        for directory in directories {
+            let entries = match fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries.filter_map(std::result::Result::ok) {
+                let path = entry.path();
+                if entry.file_type().map_or(true, |kind| kind.is_dir())
+                    || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+                {
                     continue;
                 }
-            };
-
-            if let Some(parent) = entry.parent_id.as_deref()
-                && !tree.has(parent)
-            {
-                entry.parent_id = last_added.clone();
-                report.warnings.push(format!(
-                    "line {line_number} referenced an entry that is not in the file; it was reattached so earlier conversation stays reachable"
-                ));
-            }
-            match tree.add(entry.clone(), &line) {
-                Ok(()) => {
-                    last_added = Some(entry.id);
-                    if !complete {
-                        report.unterminated_tail = true;
-                    }
-                }
-                Err(error) => {
-                    report.skipped_lines += 1;
-                    report
-                        .warnings
-                        .push(format!("line {line_number} was skipped: {error}"));
+                let Ok(info) = self.describe(&path, options.with_text) else {
+                    // A malformed or inaccessible file must not hide usable
+                    // sessions in the same directory.
+                    continue;
+                };
+                if options.all_workspaces || info.cwd.is_empty() || info.cwd == target_cwd {
+                    sessions.push(info);
                 }
             }
         }
+        sessions.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if options.limit > 0 {
+            sessions.truncate(options.limit);
+        }
+        Ok(sessions)
+    }
 
-        Ok((tree, header, report))
+    pub fn most_recent(&self, cwd: impl AsRef<Path>) -> Result<Option<SessionInfo>> {
+        Ok(self
+            .list(
+                cwd,
+                ListOptions {
+                    limit: 1,
+                    ..ListOptions::default()
+                },
+            )?
+            .into_iter()
+            .next())
+    }
+
+    /// Resolves an explicit path, exact ID, or unambiguous ID prefix.
+    pub fn resolve(&self, cwd: impl AsRef<Path>, reference: &str) -> Result<SessionInfo> {
+        if reference.is_empty() {
+            return Err(SessionError::NotFound(reference.to_owned()));
+        }
+        if reference.ends_with(".jsonl") || reference.contains(['/', '\\']) {
+            return self
+                .describe(&absolute_path(Path::new(reference)), false)
+                .map_err(|_| SessionError::NotFound(reference.to_owned()));
+        }
+
+        for all_workspaces in [false, true] {
+            let mut matches = Vec::new();
+            for candidate in self.list(
+                cwd.as_ref(),
+                ListOptions {
+                    all_workspaces,
+                    ..ListOptions::default()
+                },
+            )? {
+                if candidate.id == reference {
+                    return Ok(candidate);
+                }
+                if candidate.id.starts_with(reference) {
+                    matches.push(candidate);
+                }
+            }
+            match matches.len() {
+                0 => {}
+                1 => return Ok(matches.remove(0)),
+                _ => return Err(SessionError::Ambiguous(reference.to_owned())),
+            }
+        }
+        Err(SessionError::NotFound(reference.to_owned()))
+    }
+
+    /// Removes a session only after it has been claimed, so a live writer
+    /// cannot continue appending to an unlinked file.
+    pub fn remove(&self, info: &SessionInfo) -> Result<()> {
+        let _claim = claim(&info.path)?;
+        fs::remove_file(&info.path)?;
+        Ok(())
+    }
+
+    /// Copies one selected branch into a new v3 session. For an older source,
+    /// migrated entries are encoded with their durable generated identities.
+    pub fn fork(
+        &self,
+        source: &SessionInfo,
+        at: Option<&str>,
+        target_cwd: impl AsRef<Path>,
+    ) -> Result<Writer> {
+        let (tree, header, report) = self.load(&source.path)?;
+        let path = tree.path(at);
+        if path.is_empty() && at.is_some() {
+            return Err(SessionError::MissingEntry(
+                at.expect("checked above").to_owned(),
+            ));
+        }
+        let target_cwd = target_cwd.as_ref();
+        let target_cwd = if target_cwd.as_os_str().is_empty() {
+            Path::new(&header.cwd)
+        } else {
+            target_cwd
+        };
+        let mut writer =
+            self.create_with_id(target_cwd, Some(header.id.clone()), new_session_id())?;
+        let on_path = path
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<HashSet<_>>();
+
+        for entry in tree.all() {
+            let copy = on_path.contains(entry.id.as_str())
+                || (entry.kind == TYPE_LABEL && on_path.contains(entry.target_id.as_str()));
+            if !copy
+                || (entry.kind == TYPE_LABEL
+                    && entry
+                        .parent_id
+                        .as_deref()
+                        .is_some_and(|parent| !on_path.contains(parent)))
+            {
+                continue;
+            }
+            let line = if report.migrated {
+                entry.encode()?
+            } else {
+                tree.raw(&entry.id)
+                    .ok_or_else(|| SessionError::MissingEntry(entry.id.clone()))?
+                    .to_vec()
+            };
+            if let Err(error) = writer.append_raw(entry.clone(), &line) {
+                let _ = writer.close();
+                return Err(error);
+            }
+        }
+        if let Some(id) = last_conversation_entry(&writer.tree) {
+            writer.set_leaf(id)?;
+        }
+        writer.keep();
+        writer.sync()?;
+        Ok(writer)
+    }
+
+    fn describe(&self, path: &Path, with_text: bool) -> Result<SessionInfo> {
+        let metadata = fs::metadata(path)?;
+        let (tree, header, _) = self.load(path)?;
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut info = SessionInfo {
+            id: header.id,
+            path: path.to_path_buf(),
+            cwd: header.cwd,
+            name: tree.name().to_owned(),
+            first_message: String::new(),
+            created: parse_timestamp(&header.timestamp)
+                .or_else(|| system_time_to_offset_datetime(modified)),
+            modified,
+            messages: 0,
+            cleared: 0,
+            size: metadata.len(),
+            search_text: String::new(),
+            locked: false,
+            owner: LockOwner::default(),
+        };
+        let mut search_text = String::new();
+        for entry in tree.all() {
+            if entry.kind == TYPE_TRANSCRIPT_RESET {
+                info.cleared += info.messages;
+                info.messages = 0;
+                info.first_message.clear();
+                continue;
+            }
+            if entry.kind != TYPE_MESSAGE {
+                continue;
+            }
+            info.messages += 1;
+            let text = entry
+                .message
+                .as_ref()
+                .map_or_else(String::new, message_text);
+            let role = entry
+                .message
+                .as_ref()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if info.first_message.is_empty() && role == "user" && !text.is_empty() {
+                info.first_message = first_line(&text, 120);
+            }
+            if with_text && search_text.len() < MAX_SEARCH_TEXT_BYTES && !text.is_empty() {
+                let remaining = MAX_SEARCH_TEXT_BYTES - search_text.len();
+                search_text.push_str(truncate_utf8(&text, remaining));
+                search_text.push('\n');
+            }
+        }
+        info.search_text = search_text;
+        (info.locked, info.owner) = probe_claim(path);
+        Ok(info)
     }
 }
 
-/// An append-only writer. The higher-level session runtime owns synchronization
-/// and process claims; this value keeps write ordering and JSONL invariants
-/// local to persistence.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListOptions {
+    /// Scan all workspace shards instead of only the current workspace.
+    pub all_workspaces: bool,
+    /// Maximum number of newest sessions to return. Zero means unlimited.
+    pub limit: usize,
+    /// Include bounded transcript text for resume-picker search.
+    pub with_text: bool,
+}
+
+/// One session's metadata as shown by the picker and consumed by resume.
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub id: String,
+    pub path: PathBuf,
+    pub cwd: String,
+    pub name: String,
+    pub first_message: String,
+    pub created: Option<OffsetDateTime>,
+    pub modified: SystemTime,
+    pub messages: usize,
+    pub cleared: usize,
+    pub size: u64,
+    pub search_text: String,
+    pub locked: bool,
+    pub owner: LockOwner,
+}
+
+impl SessionInfo {
+    pub fn title(&self) -> &str {
+        if !self.name.is_empty() {
+            &self.name
+        } else if !self.first_message.is_empty() {
+            &self.first_message
+        } else {
+            &self.id
+        }
+    }
+
+    pub fn short_id(&self) -> &str {
+        &self.id[..self.id.len().min(SHORT_ID_LENGTH)]
+    }
+}
+
+/// Returns unique, readable ID prefixes for a list of sessions.
+pub fn short_ids(sessions: &[SessionInfo]) -> Vec<String> {
+    let mut length = SHORT_ID_LENGTH;
+    loop {
+        let mut prefixes = HashSet::with_capacity(sessions.len());
+        let mut collision = false;
+        let mut longest = 0;
+        for session in sessions {
+            longest = longest.max(session.id.len());
+            let end = session.id.len().min(length);
+            if !prefixes.insert(&session.id[..end]) {
+                collision = true;
+                break;
+            }
+        }
+        if !collision || length >= longest {
+            return sessions
+                .iter()
+                .map(|session| session.id[..session.id.len().min(length)].to_owned())
+                .collect();
+        }
+        length += 4;
+    }
+}
+
+/// An append-only writer. It owns the process claim so every successful append
+/// has exclusive access to its session file.
 pub struct Writer {
     file: Option<File>,
     path: PathBuf,
@@ -630,6 +1114,10 @@ pub struct Writer {
     tree: Tree,
     size: u64,
     keep: bool,
+    claim: Option<LockClaim>,
+    read_only: bool,
+    degraded: Option<String>,
+    closed: bool,
 }
 
 impl fmt::Debug for Writer {
@@ -660,20 +1148,42 @@ impl Writer {
         self.size
     }
 
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn recording(&self) -> bool {
+        !self.read_only && !self.closed && self.degraded.is_none() && self.file.is_some()
+    }
+
+    pub fn degraded(&self) -> Option<&str> {
+        self.degraded.as_deref()
+    }
+
     pub fn snapshot(&self) -> Tree {
         self.tree.clone()
+    }
+
+    pub fn leaf(&self) -> Option<&str> {
+        self.tree.leaf()
     }
 
     pub fn keep(&mut self) {
         self.keep = true;
     }
 
-    pub fn append(&mut self, mut entry: Entry) -> Result<String> {
-        if self.file.is_none() {
-            return Err(SessionError::Closed);
-        }
+    /// Appends an entry at the current write head.
+    pub fn append(&mut self, entry: Entry) -> Result<String> {
+        let parent = self.tree.leaf().map(str::to_owned);
+        self.append_at(parent.as_deref(), entry)
+    }
+
+    /// Appends an entry to a specific parent, which is used when recreating a
+    /// branch without first moving the write head.
+    pub fn append_at(&mut self, parent: Option<&str>, mut entry: Entry) -> Result<String> {
+        self.ensure_writable()?;
         entry.id = new_entry_id(&self.tree);
-        entry.parent_id = self.tree.leaf().map(str::to_owned);
+        entry.parent_id = parent.map(str::to_owned);
         entry.timestamp = now();
         let line = entry.encode()?;
         if line.len() > MAX_ENTRY_BYTES {
@@ -681,10 +1191,10 @@ impl Writer {
         }
         let new_size = self.size + line.len() as u64;
         if new_size > MAX_SESSION_BYTES {
+            self.stop("the session file reached its maximum size");
             return Err(SessionError::SessionTooLarge(new_size));
         }
-        let file = self.file.as_mut().expect("checked above");
-        file.write_all(&line)?;
+        self.write_line(&line)?;
         self.size = new_size;
         let id = entry.id.clone();
         self.tree.add(entry, &line)?;
@@ -696,10 +1206,19 @@ impl Writer {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        if self.read_only || self.closed {
+            return Ok(());
+        }
+        if let Some(reason) = &self.degraded {
+            return Err(SessionError::Degraded(reason.clone()));
+        }
         let Some(file) = self.file.as_mut() else {
             return Err(SessionError::Closed);
         };
-        file.sync_all()?;
+        if let Err(error) = file.sync_all() {
+            self.stop(&error.to_string());
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -707,16 +1226,87 @@ impl Writer {
     /// unless the caller explicitly retained one (for example, a user-created
     /// fork that intentionally ends at a prompt).
     pub fn close(&mut self) -> Result<()> {
-        let Some(mut file) = self.file.take() else {
+        if self.closed {
             return Ok(());
-        };
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-        if !self.keep && !self.tree.has_assistant_message() {
-            fs::remove_file(&self.path)?;
+        }
+        self.closed = true;
+        let mut first_error = None;
+        if let Some(mut file) = self.file.take() {
+            if !self.read_only && self.degraded.is_none() {
+                if let Err(error) = file.flush().and_then(|()| file.sync_all()) {
+                    first_error = Some(SessionError::Io(error));
+                }
+            }
+        }
+        if !self.read_only && !self.keep && !self.tree.has_assistant_message() {
+            if let Err(error) = fs::remove_file(&self.path) {
+                if error.kind() != io::ErrorKind::NotFound && first_error.is_none() {
+                    first_error = Some(SessionError::Io(error));
+                }
+            }
+        }
+        self.claim.take();
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.closed {
+            return Err(SessionError::Closed);
+        }
+        if self.read_only {
+            return Err(SessionError::ReadOnly);
+        }
+        if let Some(reason) = &self.degraded {
+            return Err(SessionError::Degraded(reason.clone()));
+        }
+        if self.file.is_none() {
+            return Err(SessionError::Closed);
         }
         Ok(())
+    }
+
+    fn append_raw(&mut self, entry: Entry, raw: &[u8]) -> Result<()> {
+        self.ensure_writable()?;
+        let line = if raw.ends_with(b"\n") {
+            raw.to_vec()
+        } else {
+            [raw, b"\n"].concat()
+        };
+        if line.len() > MAX_ENTRY_BYTES {
+            return Err(SessionError::EntryTooLarge(line.len()));
+        }
+        let new_size = self.size + line.len() as u64;
+        if new_size > MAX_SESSION_BYTES {
+            self.stop("the session file reached its maximum size");
+            return Err(SessionError::SessionTooLarge(new_size));
+        }
+        self.write_line(&line)?;
+        self.size = new_size;
+        self.tree.add(entry, &line)
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> Result<()> {
+        let original_size = self.size;
+        let write_result = self
+            .file
+            .as_mut()
+            .ok_or(SessionError::Closed)
+            .and_then(|file| file.write_all(line).map_err(SessionError::Io));
+        if let Err(error) = write_result {
+            if let Some(file) = self.file.as_mut() {
+                let _ = file.set_len(original_size);
+                let _ = file.seek(SeekFrom::Start(original_size));
+            }
+            self.stop(&error.to_string());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, reason: &str) {
+        if self.degraded.is_none() {
+            self.degraded = Some(reason.to_owned());
+        }
     }
 }
 
@@ -724,6 +1314,320 @@ impl Drop for Writer {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// A sidecar `.lock` claim compatible with the Go implementation. It is an
+/// advisory claim: ownership is a token, so a stale writer cannot remove a
+/// lock reclaimed by another process.
+struct LockClaim {
+    path: PathBuf,
+    token: String,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+}
+
+impl LockClaim {
+    fn new(path: PathBuf, token: String) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let heartbeat_path = path.clone();
+        let heartbeat_token = token.clone();
+        let heartbeat = thread::spawn(move || {
+            loop {
+                match receiver.recv_timeout(LOCK_HEARTBEAT) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if fs::read(&heartbeat_path)
+                            .is_ok_and(|contents| contents.as_slice() == heartbeat_token.as_bytes())
+                        {
+                            let _ = OpenOptions::new()
+                                .write(true)
+                                .open(&heartbeat_path)
+                                .and_then(|file| {
+                                    file.set_times(
+                                        fs::FileTimes::new().set_modified(SystemTime::now()),
+                                    )
+                                });
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            path,
+            token,
+            stop: Some(stop),
+            heartbeat: Some(heartbeat),
+        }
+    }
+}
+
+impl Drop for LockClaim {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        if fs::read(&self.path).is_ok_and(|contents| contents.as_slice() == self.token.as_bytes()) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    lock_path.into()
+}
+
+fn claim(path: &Path) -> Result<LockClaim> {
+    let path = lock_path(path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let token = format!("{} {}\n", std::process::id(), Uuid::now_v7());
+    loop {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(token.as_bytes()) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error.into());
+                }
+                return Ok(LockClaim::new(path, token));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&path) {
+                    match fs::remove_file(&path) {
+                        Ok(()) | Err(ref error) if error.kind() == io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                return Err(SessionError::Busy(read_lock_owner(&path)));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed > LOCK_STALE)
+}
+
+fn read_lock_owner(path: &Path) -> LockOwner {
+    let since = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let pid = fs::read_to_string(path).ok().and_then(|contents| {
+        contents
+            .split_ascii_whitespace()
+            .next()
+            .and_then(|pid| pid.parse().ok())
+    });
+    LockOwner { pid, since }
+}
+
+fn probe_claim(path: &Path) -> (bool, LockOwner) {
+    let path = lock_path(path);
+    if !path.exists() || lock_is_stale(&path) {
+        return (false, LockOwner::default());
+    }
+    (true, read_lock_owner(&path))
+}
+
+fn read_into(file: &mut File, path: &Path) -> Result<(Tree, Header, LoadReport, u64)> {
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_SESSION_BYTES {
+        return Err(SessionError::SessionTooLarge(metadata.len()));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(64 << 10, file);
+    let first = read_line_bounded(&mut reader, MAX_ENTRY_BYTES)?;
+    if first.consumed == 0 {
+        return Err(SessionError::EmptySession);
+    }
+    if first.too_large {
+        return Err(SessionError::InvalidHeader(format!(
+            "line exceeds the {MAX_ENTRY_BYTES}-byte entry limit"
+        )));
+    }
+    let mut header = Header::decode(trim_line(&first.bytes))?;
+    let mut migration = Migrator::new(header.version);
+    let mut report = LoadReport {
+        source_version: header.version,
+        migrated: migration.needed(),
+        unterminated_tail: !first.complete,
+        ..LoadReport::default()
+    };
+    if report.migrated {
+        report.warnings.push(format!(
+            "session is format v{}; it was read as v{FORMAT_VERSION} without being rewritten",
+            header.version
+        ));
+    }
+
+    let mut tree = Tree::new();
+    let mut last_added = None::<String>;
+    let mut line_number = 1_usize;
+    let mut total = first.consumed;
+    let mut keep_bytes = total;
+    loop {
+        let line = read_line_bounded(&mut reader, MAX_ENTRY_BYTES)?;
+        if line.consumed == 0 {
+            break;
+        }
+        let line_start = total;
+        total += line.consumed;
+        line_number += 1;
+        if line.too_large {
+            report.skipped_lines += 1;
+            report.warnings.push(format!(
+                "line {line_number} exceeds the {MAX_ENTRY_BYTES}-byte entry limit and was skipped"
+            ));
+            keep_bytes = if line.complete { total } else { line_start };
+            if !line.complete {
+                report.repaired_tail = true;
+            }
+        } else {
+            let body = trim_line(&line.bytes);
+            if body.is_empty() {
+                keep_bytes = total;
+            } else {
+                let mut entry = match Entry::decode_with_id(body, !migration.needed()) {
+                    Ok(entry) => entry,
+                    Err(error) if !line.complete => {
+                        report.repaired_tail = true;
+                        report.warnings.push(format!(
+                            "line {line_number} is an unterminated malformed tail and was ignored: {error}"
+                        ));
+                        break;
+                    }
+                    Err(error) => {
+                        report.skipped_lines += 1;
+                        report
+                            .warnings
+                            .push(format!("line {line_number} was skipped: {error}"));
+                        keep_bytes = total;
+                        if !line.complete {
+                            report.repaired_tail = true;
+                            keep_bytes = line_start;
+                        }
+                        if !line.complete {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if migration.needed() {
+                    migration.apply(&mut entry, body);
+                }
+                if let Some(parent) = entry.parent_id.as_deref()
+                    && !tree.has(parent)
+                {
+                    entry.parent_id = last_added.clone();
+                    report.warnings.push(format!(
+                        "line {line_number} referenced an entry that is not in the file; it was reattached so earlier conversation stays reachable"
+                    ));
+                }
+                match tree.add(entry.clone(), &line.bytes) {
+                    Ok(()) => {
+                        last_added = Some(entry.id);
+                        if !line.complete {
+                            report.unterminated_tail = true;
+                        }
+                    }
+                    Err(error) => {
+                        report.skipped_lines += 1;
+                        report
+                            .warnings
+                            .push(format!("line {line_number} was skipped: {error}"));
+                    }
+                }
+                keep_bytes = total;
+            }
+        }
+        if !line.complete {
+            break;
+        }
+    }
+    if migration.needed() {
+        migration.finish(&mut tree);
+        header.version = FORMAT_VERSION;
+    }
+    Ok((tree, header, report, keep_bytes))
+}
+
+fn last_conversation_entry(tree: &Tree) -> Option<String> {
+    tree.all()
+        .into_iter()
+        .rev()
+        .find(|entry| !matches!(entry.kind.as_str(), TYPE_LABEL | TYPE_SESSION_INFO))
+        .map(|entry| entry.id.clone())
+}
+
+fn message_text(message: &Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    if let Some(content) = content.as_str() {
+        return content.to_owned();
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn first_line(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    let first = text.lines().next().unwrap_or_default().trim();
+    let mut characters = first.chars();
+    let visible = characters.by_ref().take(limit).collect::<String>();
+    if characters.next().is_some() {
+        format!("{visible}…")
+    } else {
+        visible
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+}
+
+fn system_time_to_offset_datetime(value: SystemTime) -> Option<OffsetDateTime> {
+    let duration = value.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    OffsetDateTime::from_unix_timestamp_nanos(duration.as_nanos() as i128).ok()
 }
 
 pub fn now() -> String {
