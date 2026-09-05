@@ -2008,7 +2008,8 @@ impl<R: Read> Read for BoundedArchiveReader<R> {
 
 fn clean_archive_path(path: &str) -> String {
     let mut components = Vec::new();
-    for component in path.replace('\\', "/").split('/') {
+    let normalized = path.replace('\\', "/");
+    for component in normalized.split('/') {
         match component {
             "" | "." => {}
             ".." => {
