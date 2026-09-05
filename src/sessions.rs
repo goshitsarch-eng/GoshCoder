@@ -418,7 +418,7 @@ fn export_markdown(info: &SessionInfo, header: &sessionlog::Header, tree: &Tree)
                 match message {
                     llm::Message::User(message) => {
                         markdown.push_str("## User\n\n");
-                        markdown.push_str(&message.text_preview());
+                        markdown.push_str(&user_text(&message));
                         markdown.push_str("\n\n");
                     }
                     llm::Message::Assistant(message) => {
@@ -497,6 +497,32 @@ fn one_line(value: &str, limit: usize) -> String {
         format!("{short}…")
     } else {
         short
+    }
+}
+
+fn user_text(message: &llm::UserMessage) -> String {
+    match &message.content {
+        llm::UserContent::Text(text) => text.clone(),
+        llm::UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(ContentBlock::plain_text)
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn human_bytes(size: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = size as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{size} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
