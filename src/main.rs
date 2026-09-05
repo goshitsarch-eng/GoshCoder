@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod compaction;
 pub mod computeruse;
 pub mod config;
+pub mod google_auth;
 pub mod llm;
 pub mod markdown;
 pub mod oauth;
@@ -76,7 +77,7 @@ The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
 model, credential, and context-compaction foundations are active. `run`
 supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
 `openai-codex-responses`, `anthropic-messages`, `google-generative-ai`, and
-`bedrock-converse-stream`;
+`google-vertex`, and `bedrock-converse-stream`;
 the remaining provider extensions and interactive commands are still being
 migrated from the previous implementation.
 "#;

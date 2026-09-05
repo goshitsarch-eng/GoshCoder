@@ -15,6 +15,7 @@
 //! - OpenAI Codex Responses (`openai-codex-responses`)
 //! - Anthropic Messages (`anthropic-messages`)
 //! - Google Generative AI (`google-generative-ai`)
+//! - Google Vertex AI (`google-vertex`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
 //! JSON parser, retry classification, token accounting, and normalized
@@ -42,7 +43,7 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, bedrock, catalog, llm, stream};
+use crate::{agent, bedrock, catalog, google_auth, llm, stream};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -50,11 +51,14 @@ pub const API_AZURE_OPENAI_RESPONSES: &str = "azure-openai-responses";
 pub const API_OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
+pub const API_GOOGLE_VERTEX: &str = "google-vertex";
 
 const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_GOOGLE_GENERATIVE_AI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_VERTEX_API_VERSION: &str = "v1";
+const VERTEX_AMBIENT_CREDENTIALS_MARKER: &str = "gcp-vertex-credentials";
 const CODEX_JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const AZURE_MANAGED_HOST_SUFFIXES: &[&str] = &[
     ".openai.azure.com",
@@ -79,6 +83,7 @@ pub enum ProviderProtocol {
     OpenAiCodexResponses,
     AnthropicMessages,
     GoogleGenerativeAi,
+    GoogleVertex,
     BedrockConverseStream,
 }
 
@@ -91,6 +96,7 @@ impl ProviderProtocol {
             API_OPENAI_CODEX_RESPONSES => Ok(Self::OpenAiCodexResponses),
             API_ANTHROPIC_MESSAGES => Ok(Self::AnthropicMessages),
             API_GOOGLE_GENERATIVE_AI => Ok(Self::GoogleGenerativeAi),
+            API_GOOGLE_VERTEX => Ok(Self::GoogleVertex),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
@@ -105,6 +111,9 @@ impl ProviderProtocol {
             Self::AnthropicMessages => "v1/messages",
             Self::GoogleGenerativeAi => {
                 unreachable!("Google uses a model-scoped GenerateContent endpoint")
+            }
+            Self::GoogleVertex => {
+                unreachable!("Vertex uses a model-scoped GenerateContent endpoint")
             }
             Self::BedrockConverseStream => {
                 unreachable!("Bedrock uses its own signed request builder")
@@ -560,6 +569,7 @@ impl ProviderResponderFactory {
             | ProviderProtocol::OpenAiResponses
             | ProviderProtocol::AnthropicMessages
             | ProviderProtocol::GoogleGenerativeAi
+            | ProviderProtocol::GoogleVertex
             | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
         };
         let payload = match protocol {
@@ -588,6 +598,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::GoogleGenerativeAi => Ok(build_google_generate_content_request(
                 model, context, &options,
             )),
+            ProviderProtocol::GoogleVertex => {
+                Ok(build_google_vertex_request(model, context, &options))
+            }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
@@ -633,6 +646,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::GoogleGenerativeAi => {
                 consume_google_generate_content(response, model, &options.cancellation, emitter)?
             }
+            ProviderProtocol::GoogleVertex => {
+                consume_google_generate_content(response, model, &options.cancellation, emitter)?
+            }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
@@ -664,8 +680,8 @@ impl ProviderResponderFactory {
         cancellation: &agent::CancellationToken,
         session_id: &str,
     ) -> Result<Response> {
-        let headers = build_request_headers(protocol, model, credentials, session_id)?;
         let endpoint = protocol_endpoint(model, protocol, credentials)?;
+        let headers = build_request_headers(protocol, model, credentials, session_id)?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
@@ -801,6 +817,9 @@ fn protocol_endpoint(
         ProviderProtocol::GoogleGenerativeAi => {
             return google_generate_content_endpoint(model);
         }
+        ProviderProtocol::GoogleVertex => {
+            return google_vertex_endpoint(model, credentials);
+        }
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder");
         }
@@ -838,6 +857,136 @@ fn google_generate_content_endpoint(model: &llm::Model) -> Result<Url> {
     );
     endpoint.set_query(Some("alt=sse"));
     Ok(endpoint)
+}
+
+fn google_vertex_endpoint(model: &llm::Model, credentials: &ProviderCredentials) -> Result<Url> {
+    let api_key = resolve_vertex_api_key(credentials.api_key_value().unwrap_or_default());
+    if !api_key.is_empty() {
+        return google_vertex_express_endpoint(model);
+    }
+    google_vertex_resource_endpoint(model, &credentials.environment)
+}
+
+fn google_vertex_express_endpoint(model: &llm::Model) -> Result<Url> {
+    let mut endpoint = google_vertex_base_endpoint(model, None)?;
+    append_endpoint_suffix(
+        &mut endpoint,
+        &format!(
+            "publishers/google/models/{}:streamGenerateContent",
+            model.id
+        ),
+    );
+    endpoint.set_query(Some("alt=sse"));
+    Ok(endpoint)
+}
+
+fn google_vertex_resource_endpoint(
+    model: &llm::Model,
+    environment: &BTreeMap<String, String>,
+) -> Result<Url> {
+    let project = vertex_project(environment)?;
+    let location = vertex_location(environment)?;
+    let mut endpoint = google_vertex_base_endpoint(model, Some(&location))?;
+    append_endpoint_suffix(
+        &mut endpoint,
+        &format!(
+            "projects/{project}/locations/{location}/publishers/google/models/{}:streamGenerateContent",
+            model.id
+        ),
+    );
+    endpoint.set_query(Some("alt=sse"));
+    Ok(endpoint)
+}
+
+fn google_vertex_base_endpoint(model: &llm::Model, location: Option<&str>) -> Result<Url> {
+    let custom = vertex_custom_base_url(&model.base_url);
+    let mut endpoint = if custom.is_empty() {
+        let host = match location {
+            Some("global") => "https://aiplatform.googleapis.com".to_owned(),
+            Some(location) => format!("https://{location}-aiplatform.googleapis.com"),
+            None => "https://aiplatform.googleapis.com".to_owned(),
+        };
+        Url::parse(&format!("{host}/{DEFAULT_VERTEX_API_VERSION}"))
+    } else {
+        Url::parse(&custom)
+    }
+    .map_err(|_| ProviderAdapterError::InvalidBaseUrl)?;
+    if endpoint.host_str().is_none() {
+        return Err(ProviderAdapterError::InvalidBaseUrl);
+    }
+    if !vertex_base_url_includes_api_version(&endpoint) {
+        append_endpoint_suffix(&mut endpoint, DEFAULT_VERTEX_API_VERSION);
+    }
+    Ok(endpoint)
+}
+
+fn resolve_vertex_api_key(api_key: &str) -> String {
+    let api_key = api_key.trim();
+    if api_key.is_empty()
+        || api_key == VERTEX_AMBIENT_CREDENTIALS_MARKER
+        || (api_key.starts_with('<') && api_key.ends_with('>'))
+    {
+        String::new()
+    } else {
+        api_key.to_owned()
+    }
+}
+
+fn vertex_project(environment: &BTreeMap<String, String>) -> Result<String> {
+    let project = bedrock::provider_env_value(environment, "GOOGLE_CLOUD_PROJECT");
+    let project = if project.is_empty() {
+        bedrock::provider_env_value(environment, "GCLOUD_PROJECT")
+    } else {
+        project
+    };
+    if project.is_empty() {
+        Err(ProviderAdapterError::Protocol(
+            "Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT".to_owned(),
+        ))
+    } else {
+        Ok(project)
+    }
+}
+
+fn vertex_location(environment: &BTreeMap<String, String>) -> Result<String> {
+    let location = bedrock::provider_env_value(environment, "GOOGLE_CLOUD_LOCATION");
+    if location.is_empty() {
+        Err(ProviderAdapterError::Protocol(
+            "Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION".to_owned(),
+        ))
+    } else {
+        Ok(location)
+    }
+}
+
+fn vertex_custom_base_url(base_url: &str) -> String {
+    let base_url = base_url.trim();
+    if base_url.is_empty() || base_url.contains("{location}") {
+        String::new()
+    } else {
+        base_url.trim_end_matches('/').to_owned()
+    }
+}
+
+fn vertex_base_url_includes_api_version(endpoint: &Url) -> bool {
+    endpoint
+        .path_segments()
+        .is_some_and(|mut segments| segments.any(vertex_api_version_segment))
+}
+
+fn vertex_api_version_segment(segment: &str) -> bool {
+    let Some(version) = segment.strip_prefix('v') else {
+        return false;
+    };
+    let digits = version.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let suffix = &version[digits..];
+    suffix.is_empty()
+        || suffix
+            .strip_prefix("beta")
+            .is_some_and(|suffix| suffix.chars().all(|character| character.is_ascii_digit()))
 }
 
 fn azure_openai_responses_endpoint(
@@ -1044,7 +1193,8 @@ fn build_request_headers(
         | ProviderProtocol::OpenAiResponses
         | ProviderProtocol::AzureOpenAiResponses
         | ProviderProtocol::OpenAiCodexResponses
-        | ProviderProtocol::GoogleGenerativeAi => {
+        | ProviderProtocol::GoogleGenerativeAi
+        | ProviderProtocol::GoogleVertex => {
             set_header_override(
                 &mut overrides,
                 "accept".to_owned(),
@@ -1095,8 +1245,37 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCodexResponses => Some(extract_codex_account_id(api_key)?),
         _ => None,
     };
-    if !ambient && !api_key.is_empty() {
-        match protocol {
+    let vertex_api_key = if protocol == ProviderProtocol::GoogleVertex {
+        resolve_vertex_api_key(api_key)
+    } else {
+        String::new()
+    };
+    let vertex_access_token =
+        if protocol == ProviderProtocol::GoogleVertex && vertex_api_key.is_empty() {
+            Some(
+                google_auth::resolve_access_token(&credentials.environment)
+                    .map_err(|error| ProviderAdapterError::Protocol(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+    match protocol {
+        ProviderProtocol::GoogleVertex => {
+            if vertex_api_key.is_empty() {
+                set_header_override(
+                    &mut overrides,
+                    "authorization".to_owned(),
+                    vertex_access_token.map(|token| format!("Bearer {token}")),
+                );
+            } else {
+                set_header_override(
+                    &mut overrides,
+                    "x-goog-api-key".to_owned(),
+                    Some(vertex_api_key),
+                );
+            }
+        }
+        _ if !ambient && !api_key.is_empty() => match protocol {
             ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
                 set_header_override(
                     &mut overrides,
@@ -1119,10 +1298,12 @@ fn build_request_headers(
                 );
             }
             ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {}
+            ProviderProtocol::GoogleVertex => unreachable!("Vertex is handled above"),
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock uses its own signed request builder")
             }
-        }
+        },
+        _ => {}
     }
 
     for (name, value) in &model.headers {
@@ -1199,6 +1380,7 @@ fn build_request_headers(
         | ProviderProtocol::OpenAiResponses
         | ProviderProtocol::AnthropicMessages
         | ProviderProtocol::GoogleGenerativeAi
+        | ProviderProtocol::GoogleVertex
         | ProviderProtocol::BedrockConverseStream => {}
     }
 
@@ -1211,7 +1393,8 @@ fn build_request_headers(
         }
         ProviderProtocol::AzureOpenAiResponses
         | ProviderProtocol::OpenAiCodexResponses
-        | ProviderProtocol::GoogleGenerativeAi => true,
+        | ProviderProtocol::GoogleGenerativeAi
+        | ProviderProtocol::GoogleVertex => true,
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
@@ -1591,6 +1774,29 @@ fn build_google_generate_content_request(
     context: &llm::Context,
     options: &agent::RequestOptions,
 ) -> Value {
+    build_google_request(model, context, options, GoogleApiVariant::Generative)
+}
+
+fn build_google_vertex_request(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: &agent::RequestOptions,
+) -> Value {
+    build_google_request(model, context, options, GoogleApiVariant::Vertex)
+}
+
+#[derive(Clone, Copy)]
+enum GoogleApiVariant {
+    Generative,
+    Vertex,
+}
+
+fn build_google_request(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: &agent::RequestOptions,
+    variant: GoogleApiVariant,
+) -> Value {
     let mut body = Map::new();
     body.insert(
         "contents".to_owned(),
@@ -1626,6 +1832,7 @@ fn build_google_generate_content_request(
         model,
         &options.thinking_level,
         options.thinking_budgets.as_ref(),
+        variant,
     ) {
         generation_config.insert("thinkingConfig".to_owned(), thinking_config);
     }
@@ -2121,41 +2328,49 @@ fn google_thinking_config(
     model: &llm::Model,
     requested: &str,
     custom_budgets: Option<&llm::ThinkingBudgets>,
+    variant: GoogleApiVariant,
 ) -> Option<Value> {
     if !model.reasoning {
         return None;
     }
     let level = stream::clamp_thinking_level(model, requested);
     if level == llm::THINKING_OFF {
-        return Some(Value::Object(google_disabled_thinking_config(&model.id)));
+        return Some(Value::Object(google_disabled_thinking_config(
+            &model.id, variant,
+        )));
     }
     let level = stream::clamp_reasoning_level(&level);
     let mut config = Map::from_iter([("includeThoughts".to_owned(), Value::Bool(true))]);
-    if google_uses_thinking_level(&model.id) {
+    if google_uses_thinking_level(&model.id, variant) {
         config.insert(
             "thinkingLevel".to_owned(),
-            Value::String(google_thinking_level(&model.id, &level).to_owned()),
+            Value::String(google_thinking_level(&model.id, &level, variant).to_owned()),
         );
     } else {
         config.insert(
             "thinkingBudget".to_owned(),
-            Value::Number(google_thinking_budget(model, &level, custom_budgets).into()),
+            Value::Number(google_thinking_budget(model, &level, custom_budgets, variant).into()),
         );
     }
     Some(Value::Object(config))
 }
 
-fn google_uses_thinking_level(model_id: &str) -> bool {
+fn google_uses_thinking_level(model_id: &str, variant: GoogleApiVariant) -> bool {
     google_is_gemini_three_pro(model_id)
         || google_is_gemini_three_flash(model_id)
-        || google_is_gemma_four(model_id)
+        || matches!(variant, GoogleApiVariant::Generative) && google_is_gemma_four(model_id)
 }
 
-fn google_disabled_thinking_config(model_id: &str) -> Map<String, Value> {
+fn google_disabled_thinking_config(
+    model_id: &str,
+    variant: GoogleApiVariant,
+) -> Map<String, Value> {
     if google_is_gemini_three_pro(model_id) {
         return Map::from_iter([("thinkingLevel".to_owned(), Value::String("LOW".to_owned()))]);
     }
-    if google_is_gemini_three_flash(model_id) || google_is_gemma_four(model_id) {
+    if google_is_gemini_three_flash(model_id)
+        || matches!(variant, GoogleApiVariant::Generative) && google_is_gemma_four(model_id)
+    {
         return Map::from_iter([(
             "thinkingLevel".to_owned(),
             Value::String("MINIMAL".to_owned()),
@@ -2164,14 +2379,14 @@ fn google_disabled_thinking_config(model_id: &str) -> Map<String, Value> {
     Map::from_iter([("thinkingBudget".to_owned(), Value::Number(0.into()))])
 }
 
-fn google_thinking_level<'a>(model_id: &str, level: &'a str) -> &'a str {
+fn google_thinking_level<'a>(model_id: &str, level: &'a str, variant: GoogleApiVariant) -> &'a str {
     if google_is_gemini_three_pro(model_id) {
         return match level {
             llm::THINKING_MINIMAL | llm::THINKING_LOW => "LOW",
             _ => "HIGH",
         };
     }
-    if google_is_gemma_four(model_id) {
+    if matches!(variant, GoogleApiVariant::Generative) && google_is_gemma_four(model_id) {
         return match level {
             llm::THINKING_MINIMAL | llm::THINKING_LOW => "MINIMAL",
             _ => "HIGH",
@@ -2189,6 +2404,7 @@ fn google_thinking_budget(
     model: &llm::Model,
     level: &str,
     custom_budgets: Option<&llm::ThinkingBudgets>,
+    variant: GoogleApiVariant,
 ) -> i64 {
     if let Some(budget) =
         custom_budgets.and_then(|budgets| google_custom_thinking_budget(budgets, level))
@@ -2198,8 +2414,11 @@ fn google_thinking_budget(
     let id = model.id.to_ascii_lowercase();
     match () {
         _ if id.contains("2.5-pro") => google_budget_for_level(level, 128, 2_048, 8_192, 32_768),
-        _ if id.contains("2.5-flash-lite") => {
+        _ if matches!(variant, GoogleApiVariant::Generative) && id.contains("2.5-flash-lite") => {
             google_budget_for_level(level, 512, 2_048, 8_192, 24_576)
+        }
+        _ if id.contains("2.5-flash-lite") => {
+            google_budget_for_level(level, 128, 2_048, 8_192, 24_576)
         }
         _ if id.contains("2.5-flash") => google_budget_for_level(level, 128, 2_048, 8_192, 24_576),
         _ => -1,
@@ -5592,6 +5811,7 @@ mod tests {
                 API_AZURE_OPENAI_RESPONSES => "azure-openai-responses".to_owned(),
                 API_OPENAI_CODEX_RESPONSES => "openai-codex".to_owned(),
                 API_GOOGLE_GENERATIVE_AI => "google".to_owned(),
+                API_GOOGLE_VERTEX => "google-vertex".to_owned(),
                 _ => "openai".to_owned(),
             },
             base_url,
@@ -6174,6 +6394,132 @@ mod tests {
     }
 
     #[test]
+    fn vertex_express_mode_uses_an_api_key_and_shared_google_streaming() {
+        let body = concat!(
+            "data: {\"responseId\":\"vertex_1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"think\",\"thought\":true,\"thoughtSignature\":\"c2ln\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"thoughtsTokenCount\":3,\"totalTokenCount\":18}}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut request_model = model(API_GOOGLE_VERTEX, format!("{base_url}/v1"));
+        request_model.id = "gemini-3-pro".to_owned();
+        request_model.reasoning = true;
+        let response = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Vertex response");
+        let request = requests.recv().expect("captured Vertex request");
+        server.join().expect("Vertex test server finishes");
+
+        assert_eq!(
+            request.target,
+            "/v1/publishers/google/models/gemini-3-pro:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request.headers.get("x-goog-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        assert!(!request.headers.contains_key("authorization"));
+        let sent: Value = serde_json::from_slice(&request.body).expect("Vertex JSON body");
+        assert_eq!(
+            sent["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "HIGH"
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.response_id, "vertex_1");
+        assert_eq!(response.usage.output, 8);
+        let llm::ContentBlock::Thinking(thinking) = &response.content[0] else {
+            panic!("expected Vertex thought content");
+        };
+        assert_eq!(thinking.thinking, "think");
+        assert_eq!(thinking.thinking_signature, "c2ln");
+        assert_eq!(response.content[1].plain_text(), Some("answer"));
+    }
+
+    #[test]
+    fn vertex_adc_mode_uses_a_bearer_token_and_regional_resource_path() {
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut credentials = ProviderCredentials::api_key(catalog::AUTHENTICATED_SENTINEL);
+        credentials.environment = BTreeMap::from([
+            (
+                "GOOGLE_OAUTH_ACCESS_TOKEN".to_owned(),
+                "ya29.token".to_owned(),
+            ),
+            ("GOOGLE_CLOUD_PROJECT".to_owned(), "my-project".to_owned()),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
+        ]);
+        let request_model = model(API_GOOGLE_VERTEX, format!("{base_url}/v1"));
+        let response = factory_with_credentials(0, credentials)
+            .respond(
+                &request_model,
+                &llm::Context {
+                    messages: vec![llm::Message::User(llm::UserMessage::text("hi", 1))],
+                    ..llm::Context::default()
+                },
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Vertex ADC response");
+        let request = requests.recv().expect("captured Vertex request");
+        server.join().expect("Vertex ADC server finishes");
+
+        assert_eq!(
+            request.target,
+            "/v1/projects/my-project/locations/us-central1/publishers/google/models/test-model:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer ya29.token")
+        );
+        assert!(!request.headers.contains_key("x-goog-api-key"));
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+    }
+
+    #[test]
+    fn vertex_endpoint_and_thinking_helpers_follow_vertex_specific_rules() {
+        let environment = BTreeMap::from([
+            ("GOOGLE_CLOUD_PROJECT".to_owned(), "project".to_owned()),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "global".to_owned()),
+        ]);
+        let credentials = ProviderCredentials {
+            api_key: Some(catalog::AUTHENTICATED_SENTINEL.to_owned()),
+            environment,
+            ..ProviderCredentials::default()
+        };
+        let endpoint = google_vertex_endpoint(
+            &llm::Model {
+                id: "gemini-2.5-flash".to_owned(),
+                base_url: "https://{location}-aiplatform.googleapis.com".to_owned(),
+                ..llm::Model::default()
+            },
+            &credentials,
+        )
+        .expect("regional Vertex endpoint");
+        assert_eq!(
+            endpoint.as_str(),
+            "https://aiplatform.googleapis.com/v1/projects/project/locations/global/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert!(vertex_base_url_includes_api_version(
+            &Url::parse("https://example.test/v1beta1").expect("versioned URL")
+        ));
+        assert!(!vertex_base_url_includes_api_version(
+            &Url::parse("https://example.test/api").expect("non-versioned URL")
+        ));
+
+        let model = llm::Model {
+            id: "gemma-4-27b".to_owned(),
+            reasoning: true,
+            ..llm::Model::default()
+        };
+        let config =
+            google_thinking_config(&model, llm::THINKING_LOW, None, GoogleApiVariant::Vertex)
+                .expect("Vertex thinking config");
+        assert_eq!(config["thinkingBudget"], -1);
+    }
+
+    #[test]
     fn retry_is_bounded_and_pre_request_cancellation_becomes_aborted_message() {
         let success = concat!(
             "data: {\"id\":\"chat_retry\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
@@ -6215,10 +6561,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_variants_include_google_azure_and_codex_responses() {
+    fn protocol_variants_include_google_vertex_azure_and_codex_responses() {
         assert_eq!(
             ProviderProtocol::from_api(API_GOOGLE_GENERATIVE_AI).expect("Google protocol"),
             ProviderProtocol::GoogleGenerativeAi
+        );
+        assert_eq!(
+            ProviderProtocol::from_api(API_GOOGLE_VERTEX).expect("Vertex protocol"),
+            ProviderProtocol::GoogleVertex
         );
         assert_eq!(
             ProviderProtocol::from_api(API_AZURE_OPENAI_RESPONSES).expect("Azure protocol"),

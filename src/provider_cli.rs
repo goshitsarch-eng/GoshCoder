@@ -264,7 +264,8 @@ fn provider_setup_hint(provider: &Provider) -> String {
                 .to_owned()
         }
         "google-vertex" | "google-vertex-anthropic" => {
-            "set GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_PROJECT".to_owned()
+            "set GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, and GOOGLE_CLOUD_LOCATION (or GOOGLE_CLOUD_API_KEY for express mode)"
+                .to_owned()
         }
         "azure" | "azure-openai-responses" => {
             "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT".to_owned()
