@@ -12,6 +12,7 @@ pub mod session;
 pub mod sessionlog;
 pub mod sessions;
 mod state;
+pub mod tools;
 mod ui;
 
 use std::{
