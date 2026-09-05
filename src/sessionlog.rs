@@ -1406,9 +1406,8 @@ fn claim(path: &Path) -> Result<LockClaim> {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 if lock_is_stale(&path) {
                     match fs::remove_file(&path) {
-                        Ok(()) | Err(ref error) if error.kind() == io::ErrorKind::NotFound => {
-                            continue;
-                        }
+                        Ok(()) => continue,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                         Err(error) => return Err(error.into()),
                     }
                 }
@@ -1448,7 +1447,7 @@ fn probe_claim(path: &Path) -> (bool, LockOwner) {
     (true, read_lock_owner(&path))
 }
 
-fn read_into(file: &mut File, path: &Path) -> Result<(Tree, Header, LoadReport, u64)> {
+fn read_into(file: &mut File, _path: &Path) -> Result<(Tree, Header, LoadReport, u64)> {
     let metadata = file.metadata()?;
     if metadata.len() > MAX_SESSION_BYTES {
         return Err(SessionError::SessionTooLarge(metadata.len()));
@@ -1664,10 +1663,14 @@ fn new_session_id() -> String {
 }
 
 fn new_entry_id(tree: &Tree) -> String {
+    new_unique_entry_id(|candidate| tree.has(candidate))
+}
+
+fn new_unique_entry_id(taken: impl Fn(&str) -> bool) -> String {
     for _ in 0..100 {
         let encoded = Uuid::now_v7().simple().to_string();
         let id = encoded[encoded.len() - 8..].to_owned();
-        if !tree.has(&id) {
+        if !taken(&id) {
             return id;
         }
     }
