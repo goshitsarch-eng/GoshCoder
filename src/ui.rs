@@ -9,7 +9,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::state::{App, FileStatus, Message, MessageRole, SidebarKind, SidebarLine};
+use crate::{
+    markdown::{MarkdownRenderer, MarkdownRole},
+    state::{App, FileStatus, Message, MessageRole, SidebarKind, SidebarLine},
+};
 
 const BACKGROUND: Color = Color::Rgb(10, 10, 10);
 const PANEL_BACKGROUND: Color = Color::Rgb(20, 20, 20);
@@ -131,7 +134,12 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
-    let lines = transcript_lines(&app.messages, app.tools_expanded, app.hide_thinking);
+    let lines = transcript_lines(
+        &app.messages,
+        area.width.saturating_sub(2),
+        app.tools_expanded,
+        app.hide_thinking,
+    );
     let max_scroll = lines.len().saturating_sub(area.height as usize);
     let scroll = usize::from(app.scroll).min(max_scroll);
     let start = lines
@@ -377,6 +385,7 @@ fn sidebar_line(line: &SidebarLine) -> Line<'static> {
 
 fn transcript_lines(
     messages: &[Message],
+    width: u16,
     tools_expanded: bool,
     hide_thinking: bool,
 ) -> Vec<Line<'static>> {
@@ -390,10 +399,10 @@ fn transcript_lines(
                 ));
             }
             MessageRole::Assistant => {
-                lines.extend(message_lines(
+                lines.extend(markdown_lines(
                     &message.text,
-                    Style::default().fg(TEXT),
-                    "  ",
+                    width,
+                    MarkdownRole::Assistant,
                 ));
             }
             MessageRole::Thinking if hide_thinking => {
@@ -403,11 +412,7 @@ fn transcript_lines(
                 ));
             }
             MessageRole::Thinking => {
-                lines.extend(message_lines(
-                    &message.text,
-                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
-                    "  ",
-                ));
+                lines.extend(markdown_lines(&message.text, width, MarkdownRole::Thinking));
             }
             MessageRole::Tool => {
                 let (icon, color) = if message.is_error {
@@ -485,6 +490,14 @@ fn transcript_lines(
             }
         }
         lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn markdown_lines(text: &str, width: u16, role: MarkdownRole) -> Vec<Line<'static>> {
+    let mut lines = MarkdownRenderer::with_role(width.saturating_sub(2), role).render_lines(text);
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw("  "));
     }
     lines
 }
@@ -687,6 +700,7 @@ mod tests {
                 text: "hello\x1b[2Jworld".to_owned(),
                 ..Message::default()
             }],
+            80,
             false,
             false,
         );

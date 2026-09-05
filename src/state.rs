@@ -163,12 +163,7 @@ impl App {
     }
 
     pub fn accept_submission(&mut self, prompt: String, follow_up: bool) {
-        self.history.push(prompt.clone());
-        self.history_index = None;
-        self.draft.clear();
-        self.input.clear();
-        self.cursor = 0;
-        self.selected_suggestion = 0;
+        self.record_submission(&prompt);
         self.messages.push(Message {
             role: MessageRole::User,
             text: prompt,
@@ -185,6 +180,24 @@ impl App {
             ..Message::default()
         });
         self.status = "Ready".to_owned();
+    }
+
+    /// Clears the composer and remembers a submitted value without adding
+    /// placeholder transcript messages. A live runtime owns transcript rows
+    /// through its agent state, so the same input cannot be rendered twice.
+    pub fn record_submission(&mut self, prompt: &str) {
+        self.history.push(prompt.to_owned());
+        self.history_index = None;
+        self.draft.clear();
+        self.input.clear();
+        self.cursor = 0;
+        self.selected_suggestion = 0;
+    }
+
+    /// Retains an externally generated transcript while keeping editor history
+    /// and selection state consistent with a completed submission.
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.messages = messages;
     }
 
     pub fn add_message(&mut self, message: Message) {
