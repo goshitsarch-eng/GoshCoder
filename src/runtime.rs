@@ -102,6 +102,7 @@ pub struct PreparedSession {
     ///
     /// This owner closes the child process when the containing session ends;
     /// the agent's `mcp` tool holds a clone for individual requests.
+    #[allow(dead_code)]
     desktop: Option<DesktopMcpRuntime>,
     /// Session-local, in-memory side discussion runtime used by `/btw`.
     pub btw: btw_runtime::Runtime,
@@ -670,12 +671,12 @@ fn desktop_mcp_runtime(
 ) -> (Option<DesktopMcpRuntime>, Vec<String>) {
     #[cfg(target_os = "linux")]
     {
-        return desktop_mcp_runtime_from_binary(
+        desktop_mcp_runtime_from_binary(
             enable_tools,
             quiet,
             computeruse::find_binary(),
             config::mcp_config_path(),
-        );
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
