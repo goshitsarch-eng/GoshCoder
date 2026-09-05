@@ -1,6 +1,9 @@
 pub mod agent;
 pub mod config;
 pub mod llm;
+pub mod markdown;
+pub mod ralph;
+pub mod session;
 pub mod sessionlog;
 pub mod sessions;
 mod state;
