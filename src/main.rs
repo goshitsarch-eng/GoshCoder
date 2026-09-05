@@ -868,7 +868,7 @@ fn line_interactive_loop(
                     "{}",
                     native_line_header(
                         terminal_width(),
-                        &build_version(),
+                        build_version(),
                         &sidebar_workspace_path(prepared),
                         &info,
                         color,
@@ -944,6 +944,7 @@ fn line_interactive_loop(
             let mut app = App::new();
             app.streaming = prepared.runtime.agent().state().is_streaming;
             let mut view = InteractiveView::default();
+            view.line_claude_tui = Some(claude_tui);
             let (turn_sender, turn_receiver) = mpsc::channel();
             let prior_claude_tui = claude_tui;
             let outcome = dispatch_runtime_slash_command(
@@ -954,8 +955,8 @@ fn line_interactive_loop(
                 turn_sender,
                 &input,
                 false,
-                Some(&mut claude_tui),
             );
+            claude_tui = view.line_claude_tui.unwrap_or(claude_tui);
             if claude_tui != prior_claude_tui {
                 last_native_sidebar = None;
             }
@@ -1064,6 +1065,9 @@ struct InteractiveView {
     git_status_root: Option<PathBuf>,
     git_status_scan: Option<Receiver<SidebarGitInfo>>,
     git_status_last_requested: Option<Instant>,
+    /// Present only for line mode, where slash commands can toggle between
+    /// the native session card and the plain prompt without a restart.
+    line_claude_tui: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1110,6 +1114,7 @@ impl Default for InteractiveView {
             git_status_root: None,
             git_status_scan: None,
             git_status_last_requested: None,
+            line_claude_tui: None,
         }
     }
 }
@@ -1620,7 +1625,6 @@ fn submit_interactive_input(
             turn_sender,
             &input,
             true,
-            None,
         );
     }
 
@@ -2107,7 +2111,6 @@ fn dispatch_runtime_slash_command(
     turn_sender: Sender<InteractiveTaskResult>,
     input: &str,
     fullscreen: bool,
-    line_claude_tui: Option<&mut bool>,
 ) -> CommandDispatch {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
@@ -2626,7 +2629,7 @@ fn dispatch_runtime_slash_command(
                     MessageRole::Notice,
                     "The fullscreen interface already uses the native sidebar layout; this switch only affects line mode.",
                 );
-            } else if let Some(claude_tui) = line_claude_tui {
+            } else if let Some(claude_tui) = view.line_claude_tui.as_mut() {
                 *claude_tui = true;
                 append_view_message(
                     view,
@@ -2643,7 +2646,7 @@ fn dispatch_runtime_slash_command(
                     MessageRole::Notice,
                     "The fullscreen layout cannot be changed in-place; restart with -fullscreen=false for the line-mode interface.",
                 );
-            } else if let Some(claude_tui) = line_claude_tui {
+            } else if let Some(claude_tui) = view.line_claude_tui.as_mut() {
                 *claude_tui = false;
                 append_view_message(
                     view,
