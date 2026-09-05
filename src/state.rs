@@ -187,10 +187,6 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        if !self.ralph_commands_available && nested_command_query(&self.input, "/ralph ").is_some()
-        {
-            return Vec::new();
-        }
         if let Some(query) = model_query(&self.input) {
             return if self.model_suggestions_query.as_deref() == Some(query) {
                 self.model_suggestions.clone()
@@ -1101,29 +1097,29 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/hotkeys", "Show keyboard shortcuts", true),
         ("/messages", "Show transcript summary", true),
         ("/name", "Name this session", true),
-        ("/resume", "Switch to a saved session", false),
+        ("/resume", "Switch to a saved session", true),
         ("/sessions", "List saved sessions", true),
-        ("/prompt", "Save, list, back up, or restore prompts", false),
+        ("/prompt", "Save, list, back up, or restore prompts", true),
         ("/tree", "Show rewind points in this session", true),
-        ("/fork", "Rewind to an earlier point", false),
-        ("/label", "Name a rewind point", false),
+        ("/fork", "Rewind to an earlier point", true),
+        ("/label", "Name a rewind point", true),
         ("/clone", "Duplicate this session", true),
-        ("/export", "Export this session", false),
-        ("/import", "Adopt a session file", false),
+        ("/export", "Export this session", true),
+        ("/import", "Adopt a session file", true),
         ("/steer", "Guide the active response", false),
         ("/followup", "Queue the next message", false),
         ("/queue", "Show queued messages", true),
         ("/clear", "Clear the transcript", true),
         ("/new", "Start a fresh conversation", true),
-        ("/compact", "Summarize older context", false),
+        ("/compact", "Summarize older context", true),
         ("/reload", "Reload local resources", true),
         ("/resources", "Show loaded resources", true),
         ("/planner", "Toggle planning mode", true),
-        ("/planner-review", "Review code changes", false),
+        ("/planner-review", "Review code changes", true),
         ("/planner-annotate", "Annotate a target", false),
         ("/planner-last", "Annotate last response", true),
         ("/ralph", "Manage Ralph loops", false),
-        ("/system", "Show or replace system prompt", false),
+        ("/system", "Show or replace system prompt", true),
         ("/exit", "Exit GoshCoder", true),
         ("/quit", "Exit GoshCoder", true),
     ];
@@ -1334,7 +1330,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_extension_commands_are_hidden_when_unavailable() {
+    fn optional_extension_root_commands_are_hidden_when_unavailable() {
         let mut app = App::new();
         app.set_command_availability(false, false);
 
@@ -1348,7 +1344,13 @@ mod tests {
         assert!(!root.iter().any(|command| command.starts_with("/planner")));
 
         app.set_input("/ralph ");
-        assert!(app.suggestions().is_empty());
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["start", "status", "list", "resume", "stop"]
+        );
     }
 
     #[test]
@@ -1447,6 +1449,35 @@ mod tests {
                 execute: false,
             }]
         );
+    }
+
+    #[test]
+    fn root_palette_executes_legacy_argumentless_commands() {
+        let mut app = App::new();
+        for command in [
+            "/resume",
+            "/prompt",
+            "/fork",
+            "/label",
+            "/export",
+            "/import",
+            "/compact",
+            "/planner-review",
+            "/system",
+        ] {
+            app.set_input(command);
+            let suggestion = app
+                .suggestions()
+                .into_iter()
+                .next()
+                .expect("root command suggestion");
+            assert_eq!(suggestion.label, command);
+            assert_eq!(suggestion.value, command);
+            assert!(
+                suggestion.execute,
+                "{command} should execute immediately from the root palette"
+            );
+        }
     }
 
     #[test]

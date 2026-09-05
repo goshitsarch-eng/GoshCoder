@@ -672,7 +672,9 @@ fn append_to_width(output: &mut String, suffix: &str, width: usize) {
 
 fn suggestion_title(input: &str) -> &'static str {
     let input = input.to_lowercase();
-    if input.starts_with("/model ") {
+    if input.starts_with("/resume ") {
+        " RESUME SESSION · type to search names and transcripts "
+    } else if input.starts_with("/model ") {
         " SELECT MODEL · type to filter authenticated providers "
     } else if input.starts_with("/thinking ") {
         " THINKING LEVEL · model-supported options "
@@ -781,6 +783,11 @@ mod tests {
     #[test]
     fn model_palette_explains_filtering() {
         assert!(suggestion_title("/model claude").contains("filter"));
+    }
+
+    #[test]
+    fn resume_palette_explains_search() {
+        assert!(suggestion_title("/resume previous task").contains("search names and transcripts"));
     }
 
     #[test]

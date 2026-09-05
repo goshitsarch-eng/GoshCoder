@@ -45,7 +45,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -168,54 +169,61 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
     )?;
-    let prepared = runtime::prepare_session(
+    let mut prepared = runtime::prepare_session(
         catalog.as_ref(),
         invocation.config,
         Some(responder),
         Vec::new(),
     )?;
 
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
-        }
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            if prepared.runtime.resumed() {
-                let messages = prepared.runtime.restored().messages;
-                let mut stderr = io::stderr().lock();
-                render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
-            } else {
-                eprintln!("{}", dim(&banner, color_enabled()));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        if !quiet {
+            for notice in runtime::drain_session_notices(&prepared.runtime) {
+                eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            }
+            if let Some(banner) = runtime::session_banner(&prepared.runtime) {
+                if prepared.runtime.resumed() {
+                    let messages = prepared.runtime.restored().messages;
+                    let mut stderr = io::stderr().lock();
+                    render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
+                } else {
+                    eprintln!("{}", dim(&banner, color_enabled()));
+                }
             }
         }
-    }
 
-    let render_lock = Arc::new(Mutex::new(()));
-    let color = color_enabled();
-    let agent = prepared.runtime.agent().clone();
-    let _render_subscription = agent.subscribe({
-        let render_lock = Arc::clone(&render_lock);
-        move |event| {
-            let _guard = render_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut stdout = io::stdout().lock();
-            let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
-        }
-    });
+        let render_lock = Arc::new(Mutex::new(()));
+        let color = color_enabled();
+        let agent = prepared.runtime.agent().clone();
+        let _interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
+        let _render_subscription = agent.subscribe({
+            let render_lock = Arc::clone(&render_lock);
+            move |event| {
+                let _guard = render_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut stdout = io::stdout().lock();
+                let mut stderr = io::stderr().lock();
+                let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            }
+        });
 
-    prepared.sync_extensions()?;
-    if let Some(outcome) = compaction::maybe_auto_compact(&agent)? {
-        print_compaction_outcome(&outcome, true, color);
-    }
-    agent.prompt(prompt)?;
-    prepared.runtime.sync()?;
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color));
+        prepared.sync_extensions()?;
+        if let Some(outcome) = compaction::maybe_auto_compact(&agent)? {
+            print_compaction_outcome(&outcome, true, color);
         }
-    }
+        agent.prompt(prompt)?;
+        prepared.runtime.sync()?;
+        if !quiet {
+            for notice in runtime::drain_session_notices(&prepared.runtime) {
+                eprintln!("{}", dim(&format!("session: {notice}"), color));
+            }
+        }
+        Ok(())
+    })();
+    let close_result = prepared.runtime.close();
+    result?;
+    close_result?;
     Ok(())
 }
 
@@ -659,6 +667,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     )?;
     remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
+    let interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
     let (agent_event_sender, agent_event_receiver) = mpsc::sync_channel(64);
     let (turn_sender, turn_receiver) = mpsc::channel();
     let _agent_event_subscription = agent.subscribe(move |event| {
@@ -689,6 +698,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         turn_sender,
         turn_receiver,
         quiet,
+        &interrupt_guard,
     );
 
     let terminal_cleanup = (|| -> io::Result<()> {
@@ -761,6 +771,7 @@ fn run_line_interactive(mut invocation: runtime::Invocation) -> Result<(), Box<d
     )?;
     remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
+    let interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
     let render_lock = Arc::new(Mutex::new(()));
     let color = color_enabled();
     let _render_subscription = agent.subscribe({
@@ -775,7 +786,7 @@ fn run_line_interactive(mut invocation: runtime::Invocation) -> Result<(), Box<d
         }
     });
 
-    let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet);
+    let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet, &interrupt_guard);
     let close_result = prepared.runtime.close();
     result?;
     close_result?;
@@ -835,10 +846,58 @@ fn onboarding_provider(choice: &str) -> Result<&'static str, Box<dyn Error>> {
     }
 }
 
+fn spawn_line_input_reader() -> io::Result<Receiver<io::Result<Option<String>>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("goshcoder-line-input".to_owned())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                let mut input = String::new();
+                match reader.read_line(&mut input) {
+                    Ok(0) => {
+                        let _ = sender.send(Ok(None));
+                        break;
+                    }
+                    Ok(_) if sender.send(Ok(Some(input))).is_err() => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+fn next_line_or_interrupt(
+    receiver: &Receiver<io::Result<Option<String>>>,
+    interrupt_guard: &InterruptGuard,
+) -> io::Result<Option<String>> {
+    loop {
+        if interrupt_guard.idle_exit_requested() {
+            return Ok(None);
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                if interrupt_guard.idle_exit_requested() {
+                    return Ok(None);
+                }
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
 fn line_interactive_loop(
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     quiet: bool,
+    interrupt_guard: &InterruptGuard,
 ) -> Result<(), Box<dyn Error>> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
     let color = color_enabled();
@@ -894,9 +953,18 @@ fn line_interactive_loop(
     }
 
     let stdin = io::stdin();
-    let mut raw = String::new();
+    let input_receiver = if interactive {
+        Some(spawn_line_input_reader()?)
+    } else {
+        None
+    };
     loop {
-        raw.clear();
+        if interrupt_guard.idle_exit_requested() {
+            if interactive {
+                eprintln!();
+            }
+            break;
+        }
         if interactive {
             let mut stderr = io::stderr().lock();
             if claude_tui {
@@ -920,7 +988,23 @@ fn line_interactive_loop(
             }
             stderr.flush()?;
         }
-        if stdin.lock().read_line(&mut raw)? == 0 {
+        let raw = if let Some(receiver) = input_receiver.as_ref() {
+            let Some(input) = next_line_or_interrupt(receiver, interrupt_guard)? else {
+                if interactive {
+                    eprintln!();
+                }
+                break;
+            };
+            input
+        } else {
+            let mut input = String::new();
+            if stdin.lock().read_line(&mut input)? == 0 {
+                String::new()
+            } else {
+                input
+            }
+        };
+        if raw.is_empty() {
             if interactive {
                 eprintln!();
             }
@@ -980,26 +1064,35 @@ fn line_interactive_loop(
                 break;
             }
         } else {
-            if let Err(error) = prepared.sync_extensions() {
-                eprintln!("error: {error}");
-                continue;
-            }
-            match compaction::maybe_auto_compact(prepared.runtime.agent()) {
-                Ok(Some(outcome)) => print_compaction_outcome(&outcome, true, color_enabled()),
-                Ok(None) => {}
-                Err(error) => {
+            let agent = prepared.runtime.agent();
+            if agent.state().is_streaming {
+                agent.steer(llm::Message::User(llm::UserMessage::text(
+                    input,
+                    now_millis(),
+                )));
+                eprintln!("{}", dim("steering message queued", color));
+            } else {
+                if let Err(error) = prepared.sync_extensions() {
                     eprintln!("error: {error}");
                     continue;
                 }
-            }
-            if let Err(error) = prepared.runtime.agent().prompt(input) {
-                eprintln!("error: {error}");
+                match compaction::maybe_auto_compact(&agent) {
+                    Ok(Some(outcome)) => print_compaction_outcome(&outcome, true, color),
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        continue;
+                    }
+                }
+                if let Err(error) = agent.prompt(input) {
+                    eprintln!("error: {error}");
+                }
             }
         }
 
         prepared.runtime.sync()?;
         for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            eprintln!("{}", dim(&format!("session: {notice}"), color));
         }
     }
     Ok(())
@@ -1099,6 +1192,86 @@ struct NativeLineInfo {
     thinking: String,
 }
 
+#[derive(Clone)]
+struct InterruptTarget {
+    identifier: u64,
+    agent: agent::Agent,
+    idle_exit: Arc<AtomicBool>,
+}
+
+/// Owns this invocation's registration in the process-wide signal handler.
+/// The handler itself is installed once because `ctrlc` does not allow
+/// replacing handlers; each guard updates its current agent target instead.
+struct InterruptGuard {
+    identifier: u64,
+    idle_exit: Arc<AtomicBool>,
+}
+
+static INTERRUPT_TARGET: OnceLock<Mutex<Option<InterruptTarget>>> = OnceLock::new();
+static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+static INTERRUPT_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
+
+impl InterruptGuard {
+    fn install(agent: &agent::Agent) -> Result<Self, String> {
+        let installation = INTERRUPT_HANDLER.get_or_init(|| {
+            ctrlc::set_handler(deliver_process_interrupt).map_err(|error| error.to_string())
+        });
+        installation.as_ref().map_err(Clone::clone)?;
+
+        let identifier = INTERRUPT_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
+        let idle_exit = Arc::new(AtomicBool::new(false));
+        let target = InterruptTarget {
+            identifier,
+            agent: agent.clone(),
+            idle_exit: Arc::clone(&idle_exit),
+        };
+        *interrupt_target()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(target);
+        Ok(Self {
+            identifier,
+            idle_exit,
+        })
+    }
+
+    fn idle_exit_requested(&self) -> bool {
+        self.idle_exit.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        let mut target = interrupt_target()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if target
+            .as_ref()
+            .is_some_and(|target| target.identifier == self.identifier)
+        {
+            *target = None;
+        }
+    }
+}
+
+fn interrupt_target() -> &'static Mutex<Option<InterruptTarget>> {
+    INTERRUPT_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+fn deliver_process_interrupt() {
+    let target = interrupt_target()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(target) = target else {
+        return;
+    };
+    if target.agent.state().is_streaming {
+        target.agent.abort();
+    } else {
+        target.idle_exit.store(true, Ordering::Release);
+    }
+}
+
 impl Default for InteractiveView {
     fn default() -> Self {
         Self {
@@ -1157,6 +1330,7 @@ fn event_loop(
     turn_sender: Sender<InteractiveTaskResult>,
     turn_results: Receiver<InteractiveTaskResult>,
     quiet: bool,
+    interrupt_guard: &InterruptGuard,
 ) -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
     app.replace_messages(Vec::new());
@@ -1172,6 +1346,9 @@ fn event_loop(
     }
 
     loop {
+        if interrupt_guard.idle_exit_requested() {
+            return Ok(());
+        }
         drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
         refresh_runtime_app(&mut app, prepared, catalog, &mut view);
         terminal.draw(|frame| ui::draw(frame, &app, &mut render_cache))?;
@@ -1333,6 +1510,8 @@ fn complete_fullscreen_terminal_success(
     app.invalidate_model_suggestions();
     app.invalidate_login_suggestions();
     app.invalidate_thinking_suggestions();
+    app.invalidate_resume_suggestions();
+    view.invalidate_resume_sessions();
     view.activity_since = None;
     match command {
         FullscreenTerminalCommand::Login { provider_id, .. } => {
@@ -2718,6 +2897,8 @@ fn dispatch_login_slash_command(
         Ok(outcome) => {
             app.invalidate_model_suggestions();
             app.invalidate_login_suggestions();
+            app.invalidate_resume_suggestions();
+            view.invalidate_resume_sessions();
             view.activity = format!("Added {}", outcome.provider_id);
             append_view_message(view, MessageRole::Notice, outcome.notice());
         }
