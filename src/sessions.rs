@@ -580,7 +580,7 @@ mod tests {
             &mut diagnostics,
         )
         .expect("list");
-        assert!(String::from_utf8_lossy(&output).contains("completed work"));
+        assert!(String::from_utf8_lossy(&output).contains("session-command"));
 
         output.clear();
         run(
