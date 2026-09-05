@@ -16,6 +16,7 @@
 //! - Anthropic Messages (`anthropic-messages`)
 //! - Google Generative AI (`google-generative-ai`)
 //! - Google Vertex AI (`google-vertex`)
+//! - Mistral Conversations (`mistral-conversations`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
 //! JSON parser, retry classification, token accounting, and normalized
@@ -30,6 +31,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -43,7 +45,7 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, bedrock, catalog, google_auth, llm, stream};
+use crate::{agent, bedrock, catalog, google_auth, llm, mistral, stream};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -52,12 +54,14 @@ pub const API_OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
 pub const API_GOOGLE_VERTEX: &str = "google-vertex";
+pub const API_MISTRAL_CONVERSATIONS: &str = "mistral-conversations";
 
 const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const DEFAULT_GOOGLE_GENERATIVE_AI_BASE_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_VERTEX_API_VERSION: &str = "v1";
+const DEFAULT_MISTRAL_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 const VERTEX_AMBIENT_CREDENTIALS_MARKER: &str = "gcp-vertex-credentials";
 const CODEX_JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const AZURE_MANAGED_HOST_SUFFIXES: &[&str] = &[
@@ -84,6 +88,7 @@ pub enum ProviderProtocol {
     AnthropicMessages,
     GoogleGenerativeAi,
     GoogleVertex,
+    MistralConversations,
     BedrockConverseStream,
 }
 
@@ -97,6 +102,7 @@ impl ProviderProtocol {
             API_ANTHROPIC_MESSAGES => Ok(Self::AnthropicMessages),
             API_GOOGLE_GENERATIVE_AI => Ok(Self::GoogleGenerativeAi),
             API_GOOGLE_VERTEX => Ok(Self::GoogleVertex),
+            API_MISTRAL_CONVERSATIONS => Ok(Self::MistralConversations),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
@@ -109,6 +115,7 @@ impl ProviderProtocol {
             Self::AzureOpenAiResponses => "responses",
             Self::OpenAiCodexResponses => "codex/responses",
             Self::AnthropicMessages => "v1/messages",
+            Self::MistralConversations => "v1/chat/completions",
             Self::GoogleGenerativeAi => {
                 unreachable!("Google uses a model-scoped GenerateContent endpoint")
             }
@@ -310,9 +317,17 @@ pub struct ProviderConfig {
     pub max_retries: u32,
     /// Maximum accepted server-directed retry delay.
     pub retry_delay_limit: stream::RetryDelayLimit,
-    /// Whole-request timeout used when the factory constructs its reqwest
-    /// client.  A caller-provided client retains its own timeout policy.
+    /// Whole-request timeout for standard request/response protocols.
+    ///
+    /// Mistral streaming intentionally does not use a whole-request deadline:
+    /// it may stream longer than this setting. A caller-provided client
+    /// retains its own timeout policy.
     pub request_timeout: Option<Duration>,
+    /// Deadline for Mistral to return HTTP response headers.
+    ///
+    /// This bounds time to first byte without truncating an active SSE
+    /// response. `None` disables the deadline.
+    pub mistral_response_header_timeout: Option<Duration>,
     /// Capacity of the externally visible normalized event stream.
     pub event_buffer_capacity: usize,
     /// Maximum response-error body retained in an error message.
@@ -325,6 +340,7 @@ impl Default for ProviderConfig {
             max_retries: 2,
             retry_delay_limit: stream::RetryDelayLimit::Default,
             request_timeout: Some(Duration::from_secs(120)),
+            mistral_response_header_timeout: Some(DEFAULT_MISTRAL_RESPONSE_HEADER_TIMEOUT),
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             max_error_body_bytes: DEFAULT_MAX_ERROR_BODY_BYTES,
         }
@@ -376,9 +392,13 @@ impl ProviderResponderFactory {
     /// Builds a factory with explicit credentials and policy.
     pub fn configured(credentials: ProviderCredentials, config: ProviderConfig) -> Result<Self> {
         config.validate()?;
-        let mut builder = Client::builder();
+        // A blocking reqwest client applies its timeout to the entire
+        // response body. Keep the client deadline-free so Mistral's active
+        // SSE stream cannot be cut off; standard protocols install their
+        // configured deadline on each individual request below.
+        let mut builder = Client::builder().timeout(None);
         if let Some(timeout) = config.request_timeout {
-            builder = builder.timeout(timeout);
+            builder = builder.connect_timeout(timeout);
         }
         let client = builder.build().map_err(ProviderAdapterError::Request)?;
         Ok(Self {
@@ -570,6 +590,7 @@ impl ProviderResponderFactory {
             | ProviderProtocol::AnthropicMessages
             | ProviderProtocol::GoogleGenerativeAi
             | ProviderProtocol::GoogleVertex
+            | ProviderProtocol::MistralConversations
             | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
         };
         let payload = match protocol {
@@ -601,6 +622,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::GoogleVertex => {
                 Ok(build_google_vertex_request(model, context, &options))
             }
+            ProviderProtocol::MistralConversations => {
+                mistral::build_mistral_request(model, context, &options)
+            }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
@@ -612,6 +636,7 @@ impl ProviderResponderFactory {
             &credentials,
             &options.cancellation,
             &options.session_id,
+            options.cache_retention,
         )?;
 
         emitter.start()?;
@@ -649,6 +674,9 @@ impl ProviderResponderFactory {
             ProviderProtocol::GoogleVertex => {
                 consume_google_generate_content(response, model, &options.cancellation, emitter)?
             }
+            ProviderProtocol::MistralConversations => {
+                mistral::consume_mistral_conversations(response, &options.cancellation, emitter)?
+            }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
@@ -679,21 +707,32 @@ impl ProviderResponderFactory {
         credentials: &ProviderCredentials,
         cancellation: &agent::CancellationToken,
         session_id: &str,
+        cache_retention: agent::CacheRetention,
     ) -> Result<Response> {
         let endpoint = protocol_endpoint(model, protocol, credentials)?;
-        let headers =
-            build_request_headers(protocol, model, credentials, session_id, cancellation)?;
+        let headers = build_request_headers(
+            protocol,
+            model,
+            credentials,
+            session_id,
+            cache_retention,
+            cancellation,
+        )?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
         loop {
             ensure_not_cancelled(cancellation)?;
-            let sent = self
-                .client
-                .post(endpoint.clone())
-                .headers(headers.clone())
-                .body(body.clone())
-                .send();
+            let sent = if protocol == ProviderProtocol::MistralConversations {
+                self.send_mistral_request(
+                    endpoint.clone(),
+                    headers.clone(),
+                    body.clone(),
+                    cancellation,
+                )
+            } else {
+                self.send_standard_request(endpoint.clone(), headers.clone(), body.clone())
+            };
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
@@ -711,11 +750,7 @@ impl ProviderResponderFactory {
                         cancellation,
                     )?;
                 }
-                Err(error) => {
-                    let error = stream::ProviderError::new(
-                        0,
-                        format!("provider network request failed: {error}"),
-                    );
+                Err(ProviderAdapterError::Provider(error)) => {
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -728,8 +763,68 @@ impl ProviderResponderFactory {
                         cancellation,
                     )?;
                 }
+                Err(error) => return Err(error),
             }
             retry_index += 1;
+        }
+    }
+
+    fn send_standard_request(
+        &self,
+        endpoint: Url,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<Response> {
+        let mut request = self.client.post(endpoint).headers(headers).body(body);
+        if let Some(timeout) = self.config.request_timeout {
+            request = request.timeout(timeout);
+        }
+        request.send().map_err(provider_network_error)
+    }
+
+    fn send_mistral_request(
+        &self,
+        endpoint: Url,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        cancellation: &agent::CancellationToken,
+    ) -> Result<Response> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let client = self.client.clone();
+        thread::spawn(move || {
+            let response = client.post(endpoint).headers(headers).body(body).send();
+            let _ = sender.send(response);
+        });
+
+        let deadline = self
+            .config
+            .mistral_response_header_timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        loop {
+            ensure_not_cancelled(cancellation)?;
+            let wait = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::from_millis(25))
+                .min(Duration::from_millis(25));
+            if let Some(deadline) = deadline
+                && wait.is_zero()
+                && Instant::now() >= deadline
+            {
+                return Err(ProviderAdapterError::Provider(stream::ProviderError::new(
+                    0,
+                    "Mistral response headers timed out",
+                )));
+            }
+            match receiver.recv_timeout(wait) {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error)) => return Err(provider_network_error(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderAdapterError::Protocol(
+                        "Mistral request worker exited before returning a response".to_owned(),
+                    ));
+                }
+            }
         }
     }
 }
@@ -764,6 +859,13 @@ impl ProviderResponderFactory {
                 .map_err(|error| error.to_string())
         })
     }
+}
+
+fn provider_network_error(error: reqwest::Error) -> ProviderAdapterError {
+    ProviderAdapterError::Provider(stream::ProviderError::new(
+        0,
+        format!("provider network request failed: {error}"),
+    ))
 }
 
 fn ensure_not_cancelled(cancellation: &agent::CancellationToken) -> Result<()> {
@@ -821,6 +923,7 @@ fn protocol_endpoint(
         ProviderProtocol::GoogleVertex => {
             return google_vertex_endpoint(model, credentials);
         }
+        ProviderProtocol::MistralConversations => {}
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder");
         }
@@ -1182,6 +1285,7 @@ fn build_request_headers(
     model: &llm::Model,
     credentials: &ProviderCredentials,
     session_id: &str,
+    cache_retention: agent::CacheRetention,
     cancellation: &agent::CancellationToken,
 ) -> Result<HeaderMap> {
     let mut overrides = BTreeMap::<String, Option<String>>::new();
@@ -1196,7 +1300,8 @@ fn build_request_headers(
         | ProviderProtocol::AzureOpenAiResponses
         | ProviderProtocol::OpenAiCodexResponses
         | ProviderProtocol::GoogleGenerativeAi
-        | ProviderProtocol::GoogleVertex => {
+        | ProviderProtocol::GoogleVertex
+        | ProviderProtocol::MistralConversations => {
             set_header_override(
                 &mut overrides,
                 "accept".to_owned(),
@@ -1242,6 +1347,12 @@ fn build_request_headers(
             });
         }
         _ => {}
+    }
+    if matches!(protocol, ProviderProtocol::MistralConversations) && (ambient || api_key.is_empty())
+    {
+        return Err(ProviderAdapterError::MissingApiKey {
+            provider: model.provider.clone(),
+        });
     }
     let codex_account_id = match protocol {
         ProviderProtocol::OpenAiCodexResponses => Some(extract_codex_account_id(api_key)?),
@@ -1295,7 +1406,9 @@ fn build_request_headers(
             }
         }
         _ if !ambient && !api_key.is_empty() => match protocol {
-            ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
+            ProviderProtocol::OpenAiCompletions
+            | ProviderProtocol::OpenAiResponses
+            | ProviderProtocol::MistralConversations => {
                 set_header_override(
                     &mut overrides,
                     "authorization".to_owned(),
@@ -1330,6 +1443,17 @@ fn build_request_headers(
     }
     for (name, value) in credentials.headers() {
         set_header_override(&mut overrides, name.clone(), value.clone());
+    }
+    if protocol == ProviderProtocol::MistralConversations
+        && cache_retention != agent::CacheRetention::None
+        && !session_id.is_empty()
+        && !has_header_override(&overrides, "x-affinity")
+    {
+        set_header_override(
+            &mut overrides,
+            "x-affinity".to_owned(),
+            Some(session_id.to_owned()),
+        );
     }
 
     match protocol {
@@ -1394,6 +1518,7 @@ fn build_request_headers(
         | ProviderProtocol::AnthropicMessages
         | ProviderProtocol::GoogleGenerativeAi
         | ProviderProtocol::GoogleVertex
+        | ProviderProtocol::MistralConversations
         | ProviderProtocol::BedrockConverseStream => {}
     }
 
@@ -1404,6 +1529,11 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
             has_authorization
         }
+        // Mistral explicitly requires an API key before configured headers
+        // are applied. Those headers may intentionally suppress or replace
+        // the default bearer credential for a gateway, matching its native
+        // client behavior.
+        ProviderProtocol::MistralConversations => true,
         ProviderProtocol::AzureOpenAiResponses
         | ProviderProtocol::OpenAiCodexResponses
         | ProviderProtocol::GoogleGenerativeAi
@@ -1461,6 +1591,12 @@ fn has_nonempty_header(headers: &BTreeMap<String, Option<String>>, name: &str) -
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
     })
+}
+
+fn has_header_override(headers: &BTreeMap<String, Option<String>>, name: &str) -> bool {
+    headers
+        .keys()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
 #[derive(Clone, Copy)]
@@ -3689,10 +3825,10 @@ impl WireIdNormalizer {
 }
 
 /// Mutable output plus safe snapshot publication for one provider turn.
-struct MessageEmitter {
+pub(crate) struct MessageEmitter {
     events: stream::AssistantMessageEventStream,
     model: llm::Model,
-    message: llm::AssistantMessage,
+    pub(crate) message: llm::AssistantMessage,
     usage_cost_multiplier: f64,
 }
 
@@ -3718,11 +3854,11 @@ impl MessageEmitter {
         Arc::new(self.message.clone())
     }
 
-    fn start(&mut self) -> Result<()> {
+    pub(crate) fn start(&mut self) -> Result<()> {
         self.publish(stream::AssistantMessageEvent::start(self.snapshot()))
     }
 
-    fn start_text(&mut self, initial: &str) -> Result<usize> {
+    pub(crate) fn start_text(&mut self, initial: &str) -> Result<usize> {
         let index = self.message.content.len();
         self.message
             .content
@@ -3738,7 +3874,7 @@ impl MessageEmitter {
         Ok(index)
     }
 
-    fn append_text(&mut self, index: usize, delta: &str) -> Result<()> {
+    pub(crate) fn append_text(&mut self, index: usize, delta: &str) -> Result<()> {
         match self.message.content.get_mut(index) {
             Some(llm::ContentBlock::Text(text)) => text.text.push_str(delta),
             _ => {
@@ -3779,7 +3915,7 @@ impl MessageEmitter {
         Ok(())
     }
 
-    fn end_text(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn end_text(&mut self, index: usize) -> Result<()> {
         let content = match self.message.content.get(index) {
             Some(llm::ContentBlock::Text(text)) => text.text.clone(),
             _ => {
@@ -3796,7 +3932,12 @@ impl MessageEmitter {
         })
     }
 
-    fn start_thinking(&mut self, initial: &str, signature: &str, redacted: bool) -> Result<usize> {
+    pub(crate) fn start_thinking(
+        &mut self,
+        initial: &str,
+        signature: &str,
+        redacted: bool,
+    ) -> Result<usize> {
         let index = self.message.content.len();
         self.message
             .content
@@ -3813,7 +3954,7 @@ impl MessageEmitter {
         Ok(index)
     }
 
-    fn append_thinking(&mut self, index: usize, delta: &str) -> Result<()> {
+    pub(crate) fn append_thinking(&mut self, index: usize, delta: &str) -> Result<()> {
         match self.message.content.get_mut(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking.push_str(delta),
             _ => {
@@ -3866,7 +4007,7 @@ impl MessageEmitter {
         }
     }
 
-    fn end_thinking(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn end_thinking(&mut self, index: usize) -> Result<()> {
         let content = match self.message.content.get(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking.clone(),
             _ => {
@@ -3883,7 +4024,7 @@ impl MessageEmitter {
         })
     }
 
-    fn start_tool(&mut self, id: &str, name: &str) -> Result<usize> {
+    pub(crate) fn start_tool(&mut self, id: &str, name: &str) -> Result<usize> {
         let index = self.message.content.len();
         self.message
             .content
@@ -3938,7 +4079,7 @@ impl MessageEmitter {
         Ok(())
     }
 
-    fn set_tool_arguments(
+    pub(crate) fn set_tool_arguments(
         &mut self,
         index: usize,
         arguments: BTreeMap<String, Value>,
@@ -3952,7 +4093,7 @@ impl MessageEmitter {
         Ok(())
     }
 
-    fn tool_delta(&mut self, index: usize, delta: &str) -> Result<()> {
+    pub(crate) fn tool_delta(&mut self, index: usize, delta: &str) -> Result<()> {
         self.publish(stream::AssistantMessageEvent {
             event_type: stream::EVENT_TOOLCALL_DELTA.to_owned(),
             content_index: Some(index),
@@ -3961,7 +4102,7 @@ impl MessageEmitter {
         })
     }
 
-    fn end_tool(&mut self, index: usize) -> Result<()> {
+    pub(crate) fn end_tool(&mut self, index: usize) -> Result<()> {
         let call = match self.message.content.get(index) {
             Some(llm::ContentBlock::ToolCall(call)) => call.clone(),
             _ => {
@@ -5826,6 +5967,7 @@ mod tests {
                 API_OPENAI_CODEX_RESPONSES => "openai-codex".to_owned(),
                 API_GOOGLE_GENERATIVE_AI => "google".to_owned(),
                 API_GOOGLE_VERTEX => "google-vertex".to_owned(),
+                API_MISTRAL_CONVERSATIONS => "mistral".to_owned(),
                 _ => "openai".to_owned(),
             },
             base_url,
@@ -5849,6 +5991,10 @@ mod tests {
             cancellation,
             thinking_level: llm::THINKING_HIGH.to_owned(),
             thinking_budgets: None,
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            cache_retention: agent::CacheRetention::Short,
             session_id: "session-1".to_owned(),
             assistant_event_listener: None,
         }
@@ -6882,6 +7028,166 @@ mod tests {
     }
 
     #[test]
+    fn mistral_conversations_serialization_and_sse_decoding_preserve_protocol_rules() {
+        let body = concat!(
+            r#"data: {"id":"mistral_1","choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"text":"consider "}]}]}}]}"#,
+            "\n\n",
+            r#"data: {"id":"mistral_1","choices":[{"delta":{"content":[{"type":"text","text":"answer"}]}}]}"#,
+            "\n\n",
+            r#"data: {"id":"mistral_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"abcdefghi","function":{"name":"weather","arguments":"{\"city\":"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"id":"mistral_1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"id":"mistral_1","choices":[{"finish_reason":"tool_calls","delta":{}}],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":2}}}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut request_model = model(API_MISTRAL_CONVERSATIONS, base_url);
+        request_model.id = "mistral-small-latest".to_owned();
+        request_model.reasoning = true;
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.temperature = Some(0.3);
+        request_options.max_tokens = Some(512);
+        request_options.tool_choice = Some(json!("required"));
+
+        let response = factory(0)
+            .respond(&request_model, &text_context(), request_options)
+            .expect("Mistral response");
+        let request = requests.recv().expect("captured Mistral request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(request.target, "/v1/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-key")
+        );
+        assert_eq!(
+            request.headers.get("x-affinity").map(String::as_str),
+            Some("session-1")
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("Mistral JSON body");
+        assert_eq!(sent["model"], "mistral-small-latest");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["max_tokens"], 512);
+        assert_eq!(sent["temperature"], 0.3);
+        assert_eq!(sent["tool_choice"], "required");
+        assert_eq!(sent["reasoning_effort"], "high");
+        assert_eq!(sent["prompt_cache_key"], "session-1");
+        assert_eq!(sent["tools"][0]["function"]["strict"], false);
+
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+        assert_eq!(response.response_id, "mistral_1");
+        assert_eq!(response.usage.input, 10);
+        assert_eq!(response.usage.output, 4);
+        assert_eq!(response.usage.cache_read, 2);
+        assert_eq!(response.usage.total_tokens, 16);
+        let llm::ContentBlock::Thinking(thinking) = &response.content[0] else {
+            panic!("expected Mistral thinking content");
+        };
+        assert_eq!(thinking.thinking, "consider ");
+        assert_eq!(response.content[1].plain_text(), Some("answer"));
+        let llm::ContentBlock::ToolCall(call) = &response.content[2] else {
+            panic!("expected Mistral tool call");
+        };
+        assert_eq!(call.id, "abcdefghi");
+        assert_eq!(call.name, "weather");
+        assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+    }
+
+    #[test]
+    fn mistral_header_overrides_and_cache_retention_match_native_behavior() {
+        let request_model = model(
+            API_MISTRAL_CONVERSATIONS,
+            "https://api.mistral.ai".to_owned(),
+        );
+        let cancellation = agent::CancellationToken::default();
+        let suppressed_authorization = build_request_headers(
+            ProviderProtocol::MistralConversations,
+            &request_model,
+            &ProviderCredentials::api_key("mistral-key").without_header("authorization"),
+            "session-1",
+            agent::CacheRetention::Short,
+            &cancellation,
+        )
+        .expect("Mistral accepts an intentional bearer-header suppression");
+        assert!(!suppressed_authorization.contains_key("authorization"));
+        assert_eq!(
+            suppressed_authorization
+                .get("x-affinity")
+                .and_then(|value| value.to_str().ok()),
+            Some("session-1")
+        );
+
+        let no_cache = build_request_headers(
+            ProviderProtocol::MistralConversations,
+            &request_model,
+            &ProviderCredentials::api_key("mistral-key"),
+            "session-1",
+            agent::CacheRetention::None,
+            &cancellation,
+        )
+        .expect("Mistral headers without prompt caching");
+        assert!(!no_cache.contains_key("x-affinity"));
+    }
+
+    #[test]
+    fn mistral_response_header_deadline_does_not_truncate_an_active_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Mistral server");
+        let address = listener.local_addr().expect("Mistral server address");
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Mistral request");
+            request_sender
+                .send(read_request(&mut stream))
+                .expect("capture Mistral request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write Mistral response headers");
+            stream.flush().expect("flush Mistral response headers");
+            for chunk in [
+                r#"data: {"id":"mistral_1","choices":[{"delta":{"content":"one "}}]}"#,
+                r#"data: {"id":"mistral_1","choices":[{"delta":{"content":"two"}}]}"#,
+                r#"data: {"id":"mistral_1","choices":[{"finish_reason":"stop","delta":{}}]}"#,
+            ] {
+                thread::sleep(Duration::from_millis(60));
+                stream
+                    .write_all(chunk.as_bytes())
+                    .expect("write Mistral chunk");
+                stream.write_all(b"\n\n").expect("terminate Mistral chunk");
+                stream.flush().expect("flush Mistral chunk");
+            }
+        });
+        let factory = ProviderResponderFactory::configured(
+            ProviderCredentials::api_key("mistral-key"),
+            ProviderConfig {
+                max_retries: 0,
+                request_timeout: Some(Duration::from_millis(50)),
+                mistral_response_header_timeout: Some(Duration::from_millis(50)),
+                ..ProviderConfig::default()
+            },
+        )
+        .expect("Mistral provider factory");
+        let request_model = model(API_MISTRAL_CONVERSATIONS, format!("http://{address}"));
+
+        let response = factory
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Mistral stream survives past standard request deadline");
+        let request = request_receiver.recv().expect("captured Mistral request");
+        server.join().expect("Mistral server finishes");
+
+        assert_eq!(request.target, "/v1/chat/completions");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.content[0].plain_text(), Some("one two"));
+    }
+
+    #[test]
     fn azure_requires_an_api_key_and_never_uses_a_bearer_header_as_a_fallback() {
         let header_secret = "Bearer header-only-secret";
         let response = factory_with_credentials(
@@ -6911,6 +7217,7 @@ mod tests {
             &request_model,
             &ProviderCredentials::api_key("azure-default").with_header("api-key", "proxy-key"),
             "",
+            agent::CacheRetention::Short,
             &cancellation,
         )
         .expect("override Azure headers");
@@ -6926,6 +7233,7 @@ mod tests {
             &request_model,
             &ProviderCredentials::api_key("azure-default").without_header("api-key"),
             "",
+            agent::CacheRetention::Short,
             &cancellation,
         )
         .expect("suppress Azure header");

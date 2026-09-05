@@ -182,12 +182,34 @@ impl Tool {
 pub type AssistantEventListener =
     Arc<dyn Fn(stream::AssistantMessageEvent) + Send + Sync + 'static>;
 
+/// Controls whether a provider may retain a prompt for follow-up turns.
+///
+/// `Short` is the common provider default. Providers that do not offer prompt
+/// caching ignore this setting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheRetention {
+    None,
+    #[default]
+    Short,
+    Long,
+}
+
 /// Per-request provider inputs that are not encoded in the transcript.
 #[derive(Clone)]
 pub struct RequestOptions {
     pub cancellation: CancellationToken,
     pub thinking_level: llm::ThinkingLevel,
     pub thinking_budgets: Option<llm::ThinkingBudgets>,
+    /// Optional runtime override for a provider's response temperature.
+    pub temperature: Option<f64>,
+    /// Optional runtime override for the model's default response limit.
+    pub max_tokens: Option<u64>,
+    /// Optional provider-native tool-choice value.
+    ///
+    /// Protocol adapters validate or ignore values that their wire format does
+    /// not support.
+    pub tool_choice: Option<Value>,
+    pub cache_retention: CacheRetention,
     pub session_id: String,
     /// Streaming responders call this for each normalized provider event.
     /// Responders that only return a completed message can leave it unused.
@@ -201,6 +223,10 @@ impl fmt::Debug for RequestOptions {
             .field("cancellation", &self.cancellation)
             .field("thinking_level", &self.thinking_level)
             .field("thinking_budgets", &self.thinking_budgets)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("tool_choice", &self.tool_choice)
+            .field("cache_retention", &self.cache_retention)
             .field("session_id", &self.session_id)
             .field(
                 "has_assistant_event_listener",
@@ -842,6 +868,10 @@ impl Agent {
                     cancellation: cancellation.clone(),
                     thinking_level,
                     thinking_budgets: None,
+                    temperature: None,
+                    max_tokens: None,
+                    tool_choice: None,
+                    cache_retention: CacheRetention::Short,
                     session_id: self.inner.session_id.clone(),
                     assistant_event_listener: Some(assistant_event_listener),
                 },
