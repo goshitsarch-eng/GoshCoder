@@ -1583,20 +1583,7 @@ fn dispatch_runtime_slash_command(
         }
         "/messages" => {
             let state = prepared.runtime.agent().state();
-            let messages = &state.messages;
-            let summary = messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    format!(
-                        "{:>3}  {:<10} {}",
-                        index + 1,
-                        message.role(),
-                        first_line(&message.text_preview())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let summary = transcript_summary(&state.messages);
             append_view_message(
                 view,
                 MessageRole::Command,
@@ -2040,6 +2027,21 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+fn transcript_summary(messages: &[llm::Message]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let (role, preview) = compaction::summary_text(message).map_or_else(
+                || (message.role(), first_line(&message.text_preview())),
+                |summary| ("compacted", first_line(&summary)),
+            );
+            format!("{:>3}  {:<10} {}", index + 1, role, preview)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn dispatch_session_export_slash_command(
@@ -3388,6 +3390,21 @@ mod tests {
              · assistant latest response\n\
              ────────────────────────────────────────"
         );
+    }
+
+    #[test]
+    fn transcript_summary_hides_the_raw_compaction_wrapper() {
+        let messages = vec![
+            compaction::summary_message("Prior work\nwith details", 1),
+            llm::Message::User(llm::UserMessage::text("latest request", 2)),
+        ];
+
+        let summary = transcript_summary(&messages);
+
+        assert!(summary.contains("compacted  Prior work"));
+        assert!(summary.contains("latest request"));
+        assert!(!summary.contains(compaction::SUMMARY_OPEN));
+        assert!(!summary.contains(compaction::SUMMARY_CLOSE));
     }
 
     #[test]
