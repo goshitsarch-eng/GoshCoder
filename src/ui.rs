@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     let sidebar_width = if area.width >= 96 {
-        min(42, max(32, area.width / 3))
+        (area.width / 3).clamp(32, 42)
     } else {
         0
     };
@@ -69,7 +69,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         app.cursor,
         area.width.saturating_sub(8) as usize,
     );
-    let composer_height = min(5, max(3, editor.lines.len() as u16 + 2));
+    let composer_height = (editor.lines.len() as u16 + 2).clamp(3, 5);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
