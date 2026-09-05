@@ -851,10 +851,7 @@ impl Credential {
         }
     }
 
-    /// Creates an OAuth credential for persistence only.
-    ///
-    /// TODO: OAuth login, expiry handling, and refresh are intentionally not
-    /// implemented in this non-OAuth catalog port.
+    /// Creates an OAuth credential for durable persistence.
     pub fn oauth(
         access: impl Into<String>,
         refresh: impl Into<String>,

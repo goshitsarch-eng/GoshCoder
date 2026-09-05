@@ -77,6 +77,8 @@ pub struct App {
     pub tools_expanded: bool,
     pub hide_thinking: bool,
     pub history: Vec<String>,
+    login_suggestions: Vec<Suggestion>,
+    login_suggestions_query: Option<String>,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -152,6 +154,8 @@ impl App {
             tools_expanded: false,
             hide_thinking: false,
             history: Vec::new(),
+            login_suggestions: Vec::new(),
+            login_suggestions_query: None,
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -159,7 +163,42 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        suggestions_for(&self.input)
+        match login_query(&self.input) {
+            Some(query) if self.login_suggestions_query.as_deref() == Some(query) => {
+                self.login_suggestions.clone()
+            }
+            Some(_) => Vec::new(),
+            None => suggestions_for(&self.input),
+        }
+    }
+
+    /// Rebuilds the `/login` provider palette only after its query changes.
+    ///
+    /// The loader belongs to the runtime because checking configured providers
+    /// can refresh OAuth credentials. Keeping it out of the renderer prevents
+    /// a terminal redraw from starting network work.
+    pub fn refresh_login_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = login_query(&self.input) else {
+            self.invalidate_login_suggestions();
+            return;
+        };
+        if self.login_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.login_suggestions = load(query);
+        self.login_suggestions_query = Some(query.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.login_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates credential-dependent provider choices after login.
+    pub fn invalidate_login_suggestions(&mut self) {
+        self.login_suggestions.clear();
+        self.login_suggestions_query = None;
     }
 
     /// Clears the composer and remembers a submitted value without adding
@@ -172,6 +211,7 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.selected_suggestion = 0;
+        self.invalidate_login_suggestions();
     }
 
     /// Retains an externally generated transcript while keeping editor history
@@ -764,6 +804,11 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         .collect()
 }
 
+fn login_query(input: &str) -> Option<&str> {
+    let query = input.strip_prefix("/login ")?;
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,6 +836,50 @@ mod tests {
 
         assert_eq!(app.input, "/model ");
         assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn login_palette_caches_provider_choices_per_query() {
+        let mut app = App::new();
+        app.set_input("/login ");
+        app.refresh_login_suggestions(|query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "Anthropic".to_owned(),
+                description: "OAuth / subscription".to_owned(),
+                value: "/login anthropic".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_login_suggestions(|_| panic!("unchanged login query must be cached"));
+        app.set_input("/login an");
+        assert!(app.suggestions().is_empty());
+        app.refresh_login_suggestions(|query| {
+            assert_eq!(query, "an");
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+
+        app.invalidate_login_suggestions();
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn root_login_command_remains_an_additive_palette_entry() {
+        let mut app = App::new();
+        app.set_input("/log");
+
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "/login".to_owned(),
+                description: "Add an OAuth or API-key provider".to_owned(),
+                value: "/login ".to_owned(),
+                execute: false,
+            }]
+        );
     }
 
     #[test]

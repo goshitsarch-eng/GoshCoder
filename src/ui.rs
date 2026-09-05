@@ -670,7 +670,7 @@ fn suggestion_title(input: &str) -> &'static str {
     } else if input.starts_with("/thinking ") {
         " THINKING LEVEL "
     } else if input.starts_with("/login ") {
-        " ADD PROVIDER "
+        " ADD PROVIDER · OAuth or API key · existing logins are kept "
     } else if input.starts_with("/omni ") {
         " OMNIROUTE "
     } else if input.starts_with("/aperture ") {
@@ -764,6 +764,11 @@ mod tests {
         assert!(text.contains("GOSHCODER"));
         assert!(text.contains("COMMANDS"));
         assert!(text.contains("New Session"));
+    }
+
+    #[test]
+    fn login_palette_explains_additive_credentials() {
+        assert!(suggestion_title("/login anthropic").contains("existing logins are kept"));
     }
 
     #[test]

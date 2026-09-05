@@ -16,6 +16,86 @@ use crate::{
     config, oauth,
 };
 
+/// The credential flow selected for an interactive `/login <provider>` command.
+///
+/// Providers with an OAuth marker but no implemented OAuth flow deliberately
+/// use the API-key path. This follows the previous client rather than
+/// advertising a login flow that cannot complete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractiveAuthCommand {
+    Login,
+    Set,
+}
+
+impl InteractiveAuthCommand {
+    pub const fn as_auth_subcommand(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Set => "set",
+        }
+    }
+}
+
+/// Successful outcome of an interactive provider credential flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InteractiveAuthOutcome {
+    pub provider_id: String,
+    pub command: InteractiveAuthCommand,
+}
+
+impl InteractiveAuthOutcome {
+    pub fn notice(&self) -> String {
+        format!(
+            "Added {}. Use /model to switch providers.",
+            self.provider_id
+        )
+    }
+}
+
+/// Selects the safe credential flow for a provider in interactive chat.
+pub fn interactive_auth_command(
+    catalog: &Catalog,
+    provider_id: &str,
+) -> Result<InteractiveAuthCommand, Box<dyn Error>> {
+    if catalog.provider(provider_id).is_none() {
+        return Err(command_error(format!("unknown provider {provider_id:?}")));
+    }
+    let command = match oauth::OAuthProviderId::parse(provider_id) {
+        Some(provider)
+            if oauth::metadata_for(provider).flow_support
+                == oauth::OAuthFlowSupport::Implemented =>
+        {
+            InteractiveAuthCommand::Login
+        }
+        Some(_) | None => InteractiveAuthCommand::Set,
+    };
+    Ok(command)
+}
+
+/// Authenticates one provider from an interactive terminal.
+///
+/// The caller owns presentation around this blocking operation. OAuth prompts
+/// and API-key input are rendered safely by the existing terminal adapters,
+/// while credential writes remain additive in the shared store.
+pub fn auth_for_provider(
+    catalog: &Catalog,
+    provider_id: &str,
+) -> Result<InteractiveAuthOutcome, Box<dyn Error>> {
+    let command = interactive_auth_command(catalog, provider_id)?;
+    let store = catalog
+        .credentials()
+        .ok_or_else(|| command_error("interactive login requires a credential store"))?;
+    match command {
+        InteractiveAuthCommand::Set => store_api_key(store, provider_id)?,
+        InteractiveAuthCommand::Login => login_with_oauth(catalog, store, provider_id)?,
+    }
+    catalog.clear_oauth_refresh_failure(provider_id);
+    Ok(InteractiveAuthOutcome {
+        provider_id: provider_id.to_owned(),
+        command,
+    })
+}
+
 /// Executes `goshcoder providers`.
 pub fn providers_command() -> Result<(), Box<dyn Error>> {
     let catalog = Catalog::with_default_credentials()?;
@@ -93,12 +173,7 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if catalog.provider(provider_id).is_none() {
                 return Err(command_error(format!("unknown provider {provider_id:?}")));
             }
-            config::ensure_agent_dir()?;
-            let key = read_secret(&format!("Enter the API key for {provider_id}: "))?;
-            if key.is_empty() {
-                return Err(command_error("no key provided"));
-            }
-            store.put(provider_id, Credential::api_key(key))?;
+            store_api_key(&store, provider_id)?;
             println!(
                 "Stored an API key for {provider_id} in {}",
                 config::auth_path().display()
@@ -123,17 +198,7 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     "no OAuth login flow is available for {provider_id:?}; use `goshcoder auth set {provider_id}`"
                 )));
             }
-            config::ensure_agent_dir()?;
-            let client = oauth::OAuthClient::system()?;
-            let cancellation = oauth::CancellationToken::new();
-            client.login_and_persist(
-                provider,
-                &store,
-                Arc::new(TerminalOAuthInteraction),
-                &oauth::ProcessEnvironment,
-                &cancellation,
-            )?;
-            catalog.clear_oauth_refresh_failure(provider_id);
+            login_with_oauth(&catalog, &store, provider_id)?;
             println!(
                 "Logged in to {provider_id} with OAuth; credentials are stored in {}",
                 config::auth_path().display()
@@ -152,6 +217,45 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "unknown auth subcommand {subcommand:?}"
         ))),
     }
+}
+
+fn store_api_key(store: &CredentialStore, provider_id: &str) -> Result<(), Box<dyn Error>> {
+    config::ensure_agent_dir()?;
+    let key = read_secret(&format!("Enter the API key for {provider_id}: "))?;
+    if key.is_empty() {
+        return Err(command_error("no key provided"));
+    }
+    store.put(provider_id, Credential::api_key(key))?;
+    Ok(())
+}
+
+fn login_with_oauth(
+    catalog: &Catalog,
+    store: &CredentialStore,
+    provider_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let provider = oauth::OAuthProviderId::parse(provider_id).ok_or_else(|| {
+        command_error(format!(
+            "{provider_id:?} does not support OAuth login; use `goshcoder auth set {provider_id}`"
+        ))
+    })?;
+    if oauth::metadata_for(provider).flow_support == oauth::OAuthFlowSupport::MetadataOnly {
+        return Err(command_error(format!(
+            "no OAuth login flow is available for {provider_id:?}; use `goshcoder auth set {provider_id}`"
+        )));
+    }
+    config::ensure_agent_dir()?;
+    let client = oauth::OAuthClient::system()?;
+    let cancellation = oauth::CancellationToken::new();
+    client.login_and_persist(
+        provider,
+        store,
+        Arc::new(TerminalOAuthInteraction),
+        &oauth::ProcessEnvironment,
+        &cancellation,
+    )?;
+    catalog.clear_oauth_refresh_failure(provider_id);
+    Ok(())
 }
 
 /// Blocking CLI presentation for the provider-neutral OAuth flow.
@@ -424,5 +528,36 @@ mod tests {
         assert_eq!(select_oauth_option("2", &options), "device_code");
         assert_eq!(select_oauth_option("browser", &options), "browser");
         assert_eq!(select_oauth_option("3", &options), "3");
+    }
+
+    #[test]
+    fn interactive_login_uses_only_implemented_oauth_flows() {
+        let aperture_root = std::env::temp_dir().join(format!(
+            "goshcoder-provider-cli-login-routing-{}",
+            std::process::id()
+        ));
+        let catalog = Catalog::with_environment(
+            Some(Arc::new(CredentialStore::in_memory())),
+            Arc::new(|_| None),
+        )
+        .expect("catalog")
+        .with_aperture_paths(
+            aperture_root.join("aperture.json"),
+            aperture_root.join("aperture-cache.json"),
+        );
+
+        assert_eq!(
+            interactive_auth_command(&catalog, "anthropic").expect("OAuth provider"),
+            InteractiveAuthCommand::Login
+        );
+        assert_eq!(
+            interactive_auth_command(&catalog, "openrouter").expect("metadata-only provider"),
+            InteractiveAuthCommand::Set
+        );
+        assert_eq!(
+            interactive_auth_command(&catalog, "openai").expect("API-key provider"),
+            InteractiveAuthCommand::Set
+        );
+        assert!(interactive_auth_command(&catalog, "unknown").is_err());
     }
 }

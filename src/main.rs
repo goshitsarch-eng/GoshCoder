@@ -42,6 +42,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     io::{self, BufRead, IsTerminal, Write},
+    process::Command,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -581,7 +582,6 @@ fn line_interactive_loop(
     }
 
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
     let mut raw = String::new();
     loop {
         raw.clear();
@@ -590,7 +590,7 @@ fn line_interactive_loop(
             write!(stderr, "\n> ")?;
             stderr.flush()?;
         }
-        if reader.read_line(&mut raw)? == 0 {
+        if stdin.lock().read_line(&mut raw)? == 0 {
             if interactive {
                 eprintln!();
             }
@@ -758,7 +758,7 @@ fn event_loop(
 
     loop {
         drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
-        refresh_runtime_app(&mut app, prepared, &mut view);
+        refresh_runtime_app(&mut app, prepared, catalog, &mut view);
         terminal.draw(|frame| ui::draw(frame, &app, &mut render_cache))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -815,6 +815,17 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
+                        CommandDispatch::Login {
+                            provider_id,
+                            command,
+                        } => complete_fullscreen_login(
+                            terminal,
+                            &mut app,
+                            &mut view,
+                            catalog,
+                            &provider_id,
+                            command,
+                        ),
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -832,6 +843,17 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
+                        CommandDispatch::Login {
+                            provider_id,
+                            command,
+                        } => complete_fullscreen_login(
+                            terminal,
+                            &mut app,
+                            &mut view,
+                            catalog,
+                            &provider_id,
+                            command,
+                        ),
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -845,6 +867,90 @@ fn event_loop(
             _ => {}
         }
     }
+}
+
+/// Temporarily gives the real terminal to the credential CLI, then restores
+/// Ratatui. OAuth and secret entry cannot safely run while the alternate
+/// screen and raw mode are active.
+fn complete_fullscreen_login(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    provider_id: &str,
+    command: provider_cli::InteractiveAuthCommand,
+) {
+    view.activity = format!("Logging in to {provider_id}");
+    view.activity_since = Some(Instant::now());
+    let result = run_fullscreen_login(terminal, provider_id, command);
+    app.invalidate_login_suggestions();
+    match result {
+        Ok(()) => {
+            catalog.clear_oauth_refresh_failure(provider_id);
+            view.activity = format!("Added {provider_id}");
+            view.activity_since = None;
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("Added {provider_id}. Use /model to switch providers."),
+            );
+        }
+        Err(error) => {
+            view.activity = "Login failed".to_owned();
+            view.activity_since = None;
+            append_view_message(view, MessageRole::Error, error);
+        }
+    }
+}
+
+fn run_fullscreen_login(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    provider_id: &str,
+    command: provider_cli::InteractiveAuthCommand,
+) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    suspend_fullscreen_terminal(terminal)?;
+    let status = Command::new(executable)
+        .args(["auth", command.as_auth_subcommand(), provider_id])
+        .status()
+        .map_err(|error| format!("start credential flow: {error}"));
+    let restored = restore_fullscreen_terminal(terminal);
+    match (status, restored) {
+        (_, Err(error)) => Err(format!("restore terminal after login: {error}")),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(status), Ok(())) if status.success() => Ok(()),
+        (Ok(status), Ok(())) => Err(format!(
+            "credential flow for {provider_id} exited with {status}"
+        )),
+    }
+}
+
+fn suspend_fullscreen_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+) -> Result<(), String> {
+    terminal.show_cursor().map_err(|error| error.to_string())?;
+    disable_raw_mode().map_err(|error| error.to_string())?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn restore_fullscreen_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+) -> io::Result<()> {
+    enable_raw_mode()?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
+    terminal.clear()
 }
 
 fn drain_interactive_events(
@@ -1118,6 +1224,10 @@ fn submit_interactive_input(
 enum CommandDispatch {
     NotCommand,
     Handled,
+    Login {
+        provider_id: String,
+        command: provider_cli::InteractiveAuthCommand,
+    },
     Quit,
 }
 
@@ -1539,7 +1649,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login and fullscreen onboarding flows are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nFullscreen onboarding is still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2011,14 +2121,7 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
-        "/login" => {
-            append_view_message(
-                view,
-                MessageRole::Error,
-                "OAuth login is not available in the Rust frontend yet; use `goshcoder auth set <provider>` outside chat.",
-            );
-            CommandDispatch::Handled
-        }
+        "/login" => dispatch_login_slash_command(app, view, prepared, catalog, rest, fullscreen),
         _ if command.starts_with('/') => {
             append_view_message(
                 view,
@@ -2029,6 +2132,67 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+fn dispatch_login_slash_command(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let providers = rest.split_whitespace().collect::<Vec<_>>();
+    let [provider_id] = providers.as_slice() else {
+        if providers.is_empty() {
+            append_view_message(view, MessageRole::Command, login_command_help());
+        } else {
+            append_view_message(view, MessageRole::Error, "usage: /login <provider>");
+        }
+        return CommandDispatch::Handled;
+    };
+
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Wait for the current response before changing credentials.",
+        );
+        return CommandDispatch::Handled;
+    }
+
+    let command = match provider_cli::interactive_auth_command(catalog, provider_id) {
+        Ok(command) => command,
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.to_string());
+            return CommandDispatch::Handled;
+        }
+    };
+    if fullscreen {
+        view.activity = format!("Logging in to {provider_id}");
+        view.activity_since = Some(Instant::now());
+        return CommandDispatch::Login {
+            provider_id: (*provider_id).to_owned(),
+            command,
+        };
+    }
+
+    match provider_cli::auth_for_provider(catalog, provider_id) {
+        Ok(outcome) => {
+            app.invalidate_login_suggestions();
+            view.activity = format!("Added {}", outcome.provider_id);
+            append_view_message(view, MessageRole::Notice, outcome.notice());
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn login_command_help() -> String {
+    format!(
+        "Add a provider with /login <provider>.\nOAuth providers: {}\nAPI-key providers prompt for a key; existing logins are kept.",
+        oauth::implemented_provider_ids().join(", ")
+    )
 }
 
 fn transcript_summary(messages: &[llm::Message]) -> String {
@@ -2656,8 +2820,10 @@ fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl
 fn refresh_runtime_app(
     app: &mut App,
     prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
     view: &mut InteractiveView,
 ) {
+    app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
     let state = prepared.runtime.agent().state();
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
@@ -3082,6 +3248,58 @@ fn configured_model_references(catalog: &catalog::Catalog) -> Vec<String> {
         .collect()
 }
 
+fn login_provider_suggestions(catalog: &catalog::Catalog, query: &str) -> Vec<state::Suggestion> {
+    let configured = catalog
+        .configured_provider_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let query = query.to_ascii_lowercase();
+    let mut choices = catalog
+        .providers()
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .models()
+                .iter()
+                .any(|model| providers::ProviderProtocol::from_api(&model.api).is_ok())
+        })
+        .filter(|provider| {
+            query.is_empty()
+                || provider.id.to_ascii_lowercase().contains(&query)
+                || provider.name.to_ascii_lowercase().contains(&query)
+        })
+        .map(|provider| {
+            let oauth = oauth::OAuthProviderId::parse(&provider.id).is_some_and(|provider_id| {
+                oauth::metadata_for(provider_id).flow_support
+                    == oauth::OAuthFlowSupport::Implemented
+            });
+            let method = if oauth {
+                "OAuth / subscription"
+            } else {
+                "API key"
+            };
+            let signed_in = configured.contains(&provider.id);
+            let prefix = if signed_in { "SIGNED IN · " } else { "" };
+            (
+                oauth,
+                provider.id.clone(),
+                state::Suggestion {
+                    label: provider.id.clone(),
+                    description: format!("{prefix}{} · {method}", provider.name),
+                    value: format!("/login {}", provider.id),
+                    execute: true,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    choices
+        .into_iter()
+        .map(|(_, _, suggestion)| suggestion)
+        .collect()
+}
+
 fn interactive_models(catalog: &catalog::Catalog) -> Result<Vec<llm::Model>, String> {
     let configured = catalog
         .configured_provider_ids()
@@ -3209,6 +3427,61 @@ mod tests {
     fn help_and_version_are_non_interactive() {
         assert!(USAGE.contains("Ratatui"));
         assert!(env!("CARGO_PKG_VERSION").starts_with("0."));
+    }
+
+    #[test]
+    fn login_help_lists_supported_oauth_and_additive_api_key_flow() {
+        let help = login_command_help();
+
+        assert!(help.contains("anthropic"));
+        assert!(help.contains("API-key providers prompt for a key"));
+        assert!(help.contains("existing logins are kept"));
+    }
+
+    #[test]
+    fn login_picker_prioritizes_oauth_and_marks_signed_in_providers() {
+        let credentials = Arc::new(catalog::CredentialStore::in_memory());
+        credentials
+            .put("openai", catalog::Credential::api_key("test-key"))
+            .expect("store credential");
+        let aperture_root =
+            std::env::temp_dir().join(format!("goshcoder-login-picker-{}", std::process::id()));
+        let catalog =
+            catalog::Catalog::with_environment(Some(Arc::clone(&credentials)), Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(
+                    aperture_root.join("aperture.json"),
+                    aperture_root.join("aperture-cache.json"),
+                );
+
+        let choices = login_provider_suggestions(&catalog, "");
+        let anthropic = choices
+            .iter()
+            .find(|choice| choice.value == "/login anthropic")
+            .expect("Anthropic choice");
+        let openai = choices
+            .iter()
+            .find(|choice| choice.value == "/login openai")
+            .expect("OpenAI choice");
+
+        assert!(anthropic.description.contains("OAuth / subscription"));
+        assert!(openai.description.contains("SIGNED IN ·"));
+        assert!(openai.description.contains("API key"));
+        assert!(
+            choices
+                .iter()
+                .position(|choice| choice.value == "/login anthropic")
+                .expect("Anthropic position")
+                < choices
+                    .iter()
+                    .position(|choice| choice.value == "/login openai")
+                    .expect("OpenAI position")
+        );
+        assert_eq!(
+            login_provider_suggestions(&catalog, "anth").len(),
+            1,
+            "query should filter provider choices"
+        );
     }
 
     #[test]
