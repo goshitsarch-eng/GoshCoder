@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod config;
 pub mod llm;
 pub mod markdown;
+pub mod omni_cli;
+pub mod omniroute;
 pub mod prompts;
 pub mod provider_cli;
 pub mod ralph;
@@ -74,6 +76,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("providers") => provider_cli::providers_command(),
         Some("models") => provider_cli::models_command(&args[1..]),
         Some("auth") => provider_cli::auth_command(&args[1..]),
+        Some("omni") => omni_cli::command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),

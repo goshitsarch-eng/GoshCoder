@@ -171,7 +171,7 @@ fn provider_setup_hint(provider: &Provider) -> String {
     }
 }
 
-fn read_secret(prompt: &str) -> io::Result<String> {
+pub(crate) fn read_secret(prompt: &str) -> io::Result<String> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         let mut secret = String::new();
