@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A transcript item rendered by the terminal interface.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Message {
     pub role: MessageRole,
     pub title: String,
@@ -15,7 +15,7 @@ pub struct Message {
 // These variants are the stable view-model contract for runtime modules that
 // are still being ported. Some are not populated by the initial shell yet.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum MessageRole {
     User,
     #[default]

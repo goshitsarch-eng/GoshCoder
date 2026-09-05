@@ -744,6 +744,7 @@ fn event_loop(
     let mut app = App::new();
     app.replace_messages(Vec::new());
     let mut view = InteractiveView::default();
+    let mut render_cache = ui::MessageCache::default();
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
             append_view_message(&mut view, MessageRole::Notice, notice);
@@ -756,7 +757,7 @@ fn event_loop(
     loop {
         drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
         refresh_runtime_app(&mut app, prepared, &mut view);
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app, &mut render_cache))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;

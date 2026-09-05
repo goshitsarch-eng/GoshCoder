@@ -1,4 +1,4 @@
-use std::cmp::min;
+use std::{cmp::min, collections::HashMap};
 
 use ratatui::{
     Frame,
@@ -27,8 +27,52 @@ const RED: Color = Color::Rgb(246, 116, 116);
 const TEXT: Color = Color::Rgb(220, 230, 232);
 const MUTED: Color = Color::Rgb(119, 143, 150);
 const FAINT: Color = Color::Rgb(62, 87, 96);
+const MESSAGE_CACHE_LIMIT: usize = 4_096;
 
-pub fn draw(frame: &mut Frame, app: &App) {
+/// Memoizes immutable transcript rows across fullscreen redraws.
+///
+/// Markdown parsing and wrapping dominate a long transcript's redraw cost.
+/// The cache is owned by the interactive event loop rather than globally, so
+/// it is naturally discarded when the terminal session ends.
+#[derive(Debug, Default)]
+pub(crate) struct MessageCache {
+    width: u16,
+    tools_expanded: bool,
+    hide_thinking: bool,
+    entries: HashMap<Message, Vec<Line<'static>>>,
+}
+
+impl MessageCache {
+    fn render(
+        &mut self,
+        message: &Message,
+        width: u16,
+        tools_expanded: bool,
+        hide_thinking: bool,
+    ) -> Vec<Line<'static>> {
+        if self.entries.is_empty()
+            || self.width != width
+            || self.tools_expanded != tools_expanded
+            || self.hide_thinking != hide_thinking
+        {
+            self.entries.clear();
+            self.width = width;
+            self.tools_expanded = tools_expanded;
+            self.hide_thinking = hide_thinking;
+        }
+        if let Some(lines) = self.entries.get(message) {
+            return lines.clone();
+        }
+        if self.entries.len() >= MESSAGE_CACHE_LIMIT {
+            self.entries.clear();
+        }
+        let lines = render_transcript_message(message, width, tools_expanded, hide_thinking);
+        self.entries.insert(message.clone(), lines.clone());
+        lines
+    }
+}
+
+pub(crate) fn draw(frame: &mut Frame, app: &App, cache: &mut MessageCache) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(BACKGROUND)),
@@ -68,13 +112,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     };
     let main = regions[0];
 
-    render_main(frame, main, app);
+    render_main(frame, main, app, cache);
     if sidebar_width > 0 {
         render_sidebar(frame, regions[2], &app.sidebar);
     }
 }
 
-fn render_main(frame: &mut Frame, area: Rect, app: &App) {
+fn render_main(frame: &mut Frame, area: Rect, app: &App, cache: &mut MessageCache) {
     let editor = editor_window(
         &app.input,
         app.cursor,
@@ -125,7 +169,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(palette_height)])
         .split(chunks[1]);
-    render_transcript(frame, body[0], app);
+    render_transcript(frame, body[0], app, cache);
     if palette_height > 0 {
         render_suggestions(frame, body[1], app, &suggestions);
     }
@@ -133,12 +177,13 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
     render_status(frame, chunks[3], app);
 }
 
-fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
-    let lines = transcript_lines(
+fn render_transcript(frame: &mut Frame, area: Rect, app: &App, cache: &mut MessageCache) {
+    let lines = transcript_lines_with_cache(
         &app.messages,
         area.width.saturating_sub(2),
         app.tools_expanded,
         app.hide_thinking,
+        Some(cache),
     );
     let max_scroll = lines.len().saturating_sub(area.height as usize);
     let scroll = usize::from(app.scroll).min(max_scroll);
@@ -389,108 +434,133 @@ fn transcript_lines(
     tools_expanded: bool,
     hide_thinking: bool,
 ) -> Vec<Line<'static>> {
+    transcript_lines_with_cache(messages, width, tools_expanded, hide_thinking, None)
+}
+
+fn transcript_lines_with_cache(
+    messages: &[Message],
+    width: u16,
+    tools_expanded: bool,
+    hide_thinking: bool,
+    mut cache: Option<&mut MessageCache>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for message in messages {
-        match message.role {
-            MessageRole::User => {
-                lines.push(styled_line(
-                    format!("  {}", sanitize(&message.text)),
-                    Style::default().fg(TEXT).bg(USER_BACKGROUND),
-                ));
-            }
-            MessageRole::Assistant => {
-                lines.extend(markdown_lines(
-                    &message.text,
-                    width,
-                    MarkdownRole::Assistant,
-                ));
-            }
-            MessageRole::Thinking if hide_thinking => {
-                lines.push(styled_line(
-                    "  Thinking…".to_owned(),
-                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
-                ));
-            }
-            MessageRole::Thinking => {
-                lines.extend(markdown_lines(&message.text, width, MarkdownRole::Thinking));
-            }
-            MessageRole::Tool => {
-                let (icon, color) = if message.is_error {
-                    ("×", RED)
+        let mut rendered = match cache.as_deref_mut() {
+            Some(cache) => cache.render(message, width, tools_expanded, hide_thinking),
+            None => render_transcript_message(message, width, tools_expanded, hide_thinking),
+        };
+        lines.append(&mut rendered);
+    }
+    lines
+}
+
+fn render_transcript_message(
+    message: &Message,
+    width: u16,
+    tools_expanded: bool,
+    hide_thinking: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match message.role {
+        MessageRole::User => {
+            lines.push(styled_line(
+                format!("  {}", sanitize(&message.text)),
+                Style::default().fg(TEXT).bg(USER_BACKGROUND),
+            ));
+        }
+        MessageRole::Assistant => {
+            lines.extend(markdown_lines(
+                &message.text,
+                width,
+                MarkdownRole::Assistant,
+            ));
+        }
+        MessageRole::Thinking if hide_thinking => {
+            lines.push(styled_line(
+                "  Thinking…".to_owned(),
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            ));
+        }
+        MessageRole::Thinking => {
+            lines.extend(markdown_lines(&message.text, width, MarkdownRole::Thinking));
+        }
+        MessageRole::Tool => {
+            let (icon, color) = if message.is_error {
+                ("×", RED)
+            } else {
+                ("✓", CYAN)
+            };
+            let title = if message.title.is_empty() {
+                "tool".to_owned()
+            } else {
+                sanitize(&message.title)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().bg(TOOL_BACKGROUND)),
+                Span::styled(icon, Style::default().fg(color).bg(TOOL_BACKGROUND)),
+                Span::styled(
+                    format!(" {title}"),
+                    Style::default()
+                        .fg(TEXT)
+                        .bg(TOOL_BACKGROUND)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let detail = if tools_expanded || message.is_error {
+                if message.detail.is_empty() {
+                    &message.text
                 } else {
-                    ("✓", CYAN)
-                };
-                let title = if message.title.is_empty() {
-                    "tool".to_owned()
-                } else {
-                    sanitize(&message.title)
-                };
+                    &message.detail
+                }
+            } else {
+                &message.text
+            };
+            let max_lines = if tools_expanded || message.is_error {
+                20
+            } else {
+                3
+            };
+            for (index, line) in sanitize(detail).lines().take(max_lines).enumerate() {
                 lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().bg(TOOL_BACKGROUND)),
-                    Span::styled(icon, Style::default().fg(color).bg(TOOL_BACKGROUND)),
+                    Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
                     Span::styled(
-                        format!(" {title}"),
-                        Style::default()
-                            .fg(TEXT)
-                            .bg(TOOL_BACKGROUND)
-                            .add_modifier(Modifier::BOLD),
+                        line.to_owned(),
+                        Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
                     ),
                 ]));
-                let detail = if tools_expanded || message.is_error {
-                    if message.detail.is_empty() {
-                        &message.text
-                    } else {
-                        &message.detail
-                    }
-                } else {
-                    &message.text
-                };
-                let max_lines = if tools_expanded || message.is_error {
-                    20
-                } else {
-                    3
-                };
-                for (index, line) in sanitize(detail).lines().take(max_lines).enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
-                        Span::styled(
-                            line.to_owned(),
-                            Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
-                        ),
-                    ]));
-                    if index + 1 == max_lines && sanitize(detail).lines().count() > max_lines {
-                        lines.push(styled_line(
-                            "    … more lines (ctrl+o to expand)".to_owned(),
-                            Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
-                        ));
-                    }
+                if index + 1 == max_lines && sanitize(detail).lines().count() > max_lines {
+                    lines.push(styled_line(
+                        "    … more lines (ctrl+o to expand)".to_owned(),
+                        Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
+                    ));
                 }
             }
-            MessageRole::Error => {
-                lines.push(styled_line(
-                    "  Error".to_owned(),
-                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                ));
-                lines.extend(message_lines(&message.text, Style::default().fg(RED), "  "));
-            }
-            MessageRole::Notice | MessageRole::Command => {
-                let (symbol, color, label) = match message.role {
-                    MessageRole::Command => ("◇", VIOLET, "Command"),
-                    _ => ("i", CYAN, "Notice"),
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {symbol} "), Style::default().fg(color)),
-                    Span::styled(label, Style::default().fg(MUTED)),
-                ]));
-                lines.extend(message_lines(
-                    &message.text,
-                    Style::default().fg(MUTED),
-                    "  ",
-                ));
-            }
         }
-        lines.push(Line::from(""));
+        MessageRole::Error => {
+            lines.push(styled_line(
+                "  Error".to_owned(),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(message_lines(&message.text, Style::default().fg(RED), "  "));
+        }
+        MessageRole::Notice | MessageRole::Command => {
+            let (symbol, color, label) = match message.role {
+                MessageRole::Command => ("◇", VIOLET, "Command"),
+                _ => ("i", CYAN, "Notice"),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {symbol} "), Style::default().fg(color)),
+                Span::styled(label, Style::default().fg(MUTED)),
+            ]));
+            lines.extend(message_lines(
+                &message.text,
+                Style::default().fg(MUTED),
+                "  ",
+            ));
+        }
     }
+    lines.push(Line::from(""));
     lines
 }
 
@@ -682,8 +752,11 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::new();
         app.set_input("/mo");
+        let mut cache = MessageCache::default();
 
-        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        terminal
+            .draw(|frame| draw(frame, &app, &mut cache))
+            .expect("draw");
 
         let output = terminal.backend().buffer().content();
         let text: String = output.iter().map(|cell| cell.symbol()).collect();
@@ -710,6 +783,55 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(output, "  helloworld");
+    }
+
+    #[test]
+    fn message_cache_reuses_rendered_transcript_rows() {
+        let messages = vec![
+            Message {
+                role: MessageRole::User,
+                text: "first question".to_owned(),
+                ..Message::default()
+            },
+            Message {
+                role: MessageRole::Assistant,
+                text: "# Heading\n\nSome **bold** text and `code`.".to_owned(),
+                ..Message::default()
+            },
+            Message {
+                role: MessageRole::Assistant,
+                text: "second answer".to_owned(),
+                ..Message::default()
+            },
+        ];
+        let mut cache = MessageCache::default();
+
+        let first = transcript_lines_with_cache(&messages, 80, false, false, Some(&mut cache));
+        let second = transcript_lines_with_cache(&messages, 80, false, false, Some(&mut cache));
+
+        assert_eq!(first, second);
+        assert_eq!(cache.entries.len(), messages.len());
+        assert_eq!(
+            transcript_lines(&messages, 80, false, false),
+            first,
+            "cached rows must match an uncached render"
+        );
+    }
+
+    #[test]
+    fn message_cache_invalidates_when_transcript_layout_changes() {
+        let messages = vec![Message {
+            role: MessageRole::Assistant,
+            text: "word ".repeat(40),
+            ..Message::default()
+        }];
+        let mut cache = MessageCache::default();
+
+        let wide = transcript_lines_with_cache(&messages, 100, false, false, Some(&mut cache));
+        let narrow = transcript_lines_with_cache(&messages, 40, false, false, Some(&mut cache));
+
+        assert_ne!(wide, narrow);
+        assert_eq!(narrow, transcript_lines(&messages, 40, false, false));
     }
 
     #[test]
