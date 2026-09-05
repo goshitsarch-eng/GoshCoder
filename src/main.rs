@@ -1,5 +1,6 @@
 pub mod config;
 pub mod llm;
+pub mod sessionlog;
 mod state;
 mod ui;
 
