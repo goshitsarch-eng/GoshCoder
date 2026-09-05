@@ -666,7 +666,7 @@ fn append_to_width(output: &mut String, suffix: &str, width: usize) {
 fn suggestion_title(input: &str) -> &'static str {
     let input = input.to_lowercase();
     if input.starts_with("/model ") {
-        " SELECT MODEL "
+        " SELECT MODEL · type to filter authenticated providers "
     } else if input.starts_with("/thinking ") {
         " THINKING LEVEL "
     } else if input.starts_with("/login ") {
@@ -769,6 +769,11 @@ mod tests {
     #[test]
     fn login_palette_explains_additive_credentials() {
         assert!(suggestion_title("/login anthropic").contains("existing logins are kept"));
+    }
+
+    #[test]
+    fn model_palette_explains_filtering() {
+        assert!(suggestion_title("/model claude").contains("filter"));
     }
 
     #[test]

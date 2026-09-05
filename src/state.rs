@@ -77,6 +77,9 @@ pub struct App {
     pub tools_expanded: bool,
     pub hide_thinking: bool,
     pub history: Vec<String>,
+    model_suggestions: Vec<Suggestion>,
+    model_suggestions_query: Option<String>,
+    model_suggestions_model: Option<String>,
     login_suggestions: Vec<Suggestion>,
     login_suggestions_query: Option<String>,
     history_index: Option<usize>,
@@ -154,6 +157,9 @@ impl App {
             tools_expanded: false,
             hide_thinking: false,
             history: Vec::new(),
+            model_suggestions: Vec::new(),
+            model_suggestions_query: None,
+            model_suggestions_model: None,
             login_suggestions: Vec::new(),
             login_suggestions_query: None,
             history_index: None,
@@ -163,13 +169,50 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        match login_query(&self.input) {
-            Some(query) if self.login_suggestions_query.as_deref() == Some(query) => {
-                self.login_suggestions.clone()
+        match model_query(&self.input) {
+            Some(query) if self.model_suggestions_query.as_deref() == Some(query) => {
+                self.model_suggestions.clone()
             }
             Some(_) => Vec::new(),
-            None => suggestions_for(&self.input),
+            None => match login_query(&self.input) {
+                Some(query) if self.login_suggestions_query.as_deref() == Some(query) => {
+                    self.login_suggestions.clone()
+                }
+                Some(_) => Vec::new(),
+                None => suggestions_for(&self.input),
+            },
         }
+    }
+
+    /// Rebuilds the `/model` picker only when its query or active model
+    /// changes. The loader stays in the runtime because resolving configured
+    /// providers can refresh OAuth credentials.
+    pub fn refresh_model_suggestions<F>(&mut self, model_reference: &str, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = model_query(&self.input) else {
+            self.invalidate_model_suggestions();
+            return;
+        };
+        if self.model_suggestions_query.as_deref() == Some(query)
+            && self.model_suggestions_model.as_deref() == Some(model_reference)
+        {
+            return;
+        }
+        self.model_suggestions = load(query);
+        self.model_suggestions_query = Some(query.to_owned());
+        self.model_suggestions_model = Some(model_reference.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.model_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates model choices after a model or credential change.
+    pub fn invalidate_model_suggestions(&mut self) {
+        self.model_suggestions.clear();
+        self.model_suggestions_query = None;
+        self.model_suggestions_model = None;
     }
 
     /// Rebuilds the `/login` provider palette only after its query changes.
@@ -211,6 +254,7 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.selected_suggestion = 0;
+        self.invalidate_model_suggestions();
         self.invalidate_login_suggestions();
     }
 
@@ -805,8 +849,12 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
 }
 
 fn login_query(input: &str) -> Option<&str> {
-    let query = input.strip_prefix("/login ")?;
+    let query = input.strip_prefix("/login ")?.trim();
     (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn model_query(input: &str) -> Option<&str> {
+    input.strip_prefix("/model ").map(str::trim)
 }
 
 #[cfg(test)]
@@ -835,6 +883,38 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
 
         assert_eq!(app.input, "/model ");
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn model_palette_caches_choices_per_active_model_and_query() {
+        let mut app = App::new();
+        app.set_input("/model ");
+        app.refresh_model_suggestions("openai/gpt", |query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "GPT".to_owned(),
+                description: "openai/gpt".to_owned(),
+                value: "/model openai/gpt".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_model_suggestions("openai/gpt", |_| {
+            panic!("unchanged model picker must be cached")
+        });
+        app.refresh_model_suggestions("anthropic/claude", |query| {
+            assert!(query.is_empty());
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+
+        app.set_input("/model cl");
+        app.refresh_model_suggestions("anthropic/claude", |query| {
+            assert_eq!(query, "cl");
+            Vec::new()
+        });
         assert!(app.suggestions().is_empty());
     }
 

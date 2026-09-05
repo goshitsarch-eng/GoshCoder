@@ -849,7 +849,10 @@ fn event_loop(
                 }
                 Action::CycleModel { direction } => {
                     match cycle_interactive_model(&prepared.runtime, catalog, direction) {
-                        Ok(model) => view.activity = format!("Model set to {model}"),
+                        Ok(model) => {
+                            app.invalidate_model_suggestions();
+                            view.activity = format!("Model set to {model}");
+                        }
                         Err(error) => append_view_message(&mut view, MessageRole::Error, error),
                     }
                 }
@@ -947,6 +950,7 @@ fn complete_fullscreen_login(
     match result {
         Ok(()) => {
             catalog.clear_oauth_refresh_failure(provider_id);
+            app.invalidate_model_suggestions();
             view.activity = format!("Added {provider_id}");
             view.activity_since = None;
             append_view_message(
@@ -1784,6 +1788,7 @@ fn dispatch_runtime_slash_command(
         "/model" => {
             match runtime::set_model(&prepared.runtime, catalog, rest) {
                 Ok(model) => {
+                    app.invalidate_model_suggestions();
                     view.activity = format!("Model set to {}/{}", model.provider, model.id)
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
@@ -2239,6 +2244,7 @@ fn dispatch_login_slash_command(
 
     match provider_cli::auth_for_provider(catalog, provider_id) {
         Ok(outcome) => {
+            app.invalidate_model_suggestions();
             app.invalidate_login_suggestions();
             view.activity = format!("Added {}", outcome.provider_id);
             append_view_message(view, MessageRole::Notice, outcome.notice());
@@ -2883,8 +2889,12 @@ fn refresh_runtime_app(
     catalog: &catalog::Catalog,
     view: &mut InteractiveView,
 ) {
-    app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
     let state = prepared.runtime.agent().state();
+    let model_reference = format!("{}/{}", state.model.provider, state.model.id);
+    app.refresh_model_suggestions(&model_reference, |query| {
+        model_picker_suggestions(catalog, &state.model, query)
+    });
+    app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
         messages.extend(agent_messages(std::slice::from_ref(message)));
@@ -3308,6 +3318,83 @@ fn configured_model_references(catalog: &catalog::Catalog) -> Vec<String> {
         .collect()
 }
 
+fn model_picker_suggestions(
+    catalog: &catalog::Catalog,
+    active_model: &llm::Model,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let active_reference = format!("{}/{}", active_model.provider, active_model.id);
+    let mut models = interactive_models(catalog).unwrap_or_default();
+    if !models
+        .iter()
+        .any(|model| format!("{}/{}", model.provider, model.id) == active_reference)
+    {
+        models.push(active_model.clone());
+    }
+    let mut seen = BTreeSet::new();
+    models.retain(|model| seen.insert(format!("{}/{}", model.provider, model.id)));
+
+    let terms = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let mut choices = models
+        .into_iter()
+        .filter_map(|model| {
+            let reference = format!("{}/{}", model.provider, model.id);
+            let label = if model.name.is_empty() {
+                model.id.clone()
+            } else {
+                model.name.clone()
+            };
+            let haystack = format!(
+                "{} {} {}",
+                reference,
+                model.provider.to_ascii_lowercase(),
+                label.to_ascii_lowercase()
+            );
+            if !terms.iter().all(|term| haystack.contains(term)) {
+                return None;
+            }
+            let current = reference == active_reference;
+            let mut details = vec![reference.clone()];
+            if model.context_window > 0 {
+                details.push(format!("{} context", compact_number(model.context_window)));
+            }
+            if model.reasoning {
+                details.push("reasoning".to_owned());
+            }
+            let description = details.join(" · ");
+            Some((
+                current,
+                model.provider.clone(),
+                label.clone(),
+                state::Suggestion {
+                    label,
+                    description: if current {
+                        format!("CURRENT · {description}")
+                    } else {
+                        description
+                    },
+                    value: format!("/model {reference}"),
+                    execute: true,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    choices
+        .into_iter()
+        .map(|(_, _, _, suggestion)| suggestion)
+        .collect()
+}
+
 fn login_provider_suggestions(catalog: &catalog::Catalog, query: &str) -> Vec<state::Suggestion> {
     let configured = catalog
         .configured_provider_ids()
@@ -3562,6 +3649,49 @@ mod tests {
             login_provider_suggestions(&catalog, "anth").len(),
             1,
             "query should filter provider choices"
+        );
+    }
+
+    #[test]
+    fn model_picker_filters_models_and_keeps_an_active_unconfigured_model() {
+        let credentials = Arc::new(catalog::CredentialStore::in_memory());
+        credentials
+            .put("openai", catalog::Credential::api_key("test-key"))
+            .expect("store credential");
+        let aperture_root =
+            std::env::temp_dir().join(format!("goshcoder-model-picker-{}", std::process::id()));
+        let catalog =
+            catalog::Catalog::with_environment(Some(Arc::clone(&credentials)), Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(
+                    aperture_root.join("aperture.json"),
+                    aperture_root.join("aperture-cache.json"),
+                );
+        let active = llm::Model {
+            id: "detached".to_owned(),
+            name: "Detached Model".to_owned(),
+            provider: "local".to_owned(),
+            context_window: 8_192,
+            reasoning: true,
+            ..llm::Model::default()
+        };
+
+        let choices = model_picker_suggestions(&catalog, &active, "");
+
+        assert_eq!(choices[0].value, "/model local/detached");
+        assert!(choices[0].description.contains("CURRENT"));
+        assert!(choices[0].description.contains("8.2k context"));
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.value.starts_with("/model openai/"))
+        );
+        assert_eq!(
+            model_picker_suggestions(&catalog, &active, "detached")
+                .into_iter()
+                .map(|choice| choice.value)
+                .collect::<Vec<_>>(),
+            vec!["/model local/detached"]
         );
     }
 
