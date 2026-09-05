@@ -6,18 +6,17 @@
 //! with an agent, and use [`prepare_next_turn`] plus the prompt helpers to wire
 //! the resulting state into its own runtime.
 //!
-//! Unlike the older workspace-local `.ralph` implementation, this store keeps
-//! its files below the agent configuration directory:
+//! Loop files are workspace-local so they stay compatible with the existing
+//! Go client and the upstream pi-ralph-wiggum extension:
 //!
 //! ```text
-//! <agent-config>/ralph/<workspace-key>/<loop>.md
-//! <agent-config>/ralph/<workspace-key>/<loop>.state.json
-//! <agent-config>/ralph/<workspace-key>/archive/
+//! <workspace>/.ralph/<loop>.md
+//! <workspace>/.ralph/<loop>.state.json
+//! <workspace>/.ralph/archive/
 //! ```
 //!
-//! The workspace key is a stable hash of the canonical workspace path. It
-//! avoids leaking a full path into the configuration layout and keeps loops
-//! with the same name in different workspaces independent.
+//! All filesystem access still verifies that the `.ralph` directory and files
+//! are regular entries beneath the canonical workspace root.
 
 use std::{
     collections::BTreeMap,
@@ -46,8 +45,8 @@ use crate::{
     llm::{self, AssistantMessage, ContentBlock},
 };
 
-/// Directory below the agent configuration directory that owns Ralph data.
-pub const STORE_DIR: &str = "ralph";
+/// Directory below each workspace that owns Ralph data.
+pub const STORE_DIR: &str = ".ralph";
 pub const ARCHIVE_DIR: &str = "archive";
 pub const COMPLETE_MARKER: &str = "<promise>COMPLETE</promise>";
 pub const DEFAULT_MAX_ITERATIONS: i64 = 50;
@@ -95,7 +94,7 @@ Before completion:
 /// The guard that prevents a queued prompt from reviving a completed loop.
 pub const DEFAULT_STALE_PROMPT_GUARD: &str = r#"STALE PROMPT GUARD
 
-Before doing any work from a Ralph prompt, reload the loop state file named in the prompt from the agent configuration directory.
+Before doing any work from a Ralph prompt, reload the loop state file named in the prompt from the workspace directory.
 If the state says "status": "completed", do not edit files, do not run task commands, and do not call ralph_done. Reply briefly that the stale prompt was ignored because the loop is already completed."#;
 
 /// The reflection checkpoint inserted at configured iteration boundaries.
@@ -159,7 +158,7 @@ impl fmt::Display for RalphError {
             ),
             Self::UnsafePath(path) => write!(
                 formatter,
-                "refusing Ralph path {} because it is a symlink or escapes the agent configuration directory",
+                "refusing Ralph path {} because it is a symlink or escapes the workspace directory",
                 path.display()
             ),
             Self::IterationOverflow => formatter.write_str("Ralph iteration counter overflowed"),
@@ -209,7 +208,7 @@ impl LoopStatus {
     }
 }
 
-/// A persisted loop record. `task_file` is relative to the agent config root.
+/// A persisted loop record. `task_file` is relative to the workspace root.
 ///
 /// Field names intentionally retain the existing camel-case JSON layout so
 /// state files remain easy to inspect and migration tools can recognize them.
@@ -406,12 +405,10 @@ pub enum NextIteration {
     Completed,
 }
 
-/// One workspace-scoped loop store under the agent configuration directory.
+/// One workspace-scoped loop store beneath `.ralph`.
 #[derive(Clone, Debug)]
 pub struct Store {
-    agent_config_dir: PathBuf,
     workspace: PathBuf,
-    workspace_key: String,
     session_id: String,
     // Tool closures own a cloned Store. Sharing this cache keeps those
     // closures and direct lifecycle calls scoped to the same current loop.
@@ -419,31 +416,19 @@ pub struct Store {
 }
 
 impl Store {
-    /// Creates a store beneath an explicit agent configuration directory.
-    ///
-    /// Supplying the config root explicitly makes this type easy to embed in a
-    /// CLI, a slash-command handler, or tests without changing global
-    /// environment variables.
-    pub fn new(
-        agent_config_dir: impl AsRef<Path>,
-        workspace: impl AsRef<Path>,
-        session_id: impl Into<String>,
-    ) -> Self {
-        let agent_config_dir = absolute_path(agent_config_dir.as_ref());
+    /// Creates a store rooted at an explicit workspace.
+    pub fn new(workspace: impl AsRef<Path>, session_id: impl Into<String>) -> Self {
         let workspace = canonical_or_absolute(workspace.as_ref());
-        let workspace_key = workspace_key(&workspace);
         Self {
-            agent_config_dir,
             workspace,
-            workspace_key,
             session_id: session_id.into(),
             current: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Creates a store using GoshCoder's normal agent configuration directory.
+    /// Creates a workspace-local `.ralph` store.
     pub fn for_workspace(workspace: impl AsRef<Path>, session_id: impl Into<String>) -> Self {
-        Self::new(crate::config::agent_dir(), workspace, session_id)
+        Self::new(workspace, session_id)
     }
 
     /// Creates a default-config store for the process's current working directory.
@@ -452,30 +437,20 @@ impl Store {
         Ok(Self::for_workspace(workspace, session_id))
     }
 
-    pub fn agent_config_dir(&self) -> &Path {
-        &self.agent_config_dir
-    }
-
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
 
-    pub fn workspace_key(&self) -> &str {
-        &self.workspace_key
-    }
-
-    /// Returns the lexical (not necessarily created) workspace storage root.
+    /// Returns the lexical (not necessarily created) workspace-local storage root.
     pub fn storage_dir(&self) -> PathBuf {
-        self.agent_config_dir
-            .join(STORE_DIR)
-            .join(&self.workspace_key)
+        self.workspace.join(STORE_DIR)
     }
 
     pub fn archive_dir(&self) -> PathBuf {
         self.storage_dir().join(ARCHIVE_DIR)
     }
 
-    /// Returns the agent-config-relative task path that will be stored for a loop.
+    /// Returns the workspace-relative task path that will be stored for a loop.
     pub fn task_file(&self, name: &str, archived: bool) -> Result<String> {
         let name = checked_name(name)?;
         Ok(self.relative_task_file(&name, archived))
@@ -899,7 +874,7 @@ impl Store {
     }
 
     fn relative_task_file(&self, name: &str, archived: bool) -> String {
-        let mut path = PathBuf::from(STORE_DIR).join(&self.workspace_key);
+        let mut path = PathBuf::from(STORE_DIR);
         if archived {
             path.push(ARCHIVE_DIR);
         }
@@ -945,21 +920,16 @@ impl Store {
     /// Creates and verifies the storage directory a component at a time.
     /// Existing symlinks are refused before any loop file is opened.
     fn checked_store_dir(&self, archived: bool) -> Result<PathBuf> {
-        fs::create_dir_all(&self.agent_config_dir)?;
-        let root = fs::canonicalize(&self.agent_config_dir)?;
+        let root = fs::canonicalize(&self.workspace)?;
         let root_metadata = fs::symlink_metadata(&root)?;
         if !root_metadata.is_dir() {
             return Err(RalphError::UnsafePath(root));
         }
 
         let mut current = root.clone();
-        for component in [
-            Some(STORE_DIR),
-            Some(self.workspace_key.as_str()),
-            archived.then_some(ARCHIVE_DIR),
-        ]
-        .into_iter()
-        .flatten()
+        for component in [Some(STORE_DIR), archived.then_some(ARCHIVE_DIR)]
+            .into_iter()
+            .flatten()
         {
             let candidate = current.join(component);
             match fs::symlink_metadata(&candidate) {
@@ -1190,7 +1160,7 @@ pub fn system_prompt_suffix(state: &LoopState) -> String {
         state.name, state.task_file
     );
     suffix.push_str(&format!(
-        "- Before doing work, reload {} from the agent configuration directory; if status is completed, ignore the stale prompt and do not call ralph_done\n",
+        "- Before doing work, reload {} from the workspace directory; if status is completed, ignore the stale prompt and do not call ralph_done\n",
         state_file_from_task_file(&state.task_file)
     ));
     if state.items_per_iteration > 0 {
@@ -1675,17 +1645,6 @@ fn canonical_or_absolute(path: &Path) -> PathBuf {
     absolute.canonicalize().unwrap_or(absolute)
 }
 
-/// FNV-1a is small, deterministic, and sufficient for a directory namespace;
-/// it is not used as a security boundary.
-fn workspace_key(workspace: &Path) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in workspace.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("workspace-{hash:016x}")
-}
-
 fn now_timestamp() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -1841,7 +1800,7 @@ mod tests {
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("create test workspace");
         (
-            Store::new(&config, &workspace, "session-1"),
+            Store::new(&workspace, "session-1"),
             TestRoot(root),
             config,
             workspace,
@@ -1935,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn start_persists_only_below_agent_config_with_pi_style_fields() {
+    fn start_persists_below_workspace_with_pi_style_fields() {
         let (store, _root, config, workspace) = test_store("start");
         let state = store
             .start(
@@ -1956,13 +1915,13 @@ mod tests {
             store
                 .state_path("my_loop", false)
                 .unwrap()
-                .starts_with(&config)
+                .starts_with(&workspace)
         );
         assert!(
             !store
                 .state_path("my_loop", false)
                 .unwrap()
-                .starts_with(&workspace)
+                .starts_with(&config)
         );
         assert_eq!(
             fs::read_to_string(store.task_path("my_loop", false).unwrap()).expect("task"),
@@ -1986,7 +1945,43 @@ mod tests {
         }
         assert_eq!(json["status"], "active");
         assert_eq!(json["active"], true);
-        assert!(state.task_file.starts_with("ralph/workspace-"));
+        assert!(state.task_file.starts_with(".ralph/"));
+    }
+
+    #[test]
+    fn loads_a_go_workspace_local_ralph_state() {
+        let (store, _root, _config, _workspace) = test_store("go-interop");
+        let task_path = store.task_path("legacy", false).expect("task path");
+        fs::write(&task_path, "# Task\n\nContinue the migration").expect("write task");
+        let state_path = store.state_path("legacy", false).expect("state path");
+        fs::write(
+            state_path,
+            r#"{
+  "name": "legacy",
+  "taskFile": ".ralph/legacy.md",
+  "iteration": 3,
+  "maxIterations": 10,
+  "itemsPerIteration": 1,
+  "reflectEvery": 0,
+  "active": true,
+  "status": "active",
+  "startedAt": "2026-01-02T03:04:05Z",
+  "lastReflectionAt": 0
+}"#,
+        )
+        .expect("write Go-compatible state");
+
+        let state = store
+            .load("legacy", false)
+            .expect("load state")
+            .expect("state exists");
+
+        assert_eq!(state.status, LoopStatus::Active);
+        assert_eq!(state.task_file, ".ralph/legacy.md");
+        assert_eq!(
+            store.read_task(&state).expect("read Go-compatible task"),
+            "# Task\n\nContinue the migration"
+        );
     }
 
     #[test]
@@ -2103,7 +2098,7 @@ mod tests {
         let mut state = owner
             .start("loop", "task", LoopOptions::default())
             .expect("start");
-        let other = Store::new(config, workspace, "session-2");
+        let other = Store::new(workspace, "session-2");
         assert!(other.current().expect("other current").is_none());
         assert!(owner.current().expect("owner current").is_some());
 

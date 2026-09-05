@@ -268,7 +268,7 @@ mod tests {
         })
         .expect("open runtime");
         let agent = runtime.agent().clone();
-        let store = ralph::Store::new(directory.join("config"), &directory, "test-session");
+        let store = ralph::Store::new(&directory, "test-session");
         let queue: ralph::SharedQueue = Arc::new(agent.weak_follow_up_queue());
         agent.set_tools(store.tools(Some(queue)));
         let prompt_sync: SystemPromptSync = {

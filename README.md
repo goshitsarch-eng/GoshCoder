@@ -273,7 +273,9 @@ is recorded in [`NOTICE`](NOTICE).
   Mustier — **Ralph** (native adaptation): persistent iterative loops and
   completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
-  the model to start a loop. `/ralph` opens loop controls in the command palette.
+  the model to start a loop. Loop state is kept in the workspace-local
+  `.ralph/` directory so existing Go and pi-ralph-wiggum loops remain
+  discoverable. `/ralph` opens loop controls in the command palette.
 - **Planner** (native adaptation of
   [`@plannotator/pi-extension`](https://github.com/backnotprop/plannotator) by
   the Plannotator contributors): `/planner`,

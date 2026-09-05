@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn command_results_cover_the_external_lifecycle_messages() {
         let directory = temporary_directory();
-        let store = Store::new(&directory, &directory, "test-session");
+        let store = Store::new(&directory, "test-session");
         let state = store
             .execute(RalphCommand::Start {
                 name: "migration".to_owned(),
