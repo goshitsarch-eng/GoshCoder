@@ -739,6 +739,7 @@ dependencies = [
  "crossterm",
  "flate2",
  "hmac",
+ "libc",
  "ratatui",
  "reqwest",
  "rsa",

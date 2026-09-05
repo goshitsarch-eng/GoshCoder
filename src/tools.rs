@@ -26,7 +26,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -775,14 +775,22 @@ impl Workspace {
             command
         };
         command.current_dir(&self.root);
+        configure_process_tree(&mut command);
 
         let timeout = if self.bash_timeout.is_zero() {
             DEFAULT_BASH_TIMEOUT
         } else {
             self.bash_timeout
         };
-        let result = run_process(&mut command, cancellation, timeout, MAX_OUTPUT_BYTES, true)
-            .map_err(|error| ToolError::io("run command", Path::new(source), error))?;
+        let result = run_process(
+            &mut command,
+            cancellation,
+            timeout,
+            MAX_OUTPUT_BYTES,
+            true,
+            true,
+        )
+        .map_err(|error| ToolError::io("run command", Path::new(source), error))?;
         let output = result.output.render_text();
 
         if result.cancelled || cancellation.is_cancelled() {
@@ -1143,6 +1151,7 @@ impl Workspace {
             cancellation,
             GIT_TIMEOUT,
             MAX_CANDIDATE_BYTES,
+            false,
             false,
         ) {
             Ok(result) => result,
@@ -1648,16 +1657,16 @@ struct ProcessResult {
 
 /// Runs a child while polling the agent cancellation token and a deadline.
 ///
-/// `std` can terminate the immediate child with `Child::kill`, but it cannot
-/// portably kill an entire process group. A shell that backgrounds descendants
-/// may therefore keep a pipe open; the bounded drain grace detects that and
-/// returns a successful background-process notice instead of hanging.
+/// Shell commands opt into isolated process-tree termination so an abort or
+/// timeout reaches their descendants. Other short-lived helpers retain the
+/// immediate-child behavior.
 fn run_process(
     command: &mut Command,
     cancellation: &CancellationToken,
     timeout: Duration,
     output_limit: usize,
     combine_streams: bool,
+    isolated_process_tree: bool,
 ) -> io::Result<ProcessResult> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
@@ -1684,11 +1693,11 @@ fn run_process(
             break (status, false, cancellation.is_cancelled());
         }
         if cancellation.is_cancelled() {
-            let _ = child.kill();
+            terminate_process(&mut child, isolated_process_tree);
             break (child.wait()?, false, true);
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_process(&mut child, isolated_process_tree);
             break (child.wait()?, true, false);
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
@@ -1710,6 +1719,60 @@ fn run_process(
         output_open: stdout_open || stderr_open,
         reader_error: stdout_error.or(stderr_error),
     })
+}
+
+/// Places a shell command in a separate process group before it executes.
+/// This makes a negative-PID signal target the shell and all descendants
+/// without risking the agent's own terminal group.
+fn configure_process_tree(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = command;
+    }
+}
+
+fn terminate_process(child: &mut Child, isolated_process_tree: bool) {
+    #[cfg(unix)]
+    if isolated_process_tree && terminate_process_group(child.id()) {
+        return;
+    }
+
+    #[cfg(windows)]
+    if isolated_process_tree {
+        let pid = child.id().to_string();
+        if Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+    }
+
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn terminate_process_group(id: u32) -> bool {
+    let Ok(id) = i32::try_from(id) else {
+        return false;
+    };
+    // `configure_process_tree` makes the shell the group leader, so its
+    // negative ID reaches the complete tool-owned process tree.
+    unsafe { libc::kill(-id, libc::SIGKILL) == 0 }
 }
 
 /// A compiled glob with pi-style basename fallback and Unicode-safe matching.
@@ -3134,6 +3197,86 @@ mod tests {
             .expect("bash tool thread must not panic")
             .expect_err("cancelled shell command must fail");
         assert!(error.contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_cancellation_terminates_background_descendants() {
+        let (directory, workspace) = workspace();
+        let pid_path = directory.path.join("background.pid");
+        let command = format!(
+            "sleep 20 >/dev/null 2>&1 & echo $! > {}; wait",
+            shell_quote(&pid_path)
+        );
+        let cancellation = CancellationToken::default();
+        let running_token = cancellation.clone();
+        let tool = workspace.bash_tool();
+        let task = thread::spawn(move || {
+            (tool.execute)(
+                running_token,
+                "cancel-process-tree".to_owned(),
+                parameters([("command", json!(command))]),
+                Arc::new(|_| {}),
+            )
+        });
+
+        for _ in 0..100 {
+            if pid_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid = fs::read_to_string(&pid_path)
+            .expect("background child should start")
+            .trim()
+            .parse::<u32>()
+            .expect("background child PID");
+        cancellation.cancel();
+        let error = task
+            .join()
+            .expect("bash tool thread must not panic")
+            .expect_err("cancelled shell command must fail");
+        assert!(error.contains("cancelled"));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_alive(child_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let alive = process_is_alive(child_pid);
+        if alive {
+            terminate_test_process(child_pid);
+        }
+        assert!(
+            !alive,
+            "background process {child_pid} survived cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, state)) = stat.rsplit_once(") ")
+        {
+            return !state.starts_with('Z');
+        }
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    fn terminate_test_process(pid: u32) {
+        if let Ok(pid) = i32::try_from(pid) {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
     }
 
     #[test]
