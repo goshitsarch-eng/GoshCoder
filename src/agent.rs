@@ -725,7 +725,7 @@ impl Agent {
                 Ok(prepared_call) => prepared.push((index, prepared_call)),
                 Err(outcome) => {
                     self.tool_ended(&outcome);
-                    outcomes.push((index, outcome));
+                    outcomes.push((index, *outcome));
                 }
             }
         }
@@ -937,10 +937,10 @@ impl ToolOutcome {
 fn prepare_tool_call(
     tools: &[Tool],
     call: llm::ToolCall,
-) -> std::result::Result<PreparedToolCall, ToolOutcome> {
+) -> std::result::Result<PreparedToolCall, Box<ToolOutcome>> {
     let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() else {
         let message = format!("Tool {} not found", call.name);
-        return Err(ToolOutcome::error(call, message));
+        return Err(Box::new(ToolOutcome::error(call, message)));
     };
     let arguments = tool.prepare_arguments.as_ref().map_or_else(
         || call.arguments.clone(),
@@ -952,10 +952,10 @@ fn prepare_tool_call(
             tool,
             arguments,
         }),
-        Err(error) => Err(ToolOutcome::error(
+        Err(error) => Err(Box::new(ToolOutcome::error(
             call,
             format!("validation failed: {error}"),
-        )),
+        ))),
     }
 }
 
