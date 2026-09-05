@@ -281,15 +281,19 @@ impl App {
                 self.move_right();
                 Action::None
             }
-            (KeyCode::Home, _) | (KeyCode::Char('a'), modifiers)
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            (KeyCode::Home, _) => {
                 self.cursor = line_start(&self.input, self.cursor);
                 Action::None
             }
-            (KeyCode::End, _) | (KeyCode::Char('e'), modifiers)
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            (KeyCode::Char('a'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cursor = line_start(&self.input, self.cursor);
+                Action::None
+            }
+            (KeyCode::End, _) => {
+                self.cursor = line_end(&self.input, self.cursor);
+                Action::None
+            }
+            (KeyCode::Char('e'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor = line_end(&self.input, self.cursor);
                 Action::None
             }
