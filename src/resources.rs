@@ -1791,14 +1791,14 @@ pub fn read_archive<R: Read>(input: &mut R) -> Result<ArchiveRead> {
         budget: budget.clone(),
     };
     let mut archive = Archive::new(reader);
-    let mut entries = archive
+    let entries = archive
         .entries()
         .map_err(|error| archive_read_error("start reading tar archive", error, &budget))?;
     let mut result = ArchiveRead::default();
     let mut entry_count = 0_usize;
     let mut retained_bytes = 0_usize;
 
-    while let Some(next) = entries.next() {
+    for next in entries {
         let mut entry =
             next.map_err(|error| archive_read_error("read archive entry", error, &budget))?;
         entry_count = entry_count.saturating_add(1);

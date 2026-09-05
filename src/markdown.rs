@@ -680,9 +680,11 @@ fn quote_prefix(depth: usize) -> Vec<Fragment> {
 }
 
 fn spaces(width: usize) -> Vec<Fragment> {
-    (!width.eq(&0))
-        .then(|| vec![Fragment::new(" ".repeat(width), Style::default())])
-        .unwrap_or_default()
+    if width == 0 {
+        Vec::new()
+    } else {
+        vec![Fragment::new(" ".repeat(width), Style::default())]
+    }
 }
 
 fn inline_fragments(text: &str, style: Style) -> Vec<Fragment> {
@@ -706,46 +708,39 @@ fn inline_fragments_at_depth(text: &str, style: Style, depth: usize) -> Vec<Frag
             continue;
         }
 
-        if text[cursor..].starts_with('`') {
-            if let Some(end) = find_unescaped(text, cursor + 1, "`") {
-                if end > cursor + 1 {
-                    push_fragment(&mut fragments, &text[plain_start..cursor], style);
-                    push_fragment(&mut fragments, &text[cursor + 1..end], style.fg(BLUE));
-                    cursor = end + 1;
-                    plain_start = cursor;
-                    continue;
-                }
-            }
+        if text[cursor..].starts_with('`')
+            && let Some(end) = find_unescaped(text, cursor + 1, "`")
+            && end > cursor + 1
+        {
+            push_fragment(&mut fragments, &text[plain_start..cursor], style);
+            push_fragment(&mut fragments, &text[cursor + 1..end], style.fg(BLUE));
+            cursor = end + 1;
+            plain_start = cursor;
+            continue;
         }
 
-        if text[cursor..].starts_with('[') {
-            if let Some(label_end) = find_unescaped(text, cursor + 1, "]") {
-                if text[label_end..].starts_with("](") {
-                    if let Some(url_end) = find_unescaped(text, label_end + 2, ")") {
-                        if label_end > cursor + 1 && url_end > label_end + 2 {
-                            push_fragment(&mut fragments, &text[plain_start..cursor], style);
-                            append_fragments(
-                                &mut fragments,
-                                inline_fragments_at_depth(
-                                    &text[cursor + 1..label_end],
-                                    style.fg(CYAN),
-                                    depth + 1,
-                                ),
-                            );
-                            push_fragment(&mut fragments, " (", style.fg(FAINT));
-                            push_fragment(
-                                &mut fragments,
-                                &text[label_end + 2..url_end],
-                                style.fg(FAINT),
-                            );
-                            push_fragment(&mut fragments, ")", style.fg(FAINT));
-                            cursor = url_end + 1;
-                            plain_start = cursor;
-                            continue;
-                        }
-                    }
-                }
-            }
+        if text[cursor..].starts_with('[')
+            && let Some(label_end) = find_unescaped(text, cursor + 1, "]")
+            && text[label_end..].starts_with("](")
+            && let Some(url_end) = find_unescaped(text, label_end + 2, ")")
+            && label_end > cursor + 1
+            && url_end > label_end + 2
+        {
+            push_fragment(&mut fragments, &text[plain_start..cursor], style);
+            append_fragments(
+                &mut fragments,
+                inline_fragments_at_depth(&text[cursor + 1..label_end], style.fg(CYAN), depth + 1),
+            );
+            push_fragment(&mut fragments, " (", style.fg(FAINT));
+            push_fragment(
+                &mut fragments,
+                &text[label_end + 2..url_end],
+                style.fg(FAINT),
+            );
+            push_fragment(&mut fragments, ")", style.fg(FAINT));
+            cursor = url_end + 1;
+            plain_start = cursor;
+            continue;
         }
 
         let mut matched = false;
@@ -754,24 +749,23 @@ fn inline_fragments_at_depth(text: &str, style: Style, depth: usize) -> Vec<Frag
             ("__", Modifier::BOLD),
             ("~~", Modifier::CROSSED_OUT),
         ] {
-            if text[cursor..].starts_with(delimiter) {
-                if let Some(end) = find_unescaped(text, cursor + delimiter.len(), delimiter) {
-                    if end > cursor + delimiter.len() {
-                        push_fragment(&mut fragments, &text[plain_start..cursor], style);
-                        append_fragments(
-                            &mut fragments,
-                            inline_fragments_at_depth(
-                                &text[cursor + delimiter.len()..end],
-                                style.add_modifier(modifier),
-                                depth + 1,
-                            ),
-                        );
-                        cursor = end + delimiter.len();
-                        plain_start = cursor;
-                        matched = true;
-                        break;
-                    }
-                }
+            if text[cursor..].starts_with(delimiter)
+                && let Some(end) = find_unescaped(text, cursor + delimiter.len(), delimiter)
+                && end > cursor + delimiter.len()
+            {
+                push_fragment(&mut fragments, &text[plain_start..cursor], style);
+                append_fragments(
+                    &mut fragments,
+                    inline_fragments_at_depth(
+                        &text[cursor + delimiter.len()..end],
+                        style.add_modifier(modifier),
+                        depth + 1,
+                    ),
+                );
+                cursor = end + delimiter.len();
+                plain_start = cursor;
+                matched = true;
+                break;
             }
         }
         if matched {
@@ -782,23 +776,22 @@ fn inline_fragments_at_depth(text: &str, style: Style, depth: usize) -> Vec<Frag
             .starts_with('*')
             .then_some("*")
             .or_else(|| text[cursor..].starts_with('_').then_some("_"));
-        if let Some(delimiter) = delimiter {
-            if let Some(end) = find_unescaped(text, cursor + 1, delimiter) {
-                if end > cursor + 1 {
-                    push_fragment(&mut fragments, &text[plain_start..cursor], style);
-                    append_fragments(
-                        &mut fragments,
-                        inline_fragments_at_depth(
-                            &text[cursor + 1..end],
-                            style.add_modifier(Modifier::ITALIC),
-                            depth + 1,
-                        ),
-                    );
-                    cursor = end + 1;
-                    plain_start = cursor;
-                    continue;
-                }
-            }
+        if let Some(delimiter) = delimiter
+            && let Some(end) = find_unescaped(text, cursor + 1, delimiter)
+            && end > cursor + 1
+        {
+            push_fragment(&mut fragments, &text[plain_start..cursor], style);
+            append_fragments(
+                &mut fragments,
+                inline_fragments_at_depth(
+                    &text[cursor + 1..end],
+                    style.add_modifier(Modifier::ITALIC),
+                    depth + 1,
+                ),
+            );
+            cursor = end + 1;
+            plain_start = cursor;
+            continue;
         }
 
         cursor += next_character_len(text, cursor);
@@ -977,11 +970,11 @@ fn push_fragment(destination: &mut Vec<Fragment>, text: &str, style: Style) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = destination.last_mut() {
-        if last.style == style {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = destination.last_mut()
+        && last.style == style
+    {
+        last.text.push_str(text);
+        return;
     }
     destination.push(Fragment::new(text, style));
 }
@@ -998,12 +991,12 @@ fn tokenize(fragments: &[Fragment]) -> Vec<Token> {
     for fragment in fragments {
         for grapheme in fragment.text.graphemes(true) {
             let whitespace = grapheme.chars().all(char::is_whitespace);
-            if let Some(token) = tokens.last_mut() {
-                if token.whitespace == whitespace {
-                    push_fragment(&mut token.fragments, grapheme, fragment.style);
-                    token.width += UnicodeWidthStr::width(grapheme);
-                    continue;
-                }
+            if let Some(token) = tokens.last_mut()
+                && token.whitespace == whitespace
+            {
+                push_fragment(&mut token.fragments, grapheme, fragment.style);
+                token.width += UnicodeWidthStr::width(grapheme);
+                continue;
             }
             tokens.push(Token {
                 fragments: vec![Fragment::new(grapheme, fragment.style)],

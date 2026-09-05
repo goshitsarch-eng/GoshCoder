@@ -7,8 +7,8 @@
 use std::collections::BTreeMap;
 
 use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
     de::{Error as DeError, IntoDeserializer},
+    Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::Value;
 

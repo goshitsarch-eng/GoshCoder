@@ -422,10 +422,10 @@ fn invalid_authority_reason(authority: &str) -> Option<&'static str> {
     if host.is_empty() {
         return Some("a host is required");
     }
-    if let Some(port) = port {
-        if !is_valid_port(port) {
-            return Some("invalid port");
-        }
+    if let Some(port) = port
+        && !is_valid_port(port)
+    {
+        return Some("invalid port");
     }
     None
 }
@@ -1266,11 +1266,11 @@ pub fn setup_command<T: HttpTransport + ?Sized>(
         ..Config::default()
     };
 
-    if let Ok(current) = Config::load(config_path) {
-        if current.server_url == server_url {
-            config.models = current.models;
-            config.synced_at = current.synced_at;
-        }
+    if let Ok(current) = Config::load(config_path)
+        && current.server_url == server_url
+    {
+        config.models = current.models;
+        config.synced_at = current.synced_at;
     }
     Client::new(config.clone(), request.api_key.as_str(), transport).health()?;
     config.save(config_path)?;

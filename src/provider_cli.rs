@@ -21,10 +21,11 @@ pub fn providers_command() -> Result<(), Box<dyn Error>> {
     for provider in catalog.providers() {
         let (status, detail) = match catalog.resolve_auth(&provider.id)? {
             Some(authentication) => {
-                let ambient = authentication
-                    .is_ambient()
-                    .then_some(" (ambient)")
-                    .unwrap_or("");
+                let ambient = if authentication.is_ambient() {
+                    " (ambient)"
+                } else {
+                    ""
+                };
                 ("✓", format!("{}{}", authentication.source(), ambient))
             }
             None => ("-", provider_setup_hint(&provider)),
