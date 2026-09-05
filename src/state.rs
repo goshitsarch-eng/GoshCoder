@@ -86,6 +86,9 @@ pub struct App {
     thinking_suggestions_query: Option<String>,
     thinking_suggestions_model: Option<String>,
     thinking_suggestions_level: Option<String>,
+    resume_suggestions: Vec<Suggestion>,
+    resume_suggestions_query: Option<String>,
+    resume_suggestions_loading: bool,
     resource_suggestions: Vec<Suggestion>,
     resource_suggestions_query: Option<String>,
     history_index: Option<usize>,
@@ -172,6 +175,9 @@ impl App {
             thinking_suggestions_query: None,
             thinking_suggestions_model: None,
             thinking_suggestions_level: None,
+            resume_suggestions: Vec::new(),
+            resume_suggestions_query: None,
+            resume_suggestions_loading: false,
             resource_suggestions: Vec::new(),
             resource_suggestions_query: None,
             history_index: None,
@@ -202,6 +208,20 @@ impl App {
                 Vec::new()
             };
         }
+        if let Some(query) = resume_query(&self.input) {
+            return if self.resume_suggestions_query.as_deref() == Some(query) {
+                self.resume_suggestions.clone()
+            } else if self.resume_suggestions_loading {
+                vec![Suggestion {
+                    label: "…".to_owned(),
+                    description: "reading saved sessions".to_owned(),
+                    value: String::new(),
+                    execute: false,
+                }]
+            } else {
+                Vec::new()
+            };
+        }
         let mut suggestions = suggestions_for(&self.input);
         if let Some(query) = resource_query(&self.input)
             && self.resource_suggestions_query.as_deref() == Some(query)
@@ -209,6 +229,12 @@ impl App {
             suggestions.extend(self.resource_suggestions.clone());
         }
         suggestions
+    }
+
+    /// Reports whether the composer is requesting the asynchronous session
+    /// picker.
+    pub fn resume_palette_active(&self) -> bool {
+        resume_query(&self.input).is_some()
     }
 
     /// Rebuilds the `/model` picker only when its query or active model
@@ -308,6 +334,46 @@ impl App {
         self.thinking_suggestions_level = None;
     }
 
+    /// Marks `/resume` suggestions as loading while the runtime scans session
+    /// logs away from the terminal render path.
+    pub fn set_resume_suggestions_loading(&mut self) {
+        if resume_query(&self.input).is_some() {
+            self.resume_suggestions.clear();
+            self.resume_suggestions_query = None;
+            self.resume_suggestions_loading = true;
+            self.selected_suggestion = 0;
+        }
+    }
+
+    /// Stores asynchronously discovered `/resume` candidates for the active
+    /// query.
+    pub fn refresh_resume_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = resume_query(&self.input) else {
+            self.invalidate_resume_suggestions();
+            return;
+        };
+        if self.resume_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.resume_suggestions = load(query);
+        self.resume_suggestions_query = Some(query.to_owned());
+        self.resume_suggestions_loading = false;
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.resume_suggestions.len().saturating_sub(1));
+    }
+
+    /// Drops cached candidates after a command that may alter session names,
+    /// branches, or available session files.
+    pub fn invalidate_resume_suggestions(&mut self) {
+        self.resume_suggestions.clear();
+        self.resume_suggestions_query = None;
+        self.resume_suggestions_loading = false;
+    }
+
     /// Rebuilds local template and skill entries only after their command
     /// prefix changes. Resource loading stays in the runtime, not the
     /// renderer, so palette painting is always side-effect free.
@@ -351,6 +417,7 @@ impl App {
         self.invalidate_model_suggestions();
         self.invalidate_login_suggestions();
         self.invalidate_thinking_suggestions();
+        self.invalidate_resume_suggestions();
         self.invalidate_resource_suggestions();
     }
 
@@ -1066,6 +1133,17 @@ fn thinking_query(input: &str) -> Option<&str> {
     nested_command_query(input, "/thinking ")
 }
 
+fn resume_query(input: &str) -> Option<&str> {
+    let prefix = "/resume ";
+    if !input
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    {
+        return None;
+    }
+    input.get(prefix.len()..).map(str::trim)
+}
+
 fn resource_query(input: &str) -> Option<&str> {
     (input.starts_with('/') && !input.chars().any(char::is_whitespace)).then_some(input)
 }
@@ -1249,6 +1327,35 @@ mod tests {
             assert!(query.is_empty());
             Vec::new()
         });
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn resume_palette_shows_a_loading_row_until_the_background_scan_finishes() {
+        let mut app = App::new();
+        app.set_input("/resume streaming retry");
+        app.set_resume_suggestions_loading();
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "…".to_owned(),
+                description: "reading saved sessions".to_owned(),
+                value: String::new(),
+                execute: false,
+            }]
+        );
+
+        app.refresh_resume_suggestions(|query| {
+            assert_eq!(query, "streaming retry");
+            vec![Suggestion {
+                label: "saved".to_owned(),
+                description: "matching session".to_owned(),
+                value: "/resume saved".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+        app.invalidate_resume_suggestions();
         assert!(app.suggestions().is_empty());
     }
 

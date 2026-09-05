@@ -756,6 +756,8 @@ struct InteractiveView {
     turn_pending: bool,
     pending_btw_thread: Option<String>,
     pending_btw_turn_start: Option<usize>,
+    resume_sessions: Option<Vec<sessionlog::SessionInfo>>,
+    resume_scan: Option<Receiver<Result<Vec<sessionlog::SessionInfo>, String>>>,
 }
 
 impl Default for InteractiveView {
@@ -769,7 +771,16 @@ impl Default for InteractiveView {
             turn_pending: false,
             pending_btw_thread: None,
             pending_btw_turn_start: None,
+            resume_sessions: None,
+            resume_scan: None,
         }
+    }
+}
+
+impl InteractiveView {
+    fn invalidate_resume_sessions(&mut self) {
+        self.resume_sessions = None;
+        self.resume_scan = None;
     }
 }
 
@@ -1263,6 +1274,7 @@ fn submit_interactive_input(
         }
     };
     if input.starts_with('/') {
+        view.invalidate_resume_sessions();
         return dispatch_runtime_slash_command(
             app,
             view,
@@ -2914,6 +2926,106 @@ fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<Stri
     Ok(render_interactive_session_list(&sessions))
 }
 
+fn refresh_resume_palette(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+) {
+    if !app.resume_palette_active() {
+        app.invalidate_resume_suggestions();
+        return;
+    }
+
+    let completed_scan = view
+        .resume_scan
+        .as_ref()
+        .and_then(|receiver| match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("saved-session scan stopped unexpectedly".to_owned()))
+            }
+        });
+    if let Some(result) = completed_scan {
+        view.resume_scan = None;
+        match result {
+            Ok(sessions) => view.resume_sessions = Some(sessions),
+            Err(error) => {
+                view.resume_sessions = Some(Vec::new());
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    format!("could not read saved sessions: {error}"),
+                );
+            }
+        }
+    }
+
+    if view.resume_sessions.is_none() {
+        if view.resume_scan.is_none() {
+            let cwd = match runtime::absolute_workdir(&prepared.config.workdir) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    view.resume_sessions = Some(Vec::new());
+                    append_view_message(view, MessageRole::Error, error.to_string());
+                    return;
+                }
+            };
+            let store = sessionlog::Store::new(
+                prepared
+                    .config
+                    .sessions_dir
+                    .clone()
+                    .unwrap_or_else(config::sessions_dir),
+            );
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let result = session_picker::list_sessions_for_picker(&store, &cwd)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+            view.resume_scan = Some(receiver);
+        }
+        app.set_resume_suggestions_loading();
+        return;
+    }
+
+    let current_path = prepared.runtime.path();
+    let sessions = view.resume_sessions.as_deref().unwrap_or_default();
+    app.refresh_resume_suggestions(|query| {
+        resume_picker_suggestions(sessions, query, current_path.as_deref())
+    });
+}
+
+fn resume_picker_suggestions(
+    sessions: &[sessionlog::SessionInfo],
+    query: &str,
+    current_path: Option<&std::path::Path>,
+) -> Vec<state::Suggestion> {
+    let terms = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let labels = sessionlog::short_ids(sessions);
+    sessions
+        .iter()
+        .zip(labels)
+        .filter(|(session, _)| {
+            current_path.is_none_or(|current| session.path != current)
+                && session_picker::matches_session(session, &terms)
+        })
+        .map(|(session, label)| {
+            let (label, description) = session_picker::describe_session(session, &label, false);
+            state::Suggestion {
+                value: format!("/resume {label}"),
+                label,
+                description,
+                execute: true,
+            }
+        })
+        .collect()
+}
+
 fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> String {
     if sessions.is_empty() {
         return "No saved sessions for this workspace.".to_owned();
@@ -3013,6 +3125,7 @@ fn refresh_runtime_app(
     app.refresh_resource_suggestions(|query| {
         resource_palette_suggestions(&prepared.resources(), query)
     });
+    refresh_resume_palette(app, view, prepared);
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
         messages.extend(agent_messages(std::slice::from_ref(message)));
@@ -3975,6 +4088,58 @@ mod tests {
         assert_eq!(
             thinking_level_description("xhigh"),
             "Deep analysis for difficult problems"
+        );
+    }
+
+    #[test]
+    fn resume_picker_searches_transcript_and_hides_the_active_session() {
+        let active_path = std::path::PathBuf::from("/sessions/active.jsonl");
+        let sessions = vec![
+            sessionlog::SessionInfo {
+                id: "aaaa1111-0000-7000-8000-000000000001".to_owned(),
+                path: active_path.clone(),
+                cwd: "/workspace".to_owned(),
+                name: "Active work".to_owned(),
+                first_message: "current".to_owned(),
+                created: None,
+                modified: UNIX_EPOCH,
+                messages: 2,
+                cleared: 0,
+                size: 0,
+                search_text: "current implementation".to_owned(),
+                locked: false,
+                owner: sessionlog::LockOwner::default(),
+            },
+            sessionlog::SessionInfo {
+                id: "bbbb2222-0000-7000-8000-000000000002".to_owned(),
+                path: std::path::PathBuf::from("/sessions/older.jsonl"),
+                cwd: "/workspace".to_owned(),
+                name: "Streaming fix".to_owned(),
+                first_message: "investigate".to_owned(),
+                created: None,
+                modified: UNIX_EPOCH,
+                messages: 4,
+                cleared: 0,
+                size: 0,
+                search_text: "retry streaming response".to_owned(),
+                locked: false,
+                owner: sessionlog::LockOwner::default(),
+            },
+        ];
+
+        assert_eq!(
+            resume_picker_suggestions(&sessions, "retry", Some(&active_path)),
+            vec![state::Suggestion {
+                label: "bbbb2222".to_owned(),
+                description: "Jan 1 00:00 · 4 msg · Streaming fix".to_owned(),
+                value: "/resume bbbb2222".to_owned(),
+                execute: true,
+            }]
+        );
+        assert!(
+            resume_picker_suggestions(&sessions, "", Some(&active_path))
+                .iter()
+                .all(|suggestion| suggestion.value != "/resume aaaa1111")
         );
     }
 
