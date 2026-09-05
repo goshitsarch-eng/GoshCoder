@@ -690,6 +690,7 @@ struct InteractiveView {
     activity: String,
     recent_tool: String,
     activity_since: Option<Instant>,
+    context_estimate: compaction::ContextEstimate,
     turn_pending: bool,
     pending_btw_thread: Option<String>,
     pending_btw_turn_start: Option<usize>,
@@ -702,6 +703,7 @@ impl Default for InteractiveView {
             activity: "Ready".to_owned(),
             recent_tool: String::new(),
             activity_since: None,
+            context_estimate: compaction::ContextEstimate::default(),
             turn_pending: false,
             pending_btw_thread: None,
             pending_btw_turn_start: None,
@@ -753,7 +755,7 @@ fn event_loop(
 
     loop {
         drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
-        refresh_runtime_app(&mut app, prepared, &view);
+        refresh_runtime_app(&mut app, prepared, &mut view);
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -880,6 +882,7 @@ fn drain_interactive_events(
             }
             agent::EventKind::ContextCompacted => {
                 if event.compaction.is_some() {
+                    view.context_estimate.reset();
                     view.activity = "Context compacted".to_owned();
                     view.activity_since = None;
                 }
@@ -890,8 +893,8 @@ fn drain_interactive_events(
             | agent::EventKind::MessageEnd
             | agent::EventKind::ToolExecutionUpdate
             | agent::EventKind::ModelChange
-            | agent::EventKind::ThinkingLevelChange
-            | agent::EventKind::TranscriptReset => {}
+            | agent::EventKind::ThinkingLevelChange => {}
+            agent::EventKind::TranscriptReset => view.context_estimate.reset(),
         }
     }
     while let Ok(completion) = turn_results.try_recv() {
@@ -1869,6 +1872,7 @@ fn dispatch_runtime_slash_command(
             match prepared.runtime.switch_to(rest) {
                 Ok(handle) => {
                     app.scroll = 0;
+                    view.context_estimate.reset();
                     view.activity = format!("Resumed session {}", short_id(&handle.id));
                     append_view_message(
                         view,
@@ -2614,7 +2618,11 @@ fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl
     }
 }
 
-fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view: &InteractiveView) {
+fn refresh_runtime_app(
+    app: &mut App,
+    prepared: &runtime::PreparedSession,
+    view: &mut InteractiveView,
+) {
     let state = prepared.runtime.agent().state();
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
@@ -2853,9 +2861,9 @@ fn tool_title(call: &llm::ToolCall) -> String {
 fn runtime_sidebar(
     prepared: &runtime::PreparedSession,
     state: &agent::State,
-    view: &InteractiveView,
+    view: &mut InteractiveView,
 ) -> Vec<state::SidebarLine> {
-    let context_tokens = compaction::measured_context_tokens(&state.messages);
+    let context_tokens = view.context_estimate.measure(&state.messages);
     let limit = state.model.context_window;
     let percent = if limit == 0 {
         0

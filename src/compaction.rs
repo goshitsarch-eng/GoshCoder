@@ -356,6 +356,56 @@ pub fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
     estimate_messages_tokens(messages)
 }
 
+/// Incrementally measures compacted context for a frequently refreshed UI.
+///
+/// Before compaction, a provider's latest usage value remains authoritative and
+/// cheap to inspect. After compaction, that value describes the old prompt, so
+/// [`measured_context_tokens`] serializes the complete context instead. The
+/// terminal redraws while the final assistant message streams, but all
+/// preceding messages are immutable; this cache only reserializes that final
+/// message and resets when a compaction shortens the transcript.
+#[derive(Clone, Debug, Default)]
+pub struct ContextEstimate {
+    measured: usize,
+    total: u64,
+}
+
+impl ContextEstimate {
+    /// Returns the same value as [`measured_context_tokens`] while avoiding
+    /// repeated serialization of the stable compacted transcript prefix.
+    pub fn measure(&mut self, messages: &[llm::Message]) -> u64 {
+        if messages.is_empty() {
+            self.reset();
+            return 0;
+        }
+        if !messages.iter().any(is_summary_message) {
+            self.reset();
+            return measured_context_tokens(messages);
+        }
+
+        // The final message can grow on every streaming delta, so leave it
+        // uncached. A shorter prefix signals a wholesale replacement such as
+        // compaction or reset.
+        let stable = messages.len().saturating_sub(1);
+        if stable < self.measured {
+            self.reset();
+        }
+        for message in &messages[self.measured..stable] {
+            self.total = self.total.saturating_add(estimate_message_tokens(message));
+        }
+        self.measured = stable;
+        self.total
+            .saturating_add(estimate_message_tokens(&messages[stable]))
+    }
+
+    /// Discards a previously measured prefix after a session switches or the
+    /// transcript is otherwise replaced at the same length.
+    pub fn reset(&mut self) {
+        self.measured = 0;
+        self.total = 0;
+    }
+}
+
 fn source_limit(context_window: u64) -> usize {
     if context_window == 0 {
         return MAX_SOURCE_BYTES;
@@ -596,6 +646,53 @@ mod tests {
         assert_eq!(
             measured_context_tokens(&compacted),
             estimate_messages_tokens(&compacted)
+        );
+    }
+
+    #[test]
+    fn context_estimate_matches_full_measurement_after_compaction_and_streaming_updates() {
+        let mut estimate = ContextEstimate::default();
+        let mut messages = vec![
+            summary_message("earlier work", 1),
+            user("latest request"),
+            assistant("partial response"),
+        ];
+
+        assert_eq!(
+            estimate.measure(&messages),
+            estimate_messages_tokens(&messages)
+        );
+
+        let first = estimate.measure(&messages);
+        if let llm::Message::Assistant(message) = &mut messages[2] {
+            message.content = vec![llm::ContentBlock::text(
+                "a much longer streamed response ".repeat(50),
+            )];
+        }
+        let second = estimate.measure(&messages);
+        assert!(second > first);
+        assert_eq!(second, estimate_messages_tokens(&messages));
+
+        messages.push(user("new turn after compaction"));
+        assert_eq!(
+            estimate.measure(&messages),
+            estimate_messages_tokens(&messages)
+        );
+
+        let replacement = vec![summary_message("new summary", 1), user("newest request")];
+        assert_eq!(
+            estimate.measure(&replacement),
+            estimate_messages_tokens(&replacement)
+        );
+
+        estimate.reset();
+        let same_length_replacement = vec![
+            summary_message("resumed summary", 1),
+            user("resumed request"),
+        ];
+        assert_eq!(
+            estimate.measure(&same_length_replacement),
+            estimate_messages_tokens(&same_length_replacement)
         );
     }
 
