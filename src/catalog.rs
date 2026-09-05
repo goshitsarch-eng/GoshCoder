@@ -32,7 +32,7 @@ use std::os::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::{Map, Value};
 
-use crate::{aperture, config, llm, oauth};
+use crate::{aperture, config, llm, oauth, omniroute};
 
 const CATALOG_JSON: &str = include_str!("../internal/llm/catalog/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../internal/llm/catalog/catalog_extra.json");
@@ -1948,6 +1948,7 @@ pub struct Catalog {
     oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
     aperture_paths: AperturePaths,
     aperture_state: Arc<Mutex<Option<aperture::ApertureState>>>,
+    omniroute_path: PathBuf,
 }
 
 impl Catalog {
@@ -1992,6 +1993,16 @@ impl Catalog {
         self
     }
 
+    /// Overrides the OmniRoute configuration location for this catalog.
+    ///
+    /// This keeps embedded applications and tests independent from the
+    /// process-wide agent configuration while retaining the normal dynamic
+    /// reload behavior of the OmniRoute provider.
+    pub fn with_omniroute_path(mut self, configuration: impl Into<PathBuf>) -> Self {
+        self.omniroute_path = configuration.into();
+        self
+    }
+
     /// Creates a catalog with injectable environment and ADC file checks.
     pub fn with_environment_and_file_exists(
         credentials: Option<Arc<CredentialStore>>,
@@ -2009,6 +2020,7 @@ impl Catalog {
             oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
             aperture_paths: AperturePaths::default(),
             aperture_state: Arc::new(Mutex::new(None)),
+            omniroute_path: config::omni_route_path(),
         })
     }
 
@@ -2068,6 +2080,11 @@ impl Catalog {
         self.aperture_paths.cache.clone()
     }
 
+    /// Returns the OmniRoute configuration location used by this catalog.
+    pub fn omniroute_config_path(&self) -> PathBuf {
+        self.omniroute_path.clone()
+    }
+
     fn build_aperture_state(&self) -> aperture::ApertureState {
         let Ok(configuration) = aperture::load_config(&self.aperture_paths.config) else {
             return aperture::ApertureState::default();
@@ -2107,10 +2124,45 @@ impl Catalog {
         })
     }
 
+    fn omniroute_model(model: omniroute::LiveModel) -> llm::Model {
+        let omniroute::ModelCost { rates, tiers } = model.cost;
+        let cost = llm::ModelCost {
+            rates: llm::ModelCostRates {
+                input: rates.input,
+                output: rates.output,
+                cache_read: rates.cache_read,
+                cache_write: rates.cache_write,
+            },
+            tiers: tiers
+                .into_iter()
+                .map(|tier| llm::ModelCostTier {
+                    rates: llm::ModelCostRates {
+                        input: tier.rates.input,
+                        output: tier.rates.output,
+                        cache_read: tier.rates.cache_read,
+                        cache_write: tier.rates.cache_write,
+                    },
+                    input_tokens_above: u64::try_from(tier.input_tokens_above).unwrap_or_default(),
+                })
+                .collect(),
+        };
+        llm::Model {
+            id: model.id,
+            name: model.name,
+            api: model.api,
+            provider: model.provider,
+            base_url: model.base_url,
+            reasoning: model.reasoning,
+            thinking_level_map: model.thinking_level_map,
+            input: model.input,
+            cost,
+            context_window: model.context_window,
+            max_tokens: model.max_tokens,
+            ..llm::Model::default()
+        }
+    }
+
     /// Returns an independent provider/model view.
-    ///
-    /// TODO: Load configured OmniRoute base URLs and models here. This method
-    /// intentionally exposes only embedded static Omni metadata.
     pub fn provider(&self, id: &str) -> Option<Provider> {
         let definition = provider_definition(id)?;
         let models = self
@@ -2135,6 +2187,16 @@ impl Catalog {
             models,
             raw_compat,
         };
+        if id == omniroute::OMNI_PROVIDER_ID
+            && let Ok(configuration) = omniroute::load_config(&self.omniroute_path)
+        {
+            provider.base_url = configuration.api_base_url();
+            provider.models = configuration
+                .models
+                .iter()
+                .map(|model| Self::omniroute_model(model.live_model(&configuration)))
+                .collect();
+        }
         let aperture_state = self.aperture_state();
         if id == aperture::DEDICATED_PROVIDER_ID {
             if aperture_state.configured && aperture_state.resolved.dedicated_enabled {
@@ -2757,6 +2819,89 @@ mod tests {
         let mut catalog = test_catalog(values);
         catalog.aperture_paths = paths;
         (catalog, root)
+    }
+
+    fn omniroute_catalog(
+        values: &[(&str, &str)],
+        configuration: &omniroute::Config,
+    ) -> (Catalog, PathBuf) {
+        let root = test_directory("omniroute");
+        let path = root.join("omniroute.json");
+        omniroute::save_config(&path, configuration).expect("save OmniRoute config");
+        let catalog = test_catalog(values).with_omniroute_path(path);
+        (catalog, root)
+    }
+
+    #[test]
+    fn omniroute_provider_loads_synced_models_and_refreshes_from_disk() {
+        let configuration = omniroute::Config {
+            server_url: "https://omni.example.test/".to_owned(),
+            dashboard_url: String::new(),
+            models: vec![omniroute::Model {
+                id: "vendor/chat-web".to_owned(),
+                name: "Chat Web".to_owned(),
+                reasoning: true,
+                tool_calling: Some(false),
+                input: vec!["text".to_owned(), "image".to_owned()],
+                context_window: 200_000,
+                max_tokens: 32_768,
+                cost: omniroute::ModelCost {
+                    rates: omniroute::ModelCostRates {
+                        input: 1.5,
+                        output: 4.0,
+                        cache_read: 0.1,
+                        cache_write: 0.2,
+                    },
+                    tiers: vec![omniroute::ModelCostTier {
+                        rates: omniroute::ModelCostRates {
+                            input: 2.0,
+                            ..omniroute::ModelCostRates::default()
+                        },
+                        input_tokens_above: 100_000,
+                    }],
+                },
+                ..omniroute::Model::default()
+            }],
+            synced_at: Some(1),
+        };
+        let (catalog, root) =
+            omniroute_catalog(&[("OMNIROUTE_API_KEY", "gateway-key")], &configuration);
+
+        let provider = catalog
+            .provider(omniroute::OMNI_PROVIDER_ID)
+            .expect("OmniRoute provider");
+        assert_eq!(provider.base_url, "https://omni.example.test/v1");
+        let model = provider
+            .model("vendor/chat-web")
+            .expect("synced OmniRoute model");
+        assert_eq!(model.api, omniroute::PROMPT_TOOLS_API);
+        assert_eq!(model.provider, omniroute::OMNI_PROVIDER_ID);
+        assert_eq!(model.base_url, "https://omni.example.test/v1");
+        assert_eq!(model.context_window, 200_000);
+        assert_eq!(model.max_tokens, 32_768);
+        assert_eq!(model.cost.rates.input, 1.5);
+        assert_eq!(model.cost.tiers[0].input_tokens_above, 100_000);
+        let resolved = catalog
+            .resolve_model("omni/vendor/chat-web")
+            .expect("resolve synced OmniRoute model");
+        assert_eq!(resolved.auth().api_key(), Some("gateway-key"));
+
+        let replacement = omniroute::Config {
+            models: vec![omniroute::Model {
+                id: "vendor/new-chat".to_owned(),
+                ..omniroute::Model::default()
+            }],
+            ..configuration
+        };
+        omniroute::save_config(catalog.omniroute_config_path(), &replacement)
+            .expect("refresh OmniRoute config");
+        let refreshed = catalog
+            .provider(omniroute::OMNI_PROVIDER_ID)
+            .expect("refreshed OmniRoute provider");
+        assert!(refreshed.model("vendor/chat-web").is_none());
+        assert!(refreshed.model("vendor/new-chat").is_some());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
