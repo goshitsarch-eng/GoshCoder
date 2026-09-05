@@ -1882,7 +1882,7 @@ mod tests {
         assert!(report.migrated, "the fixture must exercise v1 migration");
         let compaction = tree
             .all()
-            .iter()
+            .into_iter()
             .find(|entry| entry.kind == TYPE_COMPACTION)
             .expect("compaction entry");
         assert!(!compaction.first_kept_entry_id.is_empty());
