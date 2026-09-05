@@ -14,7 +14,7 @@ use std::{
 use crate::{
     agent, aperture_runtime, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, planner_runtime, plannotator, providers, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -516,6 +516,7 @@ pub fn session_options(
         .resolve_model(&model_ref)
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
     let (model, _) = resolved.into_parts();
+    ensure_supported_model(&model)?;
     let thinking_level = stream::clamp_thinking_level(&model, &config.thinking);
 
     Ok(SessionOptions {
@@ -802,9 +803,20 @@ pub fn set_model(
         .resolve_model(reference)
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
     let (model, _) = resolved.into_parts();
+    ensure_supported_model(&model)?;
     runtime.agent().set_model(model.clone());
     let _ = config::write_default_model(&format!("{}/{}", model.provider, model.id));
     Ok(model)
+}
+
+fn ensure_supported_model(model: &llm::Model) -> Result<()> {
+    providers::ProviderProtocol::from_api(&model.api).map_err(|_| {
+        RuntimeError::Catalog(format!(
+            "model {}/{} uses the {:?} protocol, which is not implemented yet",
+            model.provider, model.id, model.api
+        ))
+    })?;
+    Ok(())
 }
 
 /// Resolves a resource invocation before it reaches the agent.
@@ -1165,6 +1177,21 @@ mod tests {
     fn short_ids_do_not_split_utf8() {
         assert_eq!(short_id("你好世界"), "你好");
         assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn session_models_require_a_migrated_provider_protocol() {
+        let error = ensure_supported_model(&llm::Model {
+            provider: "example".to_owned(),
+            id: "legacy".to_owned(),
+            api: "legacy-protocol".to_owned(),
+            ..llm::Model::default()
+        })
+        .expect_err("unsupported model must not start a session");
+        assert_eq!(
+            error.to_string(),
+            "model example/legacy uses the \"legacy-protocol\" protocol, which is not implemented yet"
+        );
     }
 
     #[test]

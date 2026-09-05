@@ -13,7 +13,7 @@ use crossterm::{
 
 use crate::{
     catalog::{Catalog, Credential, CredentialStore, Provider},
-    config, oauth,
+    config, oauth, providers,
 };
 
 /// The credential flow selected for an interactive `/login <provider>` command.
@@ -327,6 +327,12 @@ impl oauth::OAuthInteraction for TerminalOAuthInteraction {
 }
 
 fn select_oauth_option(input: &str, options: &[oauth::OAuthPromptOption]) -> String {
+    if input.trim().is_empty() {
+        return options
+            .first()
+            .map(|option| option.id.clone())
+            .unwrap_or_default();
+    }
     if let Ok(index) = input.parse::<usize>()
         && let Some(option) = index.checked_sub(1).and_then(|index| options.get(index))
     {
@@ -341,8 +347,17 @@ fn print_models(provider: &Provider) {
     }
     println!("\n{} ({})", provider.name, provider.id);
     for model in provider.models() {
-        println!("  {}/{}", provider.id, model.id);
+        println!("  {}", model_display_line(&provider.id, &model));
     }
+}
+
+fn model_display_line(provider_id: &str, model: &crate::llm::Model) -> String {
+    let marker = if providers::ProviderProtocol::from_api(&model.api).is_err() {
+        " [protocol not implemented]"
+    } else {
+        ""
+    };
+    format!("{provider_id}/{}{}", model.id, marker)
 }
 
 fn provider_setup_hint(provider: &Provider) -> String {
@@ -525,9 +540,33 @@ mod tests {
                 description: String::new(),
             },
         ];
+        assert_eq!(select_oauth_option("", &options), "browser");
         assert_eq!(select_oauth_option("2", &options), "device_code");
         assert_eq!(select_oauth_option("browser", &options), "browser");
         assert_eq!(select_oauth_option("3", &options), "3");
+    }
+
+    #[test]
+    fn model_listing_marks_unimplemented_protocols() {
+        let model = crate::llm::Model {
+            id: "old-model".to_owned(),
+            api: "old-protocol".to_owned(),
+            ..crate::llm::Model::default()
+        };
+        assert_eq!(
+            model_display_line("example", &model),
+            "example/old-model [protocol not implemented]"
+        );
+
+        let supported = crate::llm::Model {
+            id: "new-model".to_owned(),
+            api: providers::API_OPENAI_COMPLETIONS.to_owned(),
+            ..crate::llm::Model::default()
+        };
+        assert_eq!(
+            model_display_line("example", &supported),
+            "example/new-model"
+        );
     }
 
     #[test]
