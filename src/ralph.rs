@@ -309,10 +309,10 @@ impl LoopState {
             self.iteration.to_string()
         };
         format!(
-            "{}: {} {:?} (iteration {iteration})",
+            "{}: {} {} (iteration {iteration})",
             self.name,
             self.status.icon(),
-            self.status.to_string().to_lowercase()
+            self.status
         )
     }
 
@@ -656,8 +656,8 @@ impl Store {
             });
         }
 
-        let reflection =
-            state.reflect_every > 0 && (state.iteration - 1) % state.reflect_every as u64 == 0;
+        let reflection = state.reflect_every > 0
+            && (state.iteration - 1).is_multiple_of(state.reflect_every as u64);
         if reflection {
             state.last_reflection_at = state.iteration;
         }
@@ -731,8 +731,7 @@ impl Store {
         let mut state = match name {
             Some(name) => {
                 let name = checked_name(name)?;
-                self.load(&name, false)?
-                    .ok_or_else(|| RalphError::NotFound(name))?
+                self.load(&name, false)?.ok_or(RalphError::NotFound(name))?
             }
             None => self.current()?.ok_or(RalphError::NoActiveLoop)?,
         };
@@ -876,14 +875,6 @@ impl Store {
         path.to_string_lossy().replace('\\', "/")
     }
 
-    fn relative_state_file(&self, state: &LoopState) -> String {
-        state
-            .task_file
-            .strip_suffix(".md")
-            .map(|stem| format!("{stem}.state.json"))
-            .unwrap_or_else(|| format!("{}.state.json", state.task_file))
-    }
-
     fn validate_state_location(&self, state: &LoopState, archived: bool) -> Result<()> {
         state.validate()?;
         let expected = self.relative_task_file(&state.name, archived);
@@ -897,11 +888,7 @@ impl Store {
     }
 
     fn state_is_archived(&self, state: &LoopState) -> Result<bool> {
-        if self
-            .validate_state_location(state, false)
-            .map(|()| true)
-            .is_ok()
-        {
+        if self.validate_state_location(state, false).is_ok() {
             return Ok(false);
         }
         self.validate_state_location(state, true)?;
@@ -1261,7 +1248,8 @@ fn parse_start(arguments: &[String]) -> Result<RalphCommand> {
         index += 1;
     }
 
-    if task_words.is_empty() {
+    let task_content = task_words.join(" ");
+    if task_content.trim().is_empty() {
         return Err(RalphError::InvalidCommand(
             "usage: ralph start <name> <task> [--max-iterations N] [--items-per-iteration N] [--reflect-every N]"
                 .to_owned(),
@@ -1270,7 +1258,7 @@ fn parse_start(arguments: &[String]) -> Result<RalphCommand> {
     options.validate()?;
     Ok(RalphCommand::Start {
         name,
-        task_content: task_words.join(" "),
+        task_content,
         options,
     })
 }
@@ -1417,7 +1405,7 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
     }
     let mut file = File::open(path)?;
     let mut content = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(MAX_RALPH_FILE_BYTES as u64 + 1)
         .read_to_end(&mut content)?;
     if content.len() > MAX_RALPH_FILE_BYTES {
@@ -1430,6 +1418,12 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    if content.len() > MAX_RALPH_FILE_BYTES {
+        return Err(RalphError::FileTooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_RALPH_FILE_BYTES,
+        });
+    }
     let parent = path.parent().ok_or_else(|| {
         RalphError::InvalidState(format!("{} has no parent directory", path.display()))
     })?;
@@ -1599,6 +1593,7 @@ mod tests {
         assert_eq!(state.name, "my_loop");
         assert_eq!(state.status, LoopStatus::Active);
         assert_eq!(state.iteration, 1);
+        assert_eq!(state.summary(), "my_loop: ▶ active (iteration 1/5)");
         assert!(
             store
                 .state_path("my_loop", false)
@@ -1895,6 +1890,7 @@ mod tests {
             }
         );
         assert!(parse_command("/ralph start loop").is_err());
+        assert!(parse_command(r#"/ralph start loop """#).is_err());
         assert!(parse_command("/ralph list --nope").is_err());
         assert!(parse_command("/ralph start loop task --reflect-every -1").is_err());
         assert!(parse_command("/ralph \"unterminated").is_err());
@@ -1954,6 +1950,10 @@ mod tests {
         store
             .write_task(&state, "replaced atomically")
             .expect("write task");
+        assert!(matches!(
+            store.write_task(&state, &"x".repeat(MAX_RALPH_FILE_BYTES + 1)),
+            Err(RalphError::FileTooLarge { .. })
+        ));
         let temp_files = fs::read_dir(store.storage_dir())
             .expect("storage")
             .filter_map(|entry| entry.ok())

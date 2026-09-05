@@ -326,7 +326,14 @@ impl SessionRuntime {
             tool_execution: options.tool_execution,
             session_id,
         });
-        Self::finish_open(agent, store, options, opened, model_notices, model_selection)
+        Self::finish_open(
+            agent,
+            store,
+            options,
+            opened,
+            model_notices,
+            model_selection,
+        )
     }
 
     /// Attaches session recording to an already constructed agent.
@@ -354,7 +361,14 @@ impl SessionRuntime {
         agent.set_messages(opened.restored.messages.clone());
         agent.set_model(model);
         agent.set_thinking_level(restored_thinking(&options, &opened));
-        Self::finish_open(agent, store, options, opened, model_notices, model_selection)
+        Self::finish_open(
+            agent,
+            store,
+            options,
+            opened,
+            model_notices,
+            model_selection,
+        )
     }
 
     fn finish_open(
@@ -389,6 +403,9 @@ impl SessionRuntime {
             model_selection,
             resumed: opened.resumed,
         };
+        if !runtime.resumed && runtime.recording() {
+            runtime.record_initial_settings();
+        }
         if let Some(name) = options.name {
             if runtime.recording() {
                 runtime.set_name(name)?;
@@ -538,12 +555,13 @@ impl SessionRuntime {
                     first_kept_entry_id = id;
                 }
             }
+            let details = compaction_details_value(&summary)?;
             writer.append(Entry {
                 kind: sessionlog::TYPE_COMPACTION.to_owned(),
                 summary: summary.summary,
                 first_kept_entry_id,
                 tokens_before: summary.tokens_before,
-                details: Some(compaction_details_value(&summary)?),
+                details: Some(details),
                 ..Entry::default()
             })?;
             writer.sync()
@@ -562,6 +580,7 @@ impl SessionRuntime {
     /// Rewinds the write head to a user-message branch point while preserving
     /// the abandoned path in the JSONL file.
     pub fn fork_to(&self, index: usize) -> Result<BranchPoint> {
+        self.require_recording()?;
         self.require_idle("wait for the current response to finish before rewinding")?;
         let Some(tree) = self.tree() else {
             return Err(SessionRuntimeError::NotRecording);
@@ -606,6 +625,7 @@ impl SessionRuntime {
 
     /// Associates a label with a branch point. An empty label removes it.
     pub fn label(&self, index: usize, label: impl Into<String>) -> Result<()> {
+        self.require_recording()?;
         let label = label.into().trim().to_owned();
         let points = self.branch_points();
         let target = points
@@ -636,6 +656,7 @@ impl SessionRuntime {
     /// Copies the current selected branch into a new session and makes that
     /// copy the target of the existing stable recorder subscription.
     pub fn clone_session(&self) -> Result<SessionHandle> {
+        self.require_recording()?;
         self.require_idle("wait for the current response to finish before cloning")?;
         self.sync()?;
         let current = self.handle().ok_or(SessionRuntimeError::NotRecording)?;
@@ -650,6 +671,7 @@ impl SessionRuntime {
     /// Attaches another writable v3 session without closing the current log
     /// until the target has opened successfully.
     pub fn switch_to(&self, reference: &str) -> Result<SessionHandle> {
+        self.require_recording()?;
         self.require_idle("wait for the current response to finish before switching sessions")?;
         let current = self.handle().ok_or(SessionRuntimeError::NotRecording)?;
         let info = self.store.resolve(&self.cwd, reference)?;
@@ -667,6 +689,7 @@ impl SessionRuntime {
     /// Copies an external or otherwise selected session into this runtime's
     /// workspace and adopts the writable copy.
     pub fn import_session(&self, source: &str) -> Result<SessionHandle> {
+        self.require_recording()?;
         self.require_idle("wait for the current response to finish before importing")?;
         self.sync()?;
         if self.handle().is_none() {
@@ -711,6 +734,36 @@ impl SessionRuntime {
         Ok(())
     }
 
+    fn require_recording(&self) -> Result<()> {
+        if self.recording() {
+            Ok(())
+        } else {
+            Err(SessionRuntimeError::NotRecording)
+        }
+    }
+
+    fn record_initial_settings(&self) {
+        let state = self.agent.state();
+        let _ = self.recorder.mutate(|writer| {
+            if !state.model.provider.is_empty() && !state.model.id.is_empty() {
+                writer.append(Entry {
+                    kind: sessionlog::TYPE_MODEL_CHANGE.to_owned(),
+                    provider: state.model.provider,
+                    model_id: state.model.id,
+                    ..Entry::default()
+                })?;
+            }
+            if !state.thinking_level.is_empty() {
+                writer.append(Entry {
+                    kind: sessionlog::TYPE_THINKING_LEVEL_CHANGE.to_owned(),
+                    thinking_level: state.thinking_level,
+                    ..Entry::default()
+                })?;
+            }
+            writer.sync()
+        });
+    }
+
     fn adopt_writer(&self, writer: Writer, action: &str) -> Result<SessionHandle> {
         let restored = restore_from_tree(&writer.snapshot(), writer.leaf());
         let mut model_notices = Vec::new();
@@ -746,6 +799,9 @@ impl SessionRuntime {
         // reflect the model the agent actually runs.
         self.agent.set_model(model);
         self.agent.set_thinking_level(thinking_level);
+        for warning in restored.warnings {
+            self.notices.push("Session", warning);
+        }
         for notice in model_notices {
             self.notices.push("Session", notice);
         }
@@ -851,6 +907,14 @@ impl ModelSelection {
         notices: &mut Vec<String>,
     ) -> llm::Model {
         if explicit_override {
+            if let Some((provider, model_id)) = restored.model_reference()
+                && (self.fallback.provider != provider || self.fallback.id != model_id)
+            {
+                notices.push(format!(
+                    "this session was held on {provider}/{model_id}; continuing on {}/{} because the configured model was explicit",
+                    self.fallback.provider, self.fallback.id
+                ));
+            }
             return self.fallback.clone();
         }
         let Some((provider, model_id)) = restored.model_reference() else {
@@ -931,7 +995,7 @@ fn open_selected(store: &Store, cwd: &Path, options: &SessionOptions) -> Result<
             notices: Vec::new(),
             resumed: false,
         }),
-        SessionSelection::New => opened_new(store.create(cwd)?),
+        SessionSelection::New => Ok(opened_new(store.create(cwd)?)),
         SessionSelection::Continue => match store.most_recent(cwd)? {
             Some(info) => open_target(store, cwd, info, options.read_only),
             None => {
@@ -945,7 +1009,7 @@ fn open_selected(store: &Store, cwd: &Path, options: &SessionOptions) -> Result<
         SessionSelection::Session(reference) => match store.resolve(cwd, reference) {
             Ok(info) => open_target(store, cwd, info, options.read_only),
             Err(SessionError::NotFound(_)) if !looks_like_path(reference) => {
-                opened_new(store.create_with_id(cwd, None, reference)?)
+                Ok(opened_new(store.create_with_id(cwd, None, reference)?))
             }
             Err(error) => Err(error.into()),
         },
@@ -961,13 +1025,13 @@ fn open_selected(store: &Store, cwd: &Path, options: &SessionOptions) -> Result<
     }
 }
 
-fn opened_new(writer: Writer) -> Result<OpenedSession> {
-    Ok(OpenedSession {
+fn opened_new(writer: Writer) -> OpenedSession {
+    OpenedSession {
         writer: Some(writer),
         restored: RestoredSession::default(),
         notices: Vec::new(),
         resumed: false,
-    })
+    }
 }
 
 fn opened_existing(writer: Writer, report: LoadReport) -> OpenedSession {
@@ -1421,7 +1485,7 @@ fn export_markdown(tree: &Tree, header: &Header) -> String {
             .iter()
             .find_map(|entry| {
                 (entry.kind == sessionlog::TYPE_MESSAGE)
-                    .then(|| entry.message.as_ref())
+                    .then_some(entry.message.as_ref())
                     .flatten()
                     .and_then(|value| serde_json::from_value::<llm::Message>(value.clone()).ok())
                     .and_then(|message| match message {
@@ -1631,9 +1695,8 @@ mod tests {
         assert_eq!(messages[0].text_preview(), "after reset");
         assert_eq!(messages[1].text_preview(), "answer");
 
-        let kinds = second
-            .tree()
-            .expect("tree")
+        let tree = second.tree().expect("tree");
+        let kinds = tree
             .path(None)
             .iter()
             .map(|entry| entry.kind.as_str())
@@ -1714,6 +1777,9 @@ mod tests {
         named.selection = SessionSelection::Session("chosen-id".to_owned());
         let mut runtime = SessionRuntime::open(named).expect("create named session");
         assert_eq!(runtime.id().as_deref(), Some("chosen-id"));
+        runtime.set_name("chosen title").expect("name");
+        assert_eq!(runtime.name().as_deref(), Some("chosen title"));
+        assert_eq!(runtime.title().as_deref(), Some("chosen title"));
         close(&mut runtime);
 
         let mut missing_path = options(&root, &cwd);
@@ -1726,6 +1792,94 @@ mod tests {
             SessionRuntime::open(missing_path),
             Err(SessionRuntimeError::Session(SessionError::NotFound(_)))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initial_model_and_thinking_settings_survive_resume_without_catalog_access() {
+        let root = temp_root("initial-settings");
+        let cwd = root.join("workspace");
+        let selected = model("selected", "initial-model");
+        let mut first_options = options(&root, &cwd);
+        first_options.model = selected.clone();
+        first_options.thinking_level = llm::THINKING_MEDIUM.to_owned();
+        let mut first = SessionRuntime::open(first_options).expect("open");
+        first.agent().prompt("persist settings").expect("prompt");
+        let id = first.id().expect("id");
+        close(&mut first);
+
+        let mut resumed_options = options(&root, &cwd);
+        resumed_options.selection = SessionSelection::Session(id);
+        resumed_options.available_models = vec![selected.clone()];
+        let mut resumed = SessionRuntime::open(resumed_options).expect("resume");
+        assert_eq!(resumed.agent().state().model, selected);
+        assert_eq!(resumed.agent().state().thinking_level, llm::THINKING_MEDIUM);
+        close(&mut resumed);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initial_fork_selection_copies_a_source_branch_into_a_new_session() {
+        let root = temp_root("initial-fork");
+        let cwd = root.join("workspace");
+        let mut source = SessionRuntime::open(options(&root, &cwd)).expect("open source");
+        source.agent().prompt("source question").expect("prompt");
+        let source_id = source.id().expect("source id");
+        close(&mut source);
+
+        let mut fork_options = options(&root, &cwd);
+        fork_options.selection = SessionSelection::Fork {
+            source: source_id.clone(),
+            at: None,
+        };
+        let mut fork = SessionRuntime::open(fork_options).expect("fork source");
+        assert!(fork.resumed());
+        assert_ne!(fork.id().as_deref(), Some(source_id.as_str()));
+        assert_eq!(
+            fork.header()
+                .expect("fork header")
+                .parent_session
+                .as_deref(),
+            Some(source_id.as_str())
+        );
+        assert_eq!(fork.agent().state().messages.len(), 2);
+        close(&mut fork);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resuming_a_legacy_file_forks_it_into_a_continuable_v3_session() {
+        let root = temp_root("legacy");
+        let cwd = root.join("workspace");
+        let legacy = root.join("legacy.jsonl");
+        fs::create_dir_all(&root).expect("make root");
+        fs::write(
+            &legacy,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"legacy-source\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/old\"}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"old question\",\"timestamp\":1}}\n",
+                "{\"type\":\"message\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"old answer\"}],\"api\":\"test\",\"provider\":\"legacy\",\"model\":\"legacy-model\",\"usage\":{},\"timestamp\":2}}\n"
+            ),
+        )
+        .expect("write legacy fixture");
+
+        let mut session_options = options(&root, &cwd);
+        session_options.selection =
+            SessionSelection::Session(legacy.to_string_lossy().into_owned());
+        session_options.available_models = vec![model("legacy", "legacy-model")];
+        let mut runtime = SessionRuntime::open(session_options).expect("fork legacy");
+        assert!(runtime.resumed());
+        assert_ne!(runtime.path().as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            runtime
+                .header()
+                .expect("fork header")
+                .parent_session
+                .as_deref(),
+            Some("legacy-source")
+        );
+        assert_eq!(runtime.agent().state().messages.len(), 2);
+        close(&mut runtime);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1775,6 +1929,39 @@ mod tests {
     }
 
     #[test]
+    fn switching_attaches_the_target_before_closing_the_current_recorder() {
+        let root = temp_root("switch");
+        let cwd = root.join("workspace");
+        let mut current = SessionRuntime::open(options(&root, &cwd)).expect("open current");
+        current.agent().prompt("current question").expect("prompt");
+        let original = current.handle().expect("current handle");
+
+        let mut target = SessionRuntime::open(options(&root, &cwd)).expect("open target");
+        target.agent().prompt("target question").expect("prompt");
+        let target_handle = target.handle().expect("target handle");
+        close(&mut target);
+
+        let switched = current
+            .switch_to(&target_handle.id)
+            .expect("attach target before closing current");
+        assert_eq!(switched.id, target_handle.id);
+        current
+            .agent()
+            .prompt("only in target")
+            .expect("record after switch");
+        assert!(
+            String::from_utf8_lossy(&fs::read(&target_handle.path).expect("target log"))
+                .contains("only in target")
+        );
+        assert!(
+            !String::from_utf8_lossy(&fs::read(&original.path).expect("original log"))
+                .contains("only in target")
+        );
+        close(&mut current);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn branches_labels_clone_exports_and_imports_delegate_to_the_session_store() {
         let root = temp_root("tree");
         let cwd = root.join("workspace");
@@ -1789,7 +1976,6 @@ mod tests {
         );
 
         let original = runtime.handle().expect("original");
-        let original_bytes = fs::read(&original.path).expect("read original");
         runtime.fork_to(2).expect("rewind");
         assert_eq!(runtime.agent().state().messages.len(), 3);
         assert_eq!(
@@ -1800,6 +1986,7 @@ mod tests {
             .agent()
             .prompt("different direction")
             .expect("branch prompt");
+        let original_bytes = fs::read(&original.path).expect("read original");
 
         let clone = runtime.clone_session().expect("clone");
         assert_ne!(clone.id, original.id);
@@ -1855,10 +2042,12 @@ mod tests {
         let model_requests = Arc::new(AtomicUsize::new(0));
         let request_count = model_requests.clone();
 
-        let mut first = options(&root, &cwd);
-        first.on_notice = Some(Arc::new(move |_| {
+        let mut first_options = options(&root, &cwd);
+        first_options.selection = SessionSelection::Continue;
+        first_options.on_notice = Some(Arc::new(move |_| {
             notice_count.fetch_add(1, Ordering::Relaxed);
         }));
+        let mut first = SessionRuntime::open(first_options).expect("open");
         first
             .record_custom("planner", serde_json::json!({"phase": "review"}))
             .expect("record custom");
@@ -1882,7 +2071,7 @@ mod tests {
             second.restored().custom.get("planner"),
             Some(&serde_json::json!({"phase": "review"}))
         );
-        assert_eq!(notices.load(Ordering::Relaxed), 0);
+        assert_eq!(notices.load(Ordering::Relaxed), 1);
         close(&mut second);
         let _ = fs::remove_dir_all(root);
     }
