@@ -665,6 +665,13 @@ impl SidebarLine {
         }
     }
 
+    pub fn todo(complete: bool, value: impl Into<String>) -> Self {
+        Self {
+            kind: SidebarKind::Todo { complete },
+            value: value.into(),
+        }
+    }
+
     pub fn blank() -> Self {
         Self {
             kind: SidebarKind::Blank,

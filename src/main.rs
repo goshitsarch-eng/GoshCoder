@@ -2895,10 +2895,11 @@ fn runtime_sidebar(
         .as_ref()
         .map(|workspace| workspace.root().display().to_string())
         .unwrap_or_else(|| prepared.config.workdir.display().to_string());
-    let mode = prepared.planner.as_ref().map_or_else(
-        || "normal".to_owned(),
-        planner_runtime::PlannerRuntime::status_line,
-    );
+    let planner_state = prepared
+        .planner
+        .as_ref()
+        .map(|planner| planner.manager().state());
+    let (mode, todo_items) = planner_sidebar_details(planner_state);
     let mut lines = vec![
         state::SidebarLine::title(name),
         state::SidebarLine::accent(format!("{}/{}", state.model.provider, state.model.id)),
@@ -2942,6 +2943,17 @@ fn runtime_sidebar(
             lines.push(state::SidebarLine::meta(view.recent_tool.clone()));
         }
     }
+    if !todo_items.is_empty() {
+        lines.extend([
+            state::SidebarLine::blank(),
+            state::SidebarLine::section("Todo"),
+        ]);
+        lines.extend(
+            todo_items
+                .into_iter()
+                .map(|item| state::SidebarLine::todo(item.completed, item.text)),
+        );
+    }
     lines.extend([
         state::SidebarLine::blank(),
         state::SidebarLine::section("Workspace"),
@@ -2950,6 +2962,20 @@ fn runtime_sidebar(
         state::SidebarLine::brand(format!("● GoshCoder v{}", ui_version())),
     ]);
     lines
+}
+
+fn planner_sidebar_details(
+    planner_state: Option<plannotator::State>,
+) -> (String, Vec<plannotator::ChecklistItem>) {
+    let Some(planner_state) = planner_state else {
+        return ("normal".to_owned(), Vec::new());
+    };
+    let mode = match planner_state.phase {
+        plannotator::Phase::Planning => "planning",
+        plannotator::Phase::Executing => "executing",
+        plannotator::Phase::Idle | plannotator::Phase::Unknown(_) => "normal",
+    };
+    (mode.to_owned(), planner_state.items)
 }
 
 fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String {
@@ -3371,5 +3397,38 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn planner_sidebar_uses_compact_mode_and_keeps_checklist_items() {
+        let items = vec![
+            plannotator::ChecklistItem {
+                step: 1,
+                text: "inspect the workspace".to_owned(),
+                completed: true,
+            },
+            plannotator::ChecklistItem {
+                step: 2,
+                text: "implement the change".to_owned(),
+                completed: false,
+            },
+        ];
+        let (mode, visible_items) = planner_sidebar_details(Some(plannotator::State {
+            phase: plannotator::Phase::Executing,
+            items: items.clone(),
+            ..plannotator::State::default()
+        }));
+        assert_eq!(mode, "executing");
+        assert_eq!(visible_items, items);
+
+        let (idle_mode, retained_items) = planner_sidebar_details(Some(plannotator::State {
+            phase: plannotator::Phase::Idle,
+            items,
+            ..plannotator::State::default()
+        }));
+        assert_eq!(idle_mode, "normal");
+        assert_eq!(retained_items.len(), 2);
+        assert!(retained_items[0].completed);
+        assert!(!retained_items[1].completed);
     }
 }
