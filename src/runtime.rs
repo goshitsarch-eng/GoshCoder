@@ -312,8 +312,8 @@ pub fn default_chat_model_reference(
     }
 
     Err(RuntimeError::Catalog(
-        "no authenticated model is available; run `goshcoder auth login openai-codex` or pass -m provider/model"
-            .to_owned(),
+            "no authenticated model is available; run `goshcoder auth set <provider>` or set a provider API-key environment variable, then pass -m provider/model"
+                .to_owned(),
     ))
 }
 
