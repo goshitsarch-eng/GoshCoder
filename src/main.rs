@@ -74,9 +74,10 @@ Usage:
 
 The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
 model, credential, and context-compaction foundations are active. `run`
-supports the OpenAI, Anthropic, and Bedrock provider protocols; remaining
-provider extensions and interactive commands are still being migrated from the
-previous implementation.
+supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
+`openai-codex-responses`, `anthropic-messages`, and `bedrock-converse-stream`;
+the remaining provider extensions and interactive commands are still being
+migrated from the previous implementation.
 "#;
 
 fn main() {
