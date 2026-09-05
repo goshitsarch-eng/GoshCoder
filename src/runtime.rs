@@ -486,7 +486,7 @@ fn web_search_model(catalog: &Catalog, provider_id: &str) -> String {
     }
     catalog
         .provider(provider_id)
-        .and_then(|provider| provider.models().last().map(|model| model.id))
+        .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
         .unwrap_or_else(|| webaccess::DEFAULT_SEARCH_MODEL.to_owned())
 }
 
@@ -795,9 +795,9 @@ mod tests {
             Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
         )
         .expect("catalog");
-        let model = catalog
+        let model_id = catalog
             .provider("openai")
-            .and_then(|provider| provider.models().last())
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
             .expect("OpenAI model");
         let directory = std::env::temp_dir().join(format!(
             "goshcoder-runtime-web-search-{}-{}",
@@ -812,7 +812,7 @@ mod tests {
         let mut prepared = prepare_session(
             &catalog,
             SessionConfig {
-                model_ref: format!("openai/{}", model.id),
+                model_ref: format!("openai/{model_id}"),
                 workdir: directory.clone(),
                 enable_tools: true,
                 no_session: true,

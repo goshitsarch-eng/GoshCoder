@@ -162,26 +162,6 @@ impl App {
         suggestions_for(&self.input)
     }
 
-    pub fn accept_submission(&mut self, prompt: String, follow_up: bool) {
-        self.record_submission(&prompt);
-        self.messages.push(Message {
-            role: MessageRole::User,
-            text: prompt,
-            ..Message::default()
-        });
-        self.messages.push(Message {
-            role: MessageRole::Notice,
-            text: if follow_up {
-                "Follow-up captured by the Ratatui UI. Agent queue support is being ported."
-            } else {
-                "Prompt captured by the Ratatui UI. Agent execution is being ported."
-            }
-            .to_owned(),
-            ..Message::default()
-        });
-        self.status = "Ready".to_owned();
-    }
-
     /// Clears the composer and remembers a submitted value without adding
     /// placeholder transcript messages. A live runtime owns transcript rows
     /// through its agent state, so the same input cannot be rendered twice.
@@ -198,10 +178,6 @@ impl App {
     /// and selection state consistent with a completed submission.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
-    }
-
-    pub fn add_message(&mut self, message: Message) {
-        self.messages.push(message);
     }
 
     /// Sets whether Ctrl-C can safely exit an already-recorded session.
