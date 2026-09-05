@@ -109,12 +109,13 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(
                     app.streaming = false;
                     app.status = "No active response to abort".to_owned();
                 }
-                Action::Submit(prompt) => {
-                    if dispatch_slash_command(&mut app, &prompt) {
-                        return Ok(());
+                Action::Submit(prompt) => match dispatch_slash_command(&mut app, &prompt) {
+                    CommandDispatch::Quit => return Ok(()),
+                    CommandDispatch::Handled => {}
+                    CommandDispatch::NotCommand => {
+                        app.accept_submission(prompt, false);
                     }
-                    app.accept_submission(prompt, false);
-                }
+                },
                 Action::FollowUp(prompt) => {
                     app.accept_submission(prompt, true);
                 }
@@ -130,16 +131,23 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(
     }
 }
 
-/// Returns true when the command ends the interactive session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandDispatch {
+    NotCommand,
+    Handled,
+    Quit,
+}
+
+/// Records a known slash command and reports whether it was handled.
 ///
 /// This small command set is deliberately self-contained: it gives the
 /// Ratatui frontend useful behavior while the complete provider, session, and
 /// extension command implementations are ported behind it.
-fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
+fn dispatch_slash_command(app: &mut App, input: &str) -> CommandDispatch {
     let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
     let rest = rest.trim();
     match command {
-        "/exit" | "/quit" => true,
+        "/exit" | "/quit" => CommandDispatch::Quit,
         "/help" | "/?" => {
             app.accept_submission(input.to_owned(), false);
             app.add_message(Message {
@@ -148,7 +156,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                     .to_owned(),
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
         "/hotkeys" => {
             app.accept_submission(input.to_owned(), false);
@@ -158,7 +166,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                     .to_owned(),
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
         "/clear" | "/new" => {
             app.messages.clear();
@@ -169,7 +177,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                 ..Message::default()
             });
             app.status = "Transcript cleared".to_owned();
-            false
+            CommandDispatch::Handled
         }
         "/status" | "/session" | "/sidebar" => {
             app.accept_submission(input.to_owned(), false);
@@ -179,7 +187,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                     .to_owned(),
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
         "/messages" => {
             app.accept_submission(input.to_owned(), false);
@@ -199,7 +207,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                 },
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
         "/model" | "/login" | "/thinking" | "/tools" | "/resources" if rest.is_empty() => {
             app.accept_submission(input.to_owned(), false);
@@ -208,7 +216,7 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                 text: format!("{command} is wired into the Ratatui command palette; its runtime behavior is being ported."),
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
         _ if command.starts_with('/') => {
             app.accept_submission(input.to_owned(), false);
@@ -220,9 +228,9 @@ fn dispatch_slash_command(app: &mut App, input: &str) -> bool {
                 is_error: true,
                 ..Message::default()
             });
-            false
+            CommandDispatch::Handled
         }
-        _ => false,
+        _ => CommandDispatch::NotCommand,
     }
 }
 
@@ -245,7 +253,10 @@ mod tests {
             ..Message::default()
         });
 
-        assert!(!dispatch_slash_command(&mut app, "/clear"));
+        assert_eq!(
+            dispatch_slash_command(&mut app, "/clear"),
+            CommandDispatch::Handled
+        );
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].text.contains("cleared"));
     }
