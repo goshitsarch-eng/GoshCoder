@@ -136,6 +136,16 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(
                     app.streaming = false;
                     app.status = "No active response to abort".to_owned();
                 }
+                Action::CycleModel { direction } => {
+                    app.status = if direction < 0 {
+                        "Previous-model selection requested".to_owned()
+                    } else {
+                        "Next-model selection requested".to_owned()
+                    };
+                }
+                Action::CycleThinking => {
+                    app.status = "Thinking-level selection requested".to_owned();
+                }
                 Action::Submit(prompt) => match dispatch_slash_command(&mut app, &prompt) {
                     CommandDispatch::Quit => return Ok(()),
                     CommandDispatch::Handled => {}
