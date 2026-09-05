@@ -4472,7 +4472,10 @@ mod tests {
         collections::BTreeMap,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        sync::mpsc::{self, Receiver},
+        sync::{
+            Arc, Mutex,
+            mpsc::{self, Receiver},
+        },
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -5051,12 +5054,17 @@ mod tests {
         ]);
         let mut request_model = model(API_AZURE_OPENAI_RESPONSES, String::new());
         request_model.reasoning = true;
+        let observed_events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&observed_events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            event_log
+                .lock()
+                .expect("event log lock")
+                .push(event.event_type);
+        }));
         let response = factory_with_credentials(0, credentials)
-            .respond(
-                &request_model,
-                &text_context(),
-                options(agent::CancellationToken::default()),
-            )
+            .respond(&request_model, &text_context(), request_options)
             .expect("Azure Responses response");
         let request = requests.recv().expect("captured Azure request");
         server.join().expect("Azure test server finishes");
@@ -5083,6 +5091,10 @@ mod tests {
         assert_eq!(response.response_id, "resp_azure");
         assert_eq!(response.content[0].plain_text(), Some("Azure says hi"));
         assert_eq!(response.usage.total_tokens, 8);
+        let observed_events = observed_events.lock().expect("event log lock");
+        assert!(observed_events.contains(&stream::EVENT_START.to_owned()));
+        assert!(observed_events.contains(&stream::EVENT_TEXT_DELTA.to_owned()));
+        assert!(observed_events.contains(&stream::EVENT_DONE.to_owned()));
     }
 
     #[test]
