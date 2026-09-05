@@ -23,6 +23,7 @@ pub mod ralph_runtime;
 pub mod resources;
 pub mod runtime;
 pub mod session;
+pub mod session_picker;
 pub mod sessionlog;
 pub mod sessions;
 mod state;
@@ -358,7 +359,8 @@ fn bold(text: &str, color: bool) -> String {
 }
 
 fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let invocation = runtime::parse_chat(arguments)?;
+    let mut invocation = runtime::parse_chat(arguments)?;
+    choose_resume_session(&mut invocation.config)?;
     if !invocation.config.fullscreen || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return run_line_interactive(invocation);
     }
@@ -421,6 +423,34 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     terminal_cleanup?;
     session_cleanup?;
     result
+}
+
+/// Resolves `chat -resume` before the frontend creates a session runtime.
+///
+/// Session selection must happen before opening the log so a picked existing
+/// session follows the ordinary durable-session lifecycle, including its
+/// existing-model and read-only/busy handling.
+fn choose_resume_session(config: &mut runtime::SessionConfig) -> Result<(), Box<dyn Error>> {
+    if !config.resume {
+        return Ok(());
+    }
+    let cwd = runtime::absolute_workdir(&config.workdir)?;
+    let store = sessionlog::Store::new(
+        config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(config::sessions_dir),
+    );
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    let mut input = stdin.lock();
+    let mut output = stderr.lock();
+    let selected = session_picker::choose_session(&store, &cwd, &mut input, &mut output)?;
+    config.resume = false;
+    if let Some(selected) = selected {
+        config.session_ref = Some(selected.id);
+    }
+    Ok(())
 }
 
 /// Runs the pipe-friendly chat fallback used when the alternate-screen

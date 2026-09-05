@@ -763,7 +763,9 @@ fn thinking_level_names() -> [&'static str; 7] {
     ]
 }
 
-fn absolute_workdir(workdir: &Path) -> Result<PathBuf> {
+/// Resolves the configured working directory exactly as session construction
+/// does, without canonicalizing it away from the persisted session shard.
+pub fn absolute_workdir(workdir: &Path) -> Result<PathBuf> {
     if workdir.is_absolute() {
         return Ok(workdir.to_path_buf());
     }
