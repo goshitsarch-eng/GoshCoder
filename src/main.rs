@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod catalog;
+pub mod computeruse;
 pub mod config;
 pub mod llm;
 pub mod markdown;
