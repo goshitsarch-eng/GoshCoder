@@ -1139,11 +1139,16 @@ fn open_target(
         opened
             .notices
             .push("opened read-only; this session is not being saved".to_owned());
+        append_workspace_mismatch_notice(&mut opened, &target, cwd);
         return Ok(opened);
     }
 
     match store.attach(&target.path) {
-        Ok((writer, report)) => Ok(opened_existing(writer, report)),
+        Ok((writer, report)) => {
+            let mut opened = opened_existing(writer, report);
+            append_workspace_mismatch_notice(&mut opened, &target, cwd);
+            Ok(opened)
+        }
         Err(SessionError::LegacyFormat(version)) => {
             let (_, _, report) = store.load(&target.path)?;
             let writer = store.fork(&target, None, cwd)?;
@@ -1152,6 +1157,7 @@ fn open_target(
                 "{} is an older pi session (v{version}); it was copied into a new session so it can be continued",
                 target.short_id()
             ));
+            append_workspace_mismatch_notice(&mut opened, &target, cwd);
             Ok(opened)
         }
         Err(SessionError::Busy(owner)) => {
@@ -1161,10 +1167,34 @@ fn open_target(
                 "{} is open in another process ({owner}); continuing read-only, so this conversation is not being saved",
                 target.short_id()
             ));
+            append_workspace_mismatch_notice(&mut opened, &target, cwd);
             Ok(opened)
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn append_workspace_mismatch_notice(
+    opened: &mut OpenedSession,
+    target: &SessionInfo,
+    current_workspace: &Path,
+) {
+    let recorded_workspace = target.cwd.trim();
+    if recorded_workspace.is_empty() || recorded_workspace == current_workspace.to_string_lossy() {
+        return;
+    }
+    let notice = if fs::metadata(recorded_workspace).is_ok() {
+        format!(
+            "this session was started in {recorded_workspace}; tools will operate on {} instead",
+            current_workspace.display()
+        )
+    } else {
+        format!(
+            "this session's original workspace {recorded_workspace} no longer exists; tools will operate on {} instead",
+            current_workspace.display()
+        )
+    };
+    opened.notices.push(notice);
 }
 
 fn restored_thinking(options: &SessionOptions, opened: &OpenedSession) -> llm::ThinkingLevel {
@@ -1798,6 +1828,57 @@ mod tests {
         assert!(!root.join("sessions").exists());
 
         close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_sessions_report_when_tools_move_to_a_different_workspace() {
+        let root = temp_root("workspace-notice");
+        let original = root.join("original");
+        let current = root.join("current");
+        fs::create_dir_all(&original).expect("create original workspace");
+        fs::create_dir_all(&current).expect("create current workspace");
+        let target = SessionInfo {
+            id: "session-id".to_owned(),
+            path: root.join("session.jsonl"),
+            cwd: original.to_string_lossy().into_owned(),
+            name: String::new(),
+            first_message: String::new(),
+            created: None,
+            modified: UNIX_EPOCH,
+            messages: 0,
+            cleared: 0,
+            size: 0,
+            search_text: String::new(),
+            locked: false,
+            owner: sessionlog::LockOwner::default(),
+        };
+        let mut opened = OpenedSession {
+            writer: None,
+            restored: RestoredSession::default(),
+            notices: Vec::new(),
+            resumed: true,
+        };
+
+        append_workspace_mismatch_notice(&mut opened, &target, &current);
+
+        assert_eq!(
+            opened.notices,
+            vec![format!(
+                "this session was started in {}; tools will operate on {} instead",
+                original.display(),
+                current.display()
+            )]
+        );
+        fs::remove_dir_all(&original).expect("remove original workspace");
+        append_workspace_mismatch_notice(&mut opened, &target, &current);
+        assert!(
+            opened
+                .notices
+                .last()
+                .expect("missing-workspace notice")
+                .contains("original workspace")
+        );
         let _ = fs::remove_dir_all(root);
     }
 

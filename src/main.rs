@@ -429,6 +429,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some(responder),
         Vec::new(),
     )?;
+    remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
     let (agent_event_sender, agent_event_receiver) = mpsc::sync_channel(64);
     let (turn_sender, turn_receiver) = mpsc::channel();
@@ -530,6 +531,7 @@ fn run_line_interactive(mut invocation: runtime::Invocation) -> Result<(), Box<d
         Some(responder),
         Vec::new(),
     )?;
+    remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
     let render_lock = Arc::new(Mutex::new(()));
     let color = color_enabled();
@@ -623,6 +625,9 @@ fn line_interactive_loop(
             } else {
                 eprintln!("{}", dim(&banner, color_enabled()));
             }
+        }
+        if let Some(hint) = session_continue_hint(&prepared.runtime) {
+            eprintln!("{}", dim(&hint, color_enabled()));
         }
         if interactive {
             let state = prepared.runtime.agent().state();
@@ -725,6 +730,33 @@ fn line_interactive_loop(
         }
     }
     Ok(())
+}
+
+/// Remembers the resolved chat model only after its session is successfully
+/// constructed, mirroring the established chat startup behavior. A failed
+/// configuration write must not prevent an otherwise usable conversation.
+fn remember_default_model(prepared: &runtime::PreparedSession) {
+    let model = prepared.runtime.agent().state().model;
+    let _ = config::write_default_model(&model_reference(&model));
+}
+
+fn model_reference(model: &llm::Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+fn session_continue_hint(runtime: &session::SessionRuntime) -> Option<String> {
+    continue_session_hint(runtime.recording(), runtime.id().as_deref())
+}
+
+fn continue_session_hint(recording: bool, session_id: Option<&str>) -> Option<String> {
+    recording.then(|| {
+        session_id.map(|id| {
+            format!(
+                "session {} · resume with: goshcoder chat -continue",
+                short_id(id)
+            )
+        })
+    })?
 }
 
 fn render_line_view(view: &mut InteractiveView) {
@@ -3913,6 +3945,28 @@ mod tests {
             "kimi-coding"
         );
         assert!(onboarding_provider("4").is_err());
+    }
+
+    #[test]
+    fn continue_hint_only_promises_a_durable_session() {
+        assert_eq!(
+            continue_session_hint(true, Some("12345678-1234-7000-8000-000000000000")),
+            Some("session 12345678 · resume with: goshcoder chat -continue".to_owned())
+        );
+        assert_eq!(continue_session_hint(false, Some("saved")), None);
+        assert_eq!(continue_session_hint(true, None), None);
+    }
+
+    #[test]
+    fn model_reference_matches_the_persisted_chat_default_format() {
+        assert_eq!(
+            model_reference(&llm::Model {
+                provider: "anthropic".to_owned(),
+                id: "claude".to_owned(),
+                ..llm::Model::default()
+            }),
+            "anthropic/claude"
+        );
     }
 
     #[test]
