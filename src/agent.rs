@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Number, Value};
 
 use crate::llm;
 
@@ -579,8 +579,9 @@ impl Agent {
             Ok(messages) => messages,
             Err(_) => {
                 let error = self.error_message("the agent runtime panicked");
-                self.record_message(error.clone());
-                vec![error]
+                let message = llm::Message::Assistant(Box::new(error));
+                self.record_message(message.clone());
+                vec![message]
             }
         };
         let mut event = Event::kind(EventKind::AgentEnd);
@@ -938,10 +939,8 @@ fn prepare_tool_call(
     call: llm::ToolCall,
 ) -> std::result::Result<PreparedToolCall, ToolOutcome> {
     let Some(tool) = tools.iter().find(|tool| tool.name == call.name).cloned() else {
-        return Err(ToolOutcome::error(
-            call,
-            format!("Tool {} not found", call.name),
-        ));
+        let message = format!("Tool {} not found", call.name);
+        return Err(ToolOutcome::error(call, message));
     };
     let arguments = tool.prepare_arguments.as_ref().map_or_else(
         || call.arguments.clone(),
@@ -1213,8 +1212,8 @@ mod tests {
 
         agent.prompt("run tools").expect("prompt");
         assert_eq!(requests.load(Ordering::Relaxed), 2);
-        let result_ids = agent
-            .state()
+        let state = agent.state();
+        let result_ids = state
             .messages
             .iter()
             .filter_map(|message| match message {
