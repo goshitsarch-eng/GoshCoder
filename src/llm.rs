@@ -354,8 +354,8 @@ impl Default for ToolResultMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     User(UserMessage),
-    Assistant(AssistantMessage),
-    ToolResult(ToolResultMessage),
+    Assistant(Box<AssistantMessage>),
+    ToolResult(Box<ToolResultMessage>),
 }
 
 impl Message {
@@ -408,9 +408,11 @@ impl<'de> Deserialize<'de> for Message {
                 .map(Self::User)
                 .map_err(D::Error::custom),
             "assistant" => AssistantMessage::deserialize(decode(value))
+                .map(Box::new)
                 .map(Self::Assistant)
                 .map_err(D::Error::custom),
             "toolResult" => ToolResultMessage::deserialize(decode(value))
+                .map(Box::new)
                 .map(Self::ToolResult)
                 .map_err(D::Error::custom),
             other => Err(D::Error::custom(format!(
@@ -548,7 +550,7 @@ mod tests {
 
     #[test]
     fn session_messages_keep_pi_json_shapes() {
-        let message = Message::Assistant(AssistantMessage {
+        let message = Message::Assistant(Box::new(AssistantMessage {
             api: "anthropic-messages".to_owned(),
             provider: "anthropic".to_owned(),
             model: "claude-sonnet-5".to_owned(),
@@ -568,7 +570,7 @@ mod tests {
             stop_reason: "toolUse".to_owned(),
             timestamp: 2,
             ..AssistantMessage::default()
-        });
+        }));
 
         let encoded = serde_json::to_value(&message).expect("encode");
         assert_eq!(encoded["role"], "assistant");
