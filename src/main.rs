@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod aperture;
+pub mod aperture_cli;
 pub mod aperture_mcp;
 pub mod bedrock;
 pub mod btw;
@@ -100,6 +101,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("models") => provider_cli::models_command(&args[1..]),
         Some("auth") => provider_cli::auth_command(&args[1..]),
         Some("omni") => omni_cli::command(&args[1..]),
+        Some("aperture") => aperture_cli::command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),
