@@ -8,7 +8,9 @@
 use std::{
     cmp::{max, min},
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::to_string;
@@ -25,6 +27,8 @@ pub const MAX_TOOL_RESULT_BYTES: usize = 2_000;
 pub const SUMMARY_OPEN: &str = "<conversation-summary>";
 /// Closing delimiter for [`SUMMARY_OPEN`].
 pub const SUMMARY_CLOSE: &str = "</conversation-summary>";
+/// Upper bound for the isolated summary request.
+pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// A completed live or automatic compaction.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +45,7 @@ pub enum CompactionError {
     Busy,
     InsufficientHistory,
     EmptyHistory,
+    Timeout,
     Summary(String),
     Agent(agent::AgentError),
 }
@@ -55,6 +60,7 @@ impl fmt::Display for CompactionError {
             Self::EmptyHistory => {
                 formatter.write_str("conversation history contains no summarizable text")
             }
+            Self::Timeout => formatter.write_str("context compaction timed out after 10 minutes"),
             Self::Summary(message) => {
                 write!(formatter, "context compaction summary failed: {message}")
             }
@@ -67,7 +73,11 @@ impl std::error::Error for CompactionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::Busy | Self::InsufficientHistory | Self::EmptyHistory | Self::Summary(_) => None,
+            Self::Busy
+            | Self::InsufficientHistory
+            | Self::EmptyHistory
+            | Self::Timeout
+            | Self::Summary(_) => None,
         }
     }
 }
@@ -407,6 +417,16 @@ fn generate_summary(
     source: &str,
     instructions: &str,
 ) -> Result<String> {
+    generate_summary_with_timeout(source_agent, model, source, instructions, SUMMARY_TIMEOUT)
+}
+
+fn generate_summary_with_timeout(
+    source_agent: &agent::Agent,
+    model: &llm::Model,
+    source: &str,
+    instructions: &str,
+    timeout: Duration,
+) -> Result<String> {
     let thinking_level = stream::clamp_thinking_level(model, llm::THINKING_LOW);
     let summarizer = agent::Agent::new(agent::AgentOptions {
         initial_state: agent::InitialState {
@@ -431,7 +451,23 @@ fn generate_summary(
     let prompt = format!(
         "Summarize the serialized conversation below for another coding agent using exactly this structure:\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n## Critical Context\n<read-files>\n</read-files>\n<modified-files>\n</modified-files>\n{focus}\n<conversation>\n{source}\n</conversation>"
     );
-    summarizer.prompt(prompt).map_err(CompactionError::Agent)?;
+    let worker = summarizer.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(worker.prompt(prompt));
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map_err(CompactionError::Agent)?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            summarizer.abort();
+            return Err(CompactionError::Timeout);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(CompactionError::Summary(
+                "compaction summary worker stopped unexpectedly".to_owned(),
+            ));
+        }
+    }
     let state = summarizer.state();
     if !state.error_message.is_empty() {
         return Err(CompactionError::Summary(state.error_message));
@@ -474,7 +510,11 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use super::*;
 
@@ -552,6 +592,35 @@ mod tests {
             measured_context_tokens(&compacted),
             estimate_messages_tokens(&compacted)
         );
+    }
+
+    #[test]
+    fn summary_timeout_aborts_the_helper_agent() {
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let source_agent = agent::Agent::new(agent::AgentOptions {
+            responder: Some(Arc::new(move |_, _, options| {
+                while !options.cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let _ = stopped_sender.send(());
+                Err("request aborted".to_owned())
+            })),
+            ..agent::AgentOptions::default()
+        });
+
+        let error = generate_summary_with_timeout(
+            &source_agent,
+            &model(),
+            "[User]: old context",
+            "",
+            Duration::from_millis(100),
+        )
+        .expect_err("the helper must time out");
+
+        assert!(matches!(error, CompactionError::Timeout));
+        stopped_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the timed-out helper was aborted");
     }
 
     #[test]
