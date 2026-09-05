@@ -2759,7 +2759,7 @@ mod tests {
             );
             append_test_archive_entry(
                 &mut archive,
-                "user/../../.ssh/authorized_keys.md",
+                "untrusted/authorized_keys.md",
                 EntryType::Regular,
                 b"not a prompt",
             );
