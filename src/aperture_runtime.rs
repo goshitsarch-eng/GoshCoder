@@ -149,11 +149,7 @@ fn session_start(
         return;
     }
 
-    let timeouts = aperture_mcp::McpTimeouts {
-        initialization: aperture_mcp::MCP_INITIALIZATION_TIMEOUT,
-        call: std::time::Duration::from_secs(15),
-        initialized_notification: aperture_mcp::MCP_NOTIFICATION_TIMEOUT,
-    };
+    let timeouts = connector_timeouts();
     let session = match aperture_mcp::McpClient::new(&gateway)
         .map(|client| client.with_timeouts(timeouts))
         .and_then(|client| client.initialize_with(&cancellation))
@@ -213,6 +209,14 @@ fn session_start(
     }
     if !connector_tools.tools.is_empty() && !cancellation.is_cancelled() {
         install_tools(connector_tools.tools);
+    }
+}
+
+fn connector_timeouts() -> aperture_mcp::McpTimeouts {
+    aperture_mcp::McpTimeouts {
+        initialization: aperture_mcp::MCP_INITIALIZATION_TIMEOUT,
+        call: aperture_mcp::MCP_CALL_TIMEOUT,
+        initialized_notification: aperture_mcp::MCP_NOTIFICATION_TIMEOUT,
     }
 }
 
@@ -398,6 +402,12 @@ mod tests {
             }
         });
         (format!("http://{address}"), receiver, worker)
+    }
+
+    #[test]
+    fn connector_calls_use_the_shared_mcp_timeout() {
+        assert_eq!(connector_timeouts().call, aperture_mcp::MCP_CALL_TIMEOUT);
+        assert_eq!(connector_timeouts().call, Duration::from_secs(60));
     }
 
     #[test]
