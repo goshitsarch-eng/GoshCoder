@@ -1532,7 +1532,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, OmniRoute, and fullscreen Aperture onboarding are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1816,6 +1816,13 @@ fn dispatch_runtime_slash_command(
         }
         "/export" => dispatch_session_export_slash_command(view, prepared, rest, fullscreen),
         "/import" => dispatch_session_import_slash_command(view, prepared, rest, fullscreen),
+        "/aperture" => dispatch_aperture_slash_command(view, catalog, rest, None, fullscreen),
+        "/aperture:onboarding" => {
+            dispatch_aperture_slash_command(view, catalog, rest, Some("onboarding"), fullscreen)
+        }
+        "/aperture:settings" => {
+            dispatch_aperture_slash_command(view, catalog, rest, Some("settings"), fullscreen)
+        }
         "/resources" => {
             let resources = prepared.resources();
             append_view_message(
@@ -2135,6 +2142,34 @@ fn dispatch_session_import_slash_command(
                     short_id(&handle.id),
                     handle.id
                 ),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn dispatch_aperture_slash_command(
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    rest: &str,
+    alias: Option<&str>,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let mut arguments = alias.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
+    arguments.extend(rest.split_whitespace().map(ToOwned::to_owned));
+    match aperture_cli::execute(&arguments, !fullscreen) {
+        Ok(output) => {
+            catalog.reload_aperture_state();
+            view.activity = "Aperture command completed".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Command,
+                if output.is_empty() {
+                    "Aperture command completed.".to_owned()
+                } else {
+                    output
+                },
             );
         }
         Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),

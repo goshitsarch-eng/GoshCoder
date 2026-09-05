@@ -76,7 +76,11 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn execute(arguments: &[String], interactive: bool) -> CliResult<String> {
+/// Executes an Aperture command and returns its safe, terminal-ready output.
+///
+/// The interactive frontend uses this instead of writing directly to stdout,
+/// so status, sync, and settings results remain visible in its transcript.
+pub fn execute(arguments: &[String], interactive: bool) -> Result<String, Box<dyn Error>> {
     let (subcommand, remaining) = parse_invocation(arguments)?;
     match subcommand {
         Subcommand::Status => status_command(),

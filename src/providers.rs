@@ -848,8 +848,9 @@ impl ProviderResponderFactory {
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            let aperture_state = catalog.aperture_state();
             let routed_model = aperture::rewrite_request_model(
-                Some(catalog.aperture_state()),
+                Some(&aperture_state),
                 &resolved.model,
                 &options.session_id,
             );

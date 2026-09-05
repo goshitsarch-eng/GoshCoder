@@ -1947,7 +1947,7 @@ pub struct Catalog {
     oauth_client: Arc<oauth::OAuthClient>,
     oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
     aperture_paths: AperturePaths,
-    aperture_state: Arc<OnceLock<aperture::ApertureState>>,
+    aperture_state: Arc<Mutex<Option<aperture::ApertureState>>>,
 }
 
 impl Catalog {
@@ -1988,7 +1988,7 @@ impl Catalog {
             config: configuration.into(),
             cache: cache.into(),
         };
-        self.aperture_state = Arc::new(OnceLock::new());
+        self.aperture_state = Arc::new(Mutex::new(None));
         self
     }
 
@@ -2008,7 +2008,7 @@ impl Catalog {
             oauth_client: Arc::new(oauth_client),
             oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
             aperture_paths: AperturePaths::default(),
-            aperture_state: Arc::new(OnceLock::new()),
+            aperture_state: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -2040,9 +2040,20 @@ impl Catalog {
     /// Returns Aperture's immutable dedicated/proxy routing state for this
     /// catalog. Configuration errors leave the static catalog usable; the
     /// Aperture management command reports those errors explicitly.
-    pub fn aperture_state(&self) -> &aperture::ApertureState {
-        self.aperture_state
-            .get_or_init(|| self.build_aperture_state())
+    pub fn aperture_state(&self) -> aperture::ApertureState {
+        let mut state = lock_unpoisoned(&self.aperture_state);
+        if state.is_none() {
+            *state = Some(self.build_aperture_state());
+        }
+        state.clone().expect("Aperture state was initialized")
+    }
+
+    /// Re-reads Aperture configuration and cache after a successful gateway
+    /// sync, so an already-open interactive session can select fresh models.
+    pub fn reload_aperture_state(&self) -> aperture::ApertureState {
+        let state = self.build_aperture_state();
+        *lock_unpoisoned(&self.aperture_state) = Some(state.clone());
+        state
     }
 
     fn build_aperture_state(&self) -> aperture::ApertureState {
@@ -2072,7 +2083,8 @@ impl Catalog {
     }
 
     fn aperture_proxy_auth(&self, provider_id: &str) -> Option<Auth> {
-        let route = self.aperture_state().routes.get(provider_id)?;
+        let state = self.aperture_state();
+        let route = state.routes.get(provider_id)?;
         (!route.passthrough).then(|| {
             Auth::with_api_key(
                 "-".to_owned(),
@@ -2111,13 +2123,13 @@ impl Catalog {
             models,
             raw_compat,
         };
+        let aperture_state = self.aperture_state();
         if id == aperture::DEDICATED_PROVIDER_ID {
-            let state = self.aperture_state();
-            if state.configured && state.resolved.dedicated_enabled {
-                provider.base_url = aperture::provider_base_url(&state.resolved.base_url);
-                provider.models = state.dedicated_models.clone();
+            if aperture_state.configured && aperture_state.resolved.dedicated_enabled {
+                provider.base_url = aperture::provider_base_url(&aperture_state.resolved.base_url);
+                provider.models = aperture_state.dedicated_models.clone();
             }
-        } else if let Some(route) = self.aperture_state().routes.get(id) {
+        } else if let Some(route) = aperture_state.routes.get(id) {
             provider.models = provider
                 .models
                 .iter()
@@ -2823,6 +2835,7 @@ mod tests {
             .aperture_state()
             .routes
             .get("openai")
+            .cloned()
             .expect("OpenAI proxy route");
         let provider = catalog.provider("openai").expect("proxied OpenAI provider");
         assert_eq!(provider.base_url, route.base_url);
