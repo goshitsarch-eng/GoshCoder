@@ -1126,9 +1126,7 @@ fn dispatch_runtime_slash_command(
             );
             CommandDispatch::Handled
         }
-        "/ralph" => {
-            return dispatch_ralph_slash_command(app, view, prepared, turn_sender, rest);
-        }
+        "/ralph" => dispatch_ralph_slash_command(app, view, prepared, turn_sender, rest),
         "/planner" | "/plannator" | "/plannotator" => {
             match prepared.toggle_planner() {
                 Ok(phase) => view.activity = format!("Planner: {}", phase.as_str()),

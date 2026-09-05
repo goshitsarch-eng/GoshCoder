@@ -59,7 +59,6 @@ pub struct RalphRuntime {
     store: ralph::Store,
     base_system_prompt: Arc<Mutex<String>>,
     system_prompt_sync: SystemPromptSync,
-    notices: SessionNoticeSender,
     _subscription: agent::Subscription,
 }
 
@@ -86,7 +85,6 @@ impl RalphRuntime {
             store,
             base_system_prompt,
             system_prompt_sync,
-            notices,
             _subscription: subscription,
         };
         integration.sync_agent()?;
@@ -165,16 +163,16 @@ fn ralph_subscription(
         match store.prepare_next_turn(&base_system_prompt, &assistant) {
             Ok(preparation) => {
                 system_prompt_sync(preparation.system_prompt);
-                if preparation.completed {
-                    if let Some(state) = preparation.active_loop {
-                        notices.push(
-                            "Ralph",
-                            format!(
-                                "loop {:?} completed at iteration {}",
-                                state.name, state.iteration
-                            ),
-                        );
-                    }
+                if preparation.completed
+                    && let Some(state) = preparation.active_loop
+                {
+                    notices.push(
+                        "Ralph",
+                        format!(
+                            "loop {:?} completed at iteration {}",
+                            state.name, state.iteration
+                        ),
+                    );
                 }
             }
             Err(error) => notices.push(
