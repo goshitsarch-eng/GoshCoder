@@ -2895,6 +2895,9 @@ fn refresh_runtime_app(
         model_picker_suggestions(catalog, &state.model, query)
     });
     app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
+    app.refresh_resource_suggestions(|query| {
+        resource_palette_suggestions(&prepared.resources(), query)
+    });
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
         messages.extend(agent_messages(std::slice::from_ref(message)));
@@ -3395,6 +3398,46 @@ fn model_picker_suggestions(
         .collect()
 }
 
+fn resource_palette_suggestions(
+    resources: &resources::ResourceSet,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let query = query.to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    for template in &resources.templates {
+        let label = format!("/{}", template.name);
+        if !label.to_ascii_lowercase().starts_with(&query) {
+            continue;
+        }
+        let description = if template.argument_hint.is_empty() {
+            template.description.clone()
+        } else if template.description.is_empty() {
+            template.argument_hint.clone()
+        } else {
+            format!("{} · {}", template.argument_hint, template.description)
+        };
+        suggestions.push(state::Suggestion {
+            label: label.clone(),
+            description,
+            value: label,
+            execute: true,
+        });
+    }
+    for skill in &resources.skills {
+        let label = format!("/skill:{}", skill.name);
+        if !label.to_ascii_lowercase().starts_with(&query) {
+            continue;
+        }
+        suggestions.push(state::Suggestion {
+            label: label.clone(),
+            description: skill.description.clone(),
+            value: label,
+            execute: true,
+        });
+    }
+    suggestions
+}
+
 fn login_provider_suggestions(catalog: &catalog::Catalog, query: &str) -> Vec<state::Suggestion> {
     let configured = catalog
         .configured_provider_ids()
@@ -3692,6 +3735,46 @@ mod tests {
                 .map(|choice| choice.value)
                 .collect::<Vec<_>>(),
             vec!["/model local/detached"]
+        );
+    }
+
+    #[test]
+    fn resource_picker_includes_templates_and_skills_with_native_descriptions() {
+        let resources = resources::ResourceSet {
+            templates: vec![resources::Template {
+                name: "review".to_owned(),
+                description: "Review a diff".to_owned(),
+                argument_hint: "<path>".to_owned(),
+                path: std::path::PathBuf::from("/tmp/review.md"),
+                body: String::new(),
+            }],
+            skills: vec![resources::Skill {
+                name: "deploy".to_owned(),
+                description: "Deploy safely".to_owned(),
+                path: std::path::PathBuf::from("/tmp/deploy/SKILL.md"),
+                body: String::new(),
+                disable_model_invocation: false,
+            }],
+            ..resources::ResourceSet::default()
+        };
+
+        assert_eq!(
+            resource_palette_suggestions(&resources, "/rev"),
+            vec![state::Suggestion {
+                label: "/review".to_owned(),
+                description: "<path> · Review a diff".to_owned(),
+                value: "/review".to_owned(),
+                execute: true,
+            }]
+        );
+        assert_eq!(
+            resource_palette_suggestions(&resources, "/skill"),
+            vec![state::Suggestion {
+                label: "/skill:deploy".to_owned(),
+                description: "Deploy safely".to_owned(),
+                value: "/skill:deploy".to_owned(),
+                execute: true,
+            }]
         );
     }
 

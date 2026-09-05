@@ -82,6 +82,8 @@ pub struct App {
     model_suggestions_model: Option<String>,
     login_suggestions: Vec<Suggestion>,
     login_suggestions_query: Option<String>,
+    resource_suggestions: Vec<Suggestion>,
+    resource_suggestions_query: Option<String>,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -162,6 +164,8 @@ impl App {
             model_suggestions_model: None,
             login_suggestions: Vec::new(),
             login_suggestions_query: None,
+            resource_suggestions: Vec::new(),
+            resource_suggestions_query: None,
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -179,7 +183,15 @@ impl App {
                     self.login_suggestions.clone()
                 }
                 Some(_) => Vec::new(),
-                None => suggestions_for(&self.input),
+                None => {
+                    let mut suggestions = suggestions_for(&self.input);
+                    if let Some(query) = resource_query(&self.input)
+                        && self.resource_suggestions_query.as_deref() == Some(query)
+                    {
+                        suggestions.extend(self.resource_suggestions.clone());
+                    }
+                    suggestions
+                }
             },
         }
     }
@@ -244,6 +256,36 @@ impl App {
         self.login_suggestions_query = None;
     }
 
+    /// Rebuilds local template and skill entries only after their command
+    /// prefix changes. Resource loading stays in the runtime, not the
+    /// renderer, so palette painting is always side-effect free.
+    pub fn refresh_resource_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = resource_query(&self.input) else {
+            self.invalidate_resource_suggestions();
+            return;
+        };
+        if self.resource_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.resource_suggestions = load(query);
+        self.resource_suggestions_query = Some(query.to_owned());
+        self.selected_suggestion = self.selected_suggestion.min(
+            suggestions_for(&self.input)
+                .len()
+                .saturating_add(self.resource_suggestions.len())
+                .saturating_sub(1),
+        );
+    }
+
+    /// Invalidates local template and skill choices after a resource reload.
+    pub fn invalidate_resource_suggestions(&mut self) {
+        self.resource_suggestions.clear();
+        self.resource_suggestions_query = None;
+    }
+
     /// Clears the composer and remembers a submitted value without adding
     /// placeholder transcript messages. A live runtime owns transcript rows
     /// through its agent state, so the same input cannot be rendered twice.
@@ -256,6 +298,7 @@ impl App {
         self.selected_suggestion = 0;
         self.invalidate_model_suggestions();
         self.invalidate_login_suggestions();
+        self.invalidate_resource_suggestions();
     }
 
     /// Retains an externally generated transcript while keeping editor history
@@ -857,6 +900,10 @@ fn model_query(input: &str) -> Option<&str> {
     input.strip_prefix("/model ").map(str::trim)
 }
 
+fn resource_query(input: &str) -> Option<&str> {
+    (input.starts_with('/') && !input.chars().any(char::is_whitespace)).then_some(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -916,6 +963,38 @@ mod tests {
             Vec::new()
         });
         assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn resource_palette_merges_cached_templates_with_commands() {
+        let mut app = App::new();
+        app.set_input("/rev");
+        app.refresh_resource_suggestions(|query| {
+            assert_eq!(query, "/rev");
+            vec![Suggestion {
+                label: "/review".to_owned(),
+                description: "Review a change".to_owned(),
+                value: "/review".to_owned(),
+                execute: true,
+            }]
+        });
+
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["/review"]
+        );
+        app.refresh_resource_suggestions(|_| panic!("unchanged resource query must be cached"));
+        app.set_input("/help");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["/help"]
+        );
     }
 
     #[test]
