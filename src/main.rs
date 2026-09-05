@@ -4,6 +4,7 @@ pub mod llm;
 pub mod markdown;
 pub mod prompts;
 pub mod ralph;
+pub mod ralph_cli;
 pub mod resources;
 pub mod session;
 pub mod sessionlog;
@@ -67,6 +68,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
+        Some("ralph") => ralph_cli::command(&args[1..]),
         Some("chat") | None => run_interactive(),
         Some(argument) if argument.starts_with('-') => run_interactive(),
         Some(command) => Err(format!(
