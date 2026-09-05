@@ -157,6 +157,7 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| io::Error::other("run invocation did not include a prompt"))?;
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    ensure_interactive_model(&mut invocation.config, catalog.as_ref(), true)?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
@@ -510,9 +511,15 @@ fn choose_resume_session(config: &mut runtime::SessionConfig) -> Result<(), Box<
 /// It deliberately shares the live session, responder, slash-command
 /// dispatcher, compaction, and event renderer with fullscreen chat. The only
 /// difference is presentation: prompts and command notices are line-oriented.
-fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn Error>> {
+fn run_line_interactive(mut invocation: runtime::Invocation) -> Result<(), Box<dyn Error>> {
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    let interactive_terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
+    ensure_interactive_model(
+        &mut invocation.config,
+        catalog.as_ref(),
+        interactive_terminal,
+    )?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
@@ -543,6 +550,59 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
     result?;
     close_result?;
     Ok(())
+}
+
+/// Makes the first interactive session self-contained: a terminal user with
+/// no configured model can authenticate before session construction rather
+/// than being sent back to an external `auth` command.
+fn ensure_interactive_model(
+    config: &mut runtime::SessionConfig,
+    catalog: &catalog::Catalog,
+    can_onboard: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !config.model_ref.trim().is_empty() {
+        return Ok(());
+    }
+    match runtime::process_default_chat_model_reference(catalog) {
+        Ok(model) => {
+            config.model_ref = model;
+            Ok(())
+        }
+        Err(_) if can_onboard => {
+            config.model_ref = onboard_chat_model(catalog)?;
+            Ok(())
+        }
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+fn onboard_chat_model(catalog: &catalog::Catalog) -> Result<String, Box<dyn Error>> {
+    eprintln!("Welcome to GoshCoder. Choose a subscription login:");
+    eprintln!("  1. OpenAI Codex (recommended)");
+    eprintln!("  2. Anthropic");
+    eprintln!("  3. Kimi Coding");
+    eprint!("Choice [1]: ");
+    io::stderr().flush()?;
+
+    let mut choice = String::new();
+    io::stdin().lock().read_line(&mut choice)?;
+    let provider_id = onboarding_provider(&choice)?;
+    let outcome = provider_cli::auth_for_provider(catalog, provider_id)?;
+    eprintln!("{}", outcome.notice());
+    runtime::process_default_chat_model_reference(catalog).map_err(|error| Box::new(error) as _)
+}
+
+fn onboarding_provider(choice: &str) -> Result<&'static str, Box<dyn Error>> {
+    match choice.trim() {
+        "" | "1" => Ok("openai-codex"),
+        "2" => Ok("anthropic"),
+        "3" => Ok("kimi-coding"),
+        choice => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown login choice {choice:?}"),
+        )
+        .into()),
+    }
 }
 
 fn line_interactive_loop(
@@ -1649,7 +1709,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nFullscreen onboarding is still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -3436,6 +3496,27 @@ mod tests {
         assert!(help.contains("anthropic"));
         assert!(help.contains("API-key providers prompt for a key"));
         assert!(help.contains("existing logins are kept"));
+    }
+
+    #[test]
+    fn onboarding_selection_matches_the_subscription_login_choices() {
+        assert_eq!(
+            onboarding_provider("").expect("default choice"),
+            "openai-codex"
+        );
+        assert_eq!(
+            onboarding_provider("1").expect("first choice"),
+            "openai-codex"
+        );
+        assert_eq!(
+            onboarding_provider(" 2 ").expect("second choice"),
+            "anthropic"
+        );
+        assert_eq!(
+            onboarding_provider("3").expect("third choice"),
+            "kimi-coding"
+        );
+        assert!(onboarding_provider("4").is_err());
     }
 
     #[test]
