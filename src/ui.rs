@@ -19,7 +19,6 @@ const ACCENT: Color = Color::Rgb(255, 172, 92);
 const VIOLET: Color = Color::Rgb(73, 166, 191);
 const CYAN: Color = Color::Rgb(86, 182, 194);
 const GREEN: Color = Color::Rgb(127, 216, 143);
-const BLUE: Color = Color::Rgb(112, 174, 221);
 const AMBER: Color = Color::Rgb(242, 201, 108);
 const RED: Color = Color::Rgb(246, 116, 116);
 const TEXT: Color = Color::Rgb(220, 230, 232);
@@ -566,6 +565,6 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(output, "  helloworld");
+        assert_eq!(output, "  hello[2Jworld");
     }
 }

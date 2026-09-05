@@ -12,6 +12,9 @@ pub struct Message {
     pub is_error: bool,
 }
 
+// These variants are the stable view-model contract for runtime modules that
+// are still being ported. Some are not populated by the initial shell yet.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MessageRole {
     User,
@@ -76,6 +79,9 @@ pub struct SidebarLine {
     pub value: String,
 }
 
+// The sidebar accepts every status rendered by the previous terminal UI; the
+// early Ratatui shell only populates the fields it currently owns.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SidebarKind {
     Title,
@@ -91,6 +97,7 @@ pub enum SidebarKind {
     Blank,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileStatus {
     Added,
