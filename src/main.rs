@@ -212,7 +212,7 @@ fn render_run_event<Out: Write, Err: Write>(
                     "{}",
                     dim(
                         &format!(
-                            "tokens: {} in / {} out  cost: ${:.4f}",
+                            "tokens: {} in / {} out  cost: ${:.4}",
                             message.usage.input, message.usage.output, message.usage.cost.total
                         ),
                         color
