@@ -629,15 +629,8 @@ impl ProviderResponderFactory {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
         }?;
-        let response = self.send_streaming_request(
-            protocol,
-            model,
-            &payload,
-            &credentials,
-            &options.cancellation,
-            &options.session_id,
-            options.cache_retention,
-        )?;
+        let response =
+            self.send_streaming_request(protocol, model, &payload, &credentials, &options)?;
 
         emitter.start()?;
         match protocol {
@@ -705,30 +698,28 @@ impl ProviderResponderFactory {
         model: &llm::Model,
         payload: &Value,
         credentials: &ProviderCredentials,
-        cancellation: &agent::CancellationToken,
-        session_id: &str,
-        cache_retention: agent::CacheRetention,
+        options: &agent::RequestOptions,
     ) -> Result<Response> {
         let endpoint = protocol_endpoint(model, protocol, credentials)?;
         let headers = build_request_headers(
             protocol,
             model,
             credentials,
-            session_id,
-            cache_retention,
-            cancellation,
+            &options.session_id,
+            options.cache_retention,
+            &options.cancellation,
         )?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
         loop {
-            ensure_not_cancelled(cancellation)?;
+            ensure_not_cancelled(&options.cancellation)?;
             let sent = if protocol == ProviderProtocol::MistralConversations {
                 self.send_mistral_request(
                     endpoint.clone(),
                     headers.clone(),
                     body.clone(),
-                    cancellation,
+                    &options.cancellation,
                 )
             } else {
                 self.send_standard_request(endpoint.clone(), headers.clone(), body.clone())
@@ -747,7 +738,7 @@ impl ProviderResponderFactory {
                         &error,
                         retry_index,
                         self.config.retry_delay_limit,
-                        cancellation,
+                        &options.cancellation,
                     )?;
                 }
                 Err(ProviderAdapterError::Provider(error)) => {
@@ -760,7 +751,7 @@ impl ProviderResponderFactory {
                         &error,
                         retry_index,
                         self.config.retry_delay_limit,
-                        cancellation,
+                        &options.cancellation,
                     )?;
                 }
                 Err(error) => return Err(error),
