@@ -878,17 +878,11 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
-                        CommandDispatch::Login {
-                            provider_id,
-                            command,
-                        } => complete_fullscreen_login(
-                            terminal,
-                            &mut app,
-                            &mut view,
-                            catalog,
-                            &provider_id,
-                            command,
-                        ),
+                        CommandDispatch::TerminalCommand(command) => {
+                            complete_fullscreen_terminal_command(
+                                terminal, &mut app, &mut view, catalog, command,
+                            )
+                        }
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -906,17 +900,11 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
-                        CommandDispatch::Login {
-                            provider_id,
-                            command,
-                        } => complete_fullscreen_login(
-                            terminal,
-                            &mut app,
-                            &mut view,
-                            catalog,
-                            &provider_id,
-                            command,
-                        ),
+                        CommandDispatch::TerminalCommand(command) => {
+                            complete_fullscreen_terminal_command(
+                                terminal, &mut app, &mut view, catalog, command,
+                            )
+                        }
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -932,60 +920,83 @@ fn event_loop(
     }
 }
 
-/// Temporarily gives the real terminal to the credential CLI, then restores
-/// Ratatui. OAuth and secret entry cannot safely run while the alternate
-/// screen and raw mode are active.
-fn complete_fullscreen_login(
+/// Temporarily gives the real terminal to a command that prompts for input,
+/// then restores Ratatui. OAuth, gateway setup, and secret entry cannot
+/// safely run while the alternate screen and raw mode are active.
+fn complete_fullscreen_terminal_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
     app: &mut App,
     view: &mut InteractiveView,
     catalog: &catalog::Catalog,
-    provider_id: &str,
-    command: provider_cli::InteractiveAuthCommand,
+    command: FullscreenTerminalCommand,
 ) {
-    view.activity = format!("Logging in to {provider_id}");
+    view.activity = command.activity();
     view.activity_since = Some(Instant::now());
-    let result = run_fullscreen_login(terminal, provider_id, command);
-    app.invalidate_login_suggestions();
+    let result = run_fullscreen_terminal_command(terminal, &command);
     match result {
-        Ok(()) => {
-            catalog.clear_oauth_refresh_failure(provider_id);
-            app.invalidate_model_suggestions();
-            view.activity = format!("Added {provider_id}");
-            view.activity_since = None;
-            append_view_message(
-                view,
-                MessageRole::Notice,
-                format!("Added {provider_id}. Use /model to switch providers."),
-            );
-        }
+        Ok(()) => complete_fullscreen_terminal_success(app, view, catalog, command),
         Err(error) => {
-            view.activity = "Login failed".to_owned();
+            view.activity = format!("{} failed", command.name());
             view.activity_since = None;
             append_view_message(view, MessageRole::Error, error);
         }
     }
 }
 
-fn run_fullscreen_login(
+fn run_fullscreen_terminal_command(
     terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
-    provider_id: &str,
-    command: provider_cli::InteractiveAuthCommand,
+    command: &FullscreenTerminalCommand,
 ) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     suspend_fullscreen_terminal(terminal)?;
     let status = Command::new(executable)
-        .args(["auth", command.as_auth_subcommand(), provider_id])
+        .args(command.arguments())
         .status()
-        .map_err(|error| format!("start credential flow: {error}"));
+        .map_err(|error| format!("start {}: {error}", command.name()));
     let restored = restore_fullscreen_terminal(terminal);
     match (status, restored) {
-        (_, Err(error)) => Err(format!("restore terminal after login: {error}")),
+        (_, Err(error)) => Err(format!(
+            "restore terminal after {}: {error}",
+            command.name()
+        )),
         (Err(error), Ok(())) => Err(error),
         (Ok(status), Ok(())) if status.success() => Ok(()),
-        (Ok(status), Ok(())) => Err(format!(
-            "credential flow for {provider_id} exited with {status}"
-        )),
+        (Ok(status), Ok(())) => Err(format!("{} exited with {status}", command.name())),
+    }
+}
+
+fn complete_fullscreen_terminal_success(
+    app: &mut App,
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    command: FullscreenTerminalCommand,
+) {
+    app.invalidate_model_suggestions();
+    app.invalidate_login_suggestions();
+    view.activity_since = None;
+    match command {
+        FullscreenTerminalCommand::Login { provider_id, .. } => {
+            catalog.clear_oauth_refresh_failure(&provider_id);
+            view.activity = format!("Added {provider_id}");
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("Added {provider_id}. Use /model to switch providers."),
+            );
+        }
+        FullscreenTerminalCommand::OmniSetup => {
+            view.activity = "OmniRoute setup completed".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                "OmniRoute setup completed. Run /omni sync to refresh models.",
+            );
+        }
+        FullscreenTerminalCommand::ApertureOnboarding => {
+            catalog.reload_aperture_state();
+            view.activity = "Aperture onboarding completed".to_owned();
+            append_view_message(view, MessageRole::Notice, "Aperture onboarding completed.");
+        }
     }
 }
 
@@ -1288,11 +1299,53 @@ fn submit_interactive_input(
 enum CommandDispatch {
     NotCommand,
     Handled,
+    TerminalCommand(FullscreenTerminalCommand),
+    Quit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FullscreenTerminalCommand {
     Login {
         provider_id: String,
         command: provider_cli::InteractiveAuthCommand,
     },
-    Quit,
+    OmniSetup,
+    ApertureOnboarding,
+}
+
+impl FullscreenTerminalCommand {
+    fn arguments(&self) -> Vec<String> {
+        match self {
+            Self::Login {
+                provider_id,
+                command,
+            } => vec![
+                "auth".to_owned(),
+                command.as_auth_subcommand().to_owned(),
+                provider_id.clone(),
+            ],
+            Self::OmniSetup => vec!["omni".to_owned(), "setup".to_owned()],
+            Self::ApertureOnboarding => {
+                vec!["aperture".to_owned(), "onboarding".to_owned()]
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Login { .. } => "credential flow",
+            Self::OmniSetup => "OmniRoute setup",
+            Self::ApertureOnboarding => "Aperture onboarding",
+        }
+    }
+
+    fn activity(&self) -> String {
+        match self {
+            Self::Login { provider_id, .. } => format!("Logging in to {provider_id}"),
+            Self::OmniSetup => "Configuring OmniRoute".to_owned(),
+            Self::ApertureOnboarding => "Configuring Aperture".to_owned(),
+        }
+    }
 }
 
 fn begin_interactive_turn(
@@ -1985,8 +2038,30 @@ fn dispatch_runtime_slash_command(
         }
         "/export" => dispatch_session_export_slash_command(view, prepared, rest, fullscreen),
         "/import" => dispatch_session_import_slash_command(view, prepared, rest, fullscreen),
+        "/omni" if fullscreen && is_omni_setup(rest) => dispatch_fullscreen_terminal_command(
+            app,
+            view,
+            prepared,
+            FullscreenTerminalCommand::OmniSetup,
+        ),
         "/omni" => dispatch_omni_slash_command(view, catalog, rest, fullscreen),
+        "/aperture" if fullscreen && is_aperture_onboarding(rest) => {
+            dispatch_fullscreen_terminal_command(
+                app,
+                view,
+                prepared,
+                FullscreenTerminalCommand::ApertureOnboarding,
+            )
+        }
         "/aperture" => dispatch_aperture_slash_command(view, catalog, rest, None, fullscreen),
+        "/aperture:onboarding" if fullscreen && rest.trim().is_empty() => {
+            dispatch_fullscreen_terminal_command(
+                app,
+                view,
+                prepared,
+                FullscreenTerminalCommand::ApertureOnboarding,
+            )
+        }
         "/aperture:onboarding" => {
             dispatch_aperture_slash_command(view, catalog, rest, Some("onboarding"), fullscreen)
         }
@@ -2236,10 +2311,10 @@ fn dispatch_login_slash_command(
     if fullscreen {
         view.activity = format!("Logging in to {provider_id}");
         view.activity_since = Some(Instant::now());
-        return CommandDispatch::Login {
+        return CommandDispatch::TerminalCommand(FullscreenTerminalCommand::Login {
             provider_id: (*provider_id).to_owned(),
             command,
-        };
+        });
     }
 
     match provider_cli::auth_for_provider(catalog, provider_id) {
@@ -2388,6 +2463,36 @@ fn dispatch_session_import_slash_command(
         Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
     }
     CommandDispatch::Handled
+}
+
+fn dispatch_fullscreen_terminal_command(
+    app: &App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    command: FullscreenTerminalCommand,
+) -> CommandDispatch {
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!("Wait for the current response before {}.", command.name()),
+        );
+        return CommandDispatch::Handled;
+    }
+    view.activity = command.activity();
+    view.activity_since = Some(Instant::now());
+    CommandDispatch::TerminalCommand(command)
+}
+
+fn is_omni_setup(rest: &str) -> bool {
+    rest.trim().eq_ignore_ascii_case("setup")
+}
+
+fn is_aperture_onboarding(rest: &str) -> bool {
+    matches!(
+        rest.trim().to_ascii_lowercase().as_str(),
+        "onboarding" | "setup" | "configure"
+    )
 }
 
 fn dispatch_omni_slash_command(
@@ -3647,6 +3752,29 @@ mod tests {
             "kimi-coding"
         );
         assert!(onboarding_provider("4").is_err());
+    }
+
+    #[test]
+    fn fullscreen_terminal_commands_preserve_safe_cli_invocations() {
+        assert_eq!(
+            FullscreenTerminalCommand::Login {
+                provider_id: "anthropic".to_owned(),
+                command: provider_cli::InteractiveAuthCommand::Login,
+            }
+            .arguments(),
+            vec!["auth", "login", "anthropic"]
+        );
+        assert_eq!(
+            FullscreenTerminalCommand::OmniSetup.arguments(),
+            vec!["omni", "setup"]
+        );
+        assert_eq!(
+            FullscreenTerminalCommand::ApertureOnboarding.arguments(),
+            vec!["aperture", "onboarding"]
+        );
+        assert!(is_omni_setup(" SETUP "));
+        assert!(is_aperture_onboarding("configure"));
+        assert!(!is_aperture_onboarding("settings"));
     }
 
     #[test]
