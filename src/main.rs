@@ -667,7 +667,6 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     )?;
     remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
-    let interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
     let (agent_event_sender, agent_event_receiver) = mpsc::sync_channel(64);
     let (turn_sender, turn_receiver) = mpsc::channel();
     let _agent_event_subscription = agent.subscribe(move |event| {
@@ -698,7 +697,6 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         turn_sender,
         turn_receiver,
         quiet,
-        &interrupt_guard,
     );
 
     let terminal_cleanup = (|| -> io::Result<()> {
@@ -1076,7 +1074,7 @@ fn line_interactive_loop(
                     eprintln!("error: {error}");
                     continue;
                 }
-                match compaction::maybe_auto_compact(&agent) {
+                match compaction::maybe_auto_compact(agent) {
                     Ok(Some(outcome)) => print_compaction_outcome(&outcome, true, color),
                     Ok(None) => {}
                     Err(error) => {
@@ -1330,8 +1328,9 @@ fn event_loop(
     turn_sender: Sender<InteractiveTaskResult>,
     turn_results: Receiver<InteractiveTaskResult>,
     quiet: bool,
-    interrupt_guard: &InterruptGuard,
 ) -> Result<(), Box<dyn Error>> {
+    let interrupt_guard =
+        InterruptGuard::install(prepared.runtime.agent()).map_err(io::Error::other)?;
     let mut app = App::new();
     app.replace_messages(Vec::new());
     let mut view = InteractiveView::default();
@@ -5186,6 +5185,20 @@ mod tests {
         assert!(header.contains("GoshCoder vtest"));
         assert!(header.contains("openai/gpt-test"));
         assert_eq!(native_line_input_prompt(8, false), "╭──────╮\n╰─❯ ");
+    }
+
+    #[test]
+    fn line_input_wait_can_exit_after_an_idle_interrupt() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<io::Result<Option<String>>>();
+        let guard = InterruptGuard {
+            identifier: u64::MAX,
+            idle_exit: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert_eq!(
+            next_line_or_interrupt(&receiver, &guard).expect("line wait"),
+            None
+        );
     }
 
     #[test]
