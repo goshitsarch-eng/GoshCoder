@@ -744,7 +744,7 @@ pub fn validate_session_id(id: &str) -> Result<()> {
         return Err(SessionError::InvalidSessionId(id.to_owned()));
     };
     if !first.is_ascii_alphanumeric()
-        || !id
+        || id
             .chars()
             .last()
             .is_some_and(|character| !character.is_ascii_alphanumeric())
