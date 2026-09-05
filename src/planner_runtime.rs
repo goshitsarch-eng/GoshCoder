@@ -55,6 +55,10 @@ impl From<plannotator::PlannerError> for PlannerRuntimeError {
 
 pub type Result<T> = std::result::Result<T, PlannerRuntimeError>;
 
+/// A session-extension callback that applies Planner state to a raw system
+/// prompt while rebuilding the corresponding model-visible tool set.
+pub type SystemPromptSync = Arc<dyn Fn(String) + Send + Sync + 'static>;
+
 /// Keeps a planner attached to one session and its live agent.
 ///
 /// Its subscription must remain alive for the complete session: it applies
@@ -222,6 +226,41 @@ impl PlannerRuntime {
             &self.base_system_prompt,
         );
     }
+
+    /// Applies the current planner state to an extension-composed base prompt.
+    ///
+    /// Ralph invokes this after updating its own active-loop suffix so Planner
+    /// remains the outermost prompt layer and phase-specific tool rebuilding
+    /// cannot unregister Ralph's tools.
+    pub fn sync_with_base(&self, base_system_prompt: impl AsRef<str>) {
+        sync_agent_with_base(
+            &self.agent,
+            &self.manager,
+            &self.workspace,
+            &self.normal_tools,
+            base_system_prompt.as_ref(),
+        );
+    }
+
+    /// Returns a callback-safe prompt synchronizer for another session
+    /// extension. It owns the same planner state and normal tool snapshot as
+    /// this runtime, but does not alter the user's raw base prompt.
+    #[must_use]
+    pub fn system_prompt_sync(&self) -> SystemPromptSync {
+        let agent = self.agent.clone();
+        let manager = self.manager.clone();
+        let workspace = self.workspace.clone();
+        let normal_tools = self.normal_tools.clone();
+        Arc::new(move |base_system_prompt| {
+            sync_agent_with_base(
+                &agent,
+                &manager,
+                &workspace,
+                &normal_tools,
+                &base_system_prompt,
+            );
+        })
+    }
 }
 
 fn restored_state(
@@ -313,7 +352,17 @@ fn sync_agent(
     base_system_prompt: &Arc<Mutex<String>>,
 ) {
     let base = lock(base_system_prompt).clone();
-    agent.set_system_prompt(manager.prompt(base));
+    sync_agent_with_base(agent, manager, workspace, normal_tools, &base);
+}
+
+fn sync_agent_with_base(
+    agent: &agent::Agent,
+    manager: &plannotator::Manager,
+    workspace: &Workspace,
+    normal_tools: &[agent::Tool],
+    base_system_prompt: &str,
+) {
+    agent.set_system_prompt(manager.prompt(base_system_prompt));
     agent.set_tools(planner_tools(manager, workspace, normal_tools));
 }
 

@@ -14,7 +14,7 @@ use std::{
 use crate::{
     agent,
     catalog::Catalog,
-    config, llm, planner_runtime,
+    config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -95,13 +95,61 @@ pub struct Invocation {
 
 /// An initialized session plus the objects whose lifetime must outlast tools.
 pub struct PreparedSession {
+    /// Session-owned Ralph integration. It is dropped before the agent runtime
+    /// so its post-turn subscription always unregisters cleanly.
+    pub ralph: Option<ralph_runtime::RalphRuntime>,
+    /// Session-owned planner integration when chat or `-planner` requested it.
+    /// It also drops before the agent runtime for the same subscription reason.
+    pub planner: Option<planner_runtime::PlannerRuntime>,
     pub runtime: SessionRuntime,
     pub workspace: Option<Workspace>,
     pub resource_paths: ResourcePaths,
     pub resources: ResourceSet,
     pub config: SessionConfig,
-    /// Session-owned planner integration when chat or `-planner` requested it.
-    pub planner: Option<planner_runtime::PlannerRuntime>,
+}
+
+impl PreparedSession {
+    /// Synchronizes the active extension layers before a new model request.
+    pub fn sync_extensions(&self) -> Result<()> {
+        if let Some(ralph) = self.ralph.as_ref() {
+            ralph.sync_agent().map_err(|error| {
+                RuntimeError::Session(format!("synchronize Ralph loop: {error}"))
+            })?;
+        } else if let Some(planner) = self.planner.as_ref() {
+            planner.sync_agent();
+        }
+        Ok(())
+    }
+
+    /// Replaces the user-controlled base prompt while keeping active Ralph and
+    /// Planner layers composed in their Go-compatible order.
+    pub fn set_base_system_prompt(&self, prompt: impl Into<String>) -> Result<()> {
+        let prompt = prompt.into();
+        if let Some(planner) = self.planner.as_ref() {
+            planner.set_base_system_prompt(prompt.clone());
+        }
+        if let Some(ralph) = self.ralph.as_ref() {
+            ralph.set_base_system_prompt(prompt).map_err(|error| {
+                RuntimeError::Session(format!("synchronize Ralph loop: {error}"))
+            })?;
+        } else if self.planner.is_none() {
+            self.runtime.agent().set_system_prompt(prompt);
+        }
+        Ok(())
+    }
+
+    /// Toggles planning mode and reapplies any active Ralph suffix afterward.
+    pub fn toggle_planner(&self) -> Result<plannotator::Phase> {
+        let planner = self.planner.as_ref().ok_or_else(|| {
+            RuntimeError::Session(
+                "Planner is unavailable in this session. Reopen chat with planner support enabled."
+                    .to_owned(),
+            )
+        })?;
+        let phase = planner.toggle();
+        self.sync_extensions()?;
+        Ok(phase)
+    }
 }
 
 #[derive(Debug)]
@@ -418,9 +466,25 @@ pub fn prepare_session(
     tools.extend(extra_tools);
     let tool_names = tools.iter().map(|tool| tool.name.as_str());
     let system_prompt = resources.build_system_prompt(&config.system_prompt, &cwd, tool_names);
-    let options = session_options(catalog, &config, cwd, system_prompt, tools, responder)?;
+    let options = session_options(
+        catalog,
+        &config,
+        cwd.clone(),
+        system_prompt.clone(),
+        tools,
+        responder,
+    )?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let ralph_store = config
+        .enable_ralph
+        .then(|| ralph::Store::for_workspace(&cwd, format!("cli-{}", std::process::id())));
+    if let Some(store) = ralph_store.as_ref() {
+        let queue: ralph::SharedQueue = Arc::new(runtime.agent().weak_follow_up_queue());
+        let mut runtime_tools = runtime.agent().state().tools;
+        runtime_tools.extend(store.tools(Some(queue)));
+        runtime.agent().set_tools(runtime_tools);
+    }
     let planner = if config.load_planner || config.enable_planner {
         let workspace = workspace.as_ref().expect(
             "planner configuration always creates a workspace before session initialization",
@@ -439,14 +503,33 @@ pub fn prepare_session(
     } else {
         None
     };
+    let ralph = ralph_store
+        .map(|store| {
+            let system_prompt_sync: ralph_runtime::SystemPromptSync = planner.as_ref().map_or_else(
+                || {
+                    let agent = runtime.agent().clone();
+                    Arc::new(move |prompt| agent.set_system_prompt(prompt))
+                },
+                planner_runtime::PlannerRuntime::system_prompt_sync,
+            );
+            ralph_runtime::RalphRuntime::attach(
+                &runtime,
+                store,
+                system_prompt.clone(),
+                system_prompt_sync,
+            )
+        })
+        .transpose()
+        .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
     Ok(PreparedSession {
+        ralph,
+        planner,
         runtime,
         workspace,
         resource_paths,
         resources,
         config,
-        planner,
     })
 }
 
@@ -849,6 +932,85 @@ mod tests {
         assert!(state.system_prompt.contains("web_search"));
 
         prepared.runtime.close().expect("close session");
+        std::fs::remove_dir_all(directory).expect("remove workspace");
+    }
+
+    #[test]
+    fn enabled_ralph_tools_survive_planner_tool_rebuilds() {
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog");
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-ralph-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("workspace");
+
+        let mut prepared = prepare_session(
+            &catalog,
+            SessionConfig {
+                model_ref: format!("openai/{model_id}"),
+                workdir: directory.clone(),
+                enable_tools: true,
+                enable_ralph: true,
+                load_planner: true,
+                no_session: true,
+                ..SessionConfig::default()
+            },
+            None,
+            Vec::new(),
+        )
+        .expect("prepare Ralph session");
+        let storage = prepared
+            .ralph
+            .as_ref()
+            .expect("Ralph runtime")
+            .store()
+            .storage_dir();
+        assert!(prepared.ralph.is_some());
+        for name in [ralph::START_TOOL_NAME, ralph::DONE_TOOL_NAME] {
+            assert!(
+                prepared
+                    .runtime
+                    .agent()
+                    .state()
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == name),
+                "missing {name} before planner transition"
+            );
+        }
+
+        assert_eq!(
+            prepared.toggle_planner().expect("toggle planner"),
+            plannotator::Phase::Planning
+        );
+        for name in [ralph::START_TOOL_NAME, ralph::DONE_TOOL_NAME] {
+            assert!(
+                prepared
+                    .runtime
+                    .agent()
+                    .state()
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == name),
+                "missing {name} after planner transition"
+            );
+        }
+
+        prepared.runtime.close().expect("close session");
+        drop(prepared);
+        let _ = std::fs::remove_dir_all(storage);
         std::fs::remove_dir_all(directory).expect("remove workspace");
     }
 }

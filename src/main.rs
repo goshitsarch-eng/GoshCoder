@@ -19,6 +19,7 @@ pub mod provider_cli;
 pub mod providers;
 pub mod ralph;
 pub mod ralph_cli;
+pub mod ralph_runtime;
 pub mod resources;
 pub mod runtime;
 pub mod session;
@@ -163,6 +164,7 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     });
 
+    prepared.sync_extensions()?;
     let _ = compaction::maybe_auto_compact(&agent)?;
     agent.prompt(prompt)?;
     prepared.runtime.sync()?;
@@ -656,20 +658,11 @@ fn submit_interactive_input(
         return CommandDispatch::Handled;
     }
 
-    view.turn_pending = true;
-    view.activity = "Starting response".to_owned();
-    view.activity_since = Some(Instant::now());
-    app.streaming = true;
-    thread::spawn(move || {
-        let result = compaction::maybe_auto_compact(&agent)
-            .and_then(|_| {
-                agent
-                    .prompt(input)
-                    .map_err(compaction::CompactionError::Agent)
-            })
-            .map_err(|error| error.to_string());
-        let _ = turn_sender.send(result);
-    });
+    if let Err(error) = prepared.sync_extensions() {
+        append_view_message(view, MessageRole::Error, error.to_string());
+        return CommandDispatch::Handled;
+    }
+    begin_interactive_turn(view, agent, turn_sender, input, "Starting response");
     CommandDispatch::NotCommand
 }
 
@@ -678,6 +671,143 @@ enum CommandDispatch {
     NotCommand,
     Handled,
     Quit,
+}
+
+fn begin_interactive_turn(
+    view: &mut InteractiveView,
+    agent: agent::Agent,
+    turn_sender: Sender<Result<(), String>>,
+    prompt: String,
+    activity: &str,
+) {
+    view.turn_pending = true;
+    view.activity = activity.to_owned();
+    view.activity_since = Some(Instant::now());
+    thread::spawn(move || {
+        let result = compaction::maybe_auto_compact(&agent)
+            .and_then(|_| {
+                agent
+                    .prompt(prompt)
+                    .map_err(compaction::CompactionError::Agent)
+            })
+            .map_err(|error| error.to_string());
+        let _ = turn_sender.send(result);
+    });
+}
+
+fn dispatch_ralph_slash_command(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    turn_sender: Sender<Result<(), String>>,
+    rest: &str,
+) -> CommandDispatch {
+    let Some(ralph_runtime) = prepared.ralph.as_ref() else {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "ralph loops are disabled; restart with -ralph to enable them",
+        );
+        return CommandDispatch::Handled;
+    };
+
+    let mut command = match if rest.is_empty() {
+        Ok(ralph::RalphCommand::Status)
+    } else {
+        ralph::parse_command(rest)
+    } {
+        Ok(command) => command,
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.to_string());
+            return CommandDispatch::Handled;
+        }
+    };
+    if let ralph::RalphCommand::Start { task_content, .. } = &mut command
+        && !task_content.starts_with('#')
+    {
+        *task_content = format!("# Task\n\n{task_content}");
+    }
+    let mutates = !matches!(
+        &command,
+        ralph::RalphCommand::List { .. } | ralph::RalphCommand::Status
+    );
+    if mutates
+        && (app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming)
+    {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Wait for the current response before changing a Ralph loop.",
+        );
+        return CommandDispatch::Handled;
+    }
+
+    match ralph_runtime.execute(command) {
+        Ok(ralph::CommandResult::Started(state)) => {
+            let task = match ralph_runtime.store().read_task(&state) {
+                Ok(task) => task,
+                Err(error) => {
+                    append_view_message(view, MessageRole::Error, error.to_string());
+                    return CommandDispatch::Handled;
+                }
+            };
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "started Ralph loop {} (max {} iterations)",
+                    state.name, state.max_iterations
+                ),
+            );
+            begin_interactive_turn(
+                view,
+                prepared.runtime.agent().clone(),
+                turn_sender,
+                ralph::build_prompt(&state, &task, false),
+                "Starting Ralph iteration",
+            );
+        }
+        Ok(ralph::CommandResult::Listed(states)) => {
+            let text = if states.is_empty() {
+                "No loops.".to_owned()
+            } else {
+                states
+                    .into_iter()
+                    .map(|state| state.summary())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            append_view_message(view, MessageRole::Command, text);
+        }
+        Ok(ralph::CommandResult::Status(Some(state))) => {
+            append_view_message(view, MessageRole::Command, state.summary());
+        }
+        Ok(ralph::CommandResult::Status(None)) => {
+            append_view_message(view, MessageRole::Command, "No active loop.");
+        }
+        Ok(ralph::CommandResult::Resumed(state)) => {
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("resumed {} at iteration {}", state.name, state.iteration),
+            );
+        }
+        Ok(ralph::CommandResult::Stopped(state)) => {
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("stopped {} at iteration {}", state.name, state.iteration),
+            );
+        }
+        Ok(ralph::CommandResult::Archived(name)) => {
+            append_view_message(view, MessageRole::Notice, format!("archived {name}."));
+        }
+        Ok(ralph::CommandResult::Deleted(name)) => {
+            append_view_message(view, MessageRole::Notice, format!("deleted {name}."));
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
 }
 
 /// Executes slash commands that can be served without leaving the fullscreen
@@ -699,7 +829,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, BTW, OmniRoute, and Aperture commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -996,17 +1126,14 @@ fn dispatch_runtime_slash_command(
             );
             CommandDispatch::Handled
         }
+        "/ralph" => {
+            return dispatch_ralph_slash_command(app, view, prepared, turn_sender, rest);
+        }
         "/planner" | "/plannator" | "/plannotator" => {
-            let Some(planner) = prepared.planner.as_ref() else {
-                append_view_message(
-                    view,
-                    MessageRole::Error,
-                    "Planner is unavailable in this session. Reopen chat with planner support enabled.",
-                );
-                return CommandDispatch::Handled;
-            };
-            let phase = planner.toggle();
-            view.activity = format!("Planner: {}", phase.as_str());
+            match prepared.toggle_planner() {
+                Ok(phase) => view.activity = format!("Planner: {}", phase.as_str()),
+                Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+            }
             CommandDispatch::Handled
         }
         "/planner-review" | "/plannotator-review" => {
@@ -1115,17 +1242,17 @@ fn dispatch_runtime_slash_command(
             CommandDispatch::Handled
         }
         "/system" => {
-            if let Some(planner) = prepared.planner.as_ref() {
-                planner.set_base_system_prompt(rest);
-            } else {
-                prepared.runtime.agent().set_system_prompt(rest);
+            match prepared.set_base_system_prompt(rest) {
+                Ok(()) => {
+                    view.activity = "System prompt updated for this session".to_owned();
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        "The new system prompt applies to future turns in this session.",
+                    );
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
-            view.activity = "System prompt updated for this session".to_owned();
-            append_view_message(
-                view,
-                MessageRole::Notice,
-                "The new system prompt applies to future turns in this session.",
-            );
             CommandDispatch::Handled
         }
         "/login" => {
@@ -1575,8 +1702,16 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
         || "Planner: unavailable".to_owned(),
         planner_runtime::PlannerRuntime::status_line,
     );
+    let ralph = match prepared.ralph.as_ref() {
+        Some(ralph_runtime) => match ralph_runtime.current() {
+            Ok(Some(state)) => format!("Ralph: {}", state.summary()),
+            Ok(None) => "Ralph: no active loop".to_owned(),
+            Err(error) => format!("Ralph: unavailable ({error})"),
+        },
+        None => "Ralph: disabled".to_owned(),
+    };
     format!(
-        "Session: {}\nModel: {}/{}\nThinking: {}\n{planner}\nContext: {context}\nActivity: {activity}\nStorage: {storage}",
+        "Session: {}\nModel: {}/{}\nThinking: {}\n{planner}\n{ralph}\nContext: {context}\nActivity: {activity}\nStorage: {storage}",
         prepared
             .runtime
             .id()

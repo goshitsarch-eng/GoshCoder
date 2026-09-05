@@ -1259,6 +1259,16 @@ impl Queue for agent::Agent {
     }
 }
 
+impl Queue for agent::WeakFollowUpQueue {
+    fn follow_up(&self, message: llm::Message) {
+        agent::WeakFollowUpQueue::follow_up(self, message);
+    }
+
+    fn has_queued_messages(&self) -> bool {
+        agent::WeakFollowUpQueue::has_queued_messages(self)
+    }
+}
+
 /// Returns the `ralph_start` model-facing agent tool.
 ///
 /// The supplied store is cloned into the executor. Store clones share their

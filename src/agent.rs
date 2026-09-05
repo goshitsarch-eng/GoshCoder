@@ -347,6 +347,37 @@ pub struct Agent {
     inner: Arc<AgentInner>,
 }
 
+/// A non-owning queue handle for extensions that schedule a follow-up turn.
+///
+/// Tool executors are retained by an agent's tool list, so an extension must
+/// not capture an [`Agent`] strongly merely to queue work: that would create
+/// an `Agent → Tool → Queue → Agent` reference cycle.
+#[derive(Clone)]
+pub struct WeakFollowUpQueue {
+    inner: Weak<AgentInner>,
+}
+
+impl WeakFollowUpQueue {
+    /// Queues a message while the owning agent is still alive.
+    ///
+    /// Dropping an extension after its session has closed is intentionally a
+    /// harmless no-op rather than a panic from a stale tool closure.
+    pub fn follow_up(&self, message: llm::Message) {
+        if let Some(agent) = self.inner.upgrade() {
+            lock(&agent.state).follow_ups.push(message);
+        }
+    }
+
+    /// Reports whether the live agent has pending steering or follow-up work.
+    #[must_use]
+    pub fn has_queued_messages(&self) -> bool {
+        self.inner.upgrade().is_some_and(|agent| {
+            let state = lock(&agent.state);
+            !state.steering.is_empty() || !state.follow_ups.is_empty()
+        })
+    }
+}
+
 struct AgentInner {
     state: Mutex<InnerState>,
     /// Serializes durable lifecycle mutations with beginning a new run.
@@ -499,6 +530,14 @@ impl Agent {
     /// isolated, unrecorded helper turn without changing the live transcript.
     pub fn responder(&self) -> AssistantResponder {
         Arc::clone(&self.inner.responder)
+    }
+
+    /// Returns a queue handle that does not keep this agent alive.
+    #[must_use]
+    pub fn weak_follow_up_queue(&self) -> WeakFollowUpQueue {
+        WeakFollowUpQueue {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     pub fn steer(&self, message: llm::Message) {
@@ -1403,5 +1442,32 @@ mod tests {
         assert_eq!(events[0].kind, EventKind::ContextCompacted);
         assert_eq!(events[0].kept, kept);
         assert_eq!(events[0].compaction.as_ref(), Some(&info));
+    }
+
+    #[test]
+    fn weak_follow_up_queue_forwards_without_retaining_the_agent() {
+        let queue = {
+            let agent = Agent::new(AgentOptions {
+                initial_state: InitialState {
+                    model: model(),
+                    ..InitialState::default()
+                },
+                ..AgentOptions::default()
+            });
+            let queue = agent.weak_follow_up_queue();
+            queue.follow_up(llm::Message::User(llm::UserMessage::text(
+                "queued",
+                now_millis(),
+            )));
+            assert!(agent.has_queued_messages());
+            queue
+        };
+
+        assert!(!queue.has_queued_messages());
+        queue.follow_up(llm::Message::User(llm::UserMessage::text(
+            "ignored after drop",
+            now_millis(),
+        )));
+        assert!(!queue.has_queued_messages());
     }
 }
