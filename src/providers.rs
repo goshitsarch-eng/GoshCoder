@@ -45,7 +45,9 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, aperture, bedrock, catalog, google_auth, llm, mistral, stream};
+use crate::{
+    agent, aperture, bedrock, catalog, google_auth, llm, mistral, omni_prompt_tools, stream,
+};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -89,6 +91,7 @@ pub enum ProviderProtocol {
     GoogleGenerativeAi,
     GoogleVertex,
     MistralConversations,
+    OmniPromptTools,
     BedrockConverseStream,
 }
 
@@ -103,6 +106,7 @@ impl ProviderProtocol {
             API_GOOGLE_GENERATIVE_AI => Ok(Self::GoogleGenerativeAi),
             API_GOOGLE_VERTEX => Ok(Self::GoogleVertex),
             API_MISTRAL_CONVERSATIONS => Ok(Self::MistralConversations),
+            omni_prompt_tools::API_OMNI_PROMPT_TOOLS => Ok(Self::OmniPromptTools),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
@@ -116,6 +120,9 @@ impl ProviderProtocol {
             Self::OpenAiCodexResponses => "codex/responses",
             Self::AnthropicMessages => "v1/messages",
             Self::MistralConversations => "v1/chat/completions",
+            Self::OmniPromptTools => {
+                unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+            }
             Self::GoogleGenerativeAi => {
                 unreachable!("Google uses a model-scoped GenerateContent endpoint")
             }
@@ -503,6 +510,14 @@ impl ProviderResponderFactory {
         if model.api == bedrock::API_BEDROCK_CONVERSE_STREAM {
             return self.stream_bedrock_with_credentials(model, context, options, credentials);
         }
+        if model.api == omni_prompt_tools::API_OMNI_PROMPT_TOOLS {
+            return self.stream_omni_prompt_tools_with_credentials(
+                model,
+                context,
+                options,
+                credentials,
+            );
+        }
         let events =
             stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
                 .expect("validated provider event buffer capacity");
@@ -568,6 +583,67 @@ impl ProviderResponderFactory {
         events
     }
 
+    fn stream_omni_prompt_tools_with_credentials(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+    ) -> stream::AssistantMessageEventStream {
+        let events =
+            stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
+                .expect("validated provider event buffer capacity");
+        let worker_events = events.clone();
+        let factory = self.clone();
+        let model = model.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let cancellation = options.cancellation.clone();
+            let mut emitter = MessageEmitter::new(worker_events, &model);
+            if let Err(error) =
+                factory.run_omni_prompt_tools(&model, &context, options, credentials, &mut emitter)
+            {
+                let _ = emitter.fail(error, &cancellation);
+            }
+        });
+        events
+    }
+
+    fn run_omni_prompt_tools(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        mut options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+        emitter: &mut MessageEmitter,
+    ) -> Result<()> {
+        ensure_not_cancelled(&options.cancellation)?;
+        emitter.start()?;
+
+        let inner_context = omni_prompt_tools::inner_context(context);
+        let mut inner_model = model.clone();
+        inner_model.api = API_OPENAI_COMPLETIONS.to_owned();
+        // The adapter owns the externally visible event stream. The hidden
+        // completion must be drained silently before native events are
+        // replayed, otherwise callers would receive duplicate raw XML events.
+        options.assistant_event_listener = None;
+        let response =
+            self.respond_with_credentials(&inner_model, &inner_context, options, credentials)?;
+
+        emitter.message.usage = response.usage.clone();
+        emitter.message.response_id = response.response_id.clone();
+        emitter.message.response_model = response.response_model.clone();
+        if matches!(
+            response.stop_reason.as_str(),
+            stream::STOP_ERROR | stream::STOP_ABORTED
+        ) {
+            return emitter.finish_error(&response.stop_reason, response.error_message);
+        }
+
+        omni_prompt_tools::replay_response(emitter, &response)?;
+        emitter.finish()
+    }
+
     fn run_stream(
         &self,
         model: &llm::Model,
@@ -591,6 +667,7 @@ impl ProviderResponderFactory {
             | ProviderProtocol::GoogleGenerativeAi
             | ProviderProtocol::GoogleVertex
             | ProviderProtocol::MistralConversations
+            | ProviderProtocol::OmniPromptTools
             | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
         };
         let payload = match protocol {
@@ -624,6 +701,9 @@ impl ProviderResponderFactory {
             }
             ProviderProtocol::MistralConversations => {
                 mistral::build_mistral_request(model, context, &options)
+            }
+            ProviderProtocol::OmniPromptTools => {
+                unreachable!("Omni prompt tools is dispatched before the generic HTTP adapter")
             }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
@@ -669,6 +749,9 @@ impl ProviderResponderFactory {
             }
             ProviderProtocol::MistralConversations => {
                 mistral::consume_mistral_conversations(response, &options.cancellation, emitter)?
+            }
+            ProviderProtocol::OmniPromptTools => {
+                unreachable!("Omni prompt tools is dispatched before the generic HTTP adapter")
             }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
@@ -961,8 +1044,8 @@ fn protocol_endpoint(
             return google_vertex_endpoint(model, credentials);
         }
         ProviderProtocol::MistralConversations => {}
-        ProviderProtocol::BedrockConverseStream => {
-            unreachable!("Bedrock uses its own signed request builder");
+        ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+            unreachable!("adapter uses its own request builder");
         }
         ProviderProtocol::OpenAiCompletions
         | ProviderProtocol::OpenAiResponses
@@ -1360,6 +1443,9 @@ fn build_request_headers(
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
         }
+        ProviderProtocol::OmniPromptTools => {
+            unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+        }
     }
 
     let api_key = credentials.api_key_value().unwrap_or_default();
@@ -1468,8 +1554,8 @@ fn build_request_headers(
             }
             ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {}
             ProviderProtocol::GoogleVertex => unreachable!("Vertex is handled above"),
-            ProviderProtocol::BedrockConverseStream => {
-                unreachable!("Bedrock uses its own signed request builder")
+            ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+                unreachable!("adapter uses its own request builder")
             }
         },
         _ => {}
@@ -1557,6 +1643,9 @@ fn build_request_headers(
         | ProviderProtocol::GoogleVertex
         | ProviderProtocol::MistralConversations
         | ProviderProtocol::BedrockConverseStream => {}
+        ProviderProtocol::OmniPromptTools => {
+            unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+        }
     }
 
     let has_authorization = has_nonempty_header(&overrides, "authorization")
@@ -1576,8 +1665,8 @@ fn build_request_headers(
         | ProviderProtocol::GoogleGenerativeAi
         | ProviderProtocol::GoogleVertex => true,
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
-        ProviderProtocol::BedrockConverseStream => {
-            unreachable!("Bedrock uses its own signed request builder")
+        ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+            unreachable!("adapter uses its own request builder")
         }
     };
     if !authenticated {
@@ -4189,13 +4278,26 @@ impl MessageEmitter {
         error: ProviderAdapterError,
         cancellation: &agent::CancellationToken,
     ) -> Result<()> {
-        self.message.stop_reason =
+        let reason =
             if cancellation.is_cancelled() || matches!(&error, ProviderAdapterError::Cancelled) {
-                stream::STOP_ABORTED.to_owned()
+                stream::STOP_ABORTED
             } else {
-                stream::STOP_ERROR.to_owned()
+                stream::STOP_ERROR
             };
-        self.message.error_message = error.to_string();
+        self.finish_error(reason, error.to_string())
+    }
+
+    fn finish_error(
+        &mut self,
+        requested_reason: &str,
+        error_message: impl Into<String>,
+    ) -> Result<()> {
+        self.message.stop_reason = if requested_reason == stream::STOP_ABORTED {
+            stream::STOP_ABORTED.to_owned()
+        } else {
+            stream::STOP_ERROR.to_owned()
+        };
+        self.message.error_message = error_message.into();
         self.calculate_usage_cost();
         let result = self.events.push(stream::AssistantMessageEvent::error(
             self.message.stop_reason.clone(),
@@ -6054,6 +6156,32 @@ mod tests {
         }
     }
 
+    fn omni_prompt_tools_sse(content: &str, finish_reason: &str) -> String {
+        let first = json!({
+            "id": "omni_1",
+            "model": "gateway/chat-web",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": Value::Null,
+            }],
+        });
+        let terminal = json!({
+            "id": "omni_1",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18,
+            },
+        });
+        format!("data: {first}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
+    }
+
     fn bedrock_frame(event_type: &str, payload: &str) -> Vec<u8> {
         bedrock::encode_event_stream_message(
             &BTreeMap::from([
@@ -6167,6 +6295,142 @@ mod tests {
         assert_eq!(call.id, "call_1");
         assert_eq!(call.name, "weather");
         assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+    }
+
+    #[test]
+    fn omni_prompt_tools_converts_text_blocks_to_native_calls_without_inner_events() {
+        let body = omni_prompt_tools_sse(
+            "I will inspect it.\n<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+            "stop",
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, &body)]);
+        let mut request_model = model(omni_prompt_tools::API_OMNI_PROMPT_TOOLS, base_url);
+        request_model.provider = "omni".to_owned();
+        request_model.id = "gateway/chat-web".to_owned();
+        let observed_events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&observed_events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            event_log
+                .lock()
+                .expect("OmniRoute event log lock")
+                .push(event);
+        }));
+
+        let response = factory(0)
+            .respond(&request_model, &text_context(), request_options)
+            .expect("prompt-protocol response");
+        let request = requests.recv().expect("captured OmniRoute request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(request.target, "/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-key")
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("completion JSON body");
+        assert_eq!(sent["model"], "gateway/chat-web");
+        assert!(
+            sent.get("tools").is_none(),
+            "the inner completion must not receive native tool definitions"
+        );
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][1]["content"], "weather?");
+        let system_prompt = sent["messages"][0]["content"]
+            .as_str()
+            .expect("system prompt");
+        assert!(system_prompt.contains("be concise"));
+        assert!(system_prompt.contains("# Tool calling protocol"));
+        assert!(system_prompt.contains("### weather"));
+
+        assert_eq!(response.api, omni_prompt_tools::API_OMNI_PROMPT_TOOLS);
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+        assert_eq!(response.response_id, "omni_1");
+        assert_eq!(response.usage.total_tokens, 18);
+        assert_eq!(response.content[0].plain_text(), Some("I will inspect it."));
+        let llm::ContentBlock::ToolCall(call) = &response.content[1] else {
+            panic!("expected native tool call, got {:?}", response.content);
+        };
+        assert!(call.id.starts_with("call_omni_"));
+        assert_eq!(call.name, "weather");
+        assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+
+        let observed_events = observed_events
+            .lock()
+            .expect("OmniRoute event log lock")
+            .clone();
+        assert_eq!(
+            observed_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                stream::EVENT_START,
+                stream::EVENT_TEXT_START,
+                stream::EVENT_TEXT_DELTA,
+                stream::EVENT_TEXT_END,
+                stream::EVENT_TOOLCALL_START,
+                stream::EVENT_TOOLCALL_DELTA,
+                stream::EVENT_TOOLCALL_END,
+                stream::EVENT_DONE,
+            ]
+        );
+        let text_start = observed_events
+            .iter()
+            .find(|event| event.event_type == stream::EVENT_TEXT_START)
+            .expect("text start event");
+        let partial = text_start.partial.as_ref().expect("text start snapshot");
+        assert!(
+            partial
+                .content
+                .iter()
+                .all(|block| !matches!(block, llm::ContentBlock::ToolCall(_))),
+            "a published text snapshot must not mutate with future tool calls"
+        );
+        assert_ne!(partial.stop_reason, stream::STOP_TOOL_USE);
+    }
+
+    #[test]
+    fn omni_prompt_tools_preserves_truncation_and_reports_tool_use_when_complete() {
+        let truncated = omni_prompt_tools_sse(
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+            "length",
+        );
+        let complete = omni_prompt_tools_sse(
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+            "stop",
+        );
+        let (base_url, requests, server) = test_server(vec![
+            http_response(200, &truncated),
+            http_response(200, &complete),
+        ]);
+        let mut request_model = model(omni_prompt_tools::API_OMNI_PROMPT_TOOLS, base_url);
+        request_model.provider = "omni".to_owned();
+
+        let truncated = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("truncated prompt-protocol response");
+        let complete = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("complete prompt-protocol response");
+        let _ = requests.recv().expect("first OmniRoute request");
+        let _ = requests.recv().expect("second OmniRoute request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(truncated.stop_reason, stream::STOP_LENGTH);
+        assert_eq!(complete.stop_reason, stream::STOP_TOOL_USE);
+        assert!(matches!(
+            truncated.content.first(),
+            Some(llm::ContentBlock::ToolCall(_))
+        ));
     }
 
     #[test]

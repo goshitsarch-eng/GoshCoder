@@ -181,7 +181,7 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `src/webaccess.rs` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
-| `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
+| `src/{omniroute,omni_cli,omni_prompt_tools}.rs` | OmniRoute setup, catalog synchronization, command adapter, and chat-only tool emulation |
 | `src/{aperture,aperture_mcp}.rs` | Tailscale Aperture core, routing, cache, and connector MCP client |
 | `src/computeruse.rs` | computer-use-linux discovery, mcp.json upkeep, stdio MCP client, and `mcp` tool |
 | `src/btw.rs` | Ephemeral context-aware side threads and settings |
@@ -194,15 +194,18 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 
 ## Provider coverage
 
-The built-in catalog covers all bundled models across nine wire protocols:
+The built-in catalog covers all bundled models across nine wire protocols plus
+the `omni-prompt-tools` chat-only tool-emulation adapter:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
-`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
+`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, and
+`omni-prompt-tools`.
 
 The live Rust responder currently supports `openai-completions`,
 `anthropic-messages`, `openai-responses`, `azure-openai-responses`,
 `openai-codex-responses`, `google-generative-ai`, and
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`.
+`google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, and
+`omni-prompt-tools`.
 
 Model data is generated from the pi reference into `catalog.json`, which is
 replaced wholesale on every regeneration. Two hand-maintained files sit beside

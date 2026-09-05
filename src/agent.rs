@@ -907,6 +907,20 @@ impl Agent {
         if calls.is_empty() {
             return Vec::new();
         }
+        if assistant.stop_reason == stream::STOP_LENGTH {
+            return calls
+                .into_iter()
+                .map(|call| {
+                    self.tool_started(&call);
+                    let outcome = ToolOutcome::error(
+                        call,
+                        "Tool call was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                    );
+                    self.tool_ended(&outcome);
+                    outcome
+                })
+                .collect();
+        }
         let tools = lock(&self.inner.state).tools.clone();
         let mut prepared = Vec::new();
         let mut outcomes = Vec::new();
@@ -1310,7 +1324,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn model() -> llm::Model {
         llm::Model {
@@ -1550,6 +1564,75 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(result_ids, ["one", "two"]);
+    }
+
+    #[test]
+    fn truncated_tool_calls_are_rejected_without_execution() {
+        let executed = Arc::new(AtomicBool::new(false));
+        let did_execute = Arc::clone(&executed);
+        let tool = Tool::new(
+            "echo",
+            "Echo",
+            "Returns its value",
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+            move |_, _, _, _| {
+                did_execute.store(true, Ordering::Release);
+                Ok(ToolResult::text("unexpected execution"))
+            },
+        );
+        let truncated = llm::AssistantMessage {
+            role: "assistant".to_owned(),
+            content: vec![llm::ContentBlock::ToolCall(llm::ToolCall {
+                id: "truncated-call".to_owned(),
+                name: "echo".to_owned(),
+                arguments: BTreeMap::from([("value".to_owned(), json!("x"))]),
+                ..llm::ToolCall::default()
+            })],
+            api: "test".to_owned(),
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            stop_reason: stream::STOP_LENGTH.to_owned(),
+            timestamp: now_millis(),
+            ..llm::AssistantMessage::default()
+        };
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![tool],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| Ok(truncated.clone()))),
+            ..AgentOptions::default()
+        });
+
+        agent.prompt("run the tool").expect("prompt");
+
+        assert!(
+            !executed.load(Ordering::Acquire),
+            "a tool call from a truncated response must not execute"
+        );
+        let tool_results = agent
+            .state()
+            .messages
+            .into_iter()
+            .filter_map(|message| match message {
+                llm::Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 1);
+        assert!(tool_results[0].is_error);
+        assert!(
+            tool_results[0]
+                .content
+                .first()
+                .and_then(llm::ContentBlock::plain_text)
+                .is_some_and(|text| text.contains("output token limit"))
+        );
     }
 
     #[test]
