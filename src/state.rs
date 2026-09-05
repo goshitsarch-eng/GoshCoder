@@ -45,6 +45,12 @@ pub enum Action {
     Submit(String),
     FollowUp(String),
     Abort,
+    /// Ask the runtime to choose the next or previous available model.
+    CycleModel {
+        direction: i8,
+    },
+    /// Ask the runtime to advance through levels supported by the active model.
+    CycleThinking,
 }
 
 /// State shared by the Ratatui renderer and terminal event loop.
@@ -62,6 +68,10 @@ pub struct App {
     pub cursor: usize,
     pub status: String,
     pub streaming: bool,
+    /// True when the active transcript is safely durable. A recorded session
+    /// can exit immediately on Ctrl-C; an in-memory transcript retains the
+    /// two-press safeguard from the previous fullscreen interface.
+    pub recording_active: bool,
     pub scroll: u16,
     pub selected_suggestion: usize,
     pub tools_expanded: bool,
@@ -136,6 +146,7 @@ impl App {
             cursor: 0,
             status: "Ready".to_owned(),
             streaming: false,
+            recording_active: false,
             scroll: 0,
             selected_suggestion: 0,
             tools_expanded: false,
@@ -180,6 +191,14 @@ impl App {
         self.messages.push(message);
     }
 
+    /// Sets whether Ctrl-C can safely exit an already-recorded session.
+    pub fn set_recording_active(&mut self, recording_active: bool) {
+        self.recording_active = recording_active;
+        if recording_active {
+            self.clear_quit_arm();
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         let modifiers = key.modifiers;
         if key.code != KeyCode::Char('c') || !modifiers.contains(KeyModifiers::CONTROL) {
@@ -215,8 +234,7 @@ impl App {
                 }
             }
             (KeyCode::Tab, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                self.status = "Thinking controls will follow the active model.".to_owned();
-                Action::None
+                Action::CycleThinking
             }
             (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.set_input("/model ");
@@ -226,12 +244,10 @@ impl App {
                 if modifiers.contains(KeyModifiers::CONTROL)
                     && modifiers.contains(KeyModifiers::SHIFT) =>
             {
-                self.status = "Previous-model selection is being ported.".to_owned();
-                Action::None
+                Action::CycleModel { direction: -1 }
             }
             (KeyCode::Char('p'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.status = "Next-model selection is being ported.".to_owned();
-                Action::None
+                Action::CycleModel { direction: 1 }
             }
             (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tools_expanded = !self.tools_expanded;
@@ -382,6 +398,9 @@ impl App {
         if self.streaming {
             self.status = "Aborting".to_owned();
             return Action::Abort;
+        }
+        if self.recording_active {
+            return Action::Quit;
         }
         if self
             .quit_armed_at
@@ -803,6 +822,38 @@ mod tests {
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Quit
+        );
+    }
+
+    #[test]
+    fn recorded_session_exits_on_the_first_idle_ctrl_c() {
+        let mut app = App::new();
+        app.set_recording_active(true);
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn model_and_thinking_hotkeys_delegate_to_the_runtime() {
+        let mut app = App::new();
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Action::CycleModel { direction: 1 }
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Action::CycleModel { direction: -1 }
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Action::CycleThinking
         );
     }
 
