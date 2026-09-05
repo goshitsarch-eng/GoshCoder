@@ -133,6 +133,50 @@ pub struct SessionNotice {
     pub text: String,
 }
 
+/// Cloneable, thread-safe access to the active session's custom-entry writer.
+///
+/// Integrations use this instead of retaining a `SessionRuntime` reference in
+/// callbacks that can outlive a single terminal draw. It silently represents
+/// a no-session runtime through [`Self::recording`], while actual active-write
+/// failures retain the normal recorder diagnostics.
+#[derive(Clone)]
+pub struct SessionCustomRecorder {
+    recorder: Recorder,
+}
+
+impl SessionCustomRecorder {
+    /// Returns whether a writable session log is currently available.
+    pub fn recording(&self) -> bool {
+        self.recorder.recording() && !self.recorder.read_only()
+    }
+
+    /// Appends one pi-compatible custom entry.
+    pub fn record(&self, custom_type: impl Into<String>, data: Value) -> Result<String> {
+        self.recorder.append(Entry {
+            kind: sessionlog::TYPE_CUSTOM.to_owned(),
+            custom_type: custom_type.into(),
+            data: Some(data),
+            ..Entry::default()
+        })
+    }
+}
+
+/// Cloneable notice sink for integration callbacks.
+///
+/// Background integrations must not write directly to stderr while Ratatui
+/// owns the terminal. They enqueue notices here and the active frontend drains
+/// them alongside ordinary session notices.
+#[derive(Clone)]
+pub struct SessionNoticeSender {
+    notices: NoticeSink,
+}
+
+impl SessionNoticeSender {
+    pub fn push(&self, kind: impl Into<String>, text: impl Into<String>) {
+        self.notices.push(kind, text);
+    }
+}
+
 /// Identifies the current session without leaking its writer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionHandle {
@@ -423,6 +467,21 @@ impl SessionRuntime {
     /// held by a UI; the recorder subscription remains owned by this runtime.
     pub fn agent(&self) -> &agent::Agent {
         &self.agent
+    }
+
+    /// Returns a callback-safe writer for integration-owned custom state.
+    pub fn custom_recorder(&self) -> SessionCustomRecorder {
+        SessionCustomRecorder {
+            recorder: self.recorder.clone(),
+        }
+    }
+
+    /// Returns a callback-safe notice sink for foreground and background
+    /// integrations.
+    pub fn notice_sender(&self) -> SessionNoticeSender {
+        SessionNoticeSender {
+            notices: self.notices.clone(),
+        }
     }
 
     /// Returns whether opening selected an existing session branch.

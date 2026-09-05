@@ -15,6 +15,7 @@ use crate::{
     agent,
     catalog::Catalog,
     config, llm,
+    planner_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -100,6 +101,8 @@ pub struct PreparedSession {
     pub resource_paths: ResourcePaths,
     pub resources: ResourceSet,
     pub config: SessionConfig,
+    /// Session-owned planner integration when chat or `-planner` requested it.
+    pub planner: Option<planner_runtime::PlannerRuntime>,
 }
 
 #[derive(Debug)]
@@ -419,6 +422,24 @@ pub fn prepare_session(
     let options = session_options(catalog, &config, cwd, system_prompt, tools, responder)?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let planner = if config.load_planner || config.enable_planner {
+        let workspace = workspace.as_ref().expect(
+            "planner configuration always creates a workspace before session initialization",
+        );
+        let agent_state = runtime.agent().state();
+        Some(
+            planner_runtime::PlannerRuntime::attach(
+                &runtime,
+                workspace.clone(),
+                agent_state.tools,
+                agent_state.system_prompt,
+                config.enable_planner,
+            )
+            .map_err(|error| RuntimeError::Session(format!("initialize planner: {error}")))?,
+        )
+    } else {
+        None
+    };
 
     Ok(PreparedSession {
         runtime,
@@ -426,6 +447,7 @@ pub fn prepare_session(
         resource_paths,
         resources,
         config,
+        planner,
     })
 }
 

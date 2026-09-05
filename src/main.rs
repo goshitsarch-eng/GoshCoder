@@ -14,6 +14,7 @@ pub mod prompts;
 pub mod provider_cli;
 pub mod providers;
 pub mod plannotator;
+pub mod planner_runtime;
 pub mod ralph;
 pub mod ralph_cli;
 pub mod resources;
@@ -65,10 +66,10 @@ Usage:
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
-The Ratatui frontend, persistent-session, prompt, Ralph, provider, model, and
-credential CLIs are active. `run` supports the OpenAI and Anthropic provider
-protocols; interactive runtime integration and remaining provider extensions
-are still being migrated from the previous implementation.
+The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
+model, and credential CLIs are active. `run` supports the OpenAI, Anthropic,
+and Bedrock provider protocols; remaining provider extensions and interactive
+commands are still being migrated from the previous implementation.
 "#;
 
 fn main() {
@@ -652,7 +653,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, planner, BTW, compaction, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /name <text>          Set the persisted session name\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /resources            Show loaded context, prompts, and skills\n  /planner              Toggle planning mode\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, session picking, prompt editing, Ralph, BTW, compaction, OmniRoute, Aperture, and planner review commands are still being migrated."
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -949,6 +950,19 @@ fn dispatch_runtime_slash_command(
             );
             CommandDispatch::Handled
         }
+        "/planner" | "/plannator" | "/plannotator" => {
+            let Some(planner) = prepared.planner.as_ref() else {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Planner is unavailable in this session. Reopen chat with planner support enabled.",
+                );
+                return CommandDispatch::Handled;
+            };
+            let phase = planner.toggle();
+            view.activity = format!("Planner: {}", phase.as_str());
+            CommandDispatch::Handled
+        }
         "/system" if rest.is_empty() => {
             append_view_message(
                 view,
@@ -958,7 +972,11 @@ fn dispatch_runtime_slash_command(
             CommandDispatch::Handled
         }
         "/system" => {
-            prepared.runtime.agent().set_system_prompt(rest);
+            if let Some(planner) = prepared.planner.as_ref() {
+                planner.set_base_system_prompt(rest);
+            } else {
+                prepared.runtime.agent().set_system_prompt(rest);
+            }
             view.activity = "System prompt updated for this session".to_owned();
             append_view_message(
                 view,
@@ -1280,10 +1298,14 @@ fn runtime_sidebar(
         .as_ref()
         .map(|workspace| workspace.root().display().to_string())
         .unwrap_or_else(|| prepared.config.workdir.display().to_string());
+    let mode = prepared
+        .planner
+        .as_ref()
+        .map_or_else(|| "normal".to_owned(), planner_runtime::PlannerRuntime::status_line);
     let mut lines = vec![
         state::SidebarLine::title(name),
         state::SidebarLine::accent(format!("{}/{}", state.model.provider, state.model.id)),
-        state::SidebarLine::meta(format!("{} thinking · normal", state.thinking_level)),
+        state::SidebarLine::meta(format!("{} thinking · {mode}", state.thinking_level)),
         state::SidebarLine::meta(storage),
         state::SidebarLine::blank(),
         state::SidebarLine::section("Context"),
@@ -1361,8 +1383,12 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
             compact_number(context_limit)
         )
     };
+    let planner = prepared
+        .planner
+        .as_ref()
+        .map_or_else(|| "Planner: unavailable".to_owned(), planner_runtime::PlannerRuntime::status_line);
     format!(
-        "Session: {}\nModel: {}/{}\nThinking: {}\nContext: {context}\nActivity: {activity}\nStorage: {storage}",
+        "Session: {}\nModel: {}/{}\nThinking: {}\n{planner}\nContext: {context}\nActivity: {activity}\nStorage: {storage}",
         prepared
             .runtime
             .id()
