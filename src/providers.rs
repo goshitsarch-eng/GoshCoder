@@ -727,8 +727,10 @@ impl ProviderResponderFactory {
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
-                    let error =
-                        provider_error_from_response(response, self.config.max_error_body_bytes);
+                    let error = mark_aperture_retryable_provider_error(
+                        model,
+                        provider_error_from_response(response, self.config.max_error_body_bytes),
+                    );
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -742,6 +744,7 @@ impl ProviderResponderFactory {
                     )?;
                 }
                 Err(ProviderAdapterError::Provider(error)) => {
+                    let error = mark_aperture_retryable_provider_error(model, error);
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -863,6 +866,23 @@ impl ProviderResponderFactory {
                 })
         })
     }
+}
+
+fn mark_aperture_retryable_provider_error(
+    model: &llm::Model,
+    mut error: stream::ProviderError,
+) -> stream::ProviderError {
+    let routed_through_aperture = model.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("referer") && value == aperture::APERTURE_REFERER
+    });
+    if routed_through_aperture && let Some(message) = aperture::mark_retryable_error(&error.message)
+    {
+        error.message = message;
+        error
+            .headers
+            .insert("x-should-retry".to_owned(), "true".to_owned());
+    }
+    error
 }
 
 fn provider_network_error(error: reqwest::Error) -> ProviderAdapterError {
@@ -6785,6 +6805,38 @@ mod tests {
         assert_eq!(response.stop_reason, stream::STOP_STOP);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routed_aperture_restart_errors_are_retried() {
+        let success = concat!(
+            "data: {\"id\":\"chat_1\",\"model\":\"route-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![
+            http_response_with_headers(400, "Aperture is restarting", &[("retry-after-ms", "0")]),
+            http_response(200, success),
+        ]);
+        let mut request_model = model(API_OPENAI_COMPLETIONS, format!("{base_url}/v1"));
+        request_model
+            .headers
+            .insert("Referer".to_owned(), aperture::APERTURE_REFERER.to_owned());
+
+        let response = factory(1)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("restart retry succeeds");
+        let first = requests.recv().expect("first routed request");
+        let second = requests.recv().expect("retried routed request");
+        server.join().expect("Aperture server finishes");
+
+        assert_eq!(first.target, "/v1/chat/completions");
+        assert_eq!(second.target, "/v1/chat/completions");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
     }
 
     #[test]
