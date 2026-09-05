@@ -157,7 +157,6 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| io::Error::other("run invocation did not include a prompt"))?;
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
-    ensure_interactive_model(&mut invocation.config, catalog.as_ref(), true)?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
@@ -419,6 +418,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    ensure_interactive_model(&mut invocation.config, catalog.as_ref(), true)?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
