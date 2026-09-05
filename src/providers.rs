@@ -11,6 +11,8 @@
 //! The implemented wire protocols are:
 //! - OpenAI Chat Completions (`openai-completions`)
 //! - OpenAI Responses (`openai-responses`)
+//! - Azure OpenAI Responses (`azure-openai-responses`)
+//! - OpenAI Codex Responses (`openai-codex-responses`)
 //! - Anthropic Messages (`anthropic-messages`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
@@ -28,6 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{
     blocking::{Client, Response},
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -39,7 +42,18 @@ use crate::{agent, bedrock, catalog, llm, stream};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
+pub const API_AZURE_OPENAI_RESPONSES: &str = "azure-openai-responses";
+pub const API_OPENAI_CODEX_RESPONSES: &str = "openai-codex-responses";
 pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
+
+const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
+const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+const CODEX_JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const AZURE_MANAGED_HOST_SUFFIXES: &[&str] = &[
+    ".openai.azure.com",
+    ".cognitiveservices.azure.com",
+    ".ai.azure.com",
+];
 
 /// The maximum request attempts after the initial request that callers may
 /// configure.  A bounded value prevents a bad configuration from creating an
@@ -53,6 +67,8 @@ pub const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub enum ProviderProtocol {
     OpenAiCompletions,
     OpenAiResponses,
+    AzureOpenAiResponses,
+    OpenAiCodexResponses,
     AnthropicMessages,
     BedrockConverseStream,
 }
@@ -62,6 +78,8 @@ impl ProviderProtocol {
         match api {
             API_OPENAI_COMPLETIONS => Ok(Self::OpenAiCompletions),
             API_OPENAI_RESPONSES => Ok(Self::OpenAiResponses),
+            API_AZURE_OPENAI_RESPONSES => Ok(Self::AzureOpenAiResponses),
+            API_OPENAI_CODEX_RESPONSES => Ok(Self::OpenAiCodexResponses),
             API_ANTHROPIC_MESSAGES => Ok(Self::AnthropicMessages),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
@@ -72,6 +90,8 @@ impl ProviderProtocol {
         match self {
             Self::OpenAiCompletions => "chat/completions",
             Self::OpenAiResponses => "responses",
+            Self::AzureOpenAiResponses => "responses",
+            Self::OpenAiCodexResponses => "codex/responses",
             Self::AnthropicMessages => "v1/messages",
             Self::BedrockConverseStream => {
                 unreachable!("Bedrock uses its own signed request builder")
@@ -92,7 +112,10 @@ pub enum ProviderAdapterError {
     InvalidHeaderName(String),
     InvalidHeaderValue(String),
     MissingCredential { provider: String },
+    MissingApiKey { provider: String },
     AmbientCredentialsUnsupported { provider: String },
+    AzureBaseUrlRequired,
+    InvalidCodexToken,
     InvalidConfiguration(&'static str),
     Request(reqwest::Error),
     Provider(stream::ProviderError),
@@ -128,10 +151,17 @@ impl fmt::Display for ProviderAdapterError {
                     "no API key or authorization header for provider {provider:?}"
                 )
             }
+            Self::MissingApiKey { provider } => {
+                write!(formatter, "no API key for provider {provider:?}")
+            }
             Self::AmbientCredentialsUnsupported { provider } => write!(
                 formatter,
                 "provider {provider:?} requires ambient credentials, which this HTTP adapter does not implement"
             ),
+            Self::AzureBaseUrlRequired => formatter.write_str(
+                "Azure OpenAI base URL is required; set AZURE_OPENAI_BASE_URL or AZURE_OPENAI_RESOURCE_NAME, or configure model.baseUrl",
+            ),
+            Self::InvalidCodexToken => formatter.write_str("failed to extract accountId from token"),
             Self::InvalidConfiguration(message) => formatter.write_str(message),
             Self::Request(error) => write!(formatter, "provider request failed: {error}"),
             Self::Provider(error) => error.fmt(formatter),
@@ -162,7 +192,10 @@ impl Error for ProviderAdapterError {
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
             | Self::MissingCredential { .. }
+            | Self::MissingApiKey { .. }
             | Self::AmbientCredentialsUnsupported { .. }
+            | Self::AzureBaseUrlRequired
+            | Self::InvalidCodexToken
             | Self::InvalidConfiguration(_)
             | Self::Protocol(_)
             | Self::Cancelled
@@ -497,6 +530,18 @@ impl ProviderResponderFactory {
     ) -> Result<()> {
         ensure_not_cancelled(&options.cancellation)?;
         let protocol = ProviderProtocol::from_api(&model.api)?;
+        let responses_grammar_tool_input_properties = match protocol {
+            ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {
+                grammar_tool_input_properties(
+                    &context.tools,
+                    compat_bool(model, "supportsOpenAIGrammarTools", false),
+                )?
+            }
+            ProviderProtocol::OpenAiCompletions
+            | ProviderProtocol::OpenAiResponses
+            | ProviderProtocol::AnthropicMessages
+            | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
+        };
         let payload = match protocol {
             ProviderProtocol::OpenAiCompletions => {
                 build_openai_completions_request(model, context, &options)
@@ -504,6 +549,19 @@ impl ProviderResponderFactory {
             ProviderProtocol::OpenAiResponses => {
                 build_openai_responses_request(model, context, &options)
             }
+            ProviderProtocol::AzureOpenAiResponses => build_azure_openai_responses_request(
+                model,
+                context,
+                &options,
+                &credentials,
+                &responses_grammar_tool_input_properties,
+            ),
+            ProviderProtocol::OpenAiCodexResponses => build_openai_codex_responses_request(
+                model,
+                context,
+                &options,
+                &responses_grammar_tool_input_properties,
+            ),
             ProviderProtocol::AnthropicMessages => {
                 build_anthropic_messages_request(model, context, &options)
             }
@@ -517,6 +575,7 @@ impl ProviderResponderFactory {
             &payload,
             &credentials,
             &options.cancellation,
+            &options.session_id,
         )?;
 
         emitter.start()?;
@@ -524,9 +583,27 @@ impl ProviderResponderFactory {
             ProviderProtocol::OpenAiCompletions => {
                 consume_openai_completions(response, model, &options.cancellation, emitter)?
             }
-            ProviderProtocol::OpenAiResponses => {
-                consume_openai_responses(response, model, &options.cancellation, emitter)?
-            }
+            ProviderProtocol::OpenAiResponses => consume_openai_responses(
+                response,
+                model,
+                &options.cancellation,
+                emitter,
+                &responses_grammar_tool_input_properties,
+            )?,
+            ProviderProtocol::AzureOpenAiResponses => consume_openai_responses(
+                response,
+                model,
+                &options.cancellation,
+                emitter,
+                &responses_grammar_tool_input_properties,
+            )?,
+            ProviderProtocol::OpenAiCodexResponses => consume_codex_responses(
+                response,
+                model,
+                &options.cancellation,
+                emitter,
+                &responses_grammar_tool_input_properties,
+            )?,
             ProviderProtocol::AnthropicMessages => {
                 consume_anthropic_messages(response, model, &options.cancellation, emitter)?
             }
@@ -559,9 +636,10 @@ impl ProviderResponderFactory {
         payload: &Value,
         credentials: &ProviderCredentials,
         cancellation: &agent::CancellationToken,
+        session_id: &str,
     ) -> Result<Response> {
-        let endpoint = protocol_endpoint(model, protocol)?;
-        let headers = build_request_headers(protocol, model, credentials)?;
+        let headers = build_request_headers(protocol, model, credentials, session_id)?;
+        let endpoint = protocol_endpoint(model, protocol, credentials)?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
@@ -682,15 +760,186 @@ fn bedrock_retry_delay_limit(limit: stream::RetryDelayLimit) -> Option<Duration>
     }
 }
 
-fn protocol_endpoint(model: &llm::Model, protocol: ProviderProtocol) -> Result<Url> {
+fn protocol_endpoint(
+    model: &llm::Model,
+    protocol: ProviderProtocol,
+    credentials: &ProviderCredentials,
+) -> Result<Url> {
+    match protocol {
+        ProviderProtocol::AzureOpenAiResponses => {
+            return azure_openai_responses_endpoint(model, credentials);
+        }
+        ProviderProtocol::OpenAiCodexResponses => {
+            return codex_responses_endpoint(&model.base_url);
+        }
+        ProviderProtocol::BedrockConverseStream => {
+            unreachable!("Bedrock uses its own signed request builder");
+        }
+        ProviderProtocol::OpenAiCompletions
+        | ProviderProtocol::OpenAiResponses
+        | ProviderProtocol::AnthropicMessages => {}
+    }
     if model.base_url.trim().is_empty() {
         return Err(ProviderAdapterError::MissingBaseUrl);
     }
     let mut endpoint =
         Url::parse(model.base_url.trim()).map_err(|_| ProviderAdapterError::InvalidBaseUrl)?;
-    let prefix = endpoint.path().trim_end_matches('/');
-    endpoint.set_path(&format!("{prefix}/{}", protocol.endpoint_suffix()));
+    append_endpoint_suffix(&mut endpoint, protocol.endpoint_suffix());
     Ok(endpoint)
+}
+
+fn append_endpoint_suffix(endpoint: &mut Url, suffix: &str) {
+    let prefix = endpoint.path().trim_end_matches('/');
+    endpoint.set_path(&format!("{prefix}/{suffix}"));
+}
+
+fn azure_openai_responses_endpoint(
+    model: &llm::Model,
+    credentials: &ProviderCredentials,
+) -> Result<Url> {
+    let (mut endpoint, api_version) = resolve_azure_openai_config(model, credentials)?;
+    append_endpoint_suffix(&mut endpoint, "responses");
+
+    let mut query = endpoint
+        .query_pairs()
+        .filter(|(name, _)| name != "api-version")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    query.push(("api-version".to_owned(), api_version));
+    endpoint.set_query(None);
+    {
+        let mut serializer = endpoint.query_pairs_mut();
+        for (name, value) in query {
+            serializer.append_pair(&name, &value);
+        }
+    }
+    Ok(endpoint)
+}
+
+fn resolve_azure_openai_config(
+    model: &llm::Model,
+    credentials: &ProviderCredentials,
+) -> Result<(Url, String)> {
+    let api_version =
+        configured_provider_environment_value(credentials, "AZURE_OPENAI_API_VERSION");
+    let api_version = if api_version.is_empty() {
+        DEFAULT_AZURE_OPENAI_API_VERSION.to_owned()
+    } else {
+        api_version
+    };
+
+    let configured_base_url =
+        configured_provider_environment_value(credentials, "AZURE_OPENAI_BASE_URL");
+    let base_url = if !configured_base_url.is_empty() {
+        configured_base_url
+    } else {
+        let resource_name =
+            configured_provider_environment_value(credentials, "AZURE_OPENAI_RESOURCE_NAME");
+        if !resource_name.is_empty() {
+            format!(
+                "https://{}.openai.azure.com/openai/v1",
+                resource_name.trim()
+            )
+        } else {
+            model.base_url.trim().to_owned()
+        }
+    };
+    if base_url.is_empty() {
+        return Err(ProviderAdapterError::AzureBaseUrlRequired);
+    }
+    Ok((normalize_azure_openai_base_url(&base_url)?, api_version))
+}
+
+fn configured_provider_environment_value(credentials: &ProviderCredentials, name: &str) -> String {
+    bedrock::provider_env_value(&credentials.environment, name)
+}
+
+fn normalize_azure_openai_base_url(base_url: &str) -> Result<Url> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let mut endpoint = Url::parse(trimmed).map_err(|_| ProviderAdapterError::InvalidBaseUrl)?;
+    if endpoint.host_str().is_none() {
+        return Err(ProviderAdapterError::InvalidBaseUrl);
+    }
+
+    let is_azure_managed = endpoint.host_str().is_some_and(|host| {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        AZURE_MANAGED_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| host.ends_with(suffix))
+    });
+    let path = endpoint.path().trim_end_matches('/');
+    if is_azure_managed && matches!(path, "" | "/openai" | "/openai/v1/responses") {
+        endpoint.set_path("/openai/v1");
+        endpoint.set_query(None);
+    }
+    Ok(endpoint)
+}
+
+fn parse_azure_deployment_name_map(value: &str) -> BTreeMap<String, String> {
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let (model_id, deployment_name) = entry.split_once('=')?;
+            let model_id = model_id.trim();
+            let deployment_name = deployment_name.trim();
+            (!model_id.is_empty() && !deployment_name.is_empty())
+                .then(|| (model_id.to_owned(), deployment_name.to_owned()))
+        })
+        .collect()
+}
+
+fn azure_deployment_name(model: &llm::Model, credentials: &ProviderCredentials) -> String {
+    let deployments = parse_azure_deployment_name_map(&configured_provider_environment_value(
+        credentials,
+        "AZURE_OPENAI_DEPLOYMENT_NAME_MAP",
+    ));
+    deployments
+        .get(&model.id)
+        .cloned()
+        .unwrap_or_else(|| model.id.clone())
+}
+
+fn codex_responses_endpoint(base_url: &str) -> Result<Url> {
+    let normalized = base_url.trim().trim_end_matches('/');
+    let base_url = if normalized.is_empty() {
+        DEFAULT_CODEX_BASE_URL
+    } else {
+        normalized
+    };
+    let mut endpoint = Url::parse(base_url).map_err(|_| ProviderAdapterError::InvalidBaseUrl)?;
+    if endpoint.host_str().is_none() {
+        return Err(ProviderAdapterError::InvalidBaseUrl);
+    }
+    let path = endpoint.path().trim_end_matches('/');
+    let path = if path.ends_with("/codex/responses") {
+        path.to_owned()
+    } else if path.ends_with("/codex") {
+        format!("{path}/responses")
+    } else {
+        format!("{path}/codex/responses")
+    };
+    endpoint.set_path(&path);
+    Ok(endpoint)
+}
+
+fn extract_codex_account_id(token: &str) -> Result<String> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    let [_, payload, _] = parts.as_slice() else {
+        return Err(ProviderAdapterError::InvalidCodexToken);
+    };
+    let payload = URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|_| ProviderAdapterError::InvalidCodexToken)?;
+    let payload = serde_json::from_slice::<Value>(&payload)
+        .map_err(|_| ProviderAdapterError::InvalidCodexToken)?;
+    payload
+        .get(CODEX_JWT_AUTH_CLAIM)
+        .and_then(Value::as_object)
+        .and_then(|claim| claim.get("chatgpt_account_id"))
+        .and_then(Value::as_str)
+        .filter(|account_id| !account_id.is_empty())
+        .map(str::to_owned)
+        .ok_or(ProviderAdapterError::InvalidCodexToken)
 }
 
 fn provider_error_from_response(
@@ -735,6 +984,7 @@ fn build_request_headers(
     protocol: ProviderProtocol,
     model: &llm::Model,
     credentials: &ProviderCredentials,
+    session_id: &str,
 ) -> Result<HeaderMap> {
     let mut overrides = BTreeMap::<String, Option<String>>::new();
     set_header_override(
@@ -743,7 +993,10 @@ fn build_request_headers(
         Some("application/json".to_owned()),
     );
     match protocol {
-        ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
+        ProviderProtocol::OpenAiCompletions
+        | ProviderProtocol::OpenAiResponses
+        | ProviderProtocol::AzureOpenAiResponses
+        | ProviderProtocol::OpenAiCodexResponses => {
             set_header_override(
                 &mut overrides,
                 "accept".to_owned(),
@@ -769,6 +1022,27 @@ fn build_request_headers(
 
     let api_key = credentials.api_key_value().unwrap_or_default();
     let ambient = api_key == catalog::AUTHENTICATED_SENTINEL;
+    match protocol {
+        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses
+            if ambient =>
+        {
+            return Err(ProviderAdapterError::AmbientCredentialsUnsupported {
+                provider: model.provider.clone(),
+            });
+        }
+        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses
+            if api_key.is_empty() =>
+        {
+            return Err(ProviderAdapterError::MissingApiKey {
+                provider: model.provider.clone(),
+            });
+        }
+        _ => {}
+    }
+    let codex_account_id = match protocol {
+        ProviderProtocol::OpenAiCodexResponses => Some(extract_codex_account_id(api_key)?),
+        _ => None,
+    };
     if !ambient && !api_key.is_empty() {
         match protocol {
             ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
@@ -785,6 +1059,7 @@ fn build_request_headers(
                     Some(api_key.to_owned()),
                 );
             }
+            ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {}
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock uses its own signed request builder")
             }
@@ -798,6 +1073,75 @@ fn build_request_headers(
         set_header_override(&mut overrides, name.clone(), value.clone());
     }
 
+    match protocol {
+        ProviderProtocol::AzureOpenAiResponses => {
+            set_header_override(
+                &mut overrides,
+                "api-key".to_owned(),
+                Some(api_key.to_owned()),
+            );
+        }
+        ProviderProtocol::OpenAiCodexResponses => {
+            let account_id = codex_account_id.expect("Codex account ID was validated");
+            set_header_override(
+                &mut overrides,
+                "authorization".to_owned(),
+                Some(format!("Bearer {api_key}")),
+            );
+            set_header_override(
+                &mut overrides,
+                "chatgpt-account-id".to_owned(),
+                Some(account_id),
+            );
+            set_header_override(
+                &mut overrides,
+                "originator".to_owned(),
+                Some("goshcoder".to_owned()),
+            );
+            set_header_override(
+                &mut overrides,
+                "user-agent".to_owned(),
+                Some(format!(
+                    "goshcoder ({}; {})",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )),
+            );
+            set_header_override(
+                &mut overrides,
+                "openai-beta".to_owned(),
+                Some("responses=experimental".to_owned()),
+            );
+            set_header_override(
+                &mut overrides,
+                "accept".to_owned(),
+                Some("text/event-stream".to_owned()),
+            );
+            set_header_override(
+                &mut overrides,
+                "content-type".to_owned(),
+                Some("application/json".to_owned()),
+            );
+            let session_id = clamp_prompt_cache_key(session_id);
+            if !session_id.is_empty() {
+                set_header_override(
+                    &mut overrides,
+                    "session-id".to_owned(),
+                    Some(session_id.clone()),
+                );
+                set_header_override(
+                    &mut overrides,
+                    "x-client-request-id".to_owned(),
+                    Some(session_id),
+                );
+            }
+        }
+        ProviderProtocol::OpenAiCompletions
+        | ProviderProtocol::OpenAiResponses
+        | ProviderProtocol::AnthropicMessages
+        | ProviderProtocol::BedrockConverseStream => {}
+    }
+
     let has_authorization = has_nonempty_header(&overrides, "authorization")
         || has_nonempty_header(&overrides, "cf-aig-authorization");
     let has_api_key_header = has_nonempty_header(&overrides, "x-api-key");
@@ -805,6 +1149,7 @@ fn build_request_headers(
         ProviderProtocol::OpenAiCompletions | ProviderProtocol::OpenAiResponses => {
             has_authorization
         }
+        ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => true,
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
@@ -1241,15 +1586,520 @@ fn build_openai_responses_request(
     Ok(Value::Object(body))
 }
 
+fn build_azure_openai_responses_request(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: &agent::RequestOptions,
+    credentials: &ProviderCredentials,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let tool_options = ResponsesToolOptions {
+        supports_strict_mode: compat_bool(model, "supportsStrictMode", true),
+        strict_null: false,
+        supports_openai_grammar_tools: compat_bool(model, "supportsOpenAIGrammarTools", false),
+        defer_loading: false,
+    };
+    let deferred_tools = BTreeMap::new();
+    let mut body = Map::new();
+    body.insert(
+        "model".to_owned(),
+        Value::String(azure_deployment_name(model, credentials)),
+    );
+    body.insert(
+        "input".to_owned(),
+        Value::Array(responses_input(
+            model,
+            context,
+            ResponsesInputOptions {
+                include_system_prompt: true,
+                supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
+                grammar_tool_input_properties,
+                deferred_tools: &deferred_tools,
+                deferred_tools_mode: None,
+                tool_options,
+            },
+        )?),
+    );
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    if let Some(max_tokens) = requested_max_tokens(model, context) {
+        body.insert(
+            "max_output_tokens".to_owned(),
+            Value::Number(max_tokens.max(16).into()),
+        );
+    }
+    if !options.session_id.is_empty() {
+        body.insert(
+            "prompt_cache_key".to_owned(),
+            Value::String(clamp_prompt_cache_key(&options.session_id)),
+        );
+    }
+    if !context.tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(responses_function_tools(&context.tools, tool_options)?),
+        );
+    }
+    if let Some(effort) = azure_reasoning_effort(model, &options.thinking_level) {
+        body.insert(
+            "reasoning".to_owned(),
+            json!({"effort": effort, "summary": "auto"}),
+        );
+        body.insert(
+            "include".to_owned(),
+            Value::Array(vec![Value::String(
+                "reasoning.encrypted_content".to_owned(),
+            )]),
+        );
+    }
+    merge_sampling_params(&mut body, model);
+    Ok(Value::Object(body))
+}
+
+fn azure_reasoning_effort(model: &llm::Model, requested: &str) -> Option<String> {
+    if !model.reasoning {
+        return None;
+    }
+    let level = stream::clamp_thinking_level(model, requested);
+    if level != llm::THINKING_OFF {
+        return Some(
+            model
+                .thinking_level_map
+                .get(&level)
+                .and_then(|mapped| mapped.clone())
+                .unwrap_or(level),
+        );
+    }
+    match model.thinking_level_map.get(llm::THINKING_OFF) {
+        Some(None) => None,
+        Some(Some(mapped)) => Some(mapped.clone()),
+        None => Some("none".to_owned()),
+    }
+}
+
+fn build_openai_codex_responses_request(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: &agent::RequestOptions,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
+) -> Result<Value> {
+    let tool_options = ResponsesToolOptions {
+        supports_strict_mode: compat_bool(model, "supportsStrictMode", true),
+        strict_null: true,
+        supports_openai_grammar_tools: compat_bool(model, "supportsOpenAIGrammarTools", false),
+        defer_loading: false,
+    };
+    let deferred_tools_mode = if compat_bool(model, "supportsAdditionalTools", false) {
+        Some(ResponsesDeferredToolsMode::AdditionalTools)
+    } else if compat_bool(model, "supportsToolSearch", false) {
+        Some(ResponsesDeferredToolsMode::ToolSearch)
+    } else {
+        None
+    };
+    let (immediate_tools, deferred_tools) =
+        split_responses_deferred_tools(context, deferred_tools_mode.is_some());
+    let instructions = if context.system_prompt.is_empty() {
+        "You are a helpful assistant.".to_owned()
+    } else {
+        context.system_prompt.clone()
+    };
+    let mut body = Map::new();
+    body.insert("model".to_owned(), Value::String(model.id.clone()));
+    body.insert("instructions".to_owned(), Value::String(instructions));
+    body.insert(
+        "input".to_owned(),
+        Value::Array(responses_input(
+            model,
+            context,
+            ResponsesInputOptions {
+                include_system_prompt: false,
+                supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
+                grammar_tool_input_properties,
+                deferred_tools: &deferred_tools,
+                deferred_tools_mode,
+                tool_options,
+            },
+        )?),
+    );
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    body.insert("text".to_owned(), json!({"verbosity": "low"}));
+    body.insert(
+        "include".to_owned(),
+        Value::Array(vec![Value::String(
+            "reasoning.encrypted_content".to_owned(),
+        )]),
+    );
+    body.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
+    body.insert("parallel_tool_calls".to_owned(), Value::Bool(true));
+    if !options.session_id.is_empty() {
+        body.insert(
+            "prompt_cache_key".to_owned(),
+            Value::String(clamp_prompt_cache_key(&options.session_id)),
+        );
+    }
+    if !immediate_tools.is_empty() {
+        body.insert(
+            "tools".to_owned(),
+            Value::Array(responses_function_tools(&immediate_tools, tool_options)?),
+        );
+    }
+    if let Some(effort) = mapped_thinking_level(model, &options.thinking_level) {
+        body.insert(
+            "reasoning".to_owned(),
+            json!({"effort": effort, "summary": "auto"}),
+        );
+    }
+    merge_sampling_params(&mut body, model);
+    Ok(Value::Object(body))
+}
+
+#[derive(Clone, Copy)]
+struct ResponsesToolOptions {
+    supports_strict_mode: bool,
+    strict_null: bool,
+    supports_openai_grammar_tools: bool,
+    defer_loading: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ResponsesDeferredToolsMode {
+    AdditionalTools,
+    ToolSearch,
+}
+
+struct ResponsesInputOptions<'a> {
+    include_system_prompt: bool,
+    supports_developer_role: bool,
+    grammar_tool_input_properties: &'a BTreeMap<String, String>,
+    deferred_tools: &'a BTreeMap<String, llm::Tool>,
+    deferred_tools_mode: Option<ResponsesDeferredToolsMode>,
+    tool_options: ResponsesToolOptions,
+}
+
+fn responses_function_tools(
+    tools: &[llm::Tool],
+    options: ResponsesToolOptions,
+) -> Result<Vec<Value>> {
+    tools
+        .iter()
+        .map(|tool| {
+            if let Some(grammar) =
+                grammar_constrained_sampling(tool, options.supports_openai_grammar_tools)?
+            {
+                let mut value = json!({
+                    "type": "custom",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "format": {
+                        "type": "grammar",
+                        "syntax": grammar.syntax,
+                        "definition": grammar.definition,
+                    },
+                });
+                if options.defer_loading {
+                    value
+                        .as_object_mut()
+                        .expect("Responses custom tool is an object")
+                        .insert("defer_loading".to_owned(), Value::Bool(true));
+                }
+                return Ok(value);
+            }
+            let requested_strict =
+                requested_json_schema_strict(tool, options.supports_strict_mode)?;
+            let mut value = json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": schema_or_empty(&tool.parameters),
+            });
+            if options.defer_loading {
+                value
+                    .as_object_mut()
+                    .expect("Responses function tool is an object")
+                    .insert("defer_loading".to_owned(), Value::Bool(true));
+            }
+            if options.supports_strict_mode {
+                value
+                    .as_object_mut()
+                    .expect("Responses function tool is an object")
+                    .insert(
+                        "strict".to_owned(),
+                        requested_strict.map(Value::Bool).unwrap_or_else(|| {
+                            if options.strict_null {
+                                Value::Null
+                            } else {
+                                Value::Bool(false)
+                            }
+                        }),
+                    );
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
+fn requested_json_schema_strict(
+    tool: &llm::Tool,
+    supports_strict_mode: bool,
+) -> Result<Option<bool>> {
+    let Some(config) = tool
+        .constrained_sampling
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    if config.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(None);
+    }
+    if supports_strict_mode {
+        return Ok(Some(true));
+    }
+    if config.get("strict").and_then(Value::as_str) == Some("require") {
+        return Err(ProviderAdapterError::Protocol(format!(
+            "Tool {:?} requires JSON-schema constrained sampling, but strict tools are unsupported",
+            tool.name
+        )));
+    }
+    Ok(None)
+}
+
+struct GrammarConstrainedSampling {
+    syntax: String,
+    definition: String,
+    input_property: String,
+}
+
+fn grammar_constrained_sampling(
+    tool: &llm::Tool,
+    supports_openai_grammar_tools: bool,
+) -> Result<Option<GrammarConstrainedSampling>> {
+    let Some(config) = tool
+        .constrained_sampling
+        .as_ref()
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    if config.get("type").and_then(Value::as_str) != Some("grammar")
+        || !supports_openai_grammar_tools
+    {
+        return Ok(None);
+    }
+    let error = |message: &str| {
+        ProviderAdapterError::Protocol(format!(
+            "Tool {:?} cannot use grammar constrained sampling: {message}",
+            tool.name
+        ))
+    };
+    let variants = config
+        .get("variants")
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("no supported grammar variant was provided"))?;
+    let lark = variants
+        .get("openai_lark")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let regex = variants
+        .get("openai_regex")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let (syntax, definition) = match (lark, regex) {
+        (Some(definition), _) => ("lark", definition),
+        (None, Some(definition)) => ("regex", definition),
+        (None, None) => {
+            return Err(error("no supported grammar variant was provided"));
+        }
+    };
+    let schema = tool
+        .parameters
+        .as_object()
+        .filter(|schema| schema.get("type").and_then(Value::as_str) == Some("object"))
+        .ok_or_else(|| error("grammar constrained sampling requires an object parameter schema"))?;
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .filter(|required| required.len() == 1)
+        .ok_or_else(|| {
+            error("grammar constrained sampling requires exactly one required string property")
+        })?;
+    let input_property = required
+        .first()
+        .and_then(Value::as_str)
+        .filter(|property| !property.is_empty())
+        .ok_or_else(|| {
+            error("grammar constrained sampling requires exactly one required string property")
+        })?;
+    let is_string = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(input_property))
+        .and_then(Value::as_object)
+        .and_then(|property| property.get("type"))
+        .and_then(Value::as_str)
+        == Some("string");
+    if !is_string {
+        return Err(error(&format!(
+            "grammar constrained sampling property {input_property} must have type string"
+        )));
+    }
+    Ok(Some(GrammarConstrainedSampling {
+        syntax: syntax.to_owned(),
+        definition: definition.to_owned(),
+        input_property: input_property.to_owned(),
+    }))
+}
+
+fn grammar_tool_input_properties(
+    tools: &[llm::Tool],
+    supports_openai_grammar_tools: bool,
+) -> Result<BTreeMap<String, String>> {
+    let mut properties = BTreeMap::new();
+    for tool in tools {
+        if let Some(grammar) = grammar_constrained_sampling(tool, supports_openai_grammar_tools)? {
+            properties.insert(tool.name.clone(), grammar.input_property);
+        }
+    }
+    Ok(properties)
+}
+
+fn split_responses_deferred_tools(
+    context: &llm::Context,
+    enabled: bool,
+) -> (Vec<llm::Tool>, BTreeMap<String, llm::Tool>) {
+    let mut order = Vec::new();
+    let mut tools = BTreeMap::new();
+    for tool in &context.tools {
+        if !tools.contains_key(&tool.name) {
+            order.push(tool.name.clone());
+        }
+        tools.insert(tool.name.clone(), tool.clone());
+    }
+    if !enabled {
+        return (
+            order
+                .into_iter()
+                .filter_map(|name| tools.get(&name).cloned())
+                .collect(),
+            BTreeMap::new(),
+        );
+    }
+
+    let mut deferred_names = BTreeSet::new();
+    let mut used_names = BTreeSet::new();
+    for message in &context.messages {
+        match message {
+            llm::Message::Assistant(assistant) => {
+                for block in &assistant.content {
+                    if let llm::ContentBlock::ToolCall(call) = block {
+                        used_names.insert(call.name.clone());
+                    }
+                }
+            }
+            llm::Message::ToolResult(result) => {
+                for name in &result.added_tool_names {
+                    if !used_names.contains(name) {
+                        deferred_names.insert(name.clone());
+                    }
+                }
+            }
+            llm::Message::User(_) => {}
+        }
+    }
+
+    let mut immediate = Vec::new();
+    let mut deferred = BTreeMap::new();
+    for name in order {
+        let Some(tool) = tools.get(&name) else {
+            continue;
+        };
+        if deferred_names.contains(&name) {
+            deferred.insert(name, tool.clone());
+        } else {
+            immediate.push(tool.clone());
+        }
+    }
+    (immediate, deferred)
+}
+
+fn responses_short_hash(value: &str) -> String {
+    let mut first = 0xdead_beefu32;
+    let mut second = 0x41c6_ce57u32;
+    for character in value.encode_utf16() {
+        first = (first ^ u32::from(character)).wrapping_mul(2_654_435_761);
+        second = (second ^ u32::from(character)).wrapping_mul(1_597_334_677);
+    }
+    first = (first ^ (first >> 16)).wrapping_mul(2_246_822_507)
+        ^ (second ^ (second >> 13)).wrapping_mul(3_266_489_909);
+    second = (second ^ (second >> 16)).wrapping_mul(2_246_822_507)
+        ^ (first ^ (first >> 13)).wrapping_mul(3_266_489_909);
+    format!("{}{}", responses_base36(second), responses_base36(first))
+}
+
+fn responses_base36(mut value: u32) -> String {
+    if value == 0 {
+        return "0".to_owned();
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut characters = [0_u8; 7];
+    let mut index = characters.len();
+    while value > 0 {
+        index -= 1;
+        characters[index] = DIGITS[(value % 36) as usize];
+        value /= 36;
+    }
+    String::from_utf8(characters[index..].to_vec()).expect("base36 output is ASCII")
+}
+
 fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<Vec<Value>> {
+    let grammar_tool_input_properties = BTreeMap::new();
+    let deferred_tools = BTreeMap::new();
+    responses_input(
+        model,
+        context,
+        ResponsesInputOptions {
+            include_system_prompt: true,
+            supports_developer_role: true,
+            grammar_tool_input_properties: &grammar_tool_input_properties,
+            deferred_tools: &deferred_tools,
+            deferred_tools_mode: None,
+            tool_options: ResponsesToolOptions {
+                supports_strict_mode: false,
+                strict_null: false,
+                supports_openai_grammar_tools: false,
+                defer_loading: false,
+            },
+        },
+    )
+}
+
+fn responses_input(
+    model: &llm::Model,
+    context: &llm::Context,
+    options: ResponsesInputOptions<'_>,
+) -> Result<Vec<Value>> {
+    let ResponsesInputOptions {
+        include_system_prompt,
+        supports_developer_role,
+        grammar_tool_input_properties,
+        deferred_tools,
+        deferred_tools_mode,
+        tool_options,
+    } = options;
     let mut input = Vec::new();
-    if !context.system_prompt.is_empty() {
+    if include_system_prompt && !context.system_prompt.is_empty() {
         input.push(json!({
-            "role": if model.reasoning { "developer" } else { "system" },
+            "role": if model.reasoning && supports_developer_role {
+                "developer"
+            } else {
+                "system"
+            },
             "content": context.system_prompt,
         }));
     }
 
+    let mut loaded_tools = BTreeSet::new();
     for (message_index, message) in context.messages.iter().enumerate() {
         match message {
             llm::Message::User(user) => {
@@ -1306,18 +2156,46 @@ fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<
                             let (call_id, item_id) = split_responses_tool_id(&call.id);
                             let same_protocol =
                                 assistant.provider == model.provider && assistant.api == model.api;
-                            let item_id = same_protocol
-                                .then_some(item_id)
-                                .flatten()
-                                .filter(|id| id.starts_with("fc_"));
-                            input.push(json!({
-                                "type": "function_call",
-                                "call_id": call_id,
-                                "id": item_id,
-                                "name": call.name,
-                                "arguments": serde_json::to_string(&call.arguments)
-                                    .unwrap_or_else(|_| "{}".to_owned()),
-                            }));
+                            let same_model = same_protocol && assistant.model == model.id;
+                            let grammar_input_property =
+                                grammar_tool_input_properties.get(&call.name);
+                            let item_id = if grammar_input_property.is_some() {
+                                same_protocol.then_some(item_id).flatten()
+                            } else {
+                                same_protocol
+                                    .then_some(item_id)
+                                    .flatten()
+                                    .filter(|id| id.starts_with("fc_"))
+                            };
+                            let mut item = if let Some(input_property) = grammar_input_property {
+                                json!({
+                                    "type": "custom_tool_call",
+                                    "call_id": call_id,
+                                    "id": item_id,
+                                    "name": call.name,
+                                    "input": grammar_tool_input(call, input_property)?,
+                                })
+                            } else {
+                                json!({
+                                    "type": "function_call",
+                                    "call_id": call_id,
+                                    "id": item_id,
+                                    "name": call.name,
+                                    "arguments": serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "{}".to_owned()),
+                                })
+                            };
+                            if (same_model || deferred_tools.contains_key(&call.name))
+                                && !call.namespace.is_empty()
+                            {
+                                item.as_object_mut()
+                                    .expect("Responses tool call is an object")
+                                    .insert(
+                                        "namespace".to_owned(),
+                                        Value::String(call.namespace.clone()),
+                                    );
+                            }
+                            input.push(item);
                         }
                         llm::ContentBlock::Image(_) | llm::ContentBlock::Thinking(_) => {}
                     }
@@ -1326,14 +2204,88 @@ fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<
             llm::Message::ToolResult(result) => {
                 let (call_id, _) = split_responses_tool_id(&result.tool_call_id);
                 input.push(json!({
-                    "type": "function_call_output",
+                    "type": if grammar_tool_input_properties.contains_key(&result.tool_name) {
+                        "custom_tool_call_output"
+                    } else {
+                        "function_call_output"
+                    },
                     "call_id": call_id,
                     "output": responses_tool_result_output(model, &result.content),
                 }));
+                let Some(deferred_tools_mode) = deferred_tools_mode else {
+                    continue;
+                };
+                let mut announced_tools = Vec::new();
+                for name in &result.added_tool_names {
+                    if let Some(tool) = deferred_tools.get(name)
+                        && loaded_tools.insert(name.clone())
+                    {
+                        announced_tools.push(tool.clone());
+                    }
+                }
+                if announced_tools.is_empty() {
+                    continue;
+                }
+                match deferred_tools_mode {
+                    ResponsesDeferredToolsMode::AdditionalTools => {
+                        input.push(json!({
+                            "type": "additional_tools",
+                            "role": "developer",
+                            "tools": responses_function_tools(&announced_tools, tool_options)?,
+                        }));
+                    }
+                    ResponsesDeferredToolsMode::ToolSearch => {
+                        let names = announced_tools
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>();
+                        let call_id = format!(
+                            "pi_tool_load_{}",
+                            responses_short_hash(&format!(
+                                "{}:{}",
+                                result.tool_call_id,
+                                names.join(",")
+                            ))
+                        );
+                        input.push(json!({
+                            "type": "tool_search_call",
+                            "call_id": call_id,
+                            "execution": "client",
+                            "status": "completed",
+                            "arguments": {"query": names.join(" "), "limit": names.len()},
+                        }));
+                        input.push(json!({
+                            "type": "tool_search_output",
+                            "call_id": call_id,
+                            "execution": "client",
+                            "status": "completed",
+                            "tools": responses_function_tools(
+                                &announced_tools,
+                                ResponsesToolOptions {
+                                    defer_loading: true,
+                                    ..tool_options
+                                },
+                            )?,
+                        }));
+                    }
+                }
             }
         }
     }
     Ok(input)
+}
+
+fn grammar_tool_input(call: &llm::ToolCall, input_property: &str) -> Result<String> {
+    call.arguments
+        .get(input_property)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ProviderAdapterError::Protocol(format!(
+                "grammar tool call {:?} requires argument {:?} to be a string",
+                call.name, input_property
+            ))
+        })
 }
 
 fn responses_user_content(content: &llm::UserContent, supports_images: bool) -> Vec<Value> {
@@ -1775,6 +2727,7 @@ struct MessageEmitter {
     events: stream::AssistantMessageEventStream,
     model: llm::Model,
     message: llm::AssistantMessage,
+    usage_cost_multiplier: f64,
 }
 
 impl MessageEmitter {
@@ -1791,6 +2744,7 @@ impl MessageEmitter {
                 timestamp: now_millis(),
                 ..llm::AssistantMessage::default()
             },
+            usage_cost_multiplier: 1.0,
         }
     }
 
@@ -2046,8 +3000,24 @@ impl MessageEmitter {
         })
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn set_usage_cost_multiplier(&mut self, multiplier: f64) {
+        self.usage_cost_multiplier = multiplier;
+    }
+
+    fn calculate_usage_cost(&mut self) {
         stream::calculate_usage_cost(&self.model, &mut self.message.usage);
+        if self.usage_cost_multiplier != 1.0 {
+            let cost = &mut self.message.usage.cost;
+            cost.input *= self.usage_cost_multiplier;
+            cost.output *= self.usage_cost_multiplier;
+            cost.cache_read *= self.usage_cost_multiplier;
+            cost.cache_write *= self.usage_cost_multiplier;
+            cost.total = cost.input + cost.output + cost.cache_read + cost.cache_write;
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.calculate_usage_cost();
         self.events
             .push(stream::AssistantMessageEvent::done(
                 self.message.stop_reason.clone(),
@@ -2070,7 +3040,7 @@ impl MessageEmitter {
                 stream::STOP_ERROR.to_owned()
             };
         self.message.error_message = error.to_string();
-        stream::calculate_usage_cost(&self.model, &mut self.message.usage);
+        self.calculate_usage_cost();
         let result = self.events.push(stream::AssistantMessageEvent::error(
             self.message.stop_reason.clone(),
             self.snapshot(),
@@ -2445,7 +3415,60 @@ enum ResponsesSlot {
     Custom {
         content_index: usize,
         input: String,
+        input_property: String,
+        buffer: GrammarToolInputBuffer,
     },
+}
+
+#[derive(Default)]
+struct GrammarToolInputBuffer {
+    input: String,
+    started: bool,
+    closed: bool,
+}
+
+fn append_grammar_tool_input_json_delta(
+    buffer: &mut GrammarToolInputBuffer,
+    input_property: &str,
+    next_input: &str,
+    close: bool,
+) -> Result<String> {
+    if buffer.closed {
+        if close && next_input == buffer.input {
+            return Ok(String::new());
+        }
+        return Err(ProviderAdapterError::Protocol(format!(
+            "grammar tool input for property {input_property:?} changed after it was closed"
+        )));
+    }
+    if !next_input.starts_with(&buffer.input) {
+        return Err(ProviderAdapterError::Protocol(format!(
+            "grammar tool input for property {input_property:?} changed non-monotonically"
+        )));
+    }
+    let input_delta = &next_input[buffer.input.len()..];
+    if !close && input_delta.is_empty() {
+        return Ok(String::new());
+    }
+    let mut delta = String::new();
+    if !buffer.started {
+        delta.push('{');
+        delta.push_str(
+            &serde_json::to_string(input_property)
+                .expect("serializing a grammar tool property cannot fail"),
+        );
+        delta.push_str(":\"");
+        buffer.started = true;
+    }
+    let escaped = serde_json::to_string(input_delta)
+        .expect("serializing a grammar tool input delta cannot fail");
+    delta.push_str(&escaped[1..escaped.len() - 1]);
+    buffer.input = next_input.to_owned();
+    if close {
+        delta.push_str("\"}");
+        buffer.closed = true;
+    }
+    Ok(delta)
 }
 
 fn response_item_type(item: &Value) -> &str {
@@ -2467,6 +3490,7 @@ fn start_responses_slot(
     item: &Value,
     slots: &mut BTreeMap<usize, ResponsesSlot>,
     emitter: &mut MessageEmitter,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
 ) -> Result<()> {
     if slots.contains_key(&output_index) {
         return Ok(());
@@ -2500,12 +3524,16 @@ fn start_responses_slot(
         }
         "custom_tool_call" => {
             let input = value_string(item, "input").unwrap_or_default().to_owned();
+            let input_property = grammar_tool_input_properties
+                .get(value_string(item, "name").unwrap_or_default())
+                .cloned()
+                .unwrap_or_else(|| "input".to_owned());
             let content_index = emitter.start_tool(
                 &response_tool_call_id(item),
                 value_string(item, "name").unwrap_or_default(),
             )?;
             let mut arguments = BTreeMap::new();
-            arguments.insert("input".to_owned(), Value::String(input.clone()));
+            arguments.insert(input_property.clone(), Value::String(input.clone()));
             emitter.set_tool_arguments(content_index, arguments)?;
             if let Some(namespace) = value_string(item, "namespace") {
                 emitter.set_tool_metadata(content_index, None, None, Some(namespace))?;
@@ -2513,6 +3541,8 @@ fn start_responses_slot(
             ResponsesSlot::Custom {
                 content_index,
                 input,
+                input_property,
+                buffer: GrammarToolInputBuffer::default(),
             }
         }
         _ => return Ok(()),
@@ -2571,8 +3601,15 @@ fn finish_responses_item(
     slots: &mut BTreeMap<usize, ResponsesSlot>,
     reasoning_blocks: &mut BTreeMap<String, usize>,
     emitter: &mut MessageEmitter,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
 ) -> Result<()> {
-    start_responses_slot(output_index, item, slots, emitter)?;
+    start_responses_slot(
+        output_index,
+        item,
+        slots,
+        emitter,
+        grammar_tool_input_properties,
+    )?;
     let Some(slot) = slots.remove(&output_index) else {
         return Ok(());
     };
@@ -2632,11 +3669,15 @@ fn finish_responses_item(
             ResponsesSlot::Custom {
                 content_index,
                 input,
+                input_property,
+                mut buffer,
             },
         ) => {
             let input = value_string(item, "input").unwrap_or(&input);
+            let delta =
+                append_grammar_tool_input_json_delta(&mut buffer, &input_property, input, true)?;
             let mut arguments = BTreeMap::new();
-            arguments.insert("input".to_owned(), Value::String(input.to_owned()));
+            arguments.insert(input_property, Value::String(input.to_owned()));
             emitter.set_tool_metadata(
                 content_index,
                 Some(&response_tool_call_id(item)),
@@ -2644,6 +3685,9 @@ fn finish_responses_item(
                 value_string(item, "namespace"),
             )?;
             emitter.set_tool_arguments(content_index, arguments)?;
+            if !delta.is_empty() {
+                emitter.tool_delta(content_index, &delta)?;
+            }
             emitter.end_tool(content_index)?;
         }
         _ => {}
@@ -2669,10 +3713,21 @@ fn close_responses_slots(
             ResponsesSlot::Custom {
                 content_index,
                 input,
+                input_property,
+                mut buffer,
             } => {
+                let delta = append_grammar_tool_input_json_delta(
+                    &mut buffer,
+                    &input_property,
+                    &input,
+                    true,
+                )?;
                 let mut arguments = BTreeMap::new();
-                arguments.insert("input".to_owned(), Value::String(input));
+                arguments.insert(input_property, Value::String(input));
                 emitter.set_tool_arguments(content_index, arguments)?;
+                if !delta.is_empty() {
+                    emitter.tool_delta(content_index, &delta)?;
+                }
                 emitter.end_tool(content_index)?;
             }
         }
@@ -2730,6 +3785,7 @@ fn finalize_responses_response(
     response: &Value,
     reasoning_blocks: &BTreeMap<String, usize>,
     emitter: &mut MessageEmitter,
+    codex_requested_service_tier: Option<&str>,
 ) -> Result<()> {
     if let Some(id) = value_string(response, "id").filter(|id| !id.is_empty()) {
         emitter.message.response_id = id.to_owned();
@@ -2739,6 +3795,16 @@ fn finalize_responses_response(
     }
     if let Some(end_turn) = response.get("end_turn").and_then(Value::as_bool) {
         emitter.message.end_turn = Some(end_turn);
+    }
+    if let Some(requested_service_tier) = codex_requested_service_tier {
+        let service_tier = resolve_codex_service_tier(
+            value_string(response, "service_tier").unwrap_or_default(),
+            requested_service_tier,
+        );
+        emitter.set_usage_cost_multiplier(responses_service_tier_cost_multiplier(
+            &emitter.model,
+            &service_tier,
+        ));
     }
     backfill_responses_reasoning_signatures(response, reasoning_blocks, emitter)?;
     let status = value_string(response, "status").unwrap_or_default();
@@ -2801,6 +3867,43 @@ fn consume_openai_responses(
     _model: &llm::Model,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
+) -> Result<()> {
+    consume_responses(
+        response,
+        cancellation,
+        emitter,
+        false,
+        grammar_tool_input_properties,
+        None,
+    )
+}
+
+fn consume_codex_responses(
+    response: Response,
+    model: &llm::Model,
+    cancellation: &agent::CancellationToken,
+    emitter: &mut MessageEmitter,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
+) -> Result<()> {
+    let requested_service_tier = requested_responses_service_tier(model);
+    consume_responses(
+        response,
+        cancellation,
+        emitter,
+        true,
+        grammar_tool_input_properties,
+        Some(requested_service_tier),
+    )
+}
+
+fn consume_responses(
+    response: Response,
+    cancellation: &agent::CancellationToken,
+    emitter: &mut MessageEmitter,
+    codex: bool,
+    grammar_tool_input_properties: &BTreeMap<String, String>,
+    codex_requested_service_tier: Option<&str>,
 ) -> Result<()> {
     let mut reader = stream::SseReader::new(response);
     let mut slots = BTreeMap::<usize, ResponsesSlot>::new();
@@ -2813,14 +3916,32 @@ fn consume_openai_responses(
         if data.is_empty() || data == "[DONE]" {
             continue;
         }
-        let payload: Value = serde_json::from_str(data)?;
-        let event_type = value_string(&payload, "type")
+        let mut payload: Value = serde_json::from_str(data)?;
+        let mut event_type = value_string(&payload, "type")
             .filter(|value| !value.is_empty())
-            .unwrap_or(&sse.event);
+            .unwrap_or(&sse.event)
+            .to_owned();
+        if codex
+            && matches!(
+                event_type.as_str(),
+                "response.done" | "response.completed" | "response.incomplete"
+            )
+        {
+            event_type = "response.completed".to_owned();
+            if let Some(response) = payload.get_mut("response")
+                && let Some(response) = response.as_object_mut()
+                && let Some(status) = response.get("status").and_then(Value::as_str)
+            {
+                response.insert(
+                    "status".to_owned(),
+                    Value::String(normalize_codex_response_status(status).to_owned()),
+                );
+            }
+        }
         let output_index = value_u64(&payload, "output_index")
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(0);
-        match event_type {
+        match event_type.as_str() {
             "response.created" => {
                 if let Some(response) = payload.get("response")
                     && let Some(id) = value_string(response, "id")
@@ -2830,7 +3951,13 @@ fn consume_openai_responses(
             }
             "response.output_item.added" => {
                 if let Some(item) = payload.get("item") {
-                    start_responses_slot(output_index, item, &mut slots, emitter)?;
+                    start_responses_slot(
+                        output_index,
+                        item,
+                        &mut slots,
+                        emitter,
+                        grammar_tool_input_properties,
+                    )?;
                 }
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
@@ -2903,38 +4030,58 @@ fn consume_openai_responses(
             }
             "response.custom_tool_call_input.delta" => {
                 let delta = value_string(&payload, "delta").unwrap_or_default();
-                let (content_index, arguments) = match slots.get_mut(&output_index) {
+                let (content_index, arguments, json_delta) = match slots.get_mut(&output_index) {
                     Some(ResponsesSlot::Custom {
                         content_index,
                         input,
+                        input_property,
+                        buffer,
                     }) => {
                         input.push_str(delta);
+                        let json_delta = append_grammar_tool_input_json_delta(
+                            buffer,
+                            input_property,
+                            input,
+                            false,
+                        )?;
                         let mut arguments = BTreeMap::new();
-                        arguments.insert("input".to_owned(), Value::String(input.clone()));
-                        (*content_index, arguments)
+                        arguments.insert(input_property.clone(), Value::String(input.clone()));
+                        (*content_index, arguments, json_delta)
                     }
                     _ => continue,
                 };
                 emitter.set_tool_arguments(content_index, arguments)?;
-                if !delta.is_empty() {
-                    emitter.tool_delta(content_index, delta)?;
+                if !json_delta.is_empty() {
+                    emitter.tool_delta(content_index, &json_delta)?;
                 }
             }
             "response.custom_tool_call_input.done" => {
-                let input = value_string(&payload, "input").unwrap_or_default();
-                let (content_index, arguments) = match slots.get_mut(&output_index) {
+                let final_input = value_string(&payload, "input").map(str::to_owned);
+                let (content_index, arguments, json_delta) = match slots.get_mut(&output_index) {
                     Some(ResponsesSlot::Custom {
                         content_index,
                         input: current,
+                        input_property,
+                        buffer,
                     }) => {
-                        *current = input.to_owned();
+                        let input = final_input.clone().unwrap_or_else(|| current.clone());
+                        let json_delta = append_grammar_tool_input_json_delta(
+                            buffer,
+                            input_property,
+                            &input,
+                            true,
+                        )?;
+                        *current = input.clone();
                         let mut arguments = BTreeMap::new();
-                        arguments.insert("input".to_owned(), Value::String(current.clone()));
-                        (*content_index, arguments)
+                        arguments.insert(input_property.clone(), Value::String(input));
+                        (*content_index, arguments, json_delta)
                     }
                     _ => continue,
                 };
                 emitter.set_tool_arguments(content_index, arguments)?;
+                if !json_delta.is_empty() {
+                    emitter.tool_delta(content_index, &json_delta)?;
+                }
             }
             "response.output_item.done" => {
                 if let Some(item) = payload.get("item") {
@@ -2944,6 +4091,7 @@ fn consume_openai_responses(
                         &mut slots,
                         &mut reasoning_blocks,
                         emitter,
+                        grammar_tool_input_properties,
                     )?;
                 }
             }
@@ -2954,19 +4102,45 @@ fn consume_openai_responses(
                         "terminal Responses event omitted response".to_owned(),
                     ));
                 };
-                finalize_responses_response(response, &reasoning_blocks, emitter)?;
+                finalize_responses_response(
+                    response,
+                    &reasoning_blocks,
+                    emitter,
+                    codex_requested_service_tier,
+                )?;
             }
             "error" => {
-                let code = value_string(&payload, "code").unwrap_or("unknown");
-                let message = value_string(&payload, "message").unwrap_or("no message");
+                let nested_error = codex.then(|| value_object(&payload, "error")).flatten();
+                let code = value_string(&payload, "code")
+                    .or_else(|| {
+                        nested_error
+                            .and_then(|error| error.get("code"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("unknown");
+                let message = value_string(&payload, "message")
+                    .or_else(|| {
+                        nested_error
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("no message");
                 return Err(ProviderAdapterError::Protocol(format!("{code}: {message}")));
             }
             _ => {}
         }
+        if codex && saw_terminal_response {
+            break;
+        }
     }
     if !saw_terminal_response {
         return Err(ProviderAdapterError::Protocol(
-            "OpenAI Responses stream ended before a terminal response event".to_owned(),
+            if codex {
+                "Codex Responses stream ended before a terminal response event"
+            } else {
+                "OpenAI Responses stream ended before a terminal response event"
+            }
+            .to_owned(),
         ));
     }
     close_responses_slots(&mut slots, emitter)?;
@@ -2976,6 +4150,43 @@ fn consume_openai_responses(
         ));
     }
     Ok(())
+}
+
+fn normalize_codex_response_status(status: &str) -> &str {
+    match status {
+        "completed" | "incomplete" | "failed" | "cancelled" | "queued" | "in_progress" => status,
+        _ => "",
+    }
+}
+
+fn requested_responses_service_tier(model: &llm::Model) -> &str {
+    model
+        .sampling_params
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|parameters| parameters.get("service_tier"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn resolve_codex_service_tier(response_tier: &str, request_tier: &str) -> String {
+    if response_tier == "default" && matches!(request_tier, "flex" | "priority") {
+        return request_tier.to_owned();
+    }
+    if response_tier.is_empty() {
+        request_tier.to_owned()
+    } else {
+        response_tier.to_owned()
+    }
+}
+
+fn responses_service_tier_cost_multiplier(model: &llm::Model, service_tier: &str) -> f64 {
+    match service_tier {
+        "flex" => 0.5,
+        "priority" if model.id == "gpt-5.5" => 2.5,
+        "priority" => 2.0,
+        _ => 1.0,
+    }
 }
 
 enum AnthropicSlot {
@@ -3375,8 +4586,15 @@ mod tests {
     }
 
     fn factory(max_retries: u32) -> ProviderResponderFactory {
+        factory_with_credentials(max_retries, ProviderCredentials::api_key("test-key"))
+    }
+
+    fn factory_with_credentials(
+        max_retries: u32,
+        credentials: ProviderCredentials,
+    ) -> ProviderResponderFactory {
         ProviderResponderFactory::configured(
-            ProviderCredentials::api_key("test-key"),
+            credentials,
             ProviderConfig {
                 max_retries,
                 request_timeout: Some(Duration::from_secs(2)),
@@ -3393,6 +4611,8 @@ mod tests {
             api: api.to_owned(),
             provider: match api {
                 API_ANTHROPIC_MESSAGES => "anthropic".to_owned(),
+                API_AZURE_OPENAI_RESPONSES => "azure-openai-responses".to_owned(),
+                API_OPENAI_CODEX_RESPONSES => "openai-codex".to_owned(),
                 _ => "openai".to_owned(),
             },
             base_url,
@@ -3401,6 +4621,14 @@ mod tests {
             max_tokens: 4_096,
             ..llm::Model::default()
         }
+    }
+
+    fn codex_test_jwt(account_id: &str) -> String {
+        let payload = serde_json::to_vec(&json!({
+            CODEX_JWT_AUTH_CLAIM: {"chatgpt_account_id": account_id},
+        }))
+        .expect("serialize Codex JWT payload");
+        format!("header.{}.signature", URL_SAFE_NO_PAD.encode(payload))
     }
 
     fn options(cancellation: agent::CancellationToken) -> agent::RequestOptions {
@@ -3699,5 +4927,513 @@ mod tests {
             .expect("cancellation is a normalized terminal assistant message");
         assert_eq!(cancelled.stop_reason, stream::STOP_ABORTED);
         assert!(cancelled.error_message.contains("request aborted"));
+    }
+
+    #[test]
+    fn protocol_variants_include_azure_and_codex_responses() {
+        assert_eq!(
+            ProviderProtocol::from_api(API_AZURE_OPENAI_RESPONSES).expect("Azure protocol"),
+            ProviderProtocol::AzureOpenAiResponses
+        );
+        assert_eq!(
+            ProviderProtocol::from_api(API_OPENAI_CODEX_RESPONSES).expect("Codex protocol"),
+            ProviderProtocol::OpenAiCodexResponses
+        );
+    }
+
+    #[test]
+    fn azure_endpoint_normalization_and_scoped_configuration_match_the_protocol() {
+        let cases = [
+            (
+                "https://resource.cognitiveservices.azure.com",
+                "https://resource.cognitiveservices.azure.com/openai/v1",
+            ),
+            (
+                "https://resource.ai.azure.com/openai",
+                "https://resource.ai.azure.com/openai/v1",
+            ),
+            (
+                "https://resource.openai.azure.com/openai/v1/responses",
+                "https://resource.openai.azure.com/openai/v1",
+            ),
+            (
+                "https://resource.openai.azure.com/openai?api-version=old",
+                "https://resource.openai.azure.com/openai/v1",
+            ),
+            (
+                "https://proxy.example.test/v1?custom=true",
+                "https://proxy.example.test/v1?custom=true",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_azure_openai_base_url(input)
+                    .expect("normalize Azure base URL")
+                    .as_str(),
+                expected
+            );
+        }
+        let invalid = normalize_azure_openai_base_url("not-a-url").expect_err("invalid URL");
+        assert!(!invalid.to_string().contains("not-a-url"));
+
+        let mut credentials = ProviderCredentials::api_key("azure-key");
+        credentials.environment = BTreeMap::from([
+            (
+                "AZURE_OPENAI_BASE_URL".to_owned(),
+                "https://override.openai.azure.com".to_owned(),
+            ),
+            (
+                "AZURE_OPENAI_RESOURCE_NAME".to_owned(),
+                "ignored-resource".to_owned(),
+            ),
+            (
+                "AZURE_OPENAI_API_VERSION".to_owned(),
+                "2025-04-01".to_owned(),
+            ),
+        ]);
+        let model = model(
+            API_AZURE_OPENAI_RESPONSES,
+            "https://model.openai.azure.com".to_owned(),
+        );
+        let (base_url, api_version) =
+            resolve_azure_openai_config(&model, &credentials).expect("Azure config");
+        assert_eq!(
+            base_url.as_str(),
+            "https://override.openai.azure.com/openai/v1"
+        );
+        assert_eq!(api_version, "2025-04-01");
+
+        credentials.environment.remove("AZURE_OPENAI_BASE_URL");
+        let (base_url, _) =
+            resolve_azure_openai_config(&model, &credentials).expect("resource Azure config");
+        assert_eq!(
+            base_url.as_str(),
+            "https://ignored-resource.openai.azure.com/openai/v1"
+        );
+        assert_eq!(
+            parse_azure_deployment_name_map(" other=nope, test-model=deployment-1, malformed "),
+            BTreeMap::from([
+                ("other".to_owned(), "nope".to_owned()),
+                ("test-model".to_owned(), "deployment-1".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn azure_responses_use_deployment_api_key_and_shared_responses_stream() {
+        let body = concat!(
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_azure\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Azure says hi\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_azure\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Azure says hi\",\"annotations\":[]}]}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_azure\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let mut credentials = ProviderCredentials::api_key("azure-test-key");
+        credentials.environment = BTreeMap::from([
+            (
+                "AZURE_OPENAI_BASE_URL".to_owned(),
+                format!("{base_url}/gateway?custom=true"),
+            ),
+            (
+                "AZURE_OPENAI_API_VERSION".to_owned(),
+                "2025-04-01".to_owned(),
+            ),
+            (
+                "AZURE_OPENAI_DEPLOYMENT_NAME_MAP".to_owned(),
+                "test-model=azure-deployment".to_owned(),
+            ),
+        ]);
+        let mut request_model = model(API_AZURE_OPENAI_RESPONSES, String::new());
+        request_model.reasoning = true;
+        let response = factory_with_credentials(0, credentials)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Azure Responses response");
+        let request = requests.recv().expect("captured Azure request");
+        server.join().expect("Azure test server finishes");
+
+        assert_eq!(
+            request.target,
+            "/gateway/responses?custom=true&api-version=2025-04-01"
+        );
+        assert_eq!(
+            request.headers.get("api-key").map(String::as_str),
+            Some("azure-test-key")
+        );
+        assert!(!request.headers.contains_key("authorization"));
+        let sent: Value = serde_json::from_slice(&request.body).expect("Azure JSON body");
+        assert_eq!(sent["model"], "azure-deployment");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
+        assert_eq!(sent["input"][0]["role"], "developer");
+        assert_eq!(sent["tools"][0]["strict"], false);
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(sent["reasoning"]["summary"], "auto");
+        assert_eq!(sent["include"][0], "reasoning.encrypted_content");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.response_id, "resp_azure");
+        assert_eq!(response.content[0].plain_text(), Some("Azure says hi"));
+        assert_eq!(response.usage.total_tokens, 8);
+    }
+
+    #[test]
+    fn azure_requires_an_api_key_and_never_uses_a_bearer_header_as_a_fallback() {
+        let header_secret = "Bearer header-only-secret";
+        let response = factory_with_credentials(
+            0,
+            ProviderCredentials::default().with_header("authorization", header_secret),
+        )
+        .respond(
+            &model(API_AZURE_OPENAI_RESPONSES, "http://127.0.0.1:1".to_owned()),
+            &llm::Context::default(),
+            options(agent::CancellationToken::default()),
+        )
+        .expect("normalized Azure auth failure");
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(response.error_message.contains("no API key"));
+        assert!(!response.error_message.contains(header_secret));
+    }
+
+    #[test]
+    fn codex_responses_send_required_headers_and_normalize_response_done() {
+        let body = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_codex\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Codex says hi\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_codex\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Codex says hi\",\"annotations\":[]}]}}\n\n",
+            "event: response.done\ndata: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_codex\",\"status\":\"completed\",\"service_tier\":\"default\",\"end_turn\":true,\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let token = codex_test_jwt("account-1");
+        let mut request_model = model(API_OPENAI_CODEX_RESPONSES, base_url);
+        request_model.id = "gpt-5.4".to_owned();
+        request_model.reasoning = true;
+        request_model.sampling_params = Some(json!({"service_tier": "flex"}));
+        request_model.cost.rates = llm::ModelCostRates {
+            input: 1_000_000.0,
+            output: 1_000_000.0,
+            ..llm::ModelCostRates::default()
+        };
+        let response = factory_with_credentials(0, ProviderCredentials::api_key(token.clone()))
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("Codex Responses response");
+        let request = requests.recv().expect("captured Codex request");
+        server.join().expect("Codex test server finishes");
+
+        assert_eq!(request.target, "/codex/responses");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some(format!("Bearer {token}").as_str())
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("account-1")
+        );
+        assert_eq!(
+            request.headers.get("originator").map(String::as_str),
+            Some("goshcoder")
+        );
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some(
+                format!(
+                    "goshcoder ({}; {})",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            request.headers.get("openai-beta").map(String::as_str),
+            Some("responses=experimental")
+        );
+        assert_eq!(
+            request.headers.get("session-id").map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-client-request-id")
+                .map(String::as_str),
+            Some("session-1")
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("Codex JSON body");
+        assert_eq!(sent["model"], "gpt-5.4");
+        assert_eq!(sent["instructions"], "be concise");
+        assert_eq!(sent["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(sent["input"][0]["role"], "user");
+        assert_eq!(sent["text"]["verbosity"], "low");
+        assert_eq!(sent["include"][0], "reasoning.encrypted_content");
+        assert_eq!(sent["tool_choice"], "auto");
+        assert_eq!(sent["parallel_tool_calls"], true);
+        assert_eq!(sent["prompt_cache_key"], "session-1");
+        assert_eq!(sent["service_tier"], "flex");
+        assert_eq!(sent["tools"][0]["strict"], Value::Null);
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.response_id, "resp_codex");
+        assert_eq!(response.end_turn, Some(true));
+        assert_eq!(response.content[0].plain_text(), Some("Codex says hi"));
+        assert_eq!(response.usage.total_tokens, 15);
+        assert_eq!(response.usage.cost.total, 7.5);
+    }
+
+    #[test]
+    fn codex_endpoint_token_errors_retries_and_nested_sse_errors_are_handled() {
+        assert_eq!(
+            codex_responses_endpoint("")
+                .expect("default Codex URL")
+                .as_str(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            codex_responses_endpoint("https://example.test/backend-api/codex/")
+                .expect("normalized Codex URL")
+                .as_str(),
+            "https://example.test/backend-api/codex/responses"
+        );
+        let token_error = extract_codex_account_id("not-a-jwt").expect_err("invalid JWT");
+        assert_eq!(
+            token_error.to_string(),
+            "failed to extract accountId from token"
+        );
+
+        let success = "event: response.done\ndata: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_retry\",\"status\":\"completed\"}}\n\n";
+        let (base_url, requests, server) = test_server(vec![
+            http_response_with_headers(
+                429,
+                r#"{"error":{"message":"slow down"}}"#,
+                &[("retry-after-ms", "0")],
+            ),
+            http_response(200, success),
+        ]);
+        let token = codex_test_jwt("retry-account");
+        let response = factory_with_credentials(1, ProviderCredentials::api_key(token.clone()))
+            .respond(
+                &model(API_OPENAI_CODEX_RESPONSES, base_url),
+                &llm::Context::default(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("retried Codex response");
+        let first = requests.recv().expect("first Codex request");
+        let second = requests.recv().expect("second Codex request");
+        server.join().expect("Codex retry server finishes");
+        assert_eq!(first.target, "/codex/responses");
+        assert_eq!(second.target, "/codex/responses");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+
+        let (base_url, requests, server) = test_server(vec![http_response(
+            200,
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"usage_limit_reached\",\"message\":\"limit reached\"}}\n\n",
+        )]);
+        let error_response = factory_with_credentials(0, ProviderCredentials::api_key(token))
+            .respond(
+                &model(API_OPENAI_CODEX_RESPONSES, base_url),
+                &llm::Context::default(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("normalized Codex SSE error");
+        let _request = requests.recv().expect("nested-error Codex request");
+        server.join().expect("Codex nested-error server finishes");
+        assert_eq!(error_response.stop_reason, stream::STOP_ERROR);
+        assert!(error_response.error_message.contains("limit reached"));
+
+        let cancellation = agent::CancellationToken::default();
+        cancellation.cancel();
+        let cancelled = factory_with_credentials(
+            0,
+            ProviderCredentials::api_key(codex_test_jwt("cancel-account")),
+        )
+        .respond(
+            &model(API_OPENAI_CODEX_RESPONSES, String::new()),
+            &llm::Context::default(),
+            options(cancellation),
+        )
+        .expect("normalized Codex cancellation");
+        assert_eq!(cancelled.stop_reason, stream::STOP_ABORTED);
+        assert!(cancelled.error_message.contains("request aborted"));
+    }
+
+    #[test]
+    fn azure_grammar_custom_tools_use_schema_property_in_requests_and_streams() {
+        let body = concat!(
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_azure\",\"call_id\":\"call_azure\",\"name\":\"pattern\",\"input\":\"\"}}\n\n",
+            "event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"output_index\":0,\"delta\":\"hello\"}\n\n",
+            "event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"output_index\":0,\"input\":\"hello\"}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"id\":\"ctc_azure\",\"call_id\":\"call_azure\",\"name\":\"pattern\",\"input\":\"hello\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_grammar\",\"status\":\"completed\"}}\n\n",
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let grammar_tool = llm::Tool {
+            name: "pattern".to_owned(),
+            description: "Match a grammar".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            }),
+            constrained_sampling: Some(json!({
+                "type": "grammar",
+                "variants": {"openai_regex": "[a-z]+"},
+            })),
+        };
+        let context = llm::Context {
+            system_prompt: "use the grammar".to_owned(),
+            messages: vec![
+                llm::Message::User(llm::UserMessage::text("first", 1)),
+                llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                    api: API_AZURE_OPENAI_RESPONSES.to_owned(),
+                    provider: "azure-openai-responses".to_owned(),
+                    model: "test-model".to_owned(),
+                    stop_reason: stream::STOP_TOOL_USE.to_owned(),
+                    content: vec![llm::ContentBlock::ToolCall(llm::ToolCall {
+                        id: "call_previous|ctc_previous".to_owned(),
+                        name: grammar_tool.name.clone(),
+                        arguments: BTreeMap::from([("query".to_owned(), json!("prior"))]),
+                        namespace: "tools".to_owned(),
+                        ..llm::ToolCall::default()
+                    })],
+                    ..llm::AssistantMessage::default()
+                })),
+                llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                    tool_call_id: "call_previous|ctc_previous".to_owned(),
+                    tool_name: grammar_tool.name.clone(),
+                    content: vec![llm::ContentBlock::text("matched")],
+                    timestamp: 2,
+                    ..llm::ToolResultMessage::default()
+                })),
+            ],
+            tools: vec![grammar_tool],
+        };
+        let mut request_model = model(API_AZURE_OPENAI_RESPONSES, base_url);
+        request_model.reasoning = true;
+        request_model.compat = Some(json!({
+            "supportsDeveloperRole": false,
+            "supportsOpenAIGrammarTools": true,
+        }));
+        let events = factory_with_credentials(0, ProviderCredentials::api_key("azure-key"))
+            .stream(
+                &request_model,
+                &context,
+                options(agent::CancellationToken::default()),
+            )
+            .iter()
+            .collect::<Vec<_>>();
+        let request = requests.recv().expect("captured Azure grammar request");
+        server.join().expect("Azure grammar server finishes");
+
+        let sent: Value = serde_json::from_slice(&request.body).expect("Azure grammar JSON");
+        assert_eq!(sent["input"][0]["role"], "system");
+        assert_eq!(sent["input"][2]["type"], "custom_tool_call");
+        assert_eq!(sent["input"][2]["id"], "ctc_previous");
+        assert_eq!(sent["input"][2]["input"], "prior");
+        assert_eq!(sent["input"][2]["namespace"], "tools");
+        assert_eq!(sent["input"][3]["type"], "custom_tool_call_output");
+        assert_eq!(sent["tools"][0]["type"], "custom");
+        assert_eq!(sent["tools"][0]["format"]["type"], "grammar");
+        assert_eq!(sent["tools"][0]["format"]["syntax"], "regex");
+        assert_eq!(sent["tools"][0]["format"]["definition"], "[a-z]+");
+        assert!(sent["tools"][0].get("strict").is_none());
+
+        let deltas = events
+            .iter()
+            .filter(|event| event.event_type == stream::EVENT_TOOLCALL_DELTA)
+            .map(|event| event.delta.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["{\"query\":\"hello", "\"}"]);
+        let response = events
+            .last()
+            .and_then(stream::AssistantMessageEvent::terminal_message)
+            .expect("terminal grammar response");
+        let llm::ContentBlock::ToolCall(call) = &response.content[0] else {
+            panic!("expected grammar tool call, got {:?}", response.content);
+        };
+        assert_eq!(call.id, "call_azure|ctc_azure");
+        assert_eq!(call.arguments.get("query"), Some(&json!("hello")));
+    }
+
+    #[test]
+    fn codex_deferred_tools_follow_additional_and_tool_search_compatibility() {
+        let body = "event: response.done\ndata: {\"type\":\"response.done\",\"response\":{\"id\":\"resp_deferred\",\"status\":\"completed\"}}\n\n";
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let immediate = llm::Tool {
+            name: "immediate".to_owned(),
+            description: "Available now".to_owned(),
+            parameters: json!({"type": "object", "properties": {}}),
+            constrained_sampling: None,
+        };
+        let deferred = llm::Tool {
+            name: "later".to_owned(),
+            description: "Available after the first result".to_owned(),
+            parameters: json!({"type": "object", "properties": {}}),
+            constrained_sampling: None,
+        };
+        let context = llm::Context {
+            messages: vec![
+                llm::Message::User(llm::UserMessage::text("start", 1)),
+                llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                    tool_call_id: "call_immediate|fc_immediate".to_owned(),
+                    tool_name: immediate.name.clone(),
+                    content: vec![llm::ContentBlock::text("result")],
+                    added_tool_names: vec![deferred.name.clone()],
+                    timestamp: 2,
+                    ..llm::ToolResultMessage::default()
+                })),
+            ],
+            tools: vec![immediate.clone(), deferred.clone()],
+            ..llm::Context::default()
+        };
+        let mut request_model = model(API_OPENAI_CODEX_RESPONSES, base_url);
+        request_model.compat = Some(json!({"supportsAdditionalTools": true}));
+        let response = factory_with_credentials(
+            0,
+            ProviderCredentials::api_key(codex_test_jwt("deferred-account")),
+        )
+        .respond(
+            &request_model,
+            &context,
+            options(agent::CancellationToken::default()),
+        )
+        .expect("Codex deferred response");
+        let request = requests.recv().expect("captured Codex deferred request");
+        server.join().expect("Codex deferred server finishes");
+
+        let sent: Value = serde_json::from_slice(&request.body).expect("Codex deferred JSON");
+        assert_eq!(sent["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(sent["tools"][0]["name"], "immediate");
+        assert_eq!(sent["input"][1]["type"], "function_call_output");
+        assert_eq!(sent["input"][2]["type"], "additional_tools");
+        assert_eq!(sent["input"][2]["tools"][0]["name"], "later");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+
+        let mut search_model = model(API_OPENAI_CODEX_RESPONSES, String::new());
+        search_model.compat = Some(json!({"supportsToolSearch": true}));
+        let grammar_properties =
+            grammar_tool_input_properties(&context.tools, false).expect("grammar properties");
+        let params = build_openai_codex_responses_request(
+            &search_model,
+            &context,
+            &options(agent::CancellationToken::default()),
+            &grammar_properties,
+        )
+        .expect("Codex tool-search params");
+        assert_eq!(params["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(params["tools"][0]["name"], "immediate");
+        assert_eq!(params["input"][2]["type"], "tool_search_call");
+        assert_eq!(params["input"][3]["type"], "tool_search_output");
+        assert_eq!(params["input"][3]["tools"][0]["name"], "later");
+        assert_eq!(params["input"][3]["tools"][0]["defer_loading"], true);
     }
 }
