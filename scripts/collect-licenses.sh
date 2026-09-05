@@ -83,6 +83,13 @@ for package_id in sorted(reachable):
         exception = exceptions_root / package["name"]
         if exception.is_dir():
             candidates.extend(path for path in exception.iterdir() if path.is_file())
+    if not candidates and package.get("license", "").strip() == "MIT":
+        # A few workspace-published crates declare plain SPDX MIT but omit a
+        # copied notice file from the crate archive. Pair the standard text
+        # with package metadata below rather than silently omitting the crate.
+        standard_mit = exceptions_root / "MIT" / "LICENSE"
+        if standard_mit.is_file():
+            candidates.append(standard_mit)
     candidates = sorted(set(candidates))
     if not candidates:
         missing.append(f'{package["name"]} {package["version"]} ({package_root})')
@@ -94,6 +101,15 @@ for package_id in sorted(reachable):
     for candidate in candidates:
         shutil.copy2(candidate, crate_destination / candidate.name)
     source = package.get("source") or "path"
+    authors = ", ".join(package.get("authors", [])) or "not included in Cargo metadata"
+    (crate_destination / "PACKAGE.txt").write_text(
+        f'package: {package["name"]}\n'
+        f'version: {package["version"]}\n'
+        f'license: {package.get("license") or "not declared"}\n'
+        f'authors: {authors}\n'
+        f'source: {source}\n',
+        encoding="utf-8",
+    )
     index.append(f'{package["name"]} {package["version"]} {source}')
 
 if missing:
