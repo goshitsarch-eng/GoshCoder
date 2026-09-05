@@ -837,7 +837,8 @@ fn drain_interactive_events(
         }
     }
     while let Ok(result) = turn_results.try_recv() {
-        if finish_pending_btw(view, prepared, result) {
+        if view.pending_btw_thread.is_some() {
+            let _ = finish_pending_btw(view, prepared, result);
             continue;
         }
         view.turn_pending = false;
