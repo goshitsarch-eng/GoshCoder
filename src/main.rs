@@ -35,6 +35,7 @@ pub mod sessions;
 mod state;
 pub mod stream;
 pub mod tools;
+pub mod turns;
 mod ui;
 pub mod webaccess;
 
@@ -193,8 +194,12 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     });
 
     prepared.sync_extensions()?;
-    let _ = compaction::maybe_auto_compact(&agent)?;
-    agent.prompt(prompt)?;
+    turns::run_prompt(
+        &agent,
+        prompt,
+        &turns::RetryPolicy::default(),
+        Some(&prepared.runtime.notice_sender()),
+    )?;
     prepared.runtime.sync()?;
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
@@ -745,11 +750,12 @@ fn line_interactive_loop(
                 eprintln!("error: {error}");
                 continue;
             }
-            if let Err(error) = compaction::maybe_auto_compact(prepared.runtime.agent()) {
-                eprintln!("error: {error}");
-                continue;
-            }
-            if let Err(error) = prepared.runtime.agent().prompt(input) {
+            if let Err(error) = turns::run_prompt(
+                prepared.runtime.agent(),
+                input,
+                &turns::RetryPolicy::default(),
+                Some(&prepared.runtime.notice_sender()),
+            ) {
                 eprintln!("error: {error}");
             }
         }
@@ -1279,35 +1285,15 @@ fn begin_interactive_turn(
     let notices = prepared_notices;
     thread::spawn(move || {
         let completion = TurnCompletion::new(turn_sender);
-        let result = compaction::maybe_auto_compact(&agent)
-            .and_then(|outcome| {
-                report_dropped_queue(&notices, outcome.as_ref());
-                agent
-                    .prompt(prompt)
-                    .map_err(compaction::CompactionError::Agent)
-            })
-            .map_err(|error| error.to_string());
+        let result = turns::run_prompt(
+            &agent,
+            prompt,
+            &turns::RetryPolicy::default(),
+            Some(&notices),
+        )
+        .map(|_| ());
         completion.finish(result);
     });
-}
-
-/// Compaction clears the steering and follow-up queues; anything typed while
-/// the summary was being written is gone and the user should hear so.
-fn report_dropped_queue(
-    notices: &session::SessionNoticeSender,
-    outcome: Option<&compaction::Outcome>,
-) {
-    if let Some(outcome) = outcome
-        && outcome.dropped_queued_messages > 0
-    {
-        notices.push(
-            "compaction",
-            format!(
-                "{} queued message(s) were discarded by compaction",
-                outcome.dropped_queued_messages
-            ),
-        );
-    }
 }
 
 fn dispatch_ralph_slash_command<'a>(
@@ -2274,7 +2260,7 @@ fn dispatch_runtime_slash_command<'a>(
             thread::spawn(move || {
                 let completion = TurnCompletion::new(turn_sender);
                 let result = compaction::compact(&agent, &instructions)
-                    .map(|outcome| report_dropped_queue(&notices, Some(&outcome)))
+                    .map(|outcome| turns::report_dropped_queue(Some(&notices), Some(&outcome)))
                     .map_err(|error| error.to_string());
                 completion.finish(result);
             });
