@@ -113,7 +113,7 @@ fn setup<T: omniroute::HttpTransport + ?Sized>(
     let message = result.render();
     config::ensure_agent_dir()?;
     CredentialStore::default_file().put("omni", Credential::api_key(result.credential_to_store))?;
-    Ok(message)
+    Ok(message.to_owned())
 }
 
 fn resolved_key(catalog: &Catalog) -> Result<String, Box<dyn Error>> {
