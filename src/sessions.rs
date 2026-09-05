@@ -8,7 +8,7 @@ use std::{
     error::Error,
     fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime},
 };
 
@@ -530,6 +530,7 @@ fn human_bytes(size: u64) -> String {
 mod tests {
     use super::*;
     use crate::sessionlog::{Entry, TYPE_MESSAGE};
+    use std::path::PathBuf;
 
     fn temp_root(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
