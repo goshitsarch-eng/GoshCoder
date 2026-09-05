@@ -8,7 +8,9 @@
 use std::{
     cmp::{max, min},
     fmt,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::to_string;
@@ -25,6 +27,8 @@ pub const MAX_TOOL_RESULT_BYTES: usize = 2_000;
 pub const SUMMARY_OPEN: &str = "<conversation-summary>";
 /// Closing delimiter for [`SUMMARY_OPEN`].
 pub const SUMMARY_CLOSE: &str = "</conversation-summary>";
+/// Upper bound for the isolated summary request.
+pub const SUMMARY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// A completed live or automatic compaction.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +45,7 @@ pub enum CompactionError {
     Busy,
     InsufficientHistory,
     EmptyHistory,
+    Timeout,
     Summary(String),
     Agent(agent::AgentError),
 }
@@ -55,6 +60,7 @@ impl fmt::Display for CompactionError {
             Self::EmptyHistory => {
                 formatter.write_str("conversation history contains no summarizable text")
             }
+            Self::Timeout => formatter.write_str("context compaction timed out after 10 minutes"),
             Self::Summary(message) => {
                 write!(formatter, "context compaction summary failed: {message}")
             }
@@ -67,7 +73,11 @@ impl std::error::Error for CompactionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::Busy | Self::InsufficientHistory | Self::EmptyHistory | Self::Summary(_) => None,
+            Self::Busy
+            | Self::InsufficientHistory
+            | Self::EmptyHistory
+            | Self::Timeout
+            | Self::Summary(_) => None,
         }
     }
 }
@@ -116,7 +126,8 @@ pub fn compact_with_summaries(
 
     let summary = generate_summary(agent, &state.model, &source, instructions)?;
     let tokens_before = estimate_messages_tokens(&state.messages);
-    let marker = summary_message(&summary, now_millis());
+    let timestamp = now_millis();
+    let marker = summary_message(&summary, timestamp);
     let dropped_queued_messages = agent.queued_message_count();
     agent.compact(
         marker,
@@ -126,7 +137,7 @@ pub fn compact_with_summaries(
             tokens_before,
             cost_before: conversation_cost(&state.messages, summaries),
             retained_messages: retained.len(),
-            timestamp: now_millis(),
+            timestamp,
         },
     )?;
     agent.clear_all_queues();
@@ -207,11 +218,15 @@ pub fn summary_message(summary: &str, timestamp: i64) -> llm::Message {
 
 /// Returns whether a user message is an internal context-compaction marker.
 pub fn is_summary_message(message: &llm::Message) -> bool {
+    summary_text(message).is_some()
+}
+
+/// Extracts the summary body from an internal context-compaction marker.
+pub fn summary_text(message: &llm::Message) -> Option<String> {
     let llm::Message::User(message) = message else {
-        return false;
+        return None;
     };
-    let text = user_text(message);
-    text.trim_start().starts_with(SUMMARY_OPEN) && text.contains(SUMMARY_CLOSE)
+    previous_summary_text(message)
 }
 
 /// Computes accumulated usage, including a persisted compaction prefix.
@@ -259,7 +274,10 @@ pub fn serialize_messages(messages: &[llm::Message]) -> String {
 /// Serializes one message in the loss-bounded summary-source format.
 pub fn serialize_message(message: &llm::Message) -> String {
     match message {
-        llm::Message::User(message) => format!("[User]: {}", user_text(message)),
+        llm::Message::User(user) => previous_summary_text(user).map_or_else(
+            || format!("[User]: {}", user_text(user)),
+            |summary| format!("[Previous conversation summary]: {summary}"),
+        ),
         llm::Message::Assistant(message) => serialize_assistant(message),
         llm::Message::ToolResult(message) => serialize_tool_result(message),
     }
@@ -318,7 +336,13 @@ fn serialize_tool_result(message: &llm::ToolResultMessage) -> String {
     format!("[Tool result {}]: {content}", message.tool_name)
 }
 
-fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
+/// Uses the same context-usage source as the legacy client.
+///
+/// Before a compaction, a provider-reported assistant token count is the best
+/// available measurement. Once a summary marker is present, it no longer
+/// describes the rewritten context, so use the full compaction serialization
+/// instead. Keeping this public lets the status UI and auto-compaction agree.
+pub fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
     if messages.iter().any(is_summary_message) {
         return estimate_messages_tokens(messages);
     }
@@ -330,6 +354,56 @@ fn measured_context_tokens(messages: &[llm::Message]) -> u64 {
         }
     }
     estimate_messages_tokens(messages)
+}
+
+/// Incrementally measures compacted context for a frequently refreshed UI.
+///
+/// Before compaction, a provider's latest usage value remains authoritative and
+/// cheap to inspect. After compaction, that value describes the old prompt, so
+/// [`measured_context_tokens`] serializes the complete context instead. The
+/// terminal redraws while the final assistant message streams, but all
+/// preceding messages are immutable; this cache only reserializes that final
+/// message and resets when a compaction shortens the transcript.
+#[derive(Clone, Debug, Default)]
+pub struct ContextEstimate {
+    measured: usize,
+    total: u64,
+}
+
+impl ContextEstimate {
+    /// Returns the same value as [`measured_context_tokens`] while avoiding
+    /// repeated serialization of the stable compacted transcript prefix.
+    pub fn measure(&mut self, messages: &[llm::Message]) -> u64 {
+        if messages.is_empty() {
+            self.reset();
+            return 0;
+        }
+        if !messages.iter().any(is_summary_message) {
+            self.reset();
+            return measured_context_tokens(messages);
+        }
+
+        // The final message can grow on every streaming delta, so leave it
+        // uncached. A shorter prefix signals a wholesale replacement such as
+        // compaction or reset.
+        let stable = messages.len().saturating_sub(1);
+        if stable < self.measured {
+            self.reset();
+        }
+        for message in &messages[self.measured..stable] {
+            self.total = self.total.saturating_add(estimate_message_tokens(message));
+        }
+        self.measured = stable;
+        self.total
+            .saturating_add(estimate_message_tokens(&messages[stable]))
+    }
+
+    /// Discards a previously measured prefix after a session switches or the
+    /// transcript is otherwise replaced at the same length.
+    pub fn reset(&mut self) {
+        self.measured = 0;
+        self.total = 0;
+    }
 }
 
 fn source_limit(context_window: u64) -> usize {
@@ -385,11 +459,28 @@ fn user_text(message: &llm::UserMessage) -> String {
     }
 }
 
+fn previous_summary_text(message: &llm::UserMessage) -> Option<String> {
+    let text = user_text(message);
+    let after_open = text.trim_start().strip_prefix(SUMMARY_OPEN)?;
+    let (summary, _) = after_open.split_once(SUMMARY_CLOSE)?;
+    Some(summary.trim().to_owned())
+}
+
 fn generate_summary(
     source_agent: &agent::Agent,
     model: &llm::Model,
     source: &str,
     instructions: &str,
+) -> Result<String> {
+    generate_summary_with_timeout(source_agent, model, source, instructions, SUMMARY_TIMEOUT)
+}
+
+fn generate_summary_with_timeout(
+    source_agent: &agent::Agent,
+    model: &llm::Model,
+    source: &str,
+    instructions: &str,
+    timeout: Duration,
 ) -> Result<String> {
     let thinking_level = stream::clamp_thinking_level(model, llm::THINKING_LOW);
     let summarizer = agent::Agent::new(agent::AgentOptions {
@@ -415,7 +506,23 @@ fn generate_summary(
     let prompt = format!(
         "Summarize the serialized conversation below for another coding agent using exactly this structure:\n\n## Goal\n## Constraints & Preferences\n## Progress\n### Done\n### In Progress\n### Blocked\n## Key Decisions\n## Next Steps\n## Critical Context\n<read-files>\n</read-files>\n<modified-files>\n</modified-files>\n{focus}\n<conversation>\n{source}\n</conversation>"
     );
-    summarizer.prompt(prompt).map_err(CompactionError::Agent)?;
+    let worker = summarizer.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(worker.prompt(prompt));
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(result) => result.map_err(CompactionError::Agent)?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            summarizer.abort();
+            return Err(CompactionError::Timeout);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(CompactionError::Summary(
+                "compaction summary worker stopped unexpectedly".to_owned(),
+            ));
+        }
+    }
     let state = summarizer.state();
     if !state.error_message.is_empty() {
         return Err(CompactionError::Summary(state.error_message));
@@ -458,7 +565,11 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use super::*;
 
@@ -510,6 +621,108 @@ mod tests {
         let serialized = serialize_message(&message);
         assert!(serialized.contains("characters truncated"));
         assert!(serialized.is_char_boundary(serialized.len()));
+    }
+
+    #[test]
+    fn recompact_serialization_labels_prior_summary_without_its_context_wrapper() {
+        let marker = summary_message("previous decisions", 1);
+
+        assert_eq!(
+            serialize_message(&marker),
+            "[Previous conversation summary]: previous decisions"
+        );
+    }
+
+    #[test]
+    fn measured_tokens_switches_to_full_serialization_after_compaction() {
+        let mut measured = assistant("response");
+        if let llm::Message::Assistant(message) = &mut measured {
+            message.usage.total_tokens = 99;
+        }
+        let messages = vec![user("request"), measured.clone()];
+        assert_eq!(measured_context_tokens(&messages), 99);
+
+        let compacted = vec![summary_message("prior work", 1), measured];
+        assert_eq!(
+            measured_context_tokens(&compacted),
+            estimate_messages_tokens(&compacted)
+        );
+    }
+
+    #[test]
+    fn context_estimate_matches_full_measurement_after_compaction_and_streaming_updates() {
+        let mut estimate = ContextEstimate::default();
+        let mut messages = vec![
+            summary_message("earlier work", 1),
+            user("latest request"),
+            assistant("partial response"),
+        ];
+
+        assert_eq!(
+            estimate.measure(&messages),
+            estimate_messages_tokens(&messages)
+        );
+
+        let first = estimate.measure(&messages);
+        if let llm::Message::Assistant(message) = &mut messages[2] {
+            message.content = vec![llm::ContentBlock::text(
+                "a much longer streamed response ".repeat(50),
+            )];
+        }
+        let second = estimate.measure(&messages);
+        assert!(second > first);
+        assert_eq!(second, estimate_messages_tokens(&messages));
+
+        messages.push(user("new turn after compaction"));
+        assert_eq!(
+            estimate.measure(&messages),
+            estimate_messages_tokens(&messages)
+        );
+
+        let replacement = vec![summary_message("new summary", 1), user("newest request")];
+        assert_eq!(
+            estimate.measure(&replacement),
+            estimate_messages_tokens(&replacement)
+        );
+
+        estimate.reset();
+        let same_length_replacement = vec![
+            summary_message("resumed summary", 1),
+            user("resumed request"),
+        ];
+        assert_eq!(
+            estimate.measure(&same_length_replacement),
+            estimate_messages_tokens(&same_length_replacement)
+        );
+    }
+
+    #[test]
+    fn summary_timeout_aborts_the_helper_agent() {
+        let (stopped_sender, stopped_receiver) = mpsc::channel();
+        let source_agent = agent::Agent::new(agent::AgentOptions {
+            responder: Some(Arc::new(move |_, _, options| {
+                while !options.cancellation.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let _ = stopped_sender.send(());
+                Err("request aborted".to_owned())
+            })),
+            ..agent::AgentOptions::default()
+        });
+
+        let error = generate_summary_with_timeout(
+            &source_agent,
+            &model(),
+            "[User]: old context",
+            "",
+            Duration::from_millis(100),
+        )
+        .expect_err("the helper must time out");
+
+        assert!(matches!(error, CompactionError::Timeout));
+        stopped_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the timed-out helper was aborted");
     }
 
     #[test]

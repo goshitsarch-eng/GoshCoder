@@ -7,17 +7,19 @@
 
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
-    agent, llm, plannotator,
+    agent, config, llm, plannotator,
     session::{SessionCustomRecorder, SessionNoticeSender, SessionRuntime},
     tools::Workspace,
 };
@@ -59,6 +61,10 @@ pub type Result<T> = std::result::Result<T, PlannerRuntimeError>;
 /// prompt while rebuilding the corresponding model-visible tool set.
 pub type SystemPromptSync = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
+/// Installs asynchronously discovered ordinary tools into every future Planner
+/// tool-list rebuild.
+pub type ToolInstaller = Arc<dyn Fn(Vec<agent::Tool>) + Send + Sync + 'static>;
+
 /// Keeps a planner attached to one session and its live agent.
 ///
 /// Its subscription must remain alive for the complete session: it applies
@@ -68,7 +74,10 @@ pub struct PlannerRuntime {
     manager: plannotator::Manager,
     agent: agent::Agent,
     workspace: Workspace,
-    normal_tools: Vec<agent::Tool>,
+    /// The ordinary (non-planner) tool set. Runtime integrations can append
+    /// asynchronously discovered tools here without losing them when Planner
+    /// changes phase and rebuilds the model-facing list.
+    normal_tools: Arc<Mutex<Vec<agent::Tool>>>,
     base_system_prompt: Arc<Mutex<String>>,
     reviewer: Arc<dyn plannotator::Reviewer>,
     notices: SessionNoticeSender,
@@ -129,7 +138,10 @@ impl PlannerRuntime {
         start_in_planning: bool,
     ) -> Result<Self> {
         let notices = runtime.notice_sender();
-        let initial = restored_state(runtime, &notices);
+        let RestoredPlannerState {
+            initial,
+            legacy_path,
+        } = restored_state(runtime, &notices, workspace.root());
         let recorder = runtime.custom_recorder();
         let reviewer: Arc<dyn plannotator::Reviewer> = Arc::new(plannotator::BrowserReviewer {
             notify: Some(review_notice_callback(notices.clone())),
@@ -140,7 +152,7 @@ impl PlannerRuntime {
             Some(Arc::clone(&reviewer)),
             plannotator::Options {
                 initial,
-                on_change: Some(persistence_callback(recorder, notices.clone())),
+                on_change: Some(persistence_callback(recorder, notices.clone(), legacy_path)),
                 warn: Some(warning_callback(notices.clone())),
             },
         )?;
@@ -150,12 +162,13 @@ impl PlannerRuntime {
         }
 
         let agent = runtime.agent().clone();
+        let normal_tools = Arc::new(Mutex::new(normal_tools));
         let base_system_prompt = Arc::new(Mutex::new(base_system_prompt));
         let subscription = planner_subscription(
             &agent,
             manager.clone(),
             workspace.clone(),
-            normal_tools.clone(),
+            Arc::clone(&normal_tools),
             Arc::clone(&base_system_prompt),
         );
         let integration = Self {
@@ -233,13 +246,33 @@ impl PlannerRuntime {
     /// remains the outermost prompt layer and phase-specific tool rebuilding
     /// cannot unregister Ralph's tools.
     pub fn sync_with_base(&self, base_system_prompt: impl AsRef<str>) {
+        let normal_tools = lock(&self.normal_tools).clone();
         sync_agent_with_base(
             &self.agent,
             &self.manager,
             &self.workspace,
-            &self.normal_tools,
+            &normal_tools,
             base_system_prompt.as_ref(),
         );
+    }
+
+    /// Returns a callback that adds ordinary tools while preserving Planner's
+    /// current phase-specific wrappers. It intentionally only updates tools:
+    /// another extension (such as Ralph) may own the current composed system
+    /// prompt and must not be overwritten by an asynchronous connector refresh.
+    pub fn tool_installer(&self) -> ToolInstaller {
+        let agent = self.agent.clone();
+        let manager = self.manager.clone();
+        let workspace = self.workspace.clone();
+        let normal_tools = Arc::clone(&self.normal_tools);
+        Arc::new(move |additions| {
+            let tools = {
+                let mut normal_tools = lock(&normal_tools);
+                append_unique_tools(&mut normal_tools, additions);
+                normal_tools.clone()
+            };
+            sync_agent_tools(&agent, &manager, &workspace, &tools);
+        })
     }
 
     /// Returns a callback-safe prompt synchronizer for another session
@@ -250,8 +283,9 @@ impl PlannerRuntime {
         let agent = self.agent.clone();
         let manager = self.manager.clone();
         let workspace = self.workspace.clone();
-        let normal_tools = self.normal_tools.clone();
+        let normal_tools = Arc::clone(&self.normal_tools);
         Arc::new(move |base_system_prompt| {
+            let normal_tools = lock(&normal_tools).clone();
             sync_agent_with_base(
                 &agent,
                 &manager,
@@ -263,27 +297,104 @@ impl PlannerRuntime {
     }
 }
 
+struct RestoredPlannerState {
+    initial: Option<plannotator::State>,
+    legacy_path: Option<PathBuf>,
+}
+
 fn restored_state(
     runtime: &SessionRuntime,
     notices: &SessionNoticeSender,
-) -> Option<plannotator::State> {
+    workspace_root: &Path,
+) -> RestoredPlannerState {
+    if !runtime.resumed() {
+        return adopt_legacy_planner_state(&config::agent_dir(), workspace_root, notices);
+    }
     let restored = runtime.restored();
-    let raw = restored.custom.get(CUSTOM_TYPE)?;
+    let Some(raw) = restored.custom.get(CUSTOM_TYPE) else {
+        return RestoredPlannerState {
+            initial: None,
+            legacy_path: None,
+        };
+    };
     match serde_json::from_value::<plannotator::State>(raw.clone()) {
-        Ok(state) => Some(state),
+        Ok(state) => RestoredPlannerState {
+            initial: Some(state),
+            legacy_path: None,
+        },
         Err(error) => {
             notices.push(
                 "Planner",
                 format!("ignoring unreadable saved planner state: {error}"),
             );
-            None
+            RestoredPlannerState {
+                initial: None,
+                legacy_path: None,
+            }
         }
     }
+}
+
+/// Adopts one pre-session planner state without deleting it before a future
+/// planner change has actually persisted the state into its session log.
+fn adopt_legacy_planner_state(
+    agent_dir: &Path,
+    workspace_root: &Path,
+    notices: &SessionNoticeSender,
+) -> RestoredPlannerState {
+    let path = legacy_planner_state_path(agent_dir, workspace_root);
+    let Ok(contents) = fs::read(&path) else {
+        return RestoredPlannerState {
+            initial: None,
+            legacy_path: None,
+        };
+    };
+    let Ok(state) = serde_json::from_slice::<plannotator::State>(&contents) else {
+        let _ = fs::remove_file(path);
+        return RestoredPlannerState {
+            initial: None,
+            legacy_path: None,
+        };
+    };
+    if state.phase.as_str().is_empty() || state.phase == plannotator::Phase::Idle {
+        let _ = fs::remove_file(path);
+        return RestoredPlannerState {
+            initial: None,
+            legacy_path: None,
+        };
+    }
+    notices.push(
+        "Planner",
+        format!(
+            "adopted the workspace's saved Planner state ({}); plan state now belongs to a session, so use -continue to come back to it",
+            state.phase.as_str()
+        ),
+    );
+    RestoredPlannerState {
+        initial: Some(state),
+        legacy_path: Some(path),
+    }
+}
+
+fn legacy_planner_state_path(agent_dir: &Path, workspace_root: &Path) -> PathBuf {
+    let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+    let identifier = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    agent_dir
+        .join("plannotator")
+        .join(format!("{identifier}.json"))
+}
+
+fn retire_legacy_planner_state(path: &Path) {
+    let _ = fs::remove_file(path);
 }
 
 fn persistence_callback(
     recorder: SessionCustomRecorder,
     notices: SessionNoticeSender,
+    legacy_path: Option<PathBuf>,
 ) -> plannotator::StateCallback {
     Arc::new(move |state| {
         // A no-session or read-only session intentionally keeps planner state
@@ -302,11 +413,18 @@ fn persistence_callback(
                 return;
             }
         };
-        if let Err(error) = recorder.record(CUSTOM_TYPE, payload) {
-            notices.push(
-                "Planner",
-                format!("could not save planner state to the session: {error}"),
-            );
+        match recorder.record(CUSTOM_TYPE, payload) {
+            Ok(_) => {
+                if let Some(path) = legacy_path.as_deref() {
+                    retire_legacy_planner_state(path);
+                }
+            }
+            Err(error) => {
+                notices.push(
+                    "Planner",
+                    format!("could not save planner state to the session: {error}"),
+                );
+            }
         }
     })
 }
@@ -323,7 +441,7 @@ fn planner_subscription(
     agent: &agent::Agent,
     manager: plannotator::Manager,
     workspace: Workspace,
-    normal_tools: Vec<agent::Tool>,
+    normal_tools: Arc<Mutex<Vec<agent::Tool>>>,
     base_system_prompt: Arc<Mutex<String>>,
 ) -> agent::Subscription {
     let agent = agent.clone();
@@ -348,11 +466,12 @@ fn sync_agent(
     agent: &agent::Agent,
     manager: &plannotator::Manager,
     workspace: &Workspace,
-    normal_tools: &[agent::Tool],
+    normal_tools: &Arc<Mutex<Vec<agent::Tool>>>,
     base_system_prompt: &Arc<Mutex<String>>,
 ) {
     let base = lock(base_system_prompt).clone();
-    sync_agent_with_base(agent, manager, workspace, normal_tools, &base);
+    let normal_tools = lock(normal_tools).clone();
+    sync_agent_with_base(agent, manager, workspace, &normal_tools, &base);
 }
 
 fn sync_agent_with_base(
@@ -363,6 +482,15 @@ fn sync_agent_with_base(
     base_system_prompt: &str,
 ) {
     agent.set_system_prompt(manager.prompt(base_system_prompt));
+    sync_agent_tools(agent, manager, workspace, normal_tools);
+}
+
+fn sync_agent_tools(
+    agent: &agent::Agent,
+    manager: &plannotator::Manager,
+    workspace: &Workspace,
+    normal_tools: &[agent::Tool],
+) {
     agent.set_tools(planner_tools(manager, workspace, normal_tools));
 }
 
@@ -404,6 +532,18 @@ fn merge_tools<const N: usize>(groups: [Vec<agent::Tool>; N]) -> Vec<agent::Tool
         .flatten()
         .filter(|tool| names.insert(tool.name.clone()))
         .collect()
+}
+
+fn append_unique_tools(tools: &mut Vec<agent::Tool>, additions: Vec<agent::Tool>) {
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    tools.extend(
+        additions
+            .into_iter()
+            .filter(|tool| names.insert(tool.name.clone())),
+    );
 }
 
 fn guard_tool(mut tool: agent::Tool, manager: plannotator::Manager) -> agent::Tool {
@@ -674,6 +814,89 @@ mod tests {
 
         drop(integration);
         runtime.close().expect("close");
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn legacy_workspace_planner_state_is_adopted_then_retired_after_session_write() {
+        let root = temporary_path("legacy-state");
+        let workspace_root = root.join("workspace");
+        let agent_dir = root.join("agent");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let state = plannotator::State {
+            phase: plannotator::Phase::Planning,
+            ..plannotator::State::default()
+        };
+        let legacy_path = legacy_planner_state_path(&agent_dir, &workspace_root);
+        fs::create_dir_all(legacy_path.parent().expect("legacy parent"))
+            .expect("create legacy planner directory");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&state).expect("encode legacy state"),
+        )
+        .expect("write legacy state");
+
+        let mut session = runtime(&workspace_root);
+        let notices = session.notice_sender();
+        let adopted = adopt_legacy_planner_state(&agent_dir, &workspace_root, &notices);
+
+        assert_eq!(adopted.initial, Some(state.clone()));
+        assert_eq!(adopted.legacy_path.as_deref(), Some(legacy_path.as_path()));
+        assert!(
+            legacy_path.exists(),
+            "state stays until a session write succeeds"
+        );
+        assert!(session.drain_notices().iter().any(|notice| {
+            notice
+                .text
+                .contains("adopted the workspace's saved Planner state")
+        }));
+
+        let persist = persistence_callback(
+            session.custom_recorder(),
+            session.notice_sender(),
+            adopted.legacy_path,
+        );
+        persist(state.clone());
+        assert!(
+            !legacy_path.exists(),
+            "legacy state is retired only after durable custom-state recording"
+        );
+        assert_eq!(
+            serde_json::from_value::<plannotator::State>(
+                session
+                    .restored()
+                    .custom
+                    .get(CUSTOM_TYPE)
+                    .cloned()
+                    .expect("session planner state"),
+            )
+            .expect("decode recorded state"),
+            state
+        );
+
+        session.close().expect("close session");
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn malformed_or_idle_legacy_planner_state_is_discarded() {
+        let root = temporary_path("legacy-invalid");
+        let workspace_root = root.join("workspace");
+        let agent_dir = root.join("agent");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        let path = legacy_planner_state_path(&agent_dir, &workspace_root);
+        fs::create_dir_all(path.parent().expect("legacy parent"))
+            .expect("create legacy planner directory");
+        fs::write(&path, br#"{"phase":"idle"}"#).expect("write idle state");
+        let mut session = runtime(&workspace_root);
+
+        let adopted =
+            adopt_legacy_planner_state(&agent_dir, &workspace_root, &session.notice_sender());
+
+        assert!(adopted.initial.is_none());
+        assert!(!path.exists());
+        session.close().expect("close session");
         fs::remove_dir_all(root).expect("remove root");
     }
 

@@ -12,9 +12,9 @@ use std::{
 };
 
 use crate::{
-    agent, btw_runtime,
+    agent, aperture_runtime, btw_runtime,
     catalog::Catalog,
-    config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, planner_runtime, plannotator, providers, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -95,6 +95,15 @@ pub struct Invocation {
 
 /// An initialized session plus the objects whose lifetime must outlast tools.
 pub struct PreparedSession {
+    /// Background Aperture refresh and connector integration for this session.
+    /// Retaining it keeps startup cancellation coupled to the session lifetime.
+    pub aperture: Option<aperture_runtime::ApertureRuntime>,
+    /// Lazily started local desktop MCP server, when available on Linux.
+    ///
+    /// This owner closes the child process when the containing session ends;
+    /// the agent's `mcp` tool holds a clone for individual requests.
+    #[allow(dead_code)]
+    desktop: Option<DesktopMcpRuntime>,
     /// Session-local, in-memory side discussion runtime used by `/btw`.
     pub btw: btw_runtime::Runtime,
     /// Session-owned Ralph integration. It is dropped before the agent runtime
@@ -109,6 +118,33 @@ pub struct PreparedSession {
     resources: Mutex<ResourceSet>,
     explicit_system_prompt: Mutex<String>,
     pub config: SessionConfig,
+}
+
+/// Session-owned lifecycle for the local `computer-use-linux` MCP server.
+///
+/// The server is deliberately not started during session construction. Its
+/// `McpSession` starts it on first tool use, but retaining this owner lets us
+/// reliably terminate that child when the coding session is dropped.
+struct DesktopMcpRuntime {
+    session: computeruse::McpSession,
+}
+
+impl DesktopMcpRuntime {
+    fn new(binary: PathBuf) -> Self {
+        Self {
+            session: computeruse::McpSession::new(binary),
+        }
+    }
+
+    fn tool(&self) -> agent::Tool {
+        computeruse::agent_tool(self.session.clone())
+    }
+}
+
+impl Drop for DesktopMcpRuntime {
+    fn drop(&mut self) {
+        self.session.close();
+    }
 }
 
 impl PreparedSession {
@@ -480,6 +516,7 @@ pub fn session_options(
         .resolve_model(&model_ref)
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
     let (model, _) = resolved.into_parts();
+    ensure_supported_model(&model)?;
     let thinking_level = stream::clamp_thinking_level(&model, &config.thinking);
 
     Ok(SessionOptions {
@@ -529,8 +566,12 @@ pub fn prepare_session(
         .filter(|_| config.enable_tools)
         .map(Workspace::all)
         .unwrap_or_default();
+    let (desktop, desktop_notices) = desktop_mcp_runtime(config.enable_tools, config.quiet);
     if config.enable_tools {
         tools.push(native_web_search_tool(catalog)?);
+    }
+    if let Some(desktop) = desktop.as_ref() {
+        tools.push(desktop.tool());
     }
     tools.extend(extra_tools);
     let tool_names = tools.iter().map(|tool| tool.name.as_str());
@@ -545,6 +586,10 @@ pub fn prepare_session(
     )?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    let notices = runtime.notice_sender();
+    for notice in desktop_notices {
+        notices.push(computeruse::PACKAGE_NAME, notice);
+    }
     let btw = btw_runtime::Runtime::with_catalog(
         runtime.agent().responder(),
         catalog.clone(),
@@ -595,8 +640,20 @@ pub fn prepare_session(
         })
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
+    let aperture_tool_installer: aperture_runtime::ToolInstaller = planner
+        .as_ref()
+        .map(planner_runtime::PlannerRuntime::tool_installer)
+        .unwrap_or_else(|| aperture_runtime::agent_tool_installer(runtime.agent().clone()));
+    let aperture = aperture_runtime::ApertureRuntime::start(
+        catalog.clone(),
+        runtime.notice_sender(),
+        config.enable_tools,
+        aperture_tool_installer,
+    );
 
     Ok(PreparedSession {
+        aperture,
+        desktop,
         btw,
         ralph,
         planner,
@@ -607,6 +664,69 @@ pub fn prepare_session(
         explicit_system_prompt: Mutex::new(config.system_prompt.clone()),
         config,
     })
+}
+
+fn desktop_mcp_runtime(
+    enable_tools: bool,
+    quiet: bool,
+) -> (Option<DesktopMcpRuntime>, Vec<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        if !enable_tools {
+            return (None, Vec::new());
+        }
+        desktop_mcp_runtime_from_binary(
+            true,
+            quiet,
+            computeruse::find_binary(),
+            config::mcp_config_path(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (enable_tools, quiet);
+        (None, Vec::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_mcp_runtime_from_binary(
+    enable_tools: bool,
+    quiet: bool,
+    binary: Option<PathBuf>,
+    mcp_config_path: PathBuf,
+) -> (Option<DesktopMcpRuntime>, Vec<String>) {
+    if !enable_tools {
+        return (None, Vec::new());
+    }
+    let Some(binary) = binary else {
+        return (
+            None,
+            vec![format!(
+                "{} binary not found. {}",
+                computeruse::SERVER_NAME,
+                computeruse::INSTALL_HINT
+            )],
+        );
+    };
+
+    let mut notices = Vec::new();
+    match computeruse::ensure_server_entry(&mcp_config_path, &binary) {
+        Ok(computeruse::EnsureResult::Updated) if !quiet => {
+            notices.push(format!(
+                "MCP server configured at {}",
+                mcp_config_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            notices.push(format!(
+                "failed to configure MCP server at {}: {error}",
+                mcp_config_path.display()
+            ));
+        }
+    }
+    (Some(DesktopMcpRuntime::new(binary)), notices)
 }
 
 /// Builds the native cited web-search tool with fresh OpenAI/Codex credential
@@ -683,9 +803,20 @@ pub fn set_model(
         .resolve_model(reference)
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
     let (model, _) = resolved.into_parts();
+    ensure_supported_model(&model)?;
     runtime.agent().set_model(model.clone());
     let _ = config::write_default_model(&format!("{}/{}", model.provider, model.id));
     Ok(model)
+}
+
+fn ensure_supported_model(model: &llm::Model) -> Result<()> {
+    providers::ProviderProtocol::from_api(&model.api).map_err(|_| {
+        RuntimeError::Catalog(format!(
+            "model {}/{} uses the {:?} protocol, which is not implemented yet",
+            model.provider, model.id, model.api
+        ))
+    })?;
+    Ok(())
 }
 
 /// Resolves a resource invocation before it reaches the agent.
@@ -716,12 +847,15 @@ fn lock_value<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Builds the short status text shown after opening a session.
 pub fn session_banner(runtime: &SessionRuntime) -> Option<String> {
     runtime.handle().map(|handle| {
-        let action = if runtime.resumed() {
-            "resumed"
+        if runtime.resumed() {
+            format!(
+                "resumed {} message(s) from {}",
+                runtime.restored().messages.len(),
+                short_id(&handle.id)
+            )
         } else {
-            "recording"
-        };
-        format!("{action} session {}", short_id(&handle.id))
+            format!("recording session {}", short_id(&handle.id))
+        }
     })
 }
 
@@ -774,7 +908,7 @@ fn parse_session_flags(arguments: &[String], config: &mut SessionConfig) -> Resu
             "C" => config.workdir = PathBuf::from(next_value()?),
             "session" => config.session_ref = Some(next_value()?),
             "name" => config.session_name = Some(next_value()?),
-            "sessions-dir" => config.sessions_dir = Some(PathBuf::from(next_value()?)),
+            "sessions-dir" => config.sessions_dir = Some(config::expand_tilde(next_value()?)),
             "tools" => config.enable_tools = bool_value(name, inline_value)?,
             "ralph" => config.enable_ralph = bool_value(name, inline_value)?,
             "planner" | "plan" => config.enable_planner = bool_value(name, inline_value)?,
@@ -857,6 +991,69 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_mcp_runtime_registers_the_proxy_and_shared_mcp_entry() {
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-desktop-mcp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary directory");
+        let binary = directory.join("computer-use-linux");
+        let mcp_config = directory.join("mcp.json");
+        std::fs::write(&binary, "#!/bin/sh\n").expect("binary placeholder");
+
+        let (desktop, notices) =
+            desktop_mcp_runtime_from_binary(true, false, Some(binary.clone()), mcp_config.clone());
+        let desktop = desktop.expect("desktop runtime");
+        assert_eq!(desktop.tool().name, "mcp");
+        assert_eq!(
+            notices,
+            vec![format!("MCP server configured at {}", mcp_config.display())]
+        );
+
+        let configuration: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mcp_config).expect("read mcp config"))
+                .expect("valid mcp config");
+        assert_eq!(
+            configuration["mcpServers"][computeruse::SERVER_NAME]["command"],
+            binary.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            configuration["mcpServers"][computeruse::SERVER_NAME]["args"],
+            serde_json::json!(["mcp"])
+        );
+
+        drop(desktop);
+        std::fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_mcp_runtime_warns_only_when_tools_are_enabled_and_binary_is_missing() {
+        let config = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-missing-desktop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let (disabled, disabled_notices) =
+            desktop_mcp_runtime_from_binary(false, false, None, config.clone());
+        assert!(disabled.is_none());
+        assert!(disabled_notices.is_empty());
+
+        let (missing, notices) = desktop_mcp_runtime_from_binary(true, true, None, config);
+        assert!(missing.is_none());
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains(computeruse::INSTALL_HINT));
     }
 
     #[test]
@@ -983,16 +1180,22 @@ mod tests {
     }
 
     #[test]
+    fn session_models_require_a_migrated_provider_protocol() {
+        let error = ensure_supported_model(&llm::Model {
+            provider: "example".to_owned(),
+            id: "legacy".to_owned(),
+            api: "legacy-protocol".to_owned(),
+            ..llm::Model::default()
+        })
+        .expect_err("unsupported model must not start a session");
+        assert_eq!(
+            error.to_string(),
+            "model example/legacy uses the \"legacy-protocol\" protocol, which is not implemented yet"
+        );
+    }
+
+    #[test]
     fn coding_sessions_register_native_web_search_in_the_prompt_and_tool_set() {
-        let catalog = Catalog::with_environment(
-            None,
-            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
-        )
-        .expect("catalog");
-        let model_id = catalog
-            .provider("openai")
-            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
-            .expect("OpenAI model");
         let directory = std::env::temp_dir().join(format!(
             "goshcoder-runtime-web-search-{}-{}",
             std::process::id(),
@@ -1002,6 +1205,19 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).expect("workspace");
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+        .with_aperture_paths(
+            directory.join("aperture.json"),
+            directory.join("aperture-cache.json"),
+        );
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
 
         let mut prepared = prepare_session(
             &catalog,
@@ -1027,15 +1243,6 @@ mod tests {
 
     #[test]
     fn enabled_ralph_tools_survive_planner_tool_rebuilds() {
-        let catalog = Catalog::with_environment(
-            None,
-            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
-        )
-        .expect("catalog");
-        let model_id = catalog
-            .provider("openai")
-            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
-            .expect("OpenAI model");
         let directory = std::env::temp_dir().join(format!(
             "goshcoder-runtime-ralph-{}-{}",
             std::process::id(),
@@ -1045,6 +1252,19 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).expect("workspace");
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+        .with_aperture_paths(
+            directory.join("aperture.json"),
+            directory.join("aperture-cache.json"),
+        );
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
 
         let mut prepared = prepare_session(
             &catalog,

@@ -1866,6 +1866,52 @@ mod tests {
     }
 
     #[test]
+    fn real_pi_v1_compaction_fixture_projects_the_kept_context() {
+        let root = temp_root("pi-v1-compaction");
+        fs::create_dir_all(&root).expect("make root");
+        let fixture = root.join("pi-v1-compaction.jsonl");
+        fs::write(
+            &fixture,
+            include_str!("../internal/sessionlog/testdata/pi-v1-compaction.jsonl"),
+        )
+        .expect("write fixture");
+        let store = Store::new(root.join("sessions"));
+
+        let (tree, _, report) = store.load(&fixture).expect("load fixture");
+
+        assert!(report.migrated, "the fixture must exercise v1 migration");
+        let compaction = tree
+            .all()
+            .into_iter()
+            .find(|entry| entry.kind == TYPE_COMPACTION)
+            .expect("compaction entry");
+        assert!(!compaction.first_kept_entry_id.is_empty());
+        assert!(tree.has(&compaction.first_kept_entry_id));
+
+        let full = tree.path(None);
+        let context = tree.context_path(None);
+        let projected = context
+            .iter()
+            .map(|entry| match entry.kind.as_str() {
+                TYPE_COMPACTION => "[compaction]".to_owned(),
+                TYPE_MESSAGE => entry.message.as_ref().map(message_text).unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projected,
+            [
+                "[compaction]",
+                "the first kept entry",
+                "after the compaction"
+            ]
+        );
+        assert!(context.len() < full.len());
+
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
     fn legacy_sessions_migrate_in_memory_and_fork_to_v3() {
         let root = temp_root("legacy");
         let store = Store::new(root.join("sessions"));

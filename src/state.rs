@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A transcript item rendered by the terminal interface.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Message {
     pub role: MessageRole,
     pub title: String,
@@ -15,7 +15,7 @@ pub struct Message {
 // These variants are the stable view-model contract for runtime modules that
 // are still being ported. Some are not populated by the initial shell yet.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum MessageRole {
     User,
     #[default]
@@ -77,6 +77,22 @@ pub struct App {
     pub tools_expanded: bool,
     pub hide_thinking: bool,
     pub history: Vec<String>,
+    model_suggestions: Vec<Suggestion>,
+    model_suggestions_query: Option<String>,
+    model_suggestions_model: Option<String>,
+    login_suggestions: Vec<Suggestion>,
+    login_suggestions_query: Option<String>,
+    thinking_suggestions: Vec<Suggestion>,
+    thinking_suggestions_query: Option<String>,
+    thinking_suggestions_model: Option<String>,
+    thinking_suggestions_level: Option<String>,
+    resume_suggestions: Vec<Suggestion>,
+    resume_suggestions_query: Option<String>,
+    resume_suggestions_loading: bool,
+    resource_suggestions: Vec<Suggestion>,
+    resource_suggestions_query: Option<String>,
+    ralph_commands_available: bool,
+    planner_commands_available: bool,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -89,10 +105,8 @@ pub struct SidebarLine {
     pub value: String,
 }
 
-// The sidebar accepts every status rendered by the previous terminal UI; the
-// early Ratatui shell only populates the fields it currently owns.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// The sidebar accepts every status rendered by the previous terminal UI.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SidebarKind {
     Title,
     Section,
@@ -107,13 +121,11 @@ pub enum SidebarKind {
     Blank,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileStatus {
-    Added,
-    Modified,
-    Deleted,
-    Untracked,
+    /// The two-column porcelain status from Git, retained verbatim so staged,
+    /// renamed, conflicted, and mixed states do not lose information.
+    Raw(String),
 }
 
 impl App {
@@ -152,6 +164,22 @@ impl App {
             tools_expanded: false,
             hide_thinking: false,
             history: Vec::new(),
+            model_suggestions: Vec::new(),
+            model_suggestions_query: None,
+            model_suggestions_model: None,
+            login_suggestions: Vec::new(),
+            login_suggestions_query: None,
+            thinking_suggestions: Vec::new(),
+            thinking_suggestions_query: None,
+            thinking_suggestions_model: None,
+            thinking_suggestions_level: None,
+            resume_suggestions: Vec::new(),
+            resume_suggestions_query: None,
+            resume_suggestions_loading: false,
+            resource_suggestions: Vec::new(),
+            resource_suggestions_query: None,
+            ralph_commands_available: true,
+            planner_commands_available: true,
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -159,7 +187,238 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        suggestions_for(&self.input)
+        if let Some(query) = model_query(&self.input) {
+            return if self.model_suggestions_query.as_deref() == Some(query) {
+                self.model_suggestions.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(query) = login_query(&self.input) {
+            return if self.login_suggestions_query.as_deref() == Some(query) {
+                self.login_suggestions.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(query) = thinking_query(&self.input) {
+            return if self.thinking_suggestions_query.as_deref() == Some(query) {
+                self.thinking_suggestions.clone()
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(query) = resume_query(&self.input) {
+            return if self.resume_suggestions_query.as_deref() == Some(query) {
+                self.resume_suggestions.clone()
+            } else if self.resume_suggestions_loading {
+                vec![Suggestion {
+                    label: "…".to_owned(),
+                    description: "reading saved sessions".to_owned(),
+                    value: String::new(),
+                    execute: false,
+                }]
+            } else {
+                Vec::new()
+            };
+        }
+        let mut suggestions = suggestions_for(&self.input);
+        suggestions.retain(|suggestion| self.root_command_available(&suggestion.label));
+        if let Some(query) = resource_query(&self.input)
+            && self.resource_suggestions_query.as_deref() == Some(query)
+        {
+            suggestions.extend(self.resource_suggestions.clone());
+        }
+        suggestions
+    }
+
+    /// Makes optional extension commands visible only when their session
+    /// runtime is loaded, matching the former fullscreen command palette.
+    pub fn set_command_availability(&mut self, ralph: bool, planner: bool) {
+        if self.ralph_commands_available == ralph && self.planner_commands_available == planner {
+            return;
+        }
+        self.ralph_commands_available = ralph;
+        self.planner_commands_available = planner;
+        self.selected_suggestion = 0;
+    }
+
+    fn root_command_available(&self, name: &str) -> bool {
+        (name != "/ralph" || self.ralph_commands_available)
+            && (!name.starts_with("/planner") || self.planner_commands_available)
+    }
+
+    /// Reports whether the composer is requesting the asynchronous session
+    /// picker.
+    pub fn resume_palette_active(&self) -> bool {
+        resume_query(&self.input).is_some()
+    }
+
+    /// Rebuilds the `/model` picker only when its query or active model
+    /// changes. The loader stays in the runtime because resolving configured
+    /// providers can refresh OAuth credentials.
+    pub fn refresh_model_suggestions<F>(&mut self, model_reference: &str, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = model_query(&self.input) else {
+            self.invalidate_model_suggestions();
+            return;
+        };
+        if self.model_suggestions_query.as_deref() == Some(query)
+            && self.model_suggestions_model.as_deref() == Some(model_reference)
+        {
+            return;
+        }
+        self.model_suggestions = load(query);
+        self.model_suggestions_query = Some(query.to_owned());
+        self.model_suggestions_model = Some(model_reference.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.model_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates model choices after a model or credential change.
+    pub fn invalidate_model_suggestions(&mut self) {
+        self.model_suggestions.clear();
+        self.model_suggestions_query = None;
+        self.model_suggestions_model = None;
+    }
+
+    /// Rebuilds the `/login` provider palette only after its query changes.
+    ///
+    /// The loader belongs to the runtime because checking configured providers
+    /// can refresh OAuth credentials. Keeping it out of the renderer prevents
+    /// a terminal redraw from starting network work.
+    pub fn refresh_login_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = login_query(&self.input) else {
+            self.invalidate_login_suggestions();
+            return;
+        };
+        if self.login_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.login_suggestions = load(query);
+        self.login_suggestions_query = Some(query.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.login_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates credential-dependent provider choices after login.
+    pub fn invalidate_login_suggestions(&mut self) {
+        self.login_suggestions.clear();
+        self.login_suggestions_query = None;
+    }
+
+    /// Rebuilds thinking-level choices when either the picker query or active
+    /// model state changes.
+    pub fn refresh_thinking_suggestions<F>(
+        &mut self,
+        model_reference: &str,
+        thinking_level: &str,
+        load: F,
+    ) where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = thinking_query(&self.input) else {
+            self.invalidate_thinking_suggestions();
+            return;
+        };
+        if self.thinking_suggestions_query.as_deref() == Some(query)
+            && self.thinking_suggestions_model.as_deref() == Some(model_reference)
+            && self.thinking_suggestions_level.as_deref() == Some(thinking_level)
+        {
+            return;
+        }
+        self.thinking_suggestions = load(query);
+        self.thinking_suggestions_query = Some(query.to_owned());
+        self.thinking_suggestions_model = Some(model_reference.to_owned());
+        self.thinking_suggestions_level = Some(thinking_level.to_owned());
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.thinking_suggestions.len().saturating_sub(1));
+    }
+
+    /// Invalidates choices when a model or its thinking level changes.
+    pub fn invalidate_thinking_suggestions(&mut self) {
+        self.thinking_suggestions.clear();
+        self.thinking_suggestions_query = None;
+        self.thinking_suggestions_model = None;
+        self.thinking_suggestions_level = None;
+    }
+
+    /// Marks `/resume` suggestions as loading while the runtime scans session
+    /// logs away from the terminal render path.
+    pub fn set_resume_suggestions_loading(&mut self) {
+        if resume_query(&self.input).is_some() {
+            self.resume_suggestions.clear();
+            self.resume_suggestions_query = None;
+            self.resume_suggestions_loading = true;
+            self.selected_suggestion = 0;
+        }
+    }
+
+    /// Stores asynchronously discovered `/resume` candidates for the active
+    /// query.
+    pub fn refresh_resume_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = resume_query(&self.input) else {
+            self.invalidate_resume_suggestions();
+            return;
+        };
+        if self.resume_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.resume_suggestions = load(query);
+        self.resume_suggestions_query = Some(query.to_owned());
+        self.resume_suggestions_loading = false;
+        self.selected_suggestion = self
+            .selected_suggestion
+            .min(self.resume_suggestions.len().saturating_sub(1));
+    }
+
+    /// Drops cached candidates after a command that may alter session names,
+    /// branches, or available session files.
+    pub fn invalidate_resume_suggestions(&mut self) {
+        self.resume_suggestions.clear();
+        self.resume_suggestions_query = None;
+        self.resume_suggestions_loading = false;
+    }
+
+    /// Rebuilds local template and skill entries only after their command
+    /// prefix changes. Resource loading stays in the runtime, not the
+    /// renderer, so palette painting is always side-effect free.
+    pub fn refresh_resource_suggestions<F>(&mut self, load: F)
+    where
+        F: FnOnce(&str) -> Vec<Suggestion>,
+    {
+        let Some(query) = resource_query(&self.input) else {
+            self.invalidate_resource_suggestions();
+            return;
+        };
+        if self.resource_suggestions_query.as_deref() == Some(query) {
+            return;
+        }
+        self.resource_suggestions = load(query);
+        self.resource_suggestions_query = Some(query.to_owned());
+        self.selected_suggestion = self.selected_suggestion.min(
+            suggestions_for(&self.input)
+                .len()
+                .saturating_add(self.resource_suggestions.len())
+                .saturating_sub(1),
+        );
+    }
+
+    /// Invalidates local template and skill choices after a resource reload.
+    pub fn invalidate_resource_suggestions(&mut self) {
+        self.resource_suggestions.clear();
+        self.resource_suggestions_query = None;
     }
 
     /// Clears the composer and remembers a submitted value without adding
@@ -172,6 +431,11 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.selected_suggestion = 0;
+        self.invalidate_model_suggestions();
+        self.invalidate_login_suggestions();
+        self.invalidate_thinking_suggestions();
+        self.invalidate_resume_suggestions();
+        self.invalidate_resource_suggestions();
     }
 
     /// Retains an externally generated transcript while keeping editor history
@@ -665,6 +929,20 @@ impl SidebarLine {
         }
     }
 
+    pub fn todo(complete: bool, value: impl Into<String>) -> Self {
+        Self {
+            kind: SidebarKind::Todo { complete },
+            value: value.into(),
+        }
+    }
+
+    pub fn file(status: FileStatus, value: impl Into<String>) -> Self {
+        Self {
+            kind: SidebarKind::File { status },
+            value: value.into(),
+        }
+    }
+
     pub fn blank() -> Self {
         Self {
             kind: SidebarKind::Blank,
@@ -691,6 +969,115 @@ fn byte_at_character(input: &str, start: usize, character_offset: usize) -> usiz
 }
 
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
+    if let Some(query) = nested_command_query(input, "/omni ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "status",
+                    "Check gateway health and synchronized models",
+                    "/omni status",
+                    true,
+                ),
+                ("sync", "Refresh models from /v1/models", "/omni sync", true),
+                ("setup", "Configure URL and API key", "/omni setup", true),
+                (
+                    "dashboard",
+                    "Show the management dashboard URL",
+                    "/omni dashboard",
+                    true,
+                ),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/aperture ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "status",
+                    "Check gateway health and capabilities",
+                    "/aperture status",
+                    true,
+                ),
+                (
+                    "sync",
+                    "Refresh the dedicated catalog and gateway snapshot",
+                    "/aperture sync",
+                    true,
+                ),
+                (
+                    "onboarding",
+                    "First-time setup for Tailscale Aperture integration",
+                    "/aperture onboarding",
+                    true,
+                ),
+                (
+                    "settings",
+                    "Show or change connection, capabilities, providers, and pins",
+                    "/aperture settings",
+                    true,
+                ),
+                (
+                    "providers",
+                    "List gateway providers and routable APIs",
+                    "/aperture providers",
+                    true,
+                ),
+                (
+                    "connectors",
+                    "List MCP connectors and gateway tools",
+                    "/aperture connectors",
+                    true,
+                ),
+                (
+                    "pin",
+                    "Pin a connector tool first-class",
+                    "/aperture pin ",
+                    false,
+                ),
+                ("unpin", "Unpin a connector tool", "/aperture unpin ", false),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/btw ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                ("list", "List in-memory side threads", "/btw list", true),
+                (
+                    "resume",
+                    "Resume a side thread by ID",
+                    "/btw resume ",
+                    false,
+                ),
+                (
+                    "settings",
+                    "View or change side-thread settings",
+                    "/btw settings",
+                    true,
+                ),
+            ],
+        );
+    }
+    if let Some(query) = nested_command_query(input, "/ralph ") {
+        return nested_command_suggestions(
+            query,
+            &[
+                (
+                    "start",
+                    "Start a new iterative development loop",
+                    "/ralph start ",
+                    false,
+                ),
+                ("status", "Show the active loop", "/ralph status", true),
+                ("list", "List saved loops", "/ralph list", true),
+                ("resume", "Resume a paused loop", "/ralph resume ", false),
+                ("stop", "Stop an active loop", "/ralph stop ", false),
+            ],
+        );
+    }
+
     const COMMANDS: &[(&str, &str, bool)] = &[
         ("/help", "Show all commands", true),
         ("/model", "Choose from authenticated models", false),
@@ -710,29 +1097,29 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/hotkeys", "Show keyboard shortcuts", true),
         ("/messages", "Show transcript summary", true),
         ("/name", "Name this session", true),
-        ("/resume", "Switch to a saved session", false),
+        ("/resume", "Switch to a saved session", true),
         ("/sessions", "List saved sessions", true),
-        ("/prompt", "Save, list, back up, or restore prompts", false),
+        ("/prompt", "Save, list, back up, or restore prompts", true),
         ("/tree", "Show rewind points in this session", true),
-        ("/fork", "Rewind to an earlier point", false),
-        ("/label", "Name a rewind point", false),
+        ("/fork", "Rewind to an earlier point", true),
+        ("/label", "Name a rewind point", true),
         ("/clone", "Duplicate this session", true),
-        ("/export", "Export this session", false),
-        ("/import", "Adopt a session file", false),
+        ("/export", "Export this session", true),
+        ("/import", "Adopt a session file", true),
         ("/steer", "Guide the active response", false),
         ("/followup", "Queue the next message", false),
         ("/queue", "Show queued messages", true),
         ("/clear", "Clear the transcript", true),
         ("/new", "Start a fresh conversation", true),
-        ("/compact", "Summarize older context", false),
+        ("/compact", "Summarize older context", true),
         ("/reload", "Reload local resources", true),
         ("/resources", "Show loaded resources", true),
         ("/planner", "Toggle planning mode", true),
-        ("/planner-review", "Review code changes", false),
+        ("/planner-review", "Review code changes", true),
         ("/planner-annotate", "Annotate a target", false),
         ("/planner-last", "Annotate last response", true),
         ("/ralph", "Manage Ralph loops", false),
-        ("/system", "Show or replace system prompt", false),
+        ("/system", "Show or replace system prompt", true),
         ("/exit", "Exit GoshCoder", true),
         ("/quit", "Exit GoshCoder", true),
     ];
@@ -752,6 +1139,60 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
             } else {
                 format!("{name} ")
             },
+            execute: *execute,
+        })
+        .collect()
+}
+
+fn login_query(input: &str) -> Option<&str> {
+    let query = input.strip_prefix("/login ")?.trim();
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn model_query(input: &str) -> Option<&str> {
+    input.strip_prefix("/model ").map(str::trim)
+}
+
+fn thinking_query(input: &str) -> Option<&str> {
+    nested_command_query(input, "/thinking ")
+}
+
+fn resume_query(input: &str) -> Option<&str> {
+    let prefix = "/resume ";
+    if !input
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+    {
+        return None;
+    }
+    input.get(prefix.len()..).map(str::trim)
+}
+
+fn resource_query(input: &str) -> Option<&str> {
+    (input.starts_with('/') && !input.chars().any(char::is_whitespace)).then_some(input)
+}
+
+fn nested_command_query<'input>(input: &'input str, prefix: &str) -> Option<&'input str> {
+    let suffix = input.get(prefix.len()..)?;
+    if !input.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let query = suffix.trim();
+    (!query.chars().any(char::is_whitespace)).then_some(query)
+}
+
+fn nested_command_suggestions(
+    query: &str,
+    commands: &[(&str, &str, &str, bool)],
+) -> Vec<Suggestion> {
+    let query = query.to_ascii_lowercase();
+    commands
+        .iter()
+        .filter(|(label, _, _, _)| label.starts_with(&query))
+        .map(|(label, description, value, execute)| Suggestion {
+            label: (*label).to_owned(),
+            description: (*description).to_owned(),
+            value: (*value).to_owned(),
             execute: *execute,
         })
         .collect()
@@ -784,6 +1225,259 @@ mod tests {
 
         assert_eq!(app.input, "/model ");
         assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn model_palette_caches_choices_per_active_model_and_query() {
+        let mut app = App::new();
+        app.set_input("/model ");
+        app.refresh_model_suggestions("openai/gpt", |query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "GPT".to_owned(),
+                description: "openai/gpt".to_owned(),
+                value: "/model openai/gpt".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_model_suggestions("openai/gpt", |_| {
+            panic!("unchanged model picker must be cached")
+        });
+        app.refresh_model_suggestions("anthropic/claude", |query| {
+            assert!(query.is_empty());
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+
+        app.set_input("/model cl");
+        app.refresh_model_suggestions("anthropic/claude", |query| {
+            assert_eq!(query, "cl");
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn resource_palette_merges_cached_templates_with_commands() {
+        let mut app = App::new();
+        app.set_input("/rev");
+        app.refresh_resource_suggestions(|query| {
+            assert_eq!(query, "/rev");
+            vec![Suggestion {
+                label: "/review".to_owned(),
+                description: "Review a change".to_owned(),
+                value: "/review".to_owned(),
+                execute: true,
+            }]
+        });
+
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["/review"]
+        );
+        app.refresh_resource_suggestions(|_| panic!("unchanged resource query must be cached"));
+        app.set_input("/help");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["/help"]
+        );
+    }
+
+    #[test]
+    fn nested_palettes_complete_gateway_and_extension_commands() {
+        let mut app = App::new();
+        app.set_input("/omni ");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect::<Vec<_>>(),
+            vec![
+                "/omni status",
+                "/omni sync",
+                "/omni setup",
+                "/omni dashboard"
+            ]
+        );
+
+        app.set_input("/aperture p");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect::<Vec<_>>(),
+            vec!["/aperture providers", "/aperture pin "]
+        );
+
+        app.set_input("/ralph res");
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "resume".to_owned(),
+                description: "Resume a paused loop".to_owned(),
+                value: "/ralph resume ".to_owned(),
+                execute: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn optional_extension_root_commands_are_hidden_when_unavailable() {
+        let mut app = App::new();
+        app.set_command_availability(false, false);
+
+        app.set_input("/");
+        let root = app
+            .suggestions()
+            .into_iter()
+            .map(|suggestion| suggestion.label)
+            .collect::<Vec<_>>();
+        assert!(!root.iter().any(|command| command == "/ralph"));
+        assert!(!root.iter().any(|command| command.starts_with("/planner")));
+
+        app.set_input("/ralph ");
+        assert_eq!(
+            app.suggestions()
+                .into_iter()
+                .map(|suggestion| suggestion.label)
+                .collect::<Vec<_>>(),
+            vec!["start", "status", "list", "resume", "stop"]
+        );
+    }
+
+    #[test]
+    fn thinking_palette_caches_choices_per_model_and_level() {
+        let mut app = App::new();
+        app.set_input("/thinking ");
+        app.refresh_thinking_suggestions("openai/gpt", "high", |query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "high".to_owned(),
+                description: "CURRENT · Complex implementation work".to_owned(),
+                value: "/thinking high".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_thinking_suggestions("openai/gpt", "high", |_| {
+            panic!("unchanged thinking picker must be cached")
+        });
+        app.refresh_thinking_suggestions("openai/gpt", "low", |query| {
+            assert!(query.is_empty());
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn resume_palette_shows_a_loading_row_until_the_background_scan_finishes() {
+        let mut app = App::new();
+        app.set_input("/resume streaming retry");
+        app.set_resume_suggestions_loading();
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "…".to_owned(),
+                description: "reading saved sessions".to_owned(),
+                value: String::new(),
+                execute: false,
+            }]
+        );
+
+        app.refresh_resume_suggestions(|query| {
+            assert_eq!(query, "streaming retry");
+            vec![Suggestion {
+                label: "saved".to_owned(),
+                description: "matching session".to_owned(),
+                value: "/resume saved".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+        app.invalidate_resume_suggestions();
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn login_palette_caches_provider_choices_per_query() {
+        let mut app = App::new();
+        app.set_input("/login ");
+        app.refresh_login_suggestions(|query| {
+            assert!(query.is_empty());
+            vec![Suggestion {
+                label: "Anthropic".to_owned(),
+                description: "OAuth / subscription".to_owned(),
+                value: "/login anthropic".to_owned(),
+                execute: true,
+            }]
+        });
+        assert_eq!(app.suggestions().len(), 1);
+
+        app.refresh_login_suggestions(|_| panic!("unchanged login query must be cached"));
+        app.set_input("/login an");
+        assert!(app.suggestions().is_empty());
+        app.refresh_login_suggestions(|query| {
+            assert_eq!(query, "an");
+            Vec::new()
+        });
+        assert!(app.suggestions().is_empty());
+
+        app.invalidate_login_suggestions();
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn root_login_command_remains_an_additive_palette_entry() {
+        let mut app = App::new();
+        app.set_input("/log");
+
+        assert_eq!(
+            app.suggestions(),
+            vec![Suggestion {
+                label: "/login".to_owned(),
+                description: "Add an OAuth or API-key provider".to_owned(),
+                value: "/login ".to_owned(),
+                execute: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn root_palette_executes_legacy_argumentless_commands() {
+        let mut app = App::new();
+        for command in [
+            "/resume",
+            "/prompt",
+            "/fork",
+            "/label",
+            "/export",
+            "/import",
+            "/compact",
+            "/planner-review",
+            "/system",
+        ] {
+            app.set_input(command);
+            let suggestion = app
+                .suggestions()
+                .into_iter()
+                .next()
+                .expect("root command suggestion");
+            assert_eq!(suggestion.label, command);
+            assert_eq!(suggestion.value, command);
+            assert!(
+                suggestion.execute,
+                "{command} should execute immediately from the root palette"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! - Google Generative AI (`google-generative-ai`)
 //! - Google Vertex AI (`google-vertex`)
 //! - Mistral Conversations (`mistral-conversations`)
+//! - OmniRoute text-protocol tools (`omni-prompt-tools`)
 //!
 //! The implementation shares the existing SSE framing, bounded incremental
 //! JSON parser, retry classification, token accounting, and normalized
@@ -45,7 +46,9 @@ use reqwest::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{agent, bedrock, catalog, google_auth, llm, mistral, stream};
+use crate::{
+    agent, aperture, bedrock, catalog, google_auth, llm, mistral, omni_prompt_tools, stream,
+};
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
 pub const API_OPENAI_RESPONSES: &str = "openai-responses";
@@ -89,6 +92,7 @@ pub enum ProviderProtocol {
     GoogleGenerativeAi,
     GoogleVertex,
     MistralConversations,
+    OmniPromptTools,
     BedrockConverseStream,
 }
 
@@ -103,6 +107,7 @@ impl ProviderProtocol {
             API_GOOGLE_GENERATIVE_AI => Ok(Self::GoogleGenerativeAi),
             API_GOOGLE_VERTEX => Ok(Self::GoogleVertex),
             API_MISTRAL_CONVERSATIONS => Ok(Self::MistralConversations),
+            omni_prompt_tools::API_OMNI_PROMPT_TOOLS => Ok(Self::OmniPromptTools),
             bedrock::API_BEDROCK_CONVERSE_STREAM => Ok(Self::BedrockConverseStream),
             other => Err(ProviderAdapterError::UnsupportedApi(other.to_owned())),
         }
@@ -116,6 +121,9 @@ impl ProviderProtocol {
             Self::OpenAiCodexResponses => "codex/responses",
             Self::AnthropicMessages => "v1/messages",
             Self::MistralConversations => "v1/chat/completions",
+            Self::OmniPromptTools => {
+                unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+            }
             Self::GoogleGenerativeAi => {
                 unreachable!("Google uses a model-scoped GenerateContent endpoint")
             }
@@ -503,6 +511,14 @@ impl ProviderResponderFactory {
         if model.api == bedrock::API_BEDROCK_CONVERSE_STREAM {
             return self.stream_bedrock_with_credentials(model, context, options, credentials);
         }
+        if model.api == omni_prompt_tools::API_OMNI_PROMPT_TOOLS {
+            return self.stream_omni_prompt_tools_with_credentials(
+                model,
+                context,
+                options,
+                credentials,
+            );
+        }
         let events =
             stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
                 .expect("validated provider event buffer capacity");
@@ -568,6 +584,67 @@ impl ProviderResponderFactory {
         events
     }
 
+    fn stream_omni_prompt_tools_with_credentials(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+    ) -> stream::AssistantMessageEventStream {
+        let events =
+            stream::AssistantMessageEventStream::with_capacity(self.config.event_buffer_capacity)
+                .expect("validated provider event buffer capacity");
+        let worker_events = events.clone();
+        let factory = self.clone();
+        let model = model.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let cancellation = options.cancellation.clone();
+            let mut emitter = MessageEmitter::new(worker_events, &model);
+            if let Err(error) =
+                factory.run_omni_prompt_tools(&model, &context, options, credentials, &mut emitter)
+            {
+                let _ = emitter.fail(error, &cancellation);
+            }
+        });
+        events
+    }
+
+    fn run_omni_prompt_tools(
+        &self,
+        model: &llm::Model,
+        context: &llm::Context,
+        mut options: agent::RequestOptions,
+        credentials: ProviderCredentials,
+        emitter: &mut MessageEmitter,
+    ) -> Result<()> {
+        ensure_not_cancelled(&options.cancellation)?;
+        emitter.start()?;
+
+        let inner_context = omni_prompt_tools::inner_context(context);
+        let mut inner_model = model.clone();
+        inner_model.api = API_OPENAI_COMPLETIONS.to_owned();
+        // The adapter owns the externally visible event stream. The hidden
+        // completion must be drained silently before native events are
+        // replayed, otherwise callers would receive duplicate raw XML events.
+        options.assistant_event_listener = None;
+        let response =
+            self.respond_with_credentials(&inner_model, &inner_context, options, credentials)?;
+
+        emitter.message.usage = response.usage.clone();
+        emitter.message.response_id = response.response_id.clone();
+        emitter.message.response_model = response.response_model.clone();
+        if matches!(
+            response.stop_reason.as_str(),
+            stream::STOP_ERROR | stream::STOP_ABORTED
+        ) {
+            return emitter.finish_error(&response.stop_reason, response.error_message);
+        }
+
+        omni_prompt_tools::replay_response(emitter, &response)?;
+        emitter.finish()
+    }
+
     fn run_stream(
         &self,
         model: &llm::Model,
@@ -591,6 +668,7 @@ impl ProviderResponderFactory {
             | ProviderProtocol::GoogleGenerativeAi
             | ProviderProtocol::GoogleVertex
             | ProviderProtocol::MistralConversations
+            | ProviderProtocol::OmniPromptTools
             | ProviderProtocol::BedrockConverseStream => BTreeMap::new(),
         };
         let payload = match protocol {
@@ -624,6 +702,9 @@ impl ProviderResponderFactory {
             }
             ProviderProtocol::MistralConversations => {
                 mistral::build_mistral_request(model, context, &options)
+            }
+            ProviderProtocol::OmniPromptTools => {
+                unreachable!("Omni prompt tools is dispatched before the generic HTTP adapter")
             }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
@@ -669,6 +750,9 @@ impl ProviderResponderFactory {
             }
             ProviderProtocol::MistralConversations => {
                 mistral::consume_mistral_conversations(response, &options.cancellation, emitter)?
+            }
+            ProviderProtocol::OmniPromptTools => {
+                unreachable!("Omni prompt tools is dispatched before the generic HTTP adapter")
             }
             ProviderProtocol::BedrockConverseStream => {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
@@ -727,8 +811,10 @@ impl ProviderResponderFactory {
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
-                    let error =
-                        provider_error_from_response(response, self.config.max_error_body_bytes);
+                    let error = mark_aperture_retryable_provider_error(
+                        model,
+                        provider_error_from_response(response, self.config.max_error_body_bytes),
+                    );
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -742,6 +828,7 @@ impl ProviderResponderFactory {
                     )?;
                 }
                 Err(ProviderAdapterError::Provider(error)) => {
+                    let error = mark_aperture_retryable_provider_error(model, error);
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -845,11 +932,54 @@ impl ProviderResponderFactory {
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            let aperture_state = catalog.aperture_state();
+            let is_aperture_routed = aperture_state.configured
+                && ((model.provider == aperture::DEDICATED_PROVIDER_ID
+                    && aperture_state.resolved.dedicated_enabled)
+                    || aperture_state.routes.contains_key(&model.provider));
+            // Keep explicit caller overrides (notably test/enterprise base
+            // URLs) for native providers. Aperture must instead use the
+            // current catalog model so changed gateway routing takes effect.
+            let request_model = if is_aperture_routed {
+                &resolved.model
+            } else {
+                model
+            };
+            let routed_model = aperture::rewrite_request_model(
+                Some(&aperture_state),
+                request_model,
+                &options.session_id,
+            );
+            let aperture_routed = matches!(&routed_model, std::borrow::Cow::Owned(_));
             transport
-                .respond_with_credentials(model, context, options, credentials)
-                .map_err(|error| error.to_string())
+                .respond_with_credentials(routed_model.as_ref(), context, options, credentials)
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if aperture_routed {
+                        aperture::mark_retryable_error(&message).unwrap_or(message)
+                    } else {
+                        message
+                    }
+                })
         })
     }
+}
+
+fn mark_aperture_retryable_provider_error(
+    model: &llm::Model,
+    mut error: stream::ProviderError,
+) -> stream::ProviderError {
+    let routed_through_aperture = model.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("referer") && value == aperture::APERTURE_REFERER
+    });
+    if routed_through_aperture && let Some(message) = aperture::mark_retryable_error(&error.message)
+    {
+        error.message = message;
+        error
+            .headers
+            .insert("x-should-retry".to_owned(), "true".to_owned());
+    }
+    error
 }
 
 fn provider_network_error(error: reqwest::Error) -> ProviderAdapterError {
@@ -915,8 +1045,8 @@ fn protocol_endpoint(
             return google_vertex_endpoint(model, credentials);
         }
         ProviderProtocol::MistralConversations => {}
-        ProviderProtocol::BedrockConverseStream => {
-            unreachable!("Bedrock uses its own signed request builder");
+        ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+            unreachable!("adapter uses its own request builder");
         }
         ProviderProtocol::OpenAiCompletions
         | ProviderProtocol::OpenAiResponses
@@ -1314,6 +1444,9 @@ fn build_request_headers(
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
         }
+        ProviderProtocol::OmniPromptTools => {
+            unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+        }
     }
 
     let api_key = credentials.api_key_value().unwrap_or_default();
@@ -1422,8 +1555,8 @@ fn build_request_headers(
             }
             ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {}
             ProviderProtocol::GoogleVertex => unreachable!("Vertex is handled above"),
-            ProviderProtocol::BedrockConverseStream => {
-                unreachable!("Bedrock uses its own signed request builder")
+            ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+                unreachable!("adapter uses its own request builder")
             }
         },
         _ => {}
@@ -1511,6 +1644,9 @@ fn build_request_headers(
         | ProviderProtocol::GoogleVertex
         | ProviderProtocol::MistralConversations
         | ProviderProtocol::BedrockConverseStream => {}
+        ProviderProtocol::OmniPromptTools => {
+            unreachable!("Omni prompt tools wraps the OpenAI Completions adapter")
+        }
     }
 
     let has_authorization = has_nonempty_header(&overrides, "authorization")
@@ -1530,8 +1666,8 @@ fn build_request_headers(
         | ProviderProtocol::GoogleGenerativeAi
         | ProviderProtocol::GoogleVertex => true,
         ProviderProtocol::AnthropicMessages => has_authorization || has_api_key_header,
-        ProviderProtocol::BedrockConverseStream => {
-            unreachable!("Bedrock uses its own signed request builder")
+        ProviderProtocol::OmniPromptTools | ProviderProtocol::BedrockConverseStream => {
+            unreachable!("adapter uses its own request builder")
         }
     };
     if !authenticated {
@@ -3865,6 +4001,36 @@ impl MessageEmitter {
         Ok(index)
     }
 
+    /// Replays an already-complete text block while retaining a stable
+    /// snapshot for every event. Prompt-protocol adapters need this shape
+    /// because their hidden provider response is buffered before publication.
+    pub(crate) fn replay_text(&mut self, content: &str) -> Result<()> {
+        let content_index = self.message.content.len();
+        self.message
+            .content
+            .push(llm::ContentBlock::Text(llm::TextContent {
+                text: content.to_owned(),
+                ..llm::TextContent::default()
+            }));
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_START.to_owned(),
+            content_index: Some(content_index),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_DELTA.to_owned(),
+            content_index: Some(content_index),
+            delta: content.to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TEXT_END.to_owned(),
+            content_index: Some(content_index),
+            content: content.to_owned(),
+            ..stream::AssistantMessageEvent::default()
+        })
+    }
+
     pub(crate) fn append_text(&mut self, index: usize, delta: &str) -> Result<()> {
         match self.message.content.get_mut(index) {
             Some(llm::ContentBlock::Text(text)) => text.text.push_str(delta),
@@ -4034,6 +4200,33 @@ impl MessageEmitter {
         Ok(index)
     }
 
+    /// Replays an already-complete tool call without exposing a mutable
+    /// partial tool block to event consumers.
+    pub(crate) fn replay_tool(&mut self, call: llm::ToolCall) -> Result<()> {
+        let arguments = serde_json::to_string(&call.arguments)?;
+        let content_index = self.message.content.len();
+        self.message
+            .content
+            .push(llm::ContentBlock::ToolCall(call.clone()));
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_START.to_owned(),
+            content_index: Some(content_index),
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_DELTA.to_owned(),
+            content_index: Some(content_index),
+            delta: arguments,
+            ..stream::AssistantMessageEvent::default()
+        })?;
+        self.publish(stream::AssistantMessageEvent {
+            event_type: stream::EVENT_TOOLCALL_END.to_owned(),
+            content_index: Some(content_index),
+            tool_call: Some(call),
+            ..stream::AssistantMessageEvent::default()
+        })
+    }
+
     fn set_tool_metadata(
         &mut self,
         index: usize,
@@ -4143,13 +4336,26 @@ impl MessageEmitter {
         error: ProviderAdapterError,
         cancellation: &agent::CancellationToken,
     ) -> Result<()> {
-        self.message.stop_reason =
+        let reason =
             if cancellation.is_cancelled() || matches!(&error, ProviderAdapterError::Cancelled) {
-                stream::STOP_ABORTED.to_owned()
+                stream::STOP_ABORTED
             } else {
-                stream::STOP_ERROR.to_owned()
+                stream::STOP_ERROR
             };
-        self.message.error_message = error.to_string();
+        self.finish_error(reason, error.to_string())
+    }
+
+    fn finish_error(
+        &mut self,
+        requested_reason: &str,
+        error_message: impl Into<String>,
+    ) -> Result<()> {
+        self.message.stop_reason = if requested_reason == stream::STOP_ABORTED {
+            stream::STOP_ABORTED.to_owned()
+        } else {
+            stream::STOP_ERROR.to_owned()
+        };
+        self.message.error_message = error_message.into();
         self.calculate_usage_cost();
         let result = self.events.push(stream::AssistantMessageEvent::error(
             self.message.stop_reason.clone(),
@@ -6008,6 +6214,32 @@ mod tests {
         }
     }
 
+    fn omni_prompt_tools_sse(content: &str, finish_reason: &str) -> String {
+        let first = json!({
+            "id": "omni_1",
+            "model": "gateway/chat-web",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": content},
+                "finish_reason": Value::Null,
+            }],
+        });
+        let terminal = json!({
+            "id": "omni_1",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18,
+            },
+        });
+        format!("data: {first}\n\ndata: {terminal}\n\ndata: [DONE]\n\n")
+    }
+
     fn bedrock_frame(event_type: &str, payload: &str) -> Vec<u8> {
         bedrock::encode_event_stream_message(
             &BTreeMap::from([
@@ -6121,6 +6353,149 @@ mod tests {
         assert_eq!(call.id, "call_1");
         assert_eq!(call.name, "weather");
         assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+    }
+
+    #[test]
+    fn omni_prompt_tools_converts_text_blocks_to_native_calls_without_inner_events() {
+        let body = omni_prompt_tools_sse(
+            "I will inspect it.\n<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>",
+            "stop",
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, &body)]);
+        let mut request_model = model(omni_prompt_tools::API_OMNI_PROMPT_TOOLS, base_url);
+        request_model.provider = "omni".to_owned();
+        request_model.id = "gateway/chat-web".to_owned();
+        let observed_events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&observed_events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            event_log
+                .lock()
+                .expect("OmniRoute event log lock")
+                .push(event);
+        }));
+
+        let response = factory(0)
+            .respond(&request_model, &text_context(), request_options)
+            .expect("prompt-protocol response");
+        let request = requests.recv().expect("captured OmniRoute request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(request.target, "/chat/completions");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-key")
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("completion JSON body");
+        assert_eq!(sent["model"], "gateway/chat-web");
+        assert!(
+            sent.get("tools").is_none(),
+            "the inner completion must not receive native tool definitions"
+        );
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][1]["content"], "weather?");
+        let system_prompt = sent["messages"][0]["content"]
+            .as_str()
+            .expect("system prompt");
+        assert!(system_prompt.contains("be concise"));
+        assert!(system_prompt.contains("# Tool calling protocol"));
+        assert!(system_prompt.contains("### weather"));
+
+        assert_eq!(response.api, omni_prompt_tools::API_OMNI_PROMPT_TOOLS);
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+        assert_eq!(response.response_id, "omni_1");
+        assert_eq!(response.usage.total_tokens, 18);
+        assert_eq!(response.content[0].plain_text(), Some("I will inspect it."));
+        let llm::ContentBlock::ToolCall(call) = &response.content[1] else {
+            panic!("expected native tool call, got {:?}", response.content);
+        };
+        assert!(call.id.starts_with("call_omni_"));
+        assert_eq!(call.name, "weather");
+        assert_eq!(call.arguments.get("city"), Some(&json!("Paris")));
+
+        let observed_events = observed_events
+            .lock()
+            .expect("OmniRoute event log lock")
+            .clone();
+        assert_eq!(
+            observed_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                stream::EVENT_START,
+                stream::EVENT_TEXT_START,
+                stream::EVENT_TEXT_DELTA,
+                stream::EVENT_TEXT_END,
+                stream::EVENT_TOOLCALL_START,
+                stream::EVENT_TOOLCALL_DELTA,
+                stream::EVENT_TOOLCALL_END,
+                stream::EVENT_DONE,
+            ]
+        );
+        let text_start = observed_events
+            .iter()
+            .find(|event| event.event_type == stream::EVENT_TEXT_START)
+            .expect("text start event");
+        let partial = text_start.partial.as_ref().expect("text start snapshot");
+        assert_eq!(
+            partial
+                .content
+                .first()
+                .and_then(llm::ContentBlock::plain_text),
+            Some("I will inspect it.")
+        );
+        assert!(
+            partial
+                .content
+                .iter()
+                .all(|block| !matches!(block, llm::ContentBlock::ToolCall(_))),
+            "a published text snapshot must not mutate with future tool calls"
+        );
+        assert_ne!(partial.stop_reason, stream::STOP_TOOL_USE);
+    }
+
+    #[test]
+    fn omni_prompt_tools_preserves_truncation_and_reports_tool_use_when_complete() {
+        let truncated = omni_prompt_tools_sse(
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+            "length",
+        );
+        let complete = omni_prompt_tools_sse(
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+            "stop",
+        );
+        let (base_url, requests, server) = test_server(vec![
+            http_response(200, &truncated),
+            http_response(200, &complete),
+        ]);
+        let mut request_model = model(omni_prompt_tools::API_OMNI_PROMPT_TOOLS, base_url);
+        request_model.provider = "omni".to_owned();
+
+        let truncated = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("truncated prompt-protocol response");
+        let complete = factory(0)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("complete prompt-protocol response");
+        let _ = requests.recv().expect("first OmniRoute request");
+        let _ = requests.recv().expect("second OmniRoute request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(truncated.stop_reason, stream::STOP_LENGTH);
+        assert_eq!(complete.stop_reason, stream::STOP_TOOL_USE);
+        assert!(matches!(
+            truncated.content.first(),
+            Some(llm::ContentBlock::ToolCall(_))
+        ));
     }
 
     #[test]
@@ -6643,12 +7018,24 @@ mod tests {
             ),
             ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
         ]);
+        let aperture_root = std::env::temp_dir().join(format!(
+            "goshcoder-catalog-isolated-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
         let catalog = Arc::new(
             catalog::Catalog::with_environment(
                 None,
                 Arc::new(move |name| environment.get(name).cloned()),
             )
-            .expect("catalog"),
+            .expect("catalog")
+            .with_aperture_paths(
+                aperture_root.join("aperture.json"),
+                aperture_root.join("aperture-cache.json"),
+            ),
         );
         let mut request_model = catalog
             .provider("google-vertex")
@@ -6678,6 +7065,131 @@ mod tests {
             request.headers.get("authorization").map(String::as_str),
             Some("Bearer ya29.prefetched")
         );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+    }
+
+    #[test]
+    fn catalog_responder_rewrites_dedicated_aperture_models_and_provenance_headers() {
+        let body = concat!(
+            "data: {\"id\":\"chat_1\",\"model\":\"route-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let root = std::env::temp_dir().join(format!(
+            "goshcoder-aperture-request-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
+        let configuration = aperture::Config {
+            base_url: base_url.clone(),
+            onboarding_done: Some(true),
+            dedicated: Some(aperture::DedicatedConfig {
+                enabled: Some(true),
+                ..aperture::DedicatedConfig::default()
+            }),
+            ..aperture::Config::default()
+        };
+        let cached_model = llm::Model {
+            id: "openai/route-model".to_owned(),
+            name: "Routed model".to_owned(),
+            api: API_OPENAI_COMPLETIONS.to_owned(),
+            provider: aperture::DEDICATED_PROVIDER_ID.to_owned(),
+            base_url: format!("{base_url}/v1"),
+            input: vec!["text".to_owned()],
+            context_window: 128_000,
+            max_tokens: 4_096,
+            ..llm::Model::default()
+        };
+        let cache = aperture::Cache {
+            catalog_key: aperture::build_catalog_key(
+                &aperture::gateway_url(&configuration.base_url),
+                &configuration.resolve(),
+            ),
+            models: vec![aperture::CachedModel {
+                model: cached_model,
+                raw_compat: None,
+            }],
+            ..aperture::Cache::default()
+        };
+        let configuration_path = root.join("extensions").join("aperture.json");
+        let cache_path = root.join("extensions").join("aperture-cache.json");
+        aperture::save_config(&configuration_path, &configuration).expect("save Aperture config");
+        aperture::save_cache(&cache_path, &cache).expect("save Aperture cache");
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(None, Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(configuration_path, cache_path),
+        );
+        let request_model = catalog
+            .provider(aperture::DEDICATED_PROVIDER_ID)
+            .expect("Aperture provider")
+            .models()
+            .into_iter()
+            .next()
+            .expect("Aperture model");
+
+        let response = factory(0).catalog_assistant_responder(catalog)(
+            &request_model,
+            &text_context(),
+            options(agent::CancellationToken::default()),
+        )
+        .expect("Aperture response");
+        let request = requests.recv().expect("captured Aperture request");
+        server.join().expect("Aperture server finishes");
+        let payload = serde_json::from_slice::<Value>(&request.body).expect("request JSON");
+
+        assert_eq!(request.target, "/v1/chat/completions");
+        assert_eq!(payload["model"], "openai/route-model");
+        assert_eq!(
+            request.headers.get("referer").map(String::as_str),
+            Some(aperture::APERTURE_REFERER)
+        );
+        assert_eq!(
+            request.headers.get("x-session-id").map(String::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer -")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn routed_aperture_restart_errors_are_retried() {
+        let success = concat!(
+            "data: {\"id\":\"chat_1\",\"model\":\"route-model\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chat_1\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![
+            http_response_with_headers(400, "Aperture is restarting", &[("retry-after-ms", "0")]),
+            http_response(200, success),
+        ]);
+        let mut request_model = model(API_OPENAI_COMPLETIONS, format!("{base_url}/v1"));
+        request_model
+            .headers
+            .insert("Referer".to_owned(), aperture::APERTURE_REFERER.to_owned());
+
+        let response = factory(1)
+            .respond(
+                &request_model,
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("restart retry succeeds");
+        let first = requests.recv().expect("first routed request");
+        let second = requests.recv().expect("retried routed request");
+        server.join().expect("Aperture server finishes");
+
+        assert_eq!(first.target, "/v1/chat/completions");
+        assert_eq!(second.target, "/v1/chat/completions");
         assert_eq!(response.stop_reason, stream::STOP_STOP);
     }
 
@@ -6852,7 +7364,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_variants_include_google_vertex_azure_and_codex_responses() {
+    fn protocol_variants_include_google_vertex_azure_codex_and_omni_prompt_tools() {
         assert_eq!(
             ProviderProtocol::from_api(API_GOOGLE_GENERATIVE_AI).expect("Google protocol"),
             ProviderProtocol::GoogleGenerativeAi
@@ -6868,6 +7380,11 @@ mod tests {
         assert_eq!(
             ProviderProtocol::from_api(API_OPENAI_CODEX_RESPONSES).expect("Codex protocol"),
             ProviderProtocol::OpenAiCodexResponses
+        );
+        assert_eq!(
+            ProviderProtocol::from_api(omni_prompt_tools::API_OMNI_PROMPT_TOOLS)
+                .expect("OmniRoute prompt-tools adapter"),
+            ProviderProtocol::OmniPromptTools
         );
     }
 

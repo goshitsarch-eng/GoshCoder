@@ -2,6 +2,7 @@ pub mod agent;
 pub mod aperture;
 pub mod aperture_cli;
 pub mod aperture_mcp;
+pub mod aperture_runtime;
 pub mod bedrock;
 pub mod btw;
 pub mod btw_runtime;
@@ -15,6 +16,7 @@ pub mod markdown;
 pub mod mistral;
 pub mod oauth;
 pub mod omni_cli;
+pub mod omni_prompt_tools;
 pub mod omniroute;
 pub mod planner_runtime;
 pub mod plannotator;
@@ -39,9 +41,12 @@ pub mod webaccess;
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -54,6 +59,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::state::{Action, App, Message, MessageRole};
 
@@ -70,7 +76,8 @@ Usage:
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
   goshcoder ralph <subcommand>       Manage Ralph loops
-  goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
+  goshcoder sessions [--sessions-dir <dir>] [subcommand]
+                                     List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
@@ -78,10 +85,16 @@ The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
 model, credential, and context-compaction foundations are active. `run`
 supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
 `openai-codex-responses`, `anthropic-messages`, `google-generative-ai`, and
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`;
+`google-vertex`, `mistral-conversations`, `omni-prompt-tools`, and
+`bedrock-converse-stream`;
 the remaining provider extensions and interactive commands are still being
 migrated from the previous implementation.
 "#;
+
+const SIDEBAR_GIT_TIMEOUT: Duration = Duration::from_secs(2);
+const SIDEBAR_GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SIDEBAR_GIT_MAX_OUTPUT_BYTES: usize = 1 << 20;
+const SIDEBAR_GIT_MAX_CHANGES: usize = 50;
 
 fn main() {
     if let Err(error) = run() {
@@ -156,46 +169,61 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
     )?;
-    let prepared = runtime::prepare_session(
+    let mut prepared = runtime::prepare_session(
         catalog.as_ref(),
         invocation.config,
         Some(responder),
         Vec::new(),
     )?;
 
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        if !quiet {
+            for notice in runtime::drain_session_notices(&prepared.runtime) {
+                eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            }
+            if let Some(banner) = runtime::session_banner(&prepared.runtime) {
+                if prepared.runtime.resumed() {
+                    let messages = prepared.runtime.restored().messages;
+                    let mut stderr = io::stderr().lock();
+                    render_restored_transcript(&messages, &banner, &mut stderr, color_enabled())?;
+                } else {
+                    eprintln!("{}", dim(&banner, color_enabled()));
+                }
+            }
         }
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
-        }
-    }
 
-    let render_lock = Arc::new(Mutex::new(()));
-    let color = color_enabled();
-    let agent = prepared.runtime.agent().clone();
-    let _render_subscription = agent.subscribe({
-        let render_lock = Arc::clone(&render_lock);
-        move |event| {
-            let _guard = render_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mut stdout = io::stdout().lock();
-            let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
-        }
-    });
+        let render_lock = Arc::new(Mutex::new(()));
+        let color = color_enabled();
+        let agent = prepared.runtime.agent().clone();
+        let _interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
+        let _render_subscription = agent.subscribe({
+            let render_lock = Arc::clone(&render_lock);
+            move |event| {
+                let _guard = render_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut stdout = io::stdout().lock();
+                let mut stderr = io::stderr().lock();
+                let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            }
+        });
 
-    prepared.sync_extensions()?;
-    let _ = compaction::maybe_auto_compact(&agent)?;
-    agent.prompt(prompt)?;
-    prepared.runtime.sync()?;
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color));
+        prepared.sync_extensions()?;
+        if let Some(outcome) = compaction::maybe_auto_compact(&agent)? {
+            print_compaction_outcome(&outcome, true, color);
         }
-    }
+        agent.prompt(prompt)?;
+        prepared.runtime.sync()?;
+        if !quiet {
+            for notice in runtime::drain_session_notices(&prepared.runtime) {
+                eprintln!("{}", dim(&format!("session: {notice}"), color));
+            }
+        }
+        Ok(())
+    })();
+    let close_result = prepared.runtime.close();
+    result?;
+    close_result?;
     Ok(())
 }
 
@@ -275,27 +303,13 @@ fn render_run_event<Out: Write, Err: Write>(
                 )?;
             }
         }
-        agent::EventKind::ContextCompacted => {
-            if let Some(info) = event.compaction.as_ref() {
-                writeln!(
-                    stderr,
-                    "{}",
-                    dim(
-                        &format!(
-                            "context compacted: {} tokens → summary + {} recent messages",
-                            info.tokens_before, info.retained_messages
-                        ),
-                        color,
-                    )
-                )?;
-            }
-        }
         agent::EventKind::AgentStart
         | agent::EventKind::TurnStart
         | agent::EventKind::MessageStart
         | agent::EventKind::ToolExecutionUpdate
         | agent::EventKind::ModelChange
         | agent::EventKind::ThinkingLevelChange
+        | agent::EventKind::ContextCompacted
         | agent::EventKind::TranscriptReset => {}
     }
     stdout.flush()?;
@@ -307,6 +321,38 @@ fn last_assistant(messages: &[llm::Message]) -> Option<&llm::AssistantMessage> {
         llm::Message::Assistant(message) => Some(message.as_ref()),
         llm::Message::User(_) | llm::Message::ToolResult(_) => None,
     })
+}
+
+fn restored_transcript_text(messages: &[llm::Message], header: &str) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![header.to_owned()];
+    for message in messages {
+        if let Some(summary) = compaction::summary_text(message) {
+            lines.push(format!("· compacted {}", first_line(&summary)));
+            continue;
+        }
+        let text = first_line(&message.text_preview());
+        if !text.trim().is_empty() {
+            lines.push(format!("· {} {text}", message.role()));
+        }
+    }
+    lines.push("─".repeat(40));
+    lines.join("\n")
+}
+
+fn render_restored_transcript<Err: Write>(
+    messages: &[llm::Message],
+    header: &str,
+    stderr: &mut Err,
+    color: bool,
+) -> io::Result<()> {
+    let transcript = restored_transcript_text(messages, header);
+    if !transcript.is_empty() {
+        writeln!(stderr, "{}", dim(&transcript, color))?;
+    }
+    Ok(())
 }
 
 fn tool_result_text(result: Option<&agent::ToolResult>) -> String {
@@ -378,6 +424,227 @@ fn bold(text: &str, color: bool) -> String {
     }
 }
 
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(80)
+}
+
+fn native_accent(text: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[38;2;215;119;87m{text}\x1b[39m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn native_display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn native_truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if native_display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 1 {
+        return "…".to_owned();
+    }
+    let mut output = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        output.push(character);
+        used += character_width;
+    }
+    output.push('…');
+    output
+}
+
+fn native_pad(text: &str, width: usize) -> String {
+    let text = native_truncate(text, width);
+    let padding = width.saturating_sub(native_display_width(&text));
+    format!("{text}{}", " ".repeat(padding))
+}
+
+fn native_center(text: &str, width: usize) -> String {
+    let text = native_truncate(text, width);
+    format!(
+        "{}{text}",
+        " ".repeat(width.saturating_sub(native_display_width(&text)) / 2)
+    )
+}
+
+fn native_format_cwd(cwd: &Path) -> String {
+    let cwd = cwd.display().to_string();
+    let Ok(home) = std::env::var("HOME") else {
+        return cwd;
+    };
+    if cwd == home {
+        return "~".to_owned();
+    }
+    let separator = std::path::MAIN_SEPARATOR.to_string();
+    cwd.strip_prefix(&(home + &separator))
+        .map_or(cwd.clone(), |suffix| format!("~{separator}{suffix}"))
+}
+
+fn native_line_info(prepared: &runtime::PreparedSession) -> NativeLineInfo {
+    let state = prepared.runtime.agent().state();
+    let git = scan_sidebar_git(&sidebar_workspace_path(prepared));
+    let planner_state = prepared
+        .planner
+        .as_ref()
+        .map(|planner| planner.manager().state());
+    let (mode, _) = planner_sidebar_details(planner_state);
+    NativeLineInfo {
+        model: format!("{}/{}", state.model.provider, state.model.id),
+        context_used: compaction::measured_context_tokens(&state.messages),
+        context_limit: state.model.context_window,
+        cost: compaction::conversation_cost(&state.messages, &state.compactions),
+        messages: state.messages.len(),
+        tools: state.tools.len(),
+        changed_files: git.changed_files,
+        branch: git.branch.unwrap_or_else(|| "not a git repo".to_owned()),
+        mode,
+        thinking: state.thinking_level,
+    }
+}
+
+fn native_info_lines(info: &NativeLineInfo) -> Vec<String> {
+    let mut context = compact_number(info.context_used);
+    if info.context_limit > 0 {
+        let percent = info
+            .context_used
+            .saturating_mul(100)
+            .saturating_div(info.context_limit)
+            .min(100);
+        context.push_str(&format!(
+            "/{} · {percent}%",
+            compact_number(info.context_limit)
+        ));
+    }
+    let mode = if info.thinking.is_empty() || info.thinking == llm::THINKING_OFF {
+        info.mode.clone()
+    } else {
+        format!("{} · {}", info.mode, info.thinking)
+    };
+    vec![
+        "Session".to_owned(),
+        native_truncate(&info.model, 24),
+        format!("Context  {context}"),
+        format!("Cost     ${:.4}", info.cost),
+        format!("Messages {} · Tools {}", info.messages, info.tools),
+        format!("Files    {} changed", info.changed_files),
+        format!("Branch   {}", info.branch),
+        format!("Mode     {mode}"),
+    ]
+}
+
+fn native_line_sidebar(info: &NativeLineInfo, width: usize, color: bool) -> String {
+    let width = width.max(24);
+    let inner = width.saturating_sub(2);
+    let mut lines = vec![native_accent(&format!("╭{}╮", "─".repeat(inner)), color)];
+    lines.extend(native_info_lines(info).into_iter().map(|line| {
+        format!(
+            "{} {} {}",
+            native_accent("│", color),
+            native_pad(&line, inner.saturating_sub(2)),
+            native_accent("│", color),
+        )
+    }));
+    lines.push(native_accent(&format!("╰{}╯", "─".repeat(inner)), color));
+    lines.join("\n")
+}
+
+fn native_line_header(
+    width: usize,
+    app_version: &str,
+    cwd: &Path,
+    info: &NativeLineInfo,
+    color: bool,
+) -> String {
+    if width < 24 {
+        return format!("GoshCoder v{app_version}");
+    }
+    let inner = width.saturating_sub(2);
+    let use_tips = inner >= 55;
+    let right_width = if use_tips {
+        (inner.saturating_mul(28) / 100).clamp(16, 28)
+    } else {
+        0
+    };
+    let left_width = if use_tips {
+        inner.saturating_sub(right_width + 3)
+    } else {
+        inner
+    };
+    let logo = ["  ██████  ", " ██  ███  ", "  ███  ██ ", "  ██   ██ "];
+    let mut left = logo
+        .iter()
+        .map(|line| native_center(line, left_width))
+        .collect::<Vec<_>>();
+    left.extend([
+        native_center("Let's build something great", left_width),
+        native_center(
+            &format!("{} · {} effort", info.model, info.thinking),
+            left_width,
+        ),
+        native_center(&native_format_cwd(cwd), left_width),
+        String::new(),
+    ]);
+    let mut right = native_info_lines(info);
+    while right.len() < left.len() {
+        right.push(String::new());
+    }
+    let label = format!(" GoshCoder v{app_version} ");
+    let fill = width
+        .saturating_sub(2)
+        .saturating_sub(native_display_width(&label))
+        .saturating_sub(3);
+    let mut lines = vec![native_accent(
+        &format!("╭───{label}{}╮", "─".repeat(fill)),
+        color,
+    )];
+    for (index, line) in left.iter().enumerate() {
+        let content = if use_tips {
+            format!(
+                "{} {} {}",
+                native_pad(line, left_width),
+                "│",
+                native_pad(&right[index], right_width),
+            )
+        } else {
+            native_pad(line, left_width)
+        };
+        lines.push(format!(
+            "{}{}{}",
+            native_accent("│", color),
+            native_pad(&content, inner),
+            native_accent("│", color)
+        ));
+    }
+    lines.push(native_accent(&format!("╰{}╯", "─".repeat(inner)), color));
+    lines.join("\n")
+}
+
+fn native_line_input_prompt(width: usize, color: bool) -> String {
+    if width < 8 {
+        return "> ".to_owned();
+    }
+    format!(
+        "{}\n{} ",
+        native_accent(&format!("╭{}╮", "─".repeat(width.saturating_sub(2))), color),
+        native_accent("╰─❯", color),
+    )
+}
+
 fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut invocation = runtime::parse_chat(arguments)?;
     choose_resume_session(&mut invocation.config)?;
@@ -387,6 +654,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    ensure_interactive_model(&mut invocation.config, catalog.as_ref(), true)?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
@@ -397,6 +665,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some(responder),
         Vec::new(),
     )?;
+    remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
     let (agent_event_sender, agent_event_receiver) = mpsc::sync_channel(64);
     let (turn_sender, turn_receiver) = mpsc::channel();
@@ -479,9 +748,15 @@ fn choose_resume_session(config: &mut runtime::SessionConfig) -> Result<(), Box<
 /// It deliberately shares the live session, responder, slash-command
 /// dispatcher, compaction, and event renderer with fullscreen chat. The only
 /// difference is presentation: prompts and command notices are line-oriented.
-fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn Error>> {
+fn run_line_interactive(mut invocation: runtime::Invocation) -> Result<(), Box<dyn Error>> {
     let quiet = invocation.config.quiet;
     let catalog = Arc::new(catalog::Catalog::with_default_credentials()?);
+    let interactive_terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
+    ensure_interactive_model(
+        &mut invocation.config,
+        catalog.as_ref(),
+        interactive_terminal,
+    )?;
     let responder = providers::assistant_responder_from_catalog(
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
@@ -492,7 +767,9 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
         Some(responder),
         Vec::new(),
     )?;
+    remember_default_model(&prepared);
     let agent = prepared.runtime.agent().clone();
+    let interrupt_guard = InterruptGuard::install(&agent).map_err(io::Error::other)?;
     let render_lock = Arc::new(Mutex::new(()));
     let color = color_enabled();
     let _render_subscription = agent.subscribe({
@@ -507,54 +784,225 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
         }
     });
 
-    let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet);
+    let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet, &interrupt_guard);
     let close_result = prepared.runtime.close();
     result?;
     close_result?;
     Ok(())
 }
 
+/// Makes the first interactive session self-contained: a terminal user with
+/// no configured model can authenticate before session construction rather
+/// than being sent back to an external `auth` command.
+fn ensure_interactive_model(
+    config: &mut runtime::SessionConfig,
+    catalog: &catalog::Catalog,
+    can_onboard: bool,
+) -> Result<(), Box<dyn Error>> {
+    if !config.model_ref.trim().is_empty() {
+        return Ok(());
+    }
+    match runtime::process_default_chat_model_reference(catalog) {
+        Ok(model) => {
+            config.model_ref = model;
+            Ok(())
+        }
+        Err(_) if can_onboard => {
+            config.model_ref = onboard_chat_model(catalog)?;
+            Ok(())
+        }
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+fn onboard_chat_model(catalog: &catalog::Catalog) -> Result<String, Box<dyn Error>> {
+    eprintln!("Welcome to GoshCoder. Choose a subscription login:");
+    eprintln!("  1. OpenAI Codex (recommended)");
+    eprintln!("  2. Anthropic");
+    eprintln!("  3. Kimi Coding");
+    eprint!("Choice [1]: ");
+    io::stderr().flush()?;
+
+    let mut choice = String::new();
+    io::stdin().lock().read_line(&mut choice)?;
+    let provider_id = onboarding_provider(&choice)?;
+    let outcome = provider_cli::auth_for_provider(catalog, provider_id)?;
+    eprintln!("{}", outcome.notice());
+    runtime::process_default_chat_model_reference(catalog).map_err(|error| Box::new(error) as _)
+}
+
+fn onboarding_provider(choice: &str) -> Result<&'static str, Box<dyn Error>> {
+    match choice.trim() {
+        "" | "1" => Ok("openai-codex"),
+        "2" => Ok("anthropic"),
+        "3" => Ok("kimi-coding"),
+        choice => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown login choice {choice:?}"),
+        )
+        .into()),
+    }
+}
+
+fn spawn_line_input_reader() -> io::Result<Receiver<io::Result<Option<String>>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("goshcoder-line-input".to_owned())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut reader = stdin.lock();
+            loop {
+                let mut input = String::new();
+                match reader.read_line(&mut input) {
+                    Ok(0) => {
+                        let _ = sender.send(Ok(None));
+                        break;
+                    }
+                    Ok(_) if sender.send(Ok(Some(input))).is_err() => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+fn next_line_or_interrupt(
+    receiver: &Receiver<io::Result<Option<String>>>,
+    interrupt_guard: &InterruptGuard,
+) -> io::Result<Option<String>> {
+    loop {
+        if interrupt_guard.idle_exit_requested() {
+            return Ok(None);
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                if interrupt_guard.idle_exit_requested() {
+                    return Ok(None);
+                }
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
 fn line_interactive_loop(
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     quiet: bool,
+    interrupt_guard: &InterruptGuard,
 ) -> Result<(), Box<dyn Error>> {
     let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let color = color_enabled();
+    let mut claude_tui = prepared.config.claude_tui;
+    let mut last_native_sidebar = None;
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            eprintln!("{}", dim(&format!("session: {notice}"), color));
         }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
+            if prepared.runtime.resumed() {
+                let messages = prepared.runtime.restored().messages;
+                let mut stderr = io::stderr().lock();
+                render_restored_transcript(&messages, &banner, &mut stderr, color)?;
+            } else {
+                eprintln!("{}", dim(&banner, color));
+            }
+        }
+        if let Some(hint) = session_continue_hint(&prepared.runtime) {
+            eprintln!("{}", dim(&hint, color));
         }
         if interactive {
-            let state = prepared.runtime.agent().state();
-            eprintln!(
-                "{}",
-                dim(
-                    &format!(
-                        "goshcoder {} · {}/{} · /help for commands",
+            if claude_tui {
+                let info = native_line_info(prepared);
+                let sidebar = native_line_sidebar(&info, terminal_width().min(42), color);
+                eprintln!(
+                    "{}",
+                    native_line_header(
+                        terminal_width(),
                         build_version(),
-                        state.model.provider,
-                        state.model.id
-                    ),
-                    color_enabled()
-                )
-            );
+                        &sidebar_workspace_path(prepared),
+                        &info,
+                        color,
+                    )
+                );
+                last_native_sidebar = Some(sidebar);
+            } else {
+                let state = prepared.runtime.agent().state();
+                eprintln!(
+                    "{}",
+                    dim(
+                        &format!(
+                            "goshcoder {} · {}/{} · /help for commands",
+                            build_version(),
+                            state.model.provider,
+                            state.model.id
+                        ),
+                        color
+                    )
+                );
+            }
         }
     }
 
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut raw = String::new();
+    let input_receiver = if interactive {
+        Some(spawn_line_input_reader()?)
+    } else {
+        None
+    };
     loop {
-        raw.clear();
+        if interrupt_guard.idle_exit_requested() {
+            if interactive {
+                eprintln!();
+            }
+            break;
+        }
         if interactive {
             let mut stderr = io::stderr().lock();
-            write!(stderr, "\n> ")?;
+            if claude_tui {
+                let sidebar = native_line_sidebar(
+                    &native_line_info(prepared),
+                    terminal_width().min(42),
+                    color,
+                );
+                if last_native_sidebar.as_deref() != Some(sidebar.as_str()) {
+                    writeln!(stderr)?;
+                    writeln!(stderr, "{sidebar}")?;
+                    last_native_sidebar = Some(sidebar);
+                }
+                write!(
+                    stderr,
+                    "\n{}",
+                    native_line_input_prompt(terminal_width().min(88), color)
+                )?;
+            } else {
+                write!(stderr, "\n> ")?;
+            }
             stderr.flush()?;
         }
-        if reader.read_line(&mut raw)? == 0 {
+        let raw = if let Some(receiver) = input_receiver.as_ref() {
+            let Some(input) = next_line_or_interrupt(receiver, interrupt_guard)? else {
+                if interactive {
+                    eprintln!();
+                }
+                break;
+            };
+            input
+        } else {
+            let mut input = String::new();
+            if stdin.lock().read_line(&mut input)? == 0 {
+                String::new()
+            } else {
+                input
+            }
+        };
+        if raw.is_empty() {
             if interactive {
                 eprintln!();
             }
@@ -577,8 +1025,12 @@ fn line_interactive_loop(
         if input.starts_with('/') {
             let mut app = App::new();
             app.streaming = prepared.runtime.agent().state().is_streaming;
-            let mut view = InteractiveView::default();
+            let mut view = InteractiveView {
+                line_claude_tui: Some(claude_tui),
+                ..InteractiveView::default()
+            };
             let (turn_sender, turn_receiver) = mpsc::channel();
+            let prior_claude_tui = claude_tui;
             let outcome = dispatch_runtime_slash_command(
                 &mut app,
                 &mut view,
@@ -588,19 +1040,13 @@ fn line_interactive_loop(
                 &input,
                 false,
             );
+            claude_tui = view.line_claude_tui.unwrap_or(claude_tui);
+            if claude_tui != prior_claude_tui {
+                last_native_sidebar = None;
+            }
             if view.turn_pending {
                 match turn_receiver.recv() {
-                    Ok(result) if view.pending_btw_thread.is_some() => {
-                        let _ = finish_pending_btw(&mut view, prepared, result);
-                    }
-                    Ok(Ok(())) => {
-                        view.turn_pending = false;
-                        view.activity = "Ready".to_owned();
-                    }
-                    Ok(Err(error)) => {
-                        view.turn_pending = false;
-                        append_view_message(&mut view, MessageRole::Error, error);
-                    }
+                    Ok(completion) => finish_interactive_task(&mut view, prepared, completion),
                     Err(_) => {
                         view.turn_pending = false;
                         append_view_message(
@@ -616,25 +1062,65 @@ fn line_interactive_loop(
                 break;
             }
         } else {
-            if let Err(error) = prepared.sync_extensions() {
-                eprintln!("error: {error}");
-                continue;
-            }
-            if let Err(error) = compaction::maybe_auto_compact(prepared.runtime.agent()) {
-                eprintln!("error: {error}");
-                continue;
-            }
-            if let Err(error) = prepared.runtime.agent().prompt(input) {
-                eprintln!("error: {error}");
+            let agent = prepared.runtime.agent();
+            if agent.state().is_streaming {
+                agent.steer(llm::Message::User(llm::UserMessage::text(
+                    input,
+                    now_millis(),
+                )));
+                eprintln!("{}", dim("steering message queued", color));
+            } else {
+                if let Err(error) = prepared.sync_extensions() {
+                    eprintln!("error: {error}");
+                    continue;
+                }
+                match compaction::maybe_auto_compact(agent) {
+                    Ok(Some(outcome)) => print_compaction_outcome(&outcome, true, color),
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        continue;
+                    }
+                }
+                if let Err(error) = agent.prompt(input) {
+                    eprintln!("error: {error}");
+                }
             }
         }
 
         prepared.runtime.sync()?;
         for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
+            eprintln!("{}", dim(&format!("session: {notice}"), color));
         }
     }
     Ok(())
+}
+
+/// Remembers the resolved chat model only after its session is successfully
+/// constructed, mirroring the established chat startup behavior. A failed
+/// configuration write must not prevent an otherwise usable conversation.
+fn remember_default_model(prepared: &runtime::PreparedSession) {
+    let model = prepared.runtime.agent().state().model;
+    let _ = config::write_default_model(&model_reference(&model));
+}
+
+fn model_reference(model: &llm::Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+fn session_continue_hint(runtime: &session::SessionRuntime) -> Option<String> {
+    continue_session_hint(runtime.recording(), runtime.id().as_deref())
+}
+
+fn continue_session_hint(recording: bool, session_id: Option<&str>) -> Option<String> {
+    recording.then(|| {
+        session_id.map(|id| {
+            format!(
+                "session {} · resume with: goshcoder chat -continue",
+                short_id(id)
+            )
+        })
+    })?
 }
 
 fn render_line_view(view: &mut InteractiveView) {
@@ -662,9 +1148,126 @@ struct InteractiveView {
     activity: String,
     recent_tool: String,
     activity_since: Option<Instant>,
+    context_estimate: compaction::ContextEstimate,
     turn_pending: bool,
     pending_btw_thread: Option<String>,
     pending_btw_turn_start: Option<usize>,
+    resume_sessions: Option<Vec<sessionlog::SessionInfo>>,
+    resume_scan: Option<Receiver<Result<Vec<sessionlog::SessionInfo>, String>>>,
+    git_status: Option<SidebarGitInfo>,
+    git_status_root: Option<PathBuf>,
+    git_status_scan: Option<Receiver<SidebarGitInfo>>,
+    git_status_last_requested: Option<Instant>,
+    /// Present only for line mode, where slash commands can toggle between
+    /// the native session card and the plain prompt without a restart.
+    line_claude_tui: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SidebarGitInfo {
+    branch: Option<String>,
+    changed_files: usize,
+    changes: Vec<SidebarGitChange>,
+}
+
+#[derive(Clone, Debug)]
+struct SidebarGitChange {
+    status: state::FileStatus,
+    path: String,
+}
+
+#[derive(Clone, Debug)]
+struct NativeLineInfo {
+    model: String,
+    context_used: u64,
+    context_limit: u64,
+    cost: f64,
+    messages: usize,
+    tools: usize,
+    changed_files: usize,
+    branch: String,
+    mode: String,
+    thinking: String,
+}
+
+#[derive(Clone)]
+struct InterruptTarget {
+    identifier: u64,
+    agent: agent::Agent,
+    idle_exit: Arc<AtomicBool>,
+}
+
+/// Owns this invocation's registration in the process-wide signal handler.
+/// The handler itself is installed once because `ctrlc` does not allow
+/// replacing handlers; each guard updates its current agent target instead.
+struct InterruptGuard {
+    identifier: u64,
+    idle_exit: Arc<AtomicBool>,
+}
+
+static INTERRUPT_TARGET: OnceLock<Mutex<Option<InterruptTarget>>> = OnceLock::new();
+static INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+static INTERRUPT_IDENTIFIER: AtomicU64 = AtomicU64::new(1);
+
+impl InterruptGuard {
+    fn install(agent: &agent::Agent) -> Result<Self, String> {
+        let installation = INTERRUPT_HANDLER.get_or_init(|| {
+            ctrlc::set_handler(deliver_process_interrupt).map_err(|error| error.to_string())
+        });
+        installation.as_ref().map_err(Clone::clone)?;
+
+        let identifier = INTERRUPT_IDENTIFIER.fetch_add(1, Ordering::Relaxed);
+        let idle_exit = Arc::new(AtomicBool::new(false));
+        let target = InterruptTarget {
+            identifier,
+            agent: agent.clone(),
+            idle_exit: Arc::clone(&idle_exit),
+        };
+        *interrupt_target()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(target);
+        Ok(Self {
+            identifier,
+            idle_exit,
+        })
+    }
+
+    fn idle_exit_requested(&self) -> bool {
+        self.idle_exit.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        let mut target = interrupt_target()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if target
+            .as_ref()
+            .is_some_and(|target| target.identifier == self.identifier)
+        {
+            *target = None;
+        }
+    }
+}
+
+fn interrupt_target() -> &'static Mutex<Option<InterruptTarget>> {
+    INTERRUPT_TARGET.get_or_init(|| Mutex::new(None))
+}
+
+fn deliver_process_interrupt() {
+    let target = interrupt_target()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let Some(target) = target else {
+        return;
+    };
+    if target.agent.state().is_streaming {
+        target.agent.abort();
+    } else {
+        target.idle_exit.store(true, Ordering::Release);
+    }
 }
 
 impl Default for InteractiveView {
@@ -674,9 +1277,45 @@ impl Default for InteractiveView {
             activity: "Ready".to_owned(),
             recent_tool: String::new(),
             activity_since: None,
+            context_estimate: compaction::ContextEstimate::default(),
             turn_pending: false,
             pending_btw_thread: None,
             pending_btw_turn_start: None,
+            resume_sessions: None,
+            resume_scan: None,
+            git_status: None,
+            git_status_root: None,
+            git_status_scan: None,
+            git_status_last_requested: None,
+            line_claude_tui: None,
+        }
+    }
+}
+
+impl InteractiveView {
+    fn invalidate_resume_sessions(&mut self) {
+        self.resume_sessions = None;
+        self.resume_scan = None;
+    }
+}
+
+/// Completion reported by a fullscreen background task.
+///
+/// Compaction has user-visible outcomes beyond success or failure, so it must
+/// not be flattened into the ordinary turn result channel.
+enum InteractiveTaskResult {
+    Finished {
+        result: Result<(), String>,
+        automatic_compaction: Option<compaction::Outcome>,
+    },
+    Compaction(Result<compaction::Outcome, String>),
+}
+
+impl InteractiveTaskResult {
+    fn finished(result: Result<(), String>) -> Self {
+        Self::Finished {
+            result,
+            automatic_compaction: None,
         }
     }
 }
@@ -686,13 +1325,16 @@ fn event_loop(
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     agent_events: Receiver<agent::Event>,
-    turn_sender: Sender<Result<(), String>>,
-    turn_results: Receiver<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
+    turn_results: Receiver<InteractiveTaskResult>,
     quiet: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let interrupt_guard =
+        InterruptGuard::install(prepared.runtime.agent()).map_err(io::Error::other)?;
     let mut app = App::new();
     app.replace_messages(Vec::new());
     let mut view = InteractiveView::default();
+    let mut render_cache = ui::MessageCache::default();
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
             append_view_message(&mut view, MessageRole::Notice, notice);
@@ -703,9 +1345,12 @@ fn event_loop(
     }
 
     loop {
+        if interrupt_guard.idle_exit_requested() {
+            return Ok(());
+        }
         drain_interactive_events(&mut view, prepared, &agent_events, &turn_results);
-        refresh_runtime_app(&mut app, prepared, &view);
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        refresh_runtime_app(&mut app, prepared, catalog, &mut view);
+        terminal.draw(|frame| ui::draw(frame, &app, &mut render_cache))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -735,12 +1380,19 @@ fn event_loop(
                 }
                 Action::CycleModel { direction } => {
                     match cycle_interactive_model(&prepared.runtime, catalog, direction) {
-                        Ok(model) => view.activity = format!("Model set to {model}"),
+                        Ok(model) => {
+                            app.invalidate_model_suggestions();
+                            app.invalidate_thinking_suggestions();
+                            view.activity = format!("Model set to {model}");
+                        }
                         Err(error) => append_view_message(&mut view, MessageRole::Error, error),
                     }
                 }
                 Action::CycleThinking => match cycle_interactive_thinking(&prepared.runtime) {
-                    Some(level) => view.activity = format!("Thinking set to {level}"),
+                    Some(level) => {
+                        app.invalidate_thinking_suggestions();
+                        view.activity = format!("Thinking set to {level}");
+                    }
                     None => append_view_message(
                         &mut view,
                         MessageRole::Notice,
@@ -761,6 +1413,11 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
+                        CommandDispatch::TerminalCommand(command) => {
+                            complete_fullscreen_terminal_command(
+                                terminal, &mut app, &mut view, catalog, command,
+                            )
+                        }
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -778,6 +1435,11 @@ fn event_loop(
                             prepared.runtime.agent().abort();
                             return Ok(());
                         }
+                        CommandDispatch::TerminalCommand(command) => {
+                            complete_fullscreen_terminal_command(
+                                terminal, &mut app, &mut view, catalog, command,
+                            )
+                        }
                         CommandDispatch::Handled | CommandDispatch::NotCommand => {}
                     }
                 }
@@ -793,11 +1455,122 @@ fn event_loop(
     }
 }
 
+/// Temporarily gives the real terminal to a command that prompts for input,
+/// then restores Ratatui. OAuth, gateway setup, and secret entry cannot
+/// safely run while the alternate screen and raw mode are active.
+fn complete_fullscreen_terminal_command(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    app: &mut App,
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    command: FullscreenTerminalCommand,
+) {
+    view.activity = command.activity();
+    view.activity_since = Some(Instant::now());
+    let result = run_fullscreen_terminal_command(terminal, &command);
+    match result {
+        Ok(()) => complete_fullscreen_terminal_success(app, view, catalog, command),
+        Err(error) => {
+            view.activity = format!("{} failed", command.name());
+            view.activity_since = None;
+            append_view_message(view, MessageRole::Error, error);
+        }
+    }
+}
+
+fn run_fullscreen_terminal_command(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+    command: &FullscreenTerminalCommand,
+) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    suspend_fullscreen_terminal(terminal)?;
+    let status = Command::new(executable)
+        .args(command.arguments())
+        .status()
+        .map_err(|error| format!("start {}: {error}", command.name()));
+    let restored = restore_fullscreen_terminal(terminal);
+    match (status, restored) {
+        (_, Err(error)) => Err(format!(
+            "restore terminal after {}: {error}",
+            command.name()
+        )),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(status), Ok(())) if status.success() => Ok(()),
+        (Ok(status), Ok(())) => Err(format!("{} exited with {status}", command.name())),
+    }
+}
+
+fn complete_fullscreen_terminal_success(
+    app: &mut App,
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    command: FullscreenTerminalCommand,
+) {
+    app.invalidate_model_suggestions();
+    app.invalidate_login_suggestions();
+    app.invalidate_thinking_suggestions();
+    app.invalidate_resume_suggestions();
+    view.invalidate_resume_sessions();
+    view.activity_since = None;
+    match command {
+        FullscreenTerminalCommand::Login { provider_id, .. } => {
+            catalog.clear_oauth_refresh_failure(&provider_id);
+            view.activity = format!("Added {provider_id}");
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("Added {provider_id}. Use /model to switch providers."),
+            );
+        }
+        FullscreenTerminalCommand::OmniSetup => {
+            view.activity = "OmniRoute setup completed".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                "OmniRoute setup completed. Run /omni sync to refresh models.",
+            );
+        }
+        FullscreenTerminalCommand::ApertureOnboarding => {
+            catalog.reload_aperture_state();
+            view.activity = "Aperture onboarding completed".to_owned();
+            append_view_message(view, MessageRole::Notice, "Aperture onboarding completed.");
+        }
+    }
+}
+
+fn suspend_fullscreen_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+) -> Result<(), String> {
+    terminal.show_cursor().map_err(|error| error.to_string())?;
+    disable_raw_mode().map_err(|error| error.to_string())?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn restore_fullscreen_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stderr>>,
+) -> io::Result<()> {
+    enable_raw_mode()?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
+    terminal.clear()
+}
+
 fn drain_interactive_events(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     agent_events: &Receiver<agent::Event>,
-    turn_results: &Receiver<Result<(), String>>,
+    turn_results: &Receiver<InteractiveTaskResult>,
 ) {
     while let Ok(event) = agent_events.try_recv() {
         match event.kind {
@@ -830,17 +1603,10 @@ fn drain_interactive_events(
                 view.activity_since = None;
             }
             agent::EventKind::ContextCompacted => {
-                if let Some(info) = event.compaction {
+                if event.compaction.is_some() {
+                    view.context_estimate.reset();
                     view.activity = "Context compacted".to_owned();
                     view.activity_since = None;
-                    append_view_message(
-                        view,
-                        MessageRole::Notice,
-                        format!(
-                            "Context compacted: {} tokens → summary + {} recent messages.",
-                            info.tokens_before, info.retained_messages
-                        ),
-                    );
                 }
             }
             agent::EventKind::TurnStart
@@ -849,19 +1615,12 @@ fn drain_interactive_events(
             | agent::EventKind::MessageEnd
             | agent::EventKind::ToolExecutionUpdate
             | agent::EventKind::ModelChange
-            | agent::EventKind::ThinkingLevelChange
-            | agent::EventKind::TranscriptReset => {}
+            | agent::EventKind::ThinkingLevelChange => {}
+            agent::EventKind::TranscriptReset => view.context_estimate.reset(),
         }
     }
-    while let Ok(result) = turn_results.try_recv() {
-        if view.pending_btw_thread.is_some() {
-            let _ = finish_pending_btw(view, prepared, result);
-            continue;
-        }
-        view.turn_pending = false;
-        if let Err(error) = result {
-            append_view_message(view, MessageRole::Error, error);
-        }
+    while let Ok(completion) = turn_results.try_recv() {
+        finish_interactive_task(view, prepared, completion);
     }
     for notice in prepared.runtime.drain_notices() {
         append_view_message(
@@ -869,6 +1628,86 @@ fn drain_interactive_events(
             MessageRole::Notice,
             format!("{}: {}", notice.kind, notice.text),
         );
+    }
+}
+
+fn compaction_notice_text(outcome: &compaction::Outcome, automatic: bool) -> String {
+    let action = if automatic {
+        "compacted context automatically"
+    } else {
+        "compacted context"
+    };
+    format!(
+        "{action}: {} messages → summary + {} recent messages",
+        outcome.messages_before, outcome.retained_messages
+    )
+}
+
+fn compaction_discard_notice(outcome: &compaction::Outcome) -> Option<String> {
+    (outcome.dropped_queued_messages > 0).then(|| {
+        format!(
+            "{} queued message(s) were discarded: they were written against the transcript that was just compacted",
+            outcome.dropped_queued_messages
+        )
+    })
+}
+
+fn print_compaction_outcome(outcome: &compaction::Outcome, automatic: bool, color: bool) {
+    eprintln!(
+        "{}",
+        dim(&compaction_notice_text(outcome, automatic), color)
+    );
+    if let Some(notice) = compaction_discard_notice(outcome) {
+        eprintln!("{}", dim(&notice, color));
+    }
+}
+
+fn report_interactive_compaction(
+    view: &mut InteractiveView,
+    outcome: &compaction::Outcome,
+    automatic: bool,
+) {
+    view.activity = "Context compacted".to_owned();
+    view.activity_since = None;
+    append_view_message(
+        view,
+        MessageRole::Notice,
+        compaction_notice_text(outcome, automatic),
+    );
+    if let Some(notice) = compaction_discard_notice(outcome) {
+        append_view_message(view, MessageRole::Notice, notice);
+    }
+}
+
+fn finish_interactive_task(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    completion: InteractiveTaskResult,
+) {
+    match completion {
+        InteractiveTaskResult::Finished {
+            result,
+            automatic_compaction,
+        } => {
+            if view.pending_btw_thread.is_some() {
+                let _ = finish_pending_btw(view, prepared, result);
+                return;
+            }
+            view.turn_pending = false;
+            if let Some(outcome) = automatic_compaction {
+                report_interactive_compaction(view, &outcome, true);
+            }
+            if let Err(error) = result {
+                append_view_message(view, MessageRole::Error, error);
+            }
+        }
+        InteractiveTaskResult::Compaction(result) => {
+            view.turn_pending = false;
+            match result {
+                Ok(outcome) => report_interactive_compaction(view, &outcome, false),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+        }
     }
 }
 
@@ -943,7 +1782,7 @@ fn submit_interactive_input(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     input: String,
     follow_up: bool,
 ) -> CommandDispatch {
@@ -957,6 +1796,7 @@ fn submit_interactive_input(
         }
     };
     if input.starts_with('/') {
+        view.invalidate_resume_sessions();
         return dispatch_runtime_slash_command(
             app,
             view,
@@ -994,17 +1834,63 @@ fn submit_interactive_input(
     CommandDispatch::NotCommand
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CommandDispatch {
     NotCommand,
     Handled,
+    TerminalCommand(FullscreenTerminalCommand),
     Quit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FullscreenTerminalCommand {
+    Login {
+        provider_id: String,
+        command: provider_cli::InteractiveAuthCommand,
+    },
+    OmniSetup,
+    ApertureOnboarding,
+}
+
+impl FullscreenTerminalCommand {
+    fn arguments(&self) -> Vec<String> {
+        match self {
+            Self::Login {
+                provider_id,
+                command,
+            } => vec![
+                "auth".to_owned(),
+                command.as_auth_subcommand().to_owned(),
+                provider_id.clone(),
+            ],
+            Self::OmniSetup => vec!["omni".to_owned(), "setup".to_owned()],
+            Self::ApertureOnboarding => {
+                vec!["aperture".to_owned(), "onboarding".to_owned()]
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Login { .. } => "credential flow",
+            Self::OmniSetup => "OmniRoute setup",
+            Self::ApertureOnboarding => "Aperture onboarding",
+        }
+    }
+
+    fn activity(&self) -> String {
+        match self {
+            Self::Login { provider_id, .. } => format!("Logging in to {provider_id}"),
+            Self::OmniSetup => "Configuring OmniRoute".to_owned(),
+            Self::ApertureOnboarding => "Configuring Aperture".to_owned(),
+        }
+    }
 }
 
 fn begin_interactive_turn(
     view: &mut InteractiveView,
     agent: agent::Agent,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     prompt: String,
     activity: &str,
 ) {
@@ -1012,14 +1898,18 @@ fn begin_interactive_turn(
     view.activity = activity.to_owned();
     view.activity_since = Some(Instant::now());
     thread::spawn(move || {
-        let result = compaction::maybe_auto_compact(&agent)
-            .and_then(|_| {
-                agent
-                    .prompt(prompt)
-                    .map_err(compaction::CompactionError::Agent)
-            })
-            .map_err(|error| error.to_string());
-        let _ = turn_sender.send(result);
+        let automatic_compaction = match compaction::maybe_auto_compact(&agent) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = turn_sender.send(InteractiveTaskResult::finished(Err(error.to_string())));
+                return;
+            }
+        };
+        let result = agent.prompt(prompt).map_err(|error| error.to_string());
+        let _ = turn_sender.send(InteractiveTaskResult::Finished {
+            result,
+            automatic_compaction,
+        });
     });
 }
 
@@ -1027,7 +1917,7 @@ fn dispatch_ralph_slash_command(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     rest: &str,
 ) -> CommandDispatch {
     let Some(ralph_runtime) = prepared.ralph.as_ref() else {
@@ -1144,7 +2034,7 @@ fn dispatch_btw_slash_command(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     rest: &str,
 ) -> CommandDispatch {
     let (action, argument) = split_prompt_action(rest);
@@ -1333,7 +2223,7 @@ fn start_btw_question(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     thread_id: String,
     question: String,
 ) {
@@ -1386,7 +2276,7 @@ fn start_btw_question(
             Ok(None) => Err("BTW side thread did not have a queued question".to_owned()),
             Err(error) => Err(error.to_string()),
         };
-        let _ = turn_sender.send(result);
+        let _ = turn_sender.send(InteractiveTaskResult::finished(result));
     });
 }
 
@@ -1398,7 +2288,7 @@ fn dispatch_runtime_slash_command(
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     input: &str,
     fullscreen: bool,
 ) -> CommandDispatch {
@@ -1415,7 +2305,7 @@ fn dispatch_runtime_slash_command(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat\n\nOAuth login, BTW, OmniRoute, and Aperture commands are still being migrated."
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /login <provider>     Add an OAuth or API-key provider\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [--md] [path] Export the current session\n  /import <path>        Copy a session into this workspace\n  /omni [command]       Manage an OmniRoute gateway\n  /aperture [command]   Manage gateway routing and connectors\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /use-claude-code-tui  Enable the native startup/editor look in line mode\n  /use-default-tui      Restore the plain line-oriented look\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1461,20 +2351,7 @@ fn dispatch_runtime_slash_command(
         }
         "/messages" => {
             let state = prepared.runtime.agent().state();
-            let messages = &state.messages;
-            let summary = messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    format!(
-                        "{:>3}  {:<10} {}",
-                        index + 1,
-                        message.role(),
-                        first_line(&message.text_preview())
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let summary = transcript_summary(&state.messages);
             append_view_message(
                 view,
                 MessageRole::Command,
@@ -1503,6 +2380,8 @@ fn dispatch_runtime_slash_command(
         "/model" => {
             match runtime::set_model(&prepared.runtime, catalog, rest) {
                 Ok(model) => {
+                    app.invalidate_model_suggestions();
+                    app.invalidate_thinking_suggestions();
                     view.activity = format!("Model set to {}/{}", model.provider, model.id)
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
@@ -1529,6 +2408,7 @@ fn dispatch_runtime_slash_command(
             let levels = stream::supported_thinking_levels(&state.model);
             if levels.iter().any(|level| level == rest) {
                 prepared.runtime.agent().set_thinking_level(rest);
+                app.invalidate_thinking_suggestions();
                 view.activity = format!("Thinking set to {rest}");
             } else {
                 append_view_message(
@@ -1697,6 +2577,38 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
+        "/export" => dispatch_session_export_slash_command(view, prepared, rest, fullscreen),
+        "/import" => dispatch_session_import_slash_command(view, prepared, rest, fullscreen),
+        "/omni" if fullscreen && is_omni_setup(rest) => dispatch_fullscreen_terminal_command(
+            app,
+            view,
+            prepared,
+            FullscreenTerminalCommand::OmniSetup,
+        ),
+        "/omni" => dispatch_omni_slash_command(view, catalog, rest, fullscreen),
+        "/aperture" if fullscreen && is_aperture_onboarding(rest) => {
+            dispatch_fullscreen_terminal_command(
+                app,
+                view,
+                prepared,
+                FullscreenTerminalCommand::ApertureOnboarding,
+            )
+        }
+        "/aperture" => dispatch_aperture_slash_command(view, catalog, rest, None, fullscreen),
+        "/aperture:onboarding" if fullscreen && rest.trim().is_empty() => {
+            dispatch_fullscreen_terminal_command(
+                app,
+                view,
+                prepared,
+                FullscreenTerminalCommand::ApertureOnboarding,
+            )
+        }
+        "/aperture:onboarding" => {
+            dispatch_aperture_slash_command(view, catalog, rest, Some("onboarding"), fullscreen)
+        }
+        "/aperture:settings" => {
+            dispatch_aperture_slash_command(view, catalog, rest, Some("settings"), fullscreen)
+        }
         "/resources" => {
             let resources = prepared.resources();
             append_view_message(
@@ -1731,26 +2643,32 @@ fn dispatch_runtime_slash_command(
             CommandDispatch::Handled
         }
         "/resume" if rest.is_empty() => {
-            match list_interactive_sessions(prepared) {
-                Ok(output) => append_view_message(
-                    view,
-                    MessageRole::Command,
-                    format!("{output}\n/resume <id> switches to a listed session."),
-                ),
-                Err(error) => append_view_message(view, MessageRole::Error, error),
-            }
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "/resume needs a session id, prefix, or path",
+            );
             CommandDispatch::Handled
         }
         "/resume" => {
             match prepared.runtime.switch_to(rest) {
                 Ok(handle) => {
                     app.scroll = 0;
+                    view.context_estimate.reset();
                     view.activity = format!("Resumed session {}", short_id(&handle.id));
                     append_view_message(
                         view,
                         MessageRole::Notice,
                         format!("Switched to session {}.", handle.id),
                     );
+                    if !fullscreen {
+                        let restored = prepared.runtime.restored();
+                        let transcript =
+                            restored_transcript_text(&restored.messages, "resumed transcript");
+                        if !transcript.is_empty() {
+                            append_view_message(view, MessageRole::Command, transcript);
+                        }
+                    }
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
@@ -1856,10 +2774,9 @@ fn dispatch_runtime_slash_command(
             view.activity = "Compacting context".to_owned();
             view.activity_since = Some(Instant::now());
             thread::spawn(move || {
-                let result = compaction::compact(&agent, &instructions)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string());
-                let _ = turn_sender.send(result);
+                let result =
+                    compaction::compact(&agent, &instructions).map_err(|error| error.to_string());
+                let _ = turn_sender.send(InteractiveTaskResult::Compaction(result));
             });
             CommandDispatch::Handled
         }
@@ -1885,14 +2802,41 @@ fn dispatch_runtime_slash_command(
             }
             CommandDispatch::Handled
         }
-        "/login" => {
-            append_view_message(
-                view,
-                MessageRole::Error,
-                "OAuth login is not available in the Rust frontend yet; use `goshcoder auth set <provider>` outside chat.",
-            );
+        "/use-claude-code-tui" => {
+            if fullscreen {
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "The fullscreen interface already uses the native sidebar layout; this switch only affects line mode.",
+                );
+            } else if let Some(claude_tui) = view.line_claude_tui.as_mut() {
+                *claude_tui = true;
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "Using native pi-claude-code-tui look.",
+                );
+            }
             CommandDispatch::Handled
         }
+        "/use-default-tui" => {
+            if fullscreen {
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "The fullscreen layout cannot be changed in-place; restart with -fullscreen=false for the line-mode interface.",
+                );
+            } else if let Some(claude_tui) = view.line_claude_tui.as_mut() {
+                *claude_tui = false;
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    "Using default GoshCoder interface.",
+                );
+            }
+            CommandDispatch::Handled
+        }
+        "/login" => dispatch_login_slash_command(app, view, prepared, catalog, rest, fullscreen),
         _ if command.starts_with('/') => {
             append_view_message(
                 view,
@@ -1903,6 +2847,286 @@ fn dispatch_runtime_slash_command(
         }
         _ => CommandDispatch::NotCommand,
     }
+}
+
+fn dispatch_login_slash_command(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let providers = rest.split_whitespace().collect::<Vec<_>>();
+    let [provider_id] = providers.as_slice() else {
+        if providers.is_empty() {
+            append_view_message(view, MessageRole::Command, login_command_help());
+        } else {
+            append_view_message(view, MessageRole::Error, "usage: /login <provider>");
+        }
+        return CommandDispatch::Handled;
+    };
+
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "Wait for the current response before changing credentials.",
+        );
+        return CommandDispatch::Handled;
+    }
+
+    let command = match provider_cli::interactive_auth_command(catalog, provider_id) {
+        Ok(command) => command,
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.to_string());
+            return CommandDispatch::Handled;
+        }
+    };
+    if fullscreen {
+        view.activity = format!("Logging in to {provider_id}");
+        view.activity_since = Some(Instant::now());
+        return CommandDispatch::TerminalCommand(FullscreenTerminalCommand::Login {
+            provider_id: (*provider_id).to_owned(),
+            command,
+        });
+    }
+
+    match provider_cli::auth_for_provider(catalog, provider_id) {
+        Ok(outcome) => {
+            app.invalidate_model_suggestions();
+            app.invalidate_login_suggestions();
+            app.invalidate_resume_suggestions();
+            view.invalidate_resume_sessions();
+            view.activity = format!("Added {}", outcome.provider_id);
+            append_view_message(view, MessageRole::Notice, outcome.notice());
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn login_command_help() -> String {
+    format!(
+        "Add a provider with /login <provider>.\nOAuth providers: {}\nAPI-key providers prompt for a key; existing logins are kept.",
+        oauth::implemented_provider_ids().join(", ")
+    )
+}
+
+fn transcript_summary(messages: &[llm::Message]) -> String {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let (role, preview) = compaction::summary_text(message).map_or_else(
+                || (message.role(), first_line(&message.text_preview())),
+                |summary| ("compacted", first_line(&summary)),
+            );
+            format!("{:>3}  {:<10} {}", index + 1, role, preview)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn dispatch_session_export_slash_command(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let arguments = rest
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let options = sessions::parse_export_options(&arguments);
+    let destination = match options.values.as_slice() {
+        [] => None,
+        [destination] => Some(destination.clone()),
+        _ => {
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "usage: /export [--md|--jsonl] [output-path]",
+            );
+            return CommandDispatch::Handled;
+        }
+    };
+    if fullscreen && destination.as_deref().is_none_or(|path| path == "-") {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "give /export a destination path; the fullscreen interface has no console to print to",
+        );
+        return CommandDispatch::Handled;
+    }
+
+    let result = match destination.as_deref() {
+        None | Some("-") => {
+            let content = prepared.runtime.export(options.format);
+            content.and_then(|content| {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(&content)?;
+                stdout.flush()?;
+                Ok(())
+            })
+        }
+        Some(destination) => prepared.runtime.export_to(options.format, destination),
+    };
+    match result {
+        Ok(()) => {
+            view.activity = "Session exported".to_owned();
+            if let Some(destination) = destination.filter(|destination| destination != "-") {
+                let id = prepared
+                    .runtime
+                    .id()
+                    .map(|id| short_id(&id).to_owned())
+                    .unwrap_or_else(|| "session".to_owned());
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    format!("Exported {id} to {destination}."),
+                );
+            }
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn dispatch_session_import_slash_command(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let arguments = rest.split_whitespace().collect::<Vec<_>>();
+    let [source] = arguments.as_slice() else {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            "/import needs exactly one .jsonl session path",
+        );
+        return CommandDispatch::Handled;
+    };
+    match prepared.runtime.import_copy(source) {
+        Ok(handle) => {
+            if !fullscreen {
+                let write_result = (|| -> io::Result<()> {
+                    let mut stdout = io::stdout().lock();
+                    writeln!(stdout, "{}", handle.path.display())?;
+                    stdout.flush()
+                })();
+                if let Err(error) = write_result {
+                    append_view_message(view, MessageRole::Error, error.to_string());
+                    return CommandDispatch::Handled;
+                }
+            }
+            view.activity = format!("Imported session {}", short_id(&handle.id));
+            let location = if fullscreen {
+                format!("\n{}", handle.path.display())
+            } else {
+                String::new()
+            };
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "Imported as {}.{location}\nUse /resume {} to switch to it.",
+                    short_id(&handle.id),
+                    handle.id
+                ),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn dispatch_fullscreen_terminal_command(
+    app: &App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    command: FullscreenTerminalCommand,
+) -> CommandDispatch {
+    if app.streaming || view.turn_pending || prepared.runtime.agent().state().is_streaming {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!("Wait for the current response before {}.", command.name()),
+        );
+        return CommandDispatch::Handled;
+    }
+    view.activity = command.activity();
+    view.activity_since = Some(Instant::now());
+    CommandDispatch::TerminalCommand(command)
+}
+
+fn is_omni_setup(rest: &str) -> bool {
+    rest.trim().eq_ignore_ascii_case("setup")
+}
+
+fn is_aperture_onboarding(rest: &str) -> bool {
+    matches!(
+        rest.trim().to_ascii_lowercase().as_str(),
+        "onboarding" | "setup" | "configure"
+    )
+}
+
+fn dispatch_omni_slash_command(
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    rest: &str,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let arguments = rest
+        .split_whitespace()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let interactive = !fullscreen && io::stdin().is_terminal() && io::stderr().is_terminal();
+    match omni_cli::execute(&arguments, catalog, interactive) {
+        Ok(output) => {
+            view.activity = "OmniRoute command completed".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Command,
+                if output.is_empty() {
+                    "OmniRoute command completed.".to_owned()
+                } else {
+                    output
+                },
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
+}
+
+fn dispatch_aperture_slash_command(
+    view: &mut InteractiveView,
+    catalog: &catalog::Catalog,
+    rest: &str,
+    alias: Option<&str>,
+    fullscreen: bool,
+) -> CommandDispatch {
+    let mut arguments = alias.into_iter().map(ToOwned::to_owned).collect::<Vec<_>>();
+    arguments.extend(rest.split_whitespace().map(ToOwned::to_owned));
+    match aperture_cli::execute(&arguments, !fullscreen) {
+        Ok(output) => {
+            catalog.reload_aperture_state();
+            view.activity = "Aperture command completed".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Command,
+                if output.is_empty() {
+                    "Aperture command completed.".to_owned()
+                } else {
+                    output
+                },
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
+    }
+    CommandDispatch::Handled
 }
 
 /// Handles `/prompt` and its compatibility alias without writing directly to
@@ -2260,6 +3484,241 @@ fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<Stri
     Ok(render_interactive_session_list(&sessions))
 }
 
+fn refresh_resume_palette(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+) {
+    if !app.resume_palette_active() {
+        app.invalidate_resume_suggestions();
+        return;
+    }
+
+    let completed_scan = view
+        .resume_scan
+        .as_ref()
+        .and_then(|receiver| match receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("saved-session scan stopped unexpectedly".to_owned()))
+            }
+        });
+    if let Some(result) = completed_scan {
+        view.resume_scan = None;
+        match result {
+            Ok(sessions) => view.resume_sessions = Some(sessions),
+            Err(error) => {
+                view.resume_sessions = Some(Vec::new());
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    format!("could not read saved sessions: {error}"),
+                );
+            }
+        }
+    }
+
+    if view.resume_sessions.is_none() {
+        if view.resume_scan.is_none() {
+            let cwd = match runtime::absolute_workdir(&prepared.config.workdir) {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    view.resume_sessions = Some(Vec::new());
+                    append_view_message(view, MessageRole::Error, error.to_string());
+                    return;
+                }
+            };
+            let store = sessionlog::Store::new(
+                prepared
+                    .config
+                    .sessions_dir
+                    .clone()
+                    .unwrap_or_else(config::sessions_dir),
+            );
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let result = session_picker::list_sessions_for_picker(&store, &cwd)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+            view.resume_scan = Some(receiver);
+        }
+        app.set_resume_suggestions_loading();
+        return;
+    }
+
+    let current_path = prepared.runtime.path();
+    let sessions = view.resume_sessions.as_deref().unwrap_or_default();
+    app.refresh_resume_suggestions(|query| {
+        resume_picker_suggestions(sessions, query, current_path.as_deref())
+    });
+}
+
+fn refresh_sidebar_git(view: &mut InteractiveView, workspace: &Path) {
+    if view.git_status_root.as_deref() != Some(workspace) {
+        view.git_status = None;
+        view.git_status_root = Some(workspace.to_path_buf());
+        view.git_status_scan = None;
+        view.git_status_last_requested = None;
+    }
+
+    let completed_scan =
+        view.git_status_scan
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(None),
+            });
+    if let Some(result) = completed_scan {
+        view.git_status_scan = None;
+        if let Some(result) = result {
+            view.git_status = Some(result);
+        }
+    }
+
+    let refresh_due = view
+        .git_status_last_requested
+        .is_none_or(|requested| requested.elapsed() >= SIDEBAR_GIT_REFRESH_INTERVAL);
+    if view.git_status_scan.is_none() && refresh_due {
+        let workspace = workspace.to_path_buf();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(scan_sidebar_git(&workspace));
+        });
+        view.git_status_scan = Some(receiver);
+        view.git_status_last_requested = Some(Instant::now());
+    }
+}
+
+fn scan_sidebar_git(workspace: &Path) -> SidebarGitInfo {
+    let mut command = Command::new("git");
+    command
+        .args(["status", "--short", "--branch", "--untracked-files=normal"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return SidebarGitInfo::default();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return SidebarGitInfo::default();
+    };
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut reader = stdout;
+        let mut output = Vec::with_capacity(SIDEBAR_GIT_MAX_OUTPUT_BYTES);
+        let mut buffer = [0_u8; 8_192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if output.len() < SIDEBAR_GIT_MAX_OUTPUT_BYTES => {
+                    let remaining = SIDEBAR_GIT_MAX_OUTPUT_BYTES - output.len();
+                    output.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Ok(_) => {}
+            }
+        }
+        let _ = sender.send(output);
+    });
+
+    let deadline = Instant::now() + SIDEBAR_GIT_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break None,
+        }
+    };
+    let output = receiver
+        .recv_timeout(Duration::from_millis(250))
+        .unwrap_or_default();
+    if !status.is_some_and(|status| status.success()) {
+        return SidebarGitInfo::default();
+    }
+    parse_sidebar_git_status(&String::from_utf8_lossy(&output))
+}
+
+fn parse_sidebar_git_status(output: &str) -> SidebarGitInfo {
+    let mut info = SidebarGitInfo::default();
+    for (index, line) in output.lines().enumerate() {
+        if index == 0
+            && let Some(branch) = line.strip_prefix("## ")
+        {
+            let branch = branch.split_once("...").map_or(branch, |(name, _)| name);
+            info.branch = Some(if branch.starts_with("HEAD ") {
+                "detached HEAD".to_owned()
+            } else {
+                branch.to_owned()
+            });
+            continue;
+        }
+        let Some((status, path)) = parse_sidebar_git_change(line) else {
+            continue;
+        };
+        info.changed_files += 1;
+        if info.changes.len() >= SIDEBAR_GIT_MAX_CHANGES {
+            continue;
+        }
+        info.changes.push(SidebarGitChange {
+            status: state::FileStatus::Raw(status),
+            path,
+        });
+    }
+    info
+}
+
+fn parse_sidebar_git_change(line: &str) -> Option<(String, String)> {
+    if line.len() < 3 {
+        return None;
+    }
+    let status = line[..2].trim().to_owned();
+    let path = line[3..]
+        .trim()
+        .split_once(" -> ")
+        .map_or_else(|| line[3..].trim(), |(_, renamed)| renamed)
+        .trim_matches('"')
+        .replace('\\', "/");
+    (!path.is_empty()).then_some((status, path))
+}
+
+fn resume_picker_suggestions(
+    sessions: &[sessionlog::SessionInfo],
+    query: &str,
+    current_path: Option<&std::path::Path>,
+) -> Vec<state::Suggestion> {
+    let terms = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let labels = sessionlog::short_ids(sessions);
+    sessions
+        .iter()
+        .zip(labels)
+        .filter(|(session, _)| {
+            current_path.is_none_or(|current| session.path != current)
+                && session_picker::matches_session(session, &terms)
+        })
+        .map(|(session, label)| {
+            let (label, description) = session_picker::describe_session(session, &label, false);
+            state::Suggestion {
+                value: format!("/resume {label}"),
+                label,
+                description,
+                execute: true,
+            }
+        })
+        .collect()
+}
+
 fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> String {
     if sessions.is_empty() {
         return "No saved sessions for this workspace.".to_owned();
@@ -2285,7 +3744,7 @@ fn start_planner_review<F>(
     app: &mut App,
     view: &mut InteractiveView,
     prepared: &runtime::PreparedSession,
-    turn_sender: Sender<Result<(), String>>,
+    turn_sender: Sender<InteractiveTaskResult>,
     activity: &str,
     request: F,
 ) -> CommandDispatch
@@ -2323,7 +3782,7 @@ where
                 Ok(())
             }
         });
-        let _ = turn_sender.send(result);
+        let _ = turn_sender.send(InteractiveTaskResult::finished(result));
     });
     CommandDispatch::Handled
 }
@@ -2341,8 +3800,26 @@ fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl
     }
 }
 
-fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view: &InteractiveView) {
+fn refresh_runtime_app(
+    app: &mut App,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    view: &mut InteractiveView,
+) {
     let state = prepared.runtime.agent().state();
+    let model_reference = format!("{}/{}", state.model.provider, state.model.id);
+    app.set_command_availability(prepared.ralph.is_some(), prepared.planner.is_some());
+    app.refresh_model_suggestions(&model_reference, |query| {
+        model_picker_suggestions(catalog, &state.model, query)
+    });
+    app.refresh_login_suggestions(|query| login_provider_suggestions(catalog, query));
+    app.refresh_thinking_suggestions(&model_reference, &state.thinking_level, |query| {
+        thinking_picker_suggestions(&state.model, &state.thinking_level, query)
+    });
+    app.refresh_resource_suggestions(|query| {
+        resource_palette_suggestions(&prepared.resources(), query)
+    });
+    refresh_resume_palette(app, view, prepared);
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
         messages.extend(agent_messages(std::slice::from_ref(message)));
@@ -2358,6 +3835,7 @@ fn refresh_runtime_app(app: &mut App, prepared: &runtime::PreparedSession, view:
         state.model.id
     );
     app.status = interactive_status(view, app.streaming);
+    refresh_sidebar_git(view, &sidebar_workspace_path(prepared));
     app.sidebar = runtime_sidebar(prepared, &state, view);
 }
 
@@ -2580,20 +4058,14 @@ fn tool_title(call: &llm::ToolCall) -> String {
 fn runtime_sidebar(
     prepared: &runtime::PreparedSession,
     state: &agent::State,
-    view: &InteractiveView,
+    view: &mut InteractiveView,
 ) -> Vec<state::SidebarLine> {
-    let context = llm::Context {
-        system_prompt: state.system_prompt.clone(),
-        messages: state.messages.clone(),
-        tools: state.tools.iter().map(agent::Tool::llm_tool).collect(),
-    };
-    let estimate = stream::estimate_context_tokens(&context);
+    let context_tokens = view.context_estimate.measure(&state.messages);
     let limit = state.model.context_window;
     let percent = if limit == 0 {
         0
     } else {
-        estimate
-            .tokens
+        context_tokens
             .saturating_mul(100)
             .saturating_div(limit)
             .min(100) as u8
@@ -2614,15 +4086,12 @@ fn runtime_sidebar(
     } else {
         "not recording".to_owned()
     };
-    let cwd = prepared
-        .workspace
+    let cwd = sidebar_workspace_path(prepared).display().to_string();
+    let planner_state = prepared
+        .planner
         .as_ref()
-        .map(|workspace| workspace.root().display().to_string())
-        .unwrap_or_else(|| prepared.config.workdir.display().to_string());
-    let mode = prepared.planner.as_ref().map_or_else(
-        || "normal".to_owned(),
-        planner_runtime::PlannerRuntime::status_line,
-    );
+        .map(|planner| planner.manager().state());
+    let (mode, todo_items) = planner_sidebar_details(planner_state);
     let mut lines = vec![
         state::SidebarLine::title(name),
         state::SidebarLine::accent(format!("{}/{}", state.model.provider, state.model.id)),
@@ -2632,11 +4101,11 @@ fn runtime_sidebar(
         state::SidebarLine::section("Context"),
         state::SidebarLine::progress(percent),
         state::SidebarLine::meta(if limit == 0 {
-            format!("{} tokens", compact_number(estimate.tokens))
+            format!("{} tokens", compact_number(context_tokens))
         } else {
             format!(
                 "{} / {} tokens",
-                compact_number(estimate.tokens),
+                compact_number(context_tokens),
                 compact_number(limit)
             )
         }),
@@ -2666,9 +4135,47 @@ fn runtime_sidebar(
             lines.push(state::SidebarLine::meta(view.recent_tool.clone()));
         }
     }
+    if !todo_items.is_empty() {
+        lines.extend([
+            state::SidebarLine::blank(),
+            state::SidebarLine::section("Todo"),
+        ]);
+        lines.extend(
+            todo_items
+                .into_iter()
+                .map(|item| state::SidebarLine::todo(item.completed, item.text)),
+        );
+    }
+    if let Some(git) = view.git_status.as_ref()
+        && !git.changes.is_empty()
+    {
+        lines.extend([
+            state::SidebarLine::blank(),
+            state::SidebarLine::section("Modified Files"),
+        ]);
+        for (index, change) in git.changes.iter().enumerate() {
+            if index >= 10 {
+                lines.push(state::SidebarLine::meta(format!(
+                    "… {} more files",
+                    git.changes.len() - index
+                )));
+                break;
+            }
+            lines.push(state::SidebarLine::file(
+                change.status.clone(),
+                change.path.clone(),
+            ));
+        }
+    }
+    let branch = view
+        .git_status
+        .as_ref()
+        .and_then(|git| git.branch.as_deref())
+        .unwrap_or("not a git repo");
     lines.extend([
         state::SidebarLine::blank(),
         state::SidebarLine::section("Workspace"),
+        state::SidebarLine::meta(branch),
         state::SidebarLine::path(cwd),
         state::SidebarLine::blank(),
         state::SidebarLine::brand(format!("● GoshCoder v{}", ui_version())),
@@ -2676,14 +4183,31 @@ fn runtime_sidebar(
     lines
 }
 
+fn sidebar_workspace_path(prepared: &runtime::PreparedSession) -> PathBuf {
+    prepared
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root().to_path_buf())
+        .unwrap_or_else(|| prepared.config.workdir.clone())
+}
+
+fn planner_sidebar_details(
+    planner_state: Option<plannotator::State>,
+) -> (String, Vec<plannotator::ChecklistItem>) {
+    let Some(planner_state) = planner_state else {
+        return ("normal".to_owned(), Vec::new());
+    };
+    let mode = match planner_state.phase {
+        plannotator::Phase::Planning => "planning",
+        plannotator::Phase::Executing => "executing",
+        plannotator::Phase::Idle | plannotator::Phase::Unknown(_) => "normal",
+    };
+    (mode.to_owned(), planner_state.items)
+}
+
 fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String {
     let state = prepared.runtime.agent().state();
-    let context = llm::Context {
-        system_prompt: state.system_prompt.clone(),
-        messages: state.messages.clone(),
-        tools: state.tools.iter().map(agent::Tool::llm_tool).collect(),
-    };
-    let estimate = stream::estimate_context_tokens(&context);
+    let context_tokens = compaction::measured_context_tokens(&state.messages);
     let storage = if prepared.runtime.recording() {
         prepared.runtime.id().map_or_else(
             || "recording".to_owned(),
@@ -2696,11 +4220,11 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
     };
     let context_limit = state.model.context_window;
     let context = if context_limit == 0 {
-        format!("{} tokens", compact_number(estimate.tokens))
+        format!("{} tokens", compact_number(context_tokens))
     } else {
         format!(
             "{} / {} tokens",
-            compact_number(estimate.tokens),
+            compact_number(context_tokens),
             compact_number(context_limit)
         )
     };
@@ -2748,6 +4272,213 @@ fn configured_model_references(catalog: &catalog::Catalog) -> Vec<String> {
                 }
             })
         })
+        .collect()
+}
+
+fn model_picker_suggestions(
+    catalog: &catalog::Catalog,
+    active_model: &llm::Model,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let active_reference = format!("{}/{}", active_model.provider, active_model.id);
+    let mut models = interactive_models(catalog).unwrap_or_default();
+    if !models
+        .iter()
+        .any(|model| format!("{}/{}", model.provider, model.id) == active_reference)
+    {
+        models.push(active_model.clone());
+    }
+    let mut seen = BTreeSet::new();
+    models.retain(|model| seen.insert(format!("{}/{}", model.provider, model.id)));
+
+    let terms = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let mut choices = models
+        .into_iter()
+        .filter_map(|model| {
+            let reference = format!("{}/{}", model.provider, model.id);
+            let label = if model.name.is_empty() {
+                model.id.clone()
+            } else {
+                model.name.clone()
+            };
+            let haystack = format!(
+                "{} {} {}",
+                reference,
+                model.provider.to_ascii_lowercase(),
+                label.to_ascii_lowercase()
+            );
+            if !terms.iter().all(|term| haystack.contains(term)) {
+                return None;
+            }
+            let current = reference == active_reference;
+            let mut details = vec![reference.clone()];
+            if model.context_window > 0 {
+                details.push(format!("{} context", compact_number(model.context_window)));
+            }
+            if model.reasoning {
+                details.push("reasoning".to_owned());
+            }
+            let description = details.join(" · ");
+            Some((
+                current,
+                model.provider.clone(),
+                label.clone(),
+                state::Suggestion {
+                    label,
+                    description: if current {
+                        format!("CURRENT · {description}")
+                    } else {
+                        description
+                    },
+                    value: format!("/model {reference}"),
+                    execute: true,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    choices
+        .into_iter()
+        .map(|(_, _, _, suggestion)| suggestion)
+        .collect()
+}
+
+fn resource_palette_suggestions(
+    resources: &resources::ResourceSet,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let query = query.to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    for template in &resources.templates {
+        let label = format!("/{}", template.name);
+        if !label.to_ascii_lowercase().starts_with(&query) {
+            continue;
+        }
+        let description = if template.argument_hint.is_empty() {
+            template.description.clone()
+        } else if template.description.is_empty() {
+            template.argument_hint.clone()
+        } else {
+            format!("{} · {}", template.argument_hint, template.description)
+        };
+        suggestions.push(state::Suggestion {
+            label: label.clone(),
+            description,
+            value: label,
+            execute: true,
+        });
+    }
+    for skill in &resources.skills {
+        let label = format!("/skill:{}", skill.name);
+        if !label.to_ascii_lowercase().starts_with(&query) {
+            continue;
+        }
+        suggestions.push(state::Suggestion {
+            label: label.clone(),
+            description: skill.description.clone(),
+            value: label,
+            execute: true,
+        });
+    }
+    suggestions
+}
+
+fn thinking_picker_suggestions(
+    model: &llm::Model,
+    current_level: &str,
+    query: &str,
+) -> Vec<state::Suggestion> {
+    let query = query.to_ascii_lowercase();
+    stream::supported_thinking_levels(model)
+        .into_iter()
+        .filter(|level| level.starts_with(&query))
+        .map(|level| {
+            let description = thinking_level_description(&level);
+            state::Suggestion {
+                label: level.clone(),
+                description: if level == current_level {
+                    format!("CURRENT · {description}")
+                } else {
+                    description.to_owned()
+                },
+                value: format!("/thinking {level}"),
+                execute: true,
+            }
+        })
+        .collect()
+}
+
+fn thinking_level_description(level: &str) -> &'static str {
+    match level {
+        "off" => "Fastest responses, no extra reasoning",
+        "minimal" => "Very brief reasoning",
+        "low" => "Quick tasks and small edits",
+        "medium" => "Balanced depth and speed",
+        "high" => "Complex implementation work",
+        "xhigh" => "Deep analysis for difficult problems",
+        "max" => "Maximum available reasoning",
+        _ => "Reasoning effort",
+    }
+}
+
+fn login_provider_suggestions(catalog: &catalog::Catalog, query: &str) -> Vec<state::Suggestion> {
+    let configured = catalog
+        .configured_provider_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let query = query.to_ascii_lowercase();
+    let mut choices = catalog
+        .providers()
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .models()
+                .iter()
+                .any(|model| providers::ProviderProtocol::from_api(&model.api).is_ok())
+        })
+        .filter(|provider| {
+            query.is_empty()
+                || provider.id.to_ascii_lowercase().contains(&query)
+                || provider.name.to_ascii_lowercase().contains(&query)
+        })
+        .map(|provider| {
+            let oauth = oauth::OAuthProviderId::parse(&provider.id).is_some_and(|provider_id| {
+                oauth::metadata_for(provider_id).flow_support
+                    == oauth::OAuthFlowSupport::Implemented
+            });
+            let method = if oauth {
+                "OAuth / subscription"
+            } else {
+                "API key"
+            };
+            let signed_in = configured.contains(&provider.id);
+            let prefix = if signed_in { "SIGNED IN · " } else { "" };
+            (
+                oauth,
+                provider.id.clone(),
+                state::Suggestion {
+                    label: provider.id.clone(),
+                    description: format!("{prefix}{} · {method}", provider.name),
+                    value: format!("/login {}", provider.id),
+                    execute: true,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    choices
+        .into_iter()
+        .map(|(_, _, suggestion)| suggestion)
         .collect()
 }
 
@@ -2878,6 +4609,286 @@ mod tests {
     fn help_and_version_are_non_interactive() {
         assert!(USAGE.contains("Ratatui"));
         assert!(env!("CARGO_PKG_VERSION").starts_with("0."));
+    }
+
+    #[test]
+    fn login_help_lists_supported_oauth_and_additive_api_key_flow() {
+        let help = login_command_help();
+
+        assert!(help.contains("anthropic"));
+        assert!(help.contains("API-key providers prompt for a key"));
+        assert!(help.contains("existing logins are kept"));
+    }
+
+    #[test]
+    fn onboarding_selection_matches_the_subscription_login_choices() {
+        assert_eq!(
+            onboarding_provider("").expect("default choice"),
+            "openai-codex"
+        );
+        assert_eq!(
+            onboarding_provider("1").expect("first choice"),
+            "openai-codex"
+        );
+        assert_eq!(
+            onboarding_provider(" 2 ").expect("second choice"),
+            "anthropic"
+        );
+        assert_eq!(
+            onboarding_provider("3").expect("third choice"),
+            "kimi-coding"
+        );
+        assert!(onboarding_provider("4").is_err());
+    }
+
+    #[test]
+    fn continue_hint_only_promises_a_durable_session() {
+        assert_eq!(
+            continue_session_hint(true, Some("12345678-1234-7000-8000-000000000000")),
+            Some("session 12345678 · resume with: goshcoder chat -continue".to_owned())
+        );
+        assert_eq!(continue_session_hint(false, Some("saved")), None);
+        assert_eq!(continue_session_hint(true, None), None);
+    }
+
+    #[test]
+    fn model_reference_matches_the_persisted_chat_default_format() {
+        assert_eq!(
+            model_reference(&llm::Model {
+                provider: "anthropic".to_owned(),
+                id: "claude".to_owned(),
+                ..llm::Model::default()
+            }),
+            "anthropic/claude"
+        );
+    }
+
+    #[test]
+    fn fullscreen_terminal_commands_preserve_safe_cli_invocations() {
+        assert_eq!(
+            FullscreenTerminalCommand::Login {
+                provider_id: "anthropic".to_owned(),
+                command: provider_cli::InteractiveAuthCommand::Login,
+            }
+            .arguments(),
+            vec!["auth", "login", "anthropic"]
+        );
+        assert_eq!(
+            FullscreenTerminalCommand::OmniSetup.arguments(),
+            vec!["omni", "setup"]
+        );
+        assert_eq!(
+            FullscreenTerminalCommand::ApertureOnboarding.arguments(),
+            vec!["aperture", "onboarding"]
+        );
+        assert!(is_omni_setup(" SETUP "));
+        assert!(is_aperture_onboarding("configure"));
+        assert!(!is_aperture_onboarding("settings"));
+    }
+
+    #[test]
+    fn login_picker_prioritizes_oauth_and_marks_signed_in_providers() {
+        let credentials = Arc::new(catalog::CredentialStore::in_memory());
+        credentials
+            .put("openai", catalog::Credential::api_key("test-key"))
+            .expect("store credential");
+        let aperture_root =
+            std::env::temp_dir().join(format!("goshcoder-login-picker-{}", std::process::id()));
+        let catalog =
+            catalog::Catalog::with_environment(Some(Arc::clone(&credentials)), Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(
+                    aperture_root.join("aperture.json"),
+                    aperture_root.join("aperture-cache.json"),
+                );
+
+        let choices = login_provider_suggestions(&catalog, "");
+        let anthropic = choices
+            .iter()
+            .find(|choice| choice.value == "/login anthropic")
+            .expect("Anthropic choice");
+        let openai = choices
+            .iter()
+            .find(|choice| choice.value == "/login openai")
+            .expect("OpenAI choice");
+
+        assert!(anthropic.description.contains("OAuth / subscription"));
+        assert!(openai.description.contains("SIGNED IN ·"));
+        assert!(openai.description.contains("API key"));
+        assert!(
+            choices
+                .iter()
+                .position(|choice| choice.value == "/login anthropic")
+                .expect("Anthropic position")
+                < choices
+                    .iter()
+                    .position(|choice| choice.value == "/login openai")
+                    .expect("OpenAI position")
+        );
+        assert_eq!(
+            login_provider_suggestions(&catalog, "anth").len(),
+            1,
+            "query should filter provider choices"
+        );
+    }
+
+    #[test]
+    fn model_picker_filters_models_and_keeps_an_active_unconfigured_model() {
+        let credentials = Arc::new(catalog::CredentialStore::in_memory());
+        credentials
+            .put("openai", catalog::Credential::api_key("test-key"))
+            .expect("store credential");
+        let aperture_root =
+            std::env::temp_dir().join(format!("goshcoder-model-picker-{}", std::process::id()));
+        let catalog =
+            catalog::Catalog::with_environment(Some(Arc::clone(&credentials)), Arc::new(|_| None))
+                .expect("catalog")
+                .with_aperture_paths(
+                    aperture_root.join("aperture.json"),
+                    aperture_root.join("aperture-cache.json"),
+                );
+        let active = llm::Model {
+            id: "detached".to_owned(),
+            name: "Detached Model".to_owned(),
+            provider: "local".to_owned(),
+            context_window: 8_192,
+            reasoning: true,
+            ..llm::Model::default()
+        };
+
+        let choices = model_picker_suggestions(&catalog, &active, "");
+
+        assert_eq!(choices[0].value, "/model local/detached");
+        assert!(choices[0].description.contains("CURRENT"));
+        assert!(choices[0].description.contains("8.2k context"));
+        assert!(
+            choices
+                .iter()
+                .any(|choice| choice.value.starts_with("/model openai/"))
+        );
+        assert_eq!(
+            model_picker_suggestions(&catalog, &active, "detached")
+                .into_iter()
+                .map(|choice| choice.value)
+                .collect::<Vec<_>>(),
+            vec!["/model local/detached"]
+        );
+    }
+
+    #[test]
+    fn resource_picker_includes_templates_and_skills_with_native_descriptions() {
+        let resources = resources::ResourceSet {
+            templates: vec![resources::Template {
+                name: "review".to_owned(),
+                description: "Review a diff".to_owned(),
+                argument_hint: "<path>".to_owned(),
+                path: std::path::PathBuf::from("/tmp/review.md"),
+                body: String::new(),
+            }],
+            skills: vec![resources::Skill {
+                name: "deploy".to_owned(),
+                description: "Deploy safely".to_owned(),
+                path: std::path::PathBuf::from("/tmp/deploy/SKILL.md"),
+                body: String::new(),
+                disable_model_invocation: false,
+            }],
+            ..resources::ResourceSet::default()
+        };
+
+        assert_eq!(
+            resource_palette_suggestions(&resources, "/rev"),
+            vec![state::Suggestion {
+                label: "/review".to_owned(),
+                description: "<path> · Review a diff".to_owned(),
+                value: "/review".to_owned(),
+                execute: true,
+            }]
+        );
+        assert_eq!(
+            resource_palette_suggestions(&resources, "/skill"),
+            vec![state::Suggestion {
+                label: "/skill:deploy".to_owned(),
+                description: "Deploy safely".to_owned(),
+                value: "/skill:deploy".to_owned(),
+                execute: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn thinking_picker_marks_the_current_supported_level() {
+        let model = llm::Model {
+            reasoning: true,
+            ..llm::Model::default()
+        };
+
+        let choices = thinking_picker_suggestions(&model, "high", "h");
+
+        assert_eq!(
+            choices,
+            vec![state::Suggestion {
+                label: "high".to_owned(),
+                description: "CURRENT · Complex implementation work".to_owned(),
+                value: "/thinking high".to_owned(),
+                execute: true,
+            }]
+        );
+        assert_eq!(
+            thinking_level_description("xhigh"),
+            "Deep analysis for difficult problems"
+        );
+    }
+
+    #[test]
+    fn resume_picker_searches_transcript_and_hides_the_active_session() {
+        let active_path = std::path::PathBuf::from("/sessions/active.jsonl");
+        let sessions = vec![
+            sessionlog::SessionInfo {
+                id: "aaaa1111-0000-7000-8000-000000000001".to_owned(),
+                path: active_path.clone(),
+                cwd: "/workspace".to_owned(),
+                name: "Active work".to_owned(),
+                first_message: "current".to_owned(),
+                created: None,
+                modified: UNIX_EPOCH,
+                messages: 2,
+                cleared: 0,
+                size: 0,
+                search_text: "current implementation".to_owned(),
+                locked: false,
+                owner: sessionlog::LockOwner::default(),
+            },
+            sessionlog::SessionInfo {
+                id: "bbbb2222-0000-7000-8000-000000000002".to_owned(),
+                path: std::path::PathBuf::from("/sessions/older.jsonl"),
+                cwd: "/workspace".to_owned(),
+                name: "Streaming fix".to_owned(),
+                first_message: "investigate".to_owned(),
+                created: None,
+                modified: UNIX_EPOCH,
+                messages: 4,
+                cleared: 0,
+                size: 0,
+                search_text: "retry streaming response".to_owned(),
+                locked: false,
+                owner: sessionlog::LockOwner::default(),
+            },
+        ];
+
+        assert_eq!(
+            resume_picker_suggestions(&sessions, "retry", Some(&active_path)),
+            vec![state::Suggestion {
+                label: "bbbb2222".to_owned(),
+                description: "Jan 1 00:00 · 4 msg · Streaming fix".to_owned(),
+                value: "/resume bbbb2222".to_owned(),
+                execute: true,
+            }]
+        );
+        assert!(
+            resume_picker_suggestions(&sessions, "", Some(&active_path))
+                .iter()
+                .all(|suggestion| suggestion.value != "/resume aaaa1111")
+        );
     }
 
     #[test]
@@ -3043,6 +5054,42 @@ mod tests {
     }
 
     #[test]
+    fn restored_transcript_includes_a_compaction_preview() {
+        let messages = vec![
+            compaction::summary_message("Prior work\nwith details", 1),
+            llm::Message::User(llm::UserMessage::text("latest request", 2)),
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::text("latest response")],
+                ..llm::AssistantMessage::default()
+            })),
+        ];
+
+        assert_eq!(
+            restored_transcript_text(&messages, "resumed 3 message(s) from session"),
+            "resumed 3 message(s) from session\n\
+             · compacted Prior work ...\n\
+             · user latest request\n\
+             · assistant latest response\n\
+             ────────────────────────────────────────"
+        );
+    }
+
+    #[test]
+    fn transcript_summary_hides_the_raw_compaction_wrapper() {
+        let messages = vec![
+            compaction::summary_message("Prior work\nwith details", 1),
+            llm::Message::User(llm::UserMessage::text("latest request", 2)),
+        ];
+
+        let summary = transcript_summary(&messages);
+
+        assert!(summary.contains("compacted  Prior work"));
+        assert!(summary.contains("latest request"));
+        assert!(!summary.contains(compaction::SUMMARY_OPEN));
+        assert!(!summary.contains(compaction::SUMMARY_CLOSE));
+    }
+
+    #[test]
     fn tool_summary_is_stable_and_bounded() {
         let arguments = BTreeMap::from([
             ("a".to_owned(), serde_json::json!("value")),
@@ -3053,5 +5100,137 @@ mod tests {
         assert!(summary.starts_with("a=\"value\" z=\""));
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= "a=\"value\" z=".len() + 63);
+    }
+
+    #[test]
+    fn compaction_notices_report_message_counts_and_dropped_queue() {
+        let outcome = compaction::Outcome {
+            messages_before: 12,
+            retained_messages: 4,
+            tokens_before: 40_000,
+            dropped_queued_messages: 2,
+        };
+
+        assert_eq!(
+            compaction_notice_text(&outcome, false),
+            "compacted context: 12 messages → summary + 4 recent messages"
+        );
+        assert_eq!(
+            compaction_notice_text(&outcome, true),
+            "compacted context automatically: 12 messages → summary + 4 recent messages"
+        );
+        assert_eq!(
+            compaction_discard_notice(&outcome),
+            Some(
+                "2 queued message(s) were discarded: they were written against the transcript that was just compacted"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn sidebar_git_status_keeps_branch_rename_and_porcelain_state() {
+        let info = parse_sidebar_git_status(
+            "## feature/sidebar...origin/feature/sidebar [ahead 1]\n\
+             MM src/main.rs\n\
+             ?? notes.txt\n\
+             R  old name.rs -> new name.rs\n",
+        );
+
+        assert_eq!(info.branch.as_deref(), Some("feature/sidebar"));
+        assert_eq!(info.changes.len(), 3);
+        assert_eq!(
+            info.changes[0].status,
+            state::FileStatus::Raw("MM".to_owned())
+        );
+        assert_eq!(info.changes[0].path, "src/main.rs");
+        assert_eq!(
+            info.changes[1].status,
+            state::FileStatus::Raw("??".to_owned())
+        );
+        assert_eq!(
+            info.changes[2].status,
+            state::FileStatus::Raw("R".to_owned())
+        );
+        assert_eq!(info.changes[2].path, "new name.rs");
+    }
+
+    #[test]
+    fn sidebar_git_status_labels_detached_heads() {
+        let info = parse_sidebar_git_status("## HEAD (detached at 1234567)\n");
+
+        assert_eq!(info.branch.as_deref(), Some("detached HEAD"));
+    }
+
+    #[test]
+    fn native_line_ui_renders_session_card_and_prompt() {
+        let info = NativeLineInfo {
+            model: "openai/gpt-test".to_owned(),
+            context_used: 1_000,
+            context_limit: 4_000,
+            cost: 0.0123,
+            messages: 4,
+            tools: 7,
+            changed_files: 2,
+            branch: "feature/native-ui".to_owned(),
+            mode: "executing".to_owned(),
+            thinking: "high".to_owned(),
+        };
+
+        let sidebar = native_line_sidebar(&info, 32, false);
+        assert!(sidebar.contains("Context  1.0k/4.0k · 25%"));
+        assert!(sidebar.contains("Files    2 changed"));
+        assert!(sidebar.contains("Mode     executing · high"));
+        let header = native_line_header(80, "test", Path::new("/workspace"), &info, false);
+        assert!(header.contains("GoshCoder vtest"));
+        assert!(header.contains("openai/gpt-test"));
+        assert_eq!(native_line_input_prompt(8, false), "╭──────╮\n╰─❯ ");
+    }
+
+    #[test]
+    fn line_input_wait_can_exit_after_an_idle_interrupt() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<io::Result<Option<String>>>();
+        let guard = InterruptGuard {
+            identifier: u64::MAX,
+            idle_exit: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert_eq!(
+            next_line_or_interrupt(&receiver, &guard).expect("line wait"),
+            None
+        );
+    }
+
+    #[test]
+    fn planner_sidebar_uses_compact_mode_and_keeps_checklist_items() {
+        let items = vec![
+            plannotator::ChecklistItem {
+                step: 1,
+                text: "inspect the workspace".to_owned(),
+                completed: true,
+            },
+            plannotator::ChecklistItem {
+                step: 2,
+                text: "implement the change".to_owned(),
+                completed: false,
+            },
+        ];
+        let (mode, visible_items) = planner_sidebar_details(Some(plannotator::State {
+            phase: plannotator::Phase::Executing,
+            items: items.clone(),
+            ..plannotator::State::default()
+        }));
+        assert_eq!(mode, "executing");
+        assert_eq!(visible_items, items);
+
+        let (idle_mode, retained_items) = planner_sidebar_details(Some(plannotator::State {
+            phase: plannotator::Phase::Idle,
+            items,
+            ..plannotator::State::default()
+        }));
+        assert_eq!(idle_mode, "normal");
+        assert_eq!(retained_items.len(), 2);
+        assert!(retained_items[0].completed);
+        assert!(!retained_items[1].completed);
     }
 }
