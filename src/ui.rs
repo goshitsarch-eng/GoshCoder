@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     markdown::{MarkdownRenderer, MarkdownRole},
@@ -134,23 +134,24 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
+    // Every line is pre-wrapped to the area, so one line is one row and the
+    // scroll arithmetic below cannot push the newest content out of view.
     let lines = transcript_lines(
         &app.messages,
         area.width.saturating_sub(2),
         app.tools_expanded,
         app.hide_thinking,
     );
-    let max_scroll = lines.len().saturating_sub(area.height as usize);
+    let height = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    app.last_max_scroll
+        .set(max_scroll.min(usize::from(u16::MAX)) as u16);
     let scroll = usize::from(app.scroll).min(max_scroll);
-    let start = lines
-        .len()
-        .saturating_sub(area.height as usize)
-        .saturating_sub(scroll)
-        .min(u16::MAX as usize) as u16;
-    let transcript = Paragraph::new(Text::from(lines))
-        .style(Style::default().fg(TEXT).bg(BACKGROUND))
-        .scroll((start, 0))
-        .wrap(Wrap { trim: false });
+    let start = max_scroll.saturating_sub(scroll);
+    let end = (start + height).min(lines.len());
+    let visible = lines[start..end].to_vec();
+    let transcript =
+        Paragraph::new(Text::from(visible)).style(Style::default().fg(TEXT).bg(BACKGROUND));
     frame.render_widget(transcript, area);
 }
 
@@ -261,7 +262,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint = if app.streaming {
         "esc abort  ·  type to steer"
     } else {
-        "enter send · shift+enter newline · ctrl+l model · / commands"
+        "enter send · ctrl+j newline · ctrl+l model · / commands"
     };
     let available = area.width as usize;
     let mut spans = left.spans.to_vec();
@@ -393,9 +394,11 @@ fn transcript_lines(
     for message in messages {
         match message.role {
             MessageRole::User => {
-                lines.push(styled_line(
-                    format!("  {}", sanitize(&message.text)),
+                lines.extend(message_lines(
+                    &message.text,
                     Style::default().fg(TEXT).bg(USER_BACKGROUND),
+                    "  ",
+                    width,
                 ));
             }
             MessageRole::Assistant => {
@@ -423,20 +426,27 @@ fn transcript_lines(
                 let title = if message.title.is_empty() {
                     "tool".to_owned()
                 } else {
-                    sanitize(&message.title)
+                    sanitize(&message.title).replace('\n', " ")
                 };
+                let title_style = Style::default()
+                    .fg(TEXT)
+                    .bg(TOOL_BACKGROUND)
+                    .add_modifier(Modifier::BOLD);
+                let mut title_rows = wrap_plain(&title, usize::from(width).saturating_sub(4));
+                let first_title = title_rows.first().cloned().unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().bg(TOOL_BACKGROUND)),
                     Span::styled(icon, Style::default().fg(color).bg(TOOL_BACKGROUND)),
-                    Span::styled(
-                        format!(" {title}"),
-                        Style::default()
-                            .fg(TEXT)
-                            .bg(TOOL_BACKGROUND)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!(" {first_title}"), title_style),
                 ]));
-                let detail = if tools_expanded || message.is_error {
+                for row in title_rows.drain(1..) {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
+                        Span::styled(row, title_style),
+                    ]));
+                }
+                let expanded = tools_expanded || message.is_error;
+                let detail = if expanded {
                     if message.detail.is_empty() {
                         &message.text
                     } else {
@@ -445,25 +455,36 @@ fn transcript_lines(
                 } else {
                     &message.text
                 };
-                let max_lines = if tools_expanded || message.is_error {
-                    20
+                let max_lines = if expanded { 20 } else { 3 };
+                let shown = sanitize(detail);
+                let shown_lines = shown.lines().collect::<Vec<_>>();
+                // The collapsed text is already a prefix of the full detail,
+                // so the hint counts what the full detail still holds.
+                let total_lines = if expanded {
+                    shown_lines.len()
                 } else {
-                    3
+                    sanitize(&message.detail)
+                        .lines()
+                        .count()
+                        .max(shown_lines.len())
                 };
-                for (index, line) in sanitize(detail).lines().take(max_lines).enumerate() {
-                    lines.push(Line::from(vec![
-                        Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
-                        Span::styled(
-                            line.to_owned(),
-                            Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
-                        ),
-                    ]));
-                    if index + 1 == max_lines && sanitize(detail).lines().count() > max_lines {
-                        lines.push(styled_line(
-                            "    … more lines (ctrl+o to expand)".to_owned(),
-                            Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
-                        ));
+                let visible = shown_lines.len().min(max_lines);
+                for line in &shown_lines[..visible] {
+                    for row in wrap_plain(line, usize::from(width).saturating_sub(4)) {
+                        lines.push(Line::from(vec![
+                            Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
+                            Span::styled(row, Style::default().fg(MUTED).bg(TOOL_BACKGROUND)),
+                        ]));
                     }
+                }
+                if total_lines > visible {
+                    lines.push(styled_line(
+                        format!(
+                            "    … {} more lines (ctrl+o to expand)",
+                            total_lines - visible
+                        ),
+                        Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
+                    ));
                 }
             }
             MessageRole::Error => {
@@ -471,7 +492,12 @@ fn transcript_lines(
                     "  Error".to_owned(),
                     Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 ));
-                lines.extend(message_lines(&message.text, Style::default().fg(RED), "  "));
+                lines.extend(message_lines(
+                    &message.text,
+                    Style::default().fg(RED),
+                    "  ",
+                    width,
+                ));
             }
             MessageRole::Notice | MessageRole::Command => {
                 let (symbol, color, label) = match message.role {
@@ -486,12 +512,62 @@ fn transcript_lines(
                     &message.text,
                     Style::default().fg(MUTED),
                     "  ",
+                    width,
                 ));
             }
         }
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Wraps plain text to `width` cells: words first, then a hard break inside
+/// a word that does not fit on its own. Tabs and control characters are
+/// expected to be gone already. A blank line stays a blank line.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        if line.width() <= width {
+            rows.push(line.to_owned());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for word in line.split(' ') {
+            let word_width = word.width();
+            let separator = usize::from(!current.is_empty());
+            if current_width + separator + word_width <= width {
+                if separator == 1 {
+                    current.push(' ');
+                }
+                current.push_str(word);
+                current_width += separator + word_width;
+                continue;
+            }
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if word_width <= width {
+                current.push_str(word);
+                current_width = word_width;
+                continue;
+            }
+            // A single token wider than the row is split by cell width.
+            for character in word.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if current_width + character_width > width && !current.is_empty() {
+                    rows.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                current.push(character);
+                current_width += character_width;
+            }
+        }
+        rows.push(current);
+    }
+    rows
 }
 
 fn markdown_lines(text: &str, width: u16, role: MarkdownRole) -> Vec<Line<'static>> {
@@ -502,13 +578,13 @@ fn markdown_lines(text: &str, width: u16, role: MarkdownRole) -> Vec<Line<'stati
     lines
 }
 
-fn message_lines(text: &str, style: Style, prefix: &str) -> Vec<Line<'static>> {
+fn message_lines(text: &str, style: Style, prefix: &str, width: u16) -> Vec<Line<'static>> {
     let sanitized = sanitize(text);
-    let lines = sanitized.lines().collect::<Vec<_>>();
-    if lines.is_empty() {
+    if sanitized.is_empty() {
         return vec![styled_line(prefix.to_owned(), style)];
     }
-    lines
+    let inner = usize::from(width).saturating_sub(prefix.width());
+    wrap_plain(&sanitized, inner)
         .into_iter()
         .map(|line| styled_line(format!("{prefix}{line}"), style))
         .collect()
@@ -626,7 +702,11 @@ fn sanitize(text: &str) -> String {
             }
             continue;
         }
-        if !character.is_control() || matches!(character, '\n' | '\t') {
+        // ratatui drops control characters when it writes cells, so a tab
+        // has to become the spaces it stands for.
+        if character == '\t' {
+            output.push_str("    ");
+        } else if !character.is_control() || character == '\n' {
             output.push(character);
         }
     }
@@ -690,6 +770,124 @@ mod tests {
         assert!(text.contains("GOSHCODER"));
         assert!(text.contains("COMMANDS"));
         assert!(text.contains("New Session"));
+    }
+
+    fn plain(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_wrapping_breaks_on_words_then_inside_long_tokens() {
+        assert_eq!(wrap_plain("short", 10), ["short"]);
+        assert_eq!(
+            wrap_plain("one two three four", 9),
+            ["one two", "three", "four"]
+        );
+        assert_eq!(wrap_plain("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_plain("a\n\nb", 5), ["a", "", "b"]);
+        assert_eq!(wrap_plain("你好世界", 4), ["你好", "世界"]);
+    }
+
+    #[test]
+    fn user_messages_keep_their_newlines_and_wrap_to_the_width() {
+        let lines = transcript_lines(
+            &[Message {
+                role: MessageRole::User,
+                text: "first line\nsecond line that is long enough to wrap".to_owned(),
+                ..Message::default()
+            }],
+            20,
+            false,
+            false,
+        );
+        let rows = plain(&lines);
+        assert_eq!(rows[0], "  first line");
+        assert_eq!(rows[1], "  second line that");
+        assert_eq!(rows[2], "  is long enough to");
+        assert!(rows.iter().all(|row| row.width() <= 20), "{rows:?}");
+    }
+
+    #[test]
+    fn collapsed_tool_cards_say_how_much_the_detail_holds() {
+        let detail = (1..=12)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = Message {
+            role: MessageRole::Tool,
+            title: "bash ls".to_owned(),
+            text: detail.lines().take(3).collect::<Vec<_>>().join("\n"),
+            detail: detail.clone(),
+            ..Message::default()
+        };
+        let collapsed = plain(&transcript_lines(
+            std::slice::from_ref(&message),
+            80,
+            false,
+            false,
+        ));
+        assert!(
+            collapsed.contains(&"    … 9 more lines (ctrl+o to expand)".to_owned()),
+            "{collapsed:?}"
+        );
+        let expanded = plain(&transcript_lines(
+            std::slice::from_ref(&message),
+            80,
+            true,
+            false,
+        ));
+        assert!(expanded.contains(&"    line 12".to_owned()));
+        assert!(!expanded.iter().any(|row| row.contains("more lines")));
+    }
+
+    #[test]
+    fn transcript_scroll_is_measured_in_rows_and_written_back() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new();
+        app.replace_messages(vec![
+            Message {
+                role: MessageRole::User,
+                text: "word ".repeat(60),
+                ..Message::default()
+            },
+            Message {
+                role: MessageRole::Assistant,
+                text: "LAST ANSWER".to_owned(),
+                ..Message::default()
+            },
+        ]);
+        app.scroll = u16::MAX;
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        assert!(app.last_max_scroll.get() > 0);
+        assert!(app.last_max_scroll.get() < u16::MAX);
+
+        app.scroll = 0;
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("LAST ANSWER"),
+            "newest content stays visible at scroll 0"
+        );
+    }
+
+    #[test]
+    fn tabs_become_spaces_instead_of_vanishing() {
+        assert_eq!(sanitize("a\tb"), "a    b");
     }
 
     #[test]

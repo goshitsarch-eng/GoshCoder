@@ -68,7 +68,10 @@ pub struct PlannerRuntime {
     manager: plannotator::Manager,
     agent: agent::Agent,
     workspace: Workspace,
-    normal_tools: Vec<agent::Tool>,
+    /// The session's ordinary tools. Shared with the turn-end subscription so
+    /// tools registered after startup (gateway connectors) survive every
+    /// phase-specific rebuild instead of being unregistered by the next one.
+    normal_tools: Arc<Mutex<Vec<agent::Tool>>>,
     base_system_prompt: Arc<Mutex<String>>,
     reviewer: Arc<dyn plannotator::Reviewer>,
     notices: SessionNoticeSender,
@@ -151,11 +154,12 @@ impl PlannerRuntime {
 
         let agent = runtime.agent().clone();
         let base_system_prompt = Arc::new(Mutex::new(base_system_prompt));
+        let normal_tools = Arc::new(Mutex::new(normal_tools));
         let subscription = planner_subscription(
             &agent,
             manager.clone(),
             workspace.clone(),
-            normal_tools.clone(),
+            Arc::clone(&normal_tools),
             Arc::clone(&base_system_prompt),
         );
         let integration = Self {
@@ -218,13 +222,38 @@ impl PlannerRuntime {
     /// Rebuilds prompt and tools after an external integration changes base
     /// state. The method is idempotent and is safe to call from a UI loop.
     pub fn sync_agent(&self) {
+        let normal_tools = lock(&self.normal_tools).clone();
         sync_agent(
             &self.agent,
             &self.manager,
             &self.workspace,
-            &self.normal_tools,
+            &normal_tools,
             &self.base_system_prompt,
         );
+    }
+
+    /// Adds tools that arrived after startup to the ordinary tool set and
+    /// re-applies the current phase. A tool whose name is already registered
+    /// is ignored so a repeated registration cannot duplicate it.
+    pub fn extend_normal_tools(&self, tools: Vec<agent::Tool>) {
+        extend_tools(&self.normal_tools, tools);
+        self.sync_agent();
+    }
+
+    /// A callback that performs [`PlannerRuntime::extend_normal_tools`] from
+    /// a background thread that must not hold the session.
+    #[must_use]
+    pub fn tool_extender(&self) -> Arc<dyn Fn(Vec<agent::Tool>) + Send + Sync> {
+        let agent = self.agent.clone();
+        let manager = self.manager.clone();
+        let workspace = self.workspace.clone();
+        let normal_tools = Arc::clone(&self.normal_tools);
+        let base_system_prompt = Arc::clone(&self.base_system_prompt);
+        Arc::new(move |tools| {
+            extend_tools(&normal_tools, tools);
+            let snapshot = lock(&normal_tools).clone();
+            sync_agent(&agent, &manager, &workspace, &snapshot, &base_system_prompt);
+        })
     }
 
     /// Applies the current planner state to an extension-composed base prompt.
@@ -233,11 +262,12 @@ impl PlannerRuntime {
     /// remains the outermost prompt layer and phase-specific tool rebuilding
     /// cannot unregister Ralph's tools.
     pub fn sync_with_base(&self, base_system_prompt: impl AsRef<str>) {
+        let normal_tools = lock(&self.normal_tools).clone();
         sync_agent_with_base(
             &self.agent,
             &self.manager,
             &self.workspace,
-            &self.normal_tools,
+            &normal_tools,
             base_system_prompt.as_ref(),
         );
     }
@@ -250,15 +280,10 @@ impl PlannerRuntime {
         let agent = self.agent.clone();
         let manager = self.manager.clone();
         let workspace = self.workspace.clone();
-        let normal_tools = self.normal_tools.clone();
+        let normal_tools = Arc::clone(&self.normal_tools);
         Arc::new(move |base_system_prompt| {
-            sync_agent_with_base(
-                &agent,
-                &manager,
-                &workspace,
-                &normal_tools,
-                &base_system_prompt,
-            );
+            let snapshot = lock(&normal_tools).clone();
+            sync_agent_with_base(&agent, &manager, &workspace, &snapshot, &base_system_prompt);
         })
     }
 }
@@ -323,7 +348,7 @@ fn planner_subscription(
     agent: &agent::Agent,
     manager: plannotator::Manager,
     workspace: Workspace,
-    normal_tools: Vec<agent::Tool>,
+    normal_tools: Arc<Mutex<Vec<agent::Tool>>>,
     base_system_prompt: Arc<Mutex<String>>,
 ) -> agent::Subscription {
     let agent = agent.clone();
@@ -334,6 +359,7 @@ fn planner_subscription(
         if let Some(llm::Message::Assistant(message)) = event.message {
             manager.track_assistant(&message);
         }
+        let normal_tools = lock(&normal_tools).clone();
         sync_agent(
             &agent,
             &manager,
@@ -387,6 +413,20 @@ fn planner_tools(
         .into_iter()
         .map(|tool| guard_tool(tool, manager.clone()))
         .collect()
+}
+
+/// Appends tools whose names are not registered yet.
+fn extend_tools(tools: &Mutex<Vec<agent::Tool>>, additions: Vec<agent::Tool>) {
+    let mut tools = lock(tools);
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<BTreeSet<_>>();
+    tools.extend(
+        additions
+            .into_iter()
+            .filter(|tool| names.insert(tool.name.clone())),
+    );
 }
 
 fn without_tool(tools: &[agent::Tool], name: &str) -> Vec<agent::Tool> {

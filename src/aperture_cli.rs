@@ -55,10 +55,10 @@ struct IndexedChoice {
 }
 
 #[derive(Clone, Debug, Default)]
-struct SyncResult {
-    models: Vec<llm::Model>,
-    gateway: Vec<aperture::GatewayProvider>,
-    warnings: Vec<String>,
+pub(crate) struct SyncResult {
+    pub(crate) models: Vec<llm::Model>,
+    pub(crate) gateway: Vec<aperture::GatewayProvider>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Executes `goshcoder aperture [subcommand]`.
@@ -76,7 +76,14 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn execute(arguments: &[String], interactive: bool) -> CliResult<String> {
+/// Whether a subcommand prompts through the terminal (onboarding) and so
+/// must not run behind an alternate screen.
+pub(crate) fn needs_terminal(arguments: &[String]) -> bool {
+    matches!(parse_invocation(arguments), Ok((Subcommand::Onboarding, _)))
+}
+
+/// Runs one Aperture subcommand and returns what it reports.
+pub(crate) fn execute(arguments: &[String], interactive: bool) -> CliResult<String> {
     let (subcommand, remaining) = parse_invocation(arguments)?;
     match subcommand {
         Subcommand::Status => status_command(),
@@ -942,6 +949,18 @@ fn sync_configuration(
     cache_path: &Path,
 ) -> CliResult<SyncResult> {
     let local_models = all_catalog_models()?;
+    sync_configuration_with_models(configuration, cache_path, &local_models)
+}
+
+/// The networked refresh a session runs in the background at start: it
+/// revalidates the cached dedicated catalog against the gateway and the local
+/// model list the caller already holds, so no second catalog is constructed
+/// and no credential is resolved.
+pub(crate) fn sync_configuration_with_models(
+    configuration: &aperture::Config,
+    cache_path: &Path,
+    local_models: &[llm::Model],
+) -> CliResult<SyncResult> {
     let resolved = configuration.resolve();
     let gateway = gateway_from_resolved(&resolved)?;
     let gateway_providers = fetch_gateway_providers(&gateway)?;
@@ -955,7 +974,7 @@ fn sync_configuration(
     finish_sync(
         configuration,
         cache_path,
-        &local_models,
+        local_models,
         &gateway,
         &gateway_providers,
         models_dev.as_ref(),

@@ -6,21 +6,27 @@
 //! workspace tools, and pi-compatible session lifecycle.
 
 use std::{
+    collections::BTreeSet,
     env, fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
 };
 
 use crate::{
-    agent, btw_runtime,
+    agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
-    session::{SessionOptions, SessionRuntime, SessionSelection},
+    session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
     tools::Workspace,
     webaccess,
 };
+
+/// Registers tools that arrive after a session started, from whichever
+/// thread fetched them.
+pub type ToolRegistrar = Arc<dyn Fn(Vec<agent::Tool>) + Send + Sync>;
 
 /// The command path that supplied a shared session configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +115,12 @@ pub struct PreparedSession {
     resources: Mutex<ResourceSet>,
     explicit_system_prompt: Mutex<String>,
     pub config: SessionConfig,
+    /// The catalog this session resolves models through; background work
+    /// (the Aperture refresh) reads the same gateway state the picker shows.
+    pub catalog: Catalog,
+    /// The lazily spawned computer-use-linux server behind the `mcp` tool.
+    /// Closed with the session so the desktop server never outlives it.
+    desktop: Option<computeruse::McpSession>,
 }
 
 impl PreparedSession {
@@ -529,8 +541,15 @@ pub fn prepare_session(
         .filter(|_| config.enable_tools)
         .map(Workspace::all)
         .unwrap_or_default();
+    let mut startup_notices = Vec::new();
+    let mut desktop = None;
     if config.enable_tools {
         tools.push(native_web_search_tool(catalog)?);
+        if let Some((tool, session)) = desktop_mcp_tool(catalog, config.quiet, &mut startup_notices)
+        {
+            tools.push(tool);
+            desktop = Some(session);
+        }
     }
     tools.extend(extra_tools);
     let tool_names = tools.iter().map(|tool| tool.name.as_str());
@@ -545,6 +564,9 @@ pub fn prepare_session(
     )?;
     let runtime =
         SessionRuntime::open(options).map_err(|error| RuntimeError::Session(error.to_string()))?;
+    for (kind, text) in startup_notices {
+        runtime.notice_sender().push(kind, text);
+    }
     let btw = btw_runtime::Runtime::with_catalog(
         runtime.agent().responder(),
         catalog.clone(),
@@ -596,7 +618,7 @@ pub fn prepare_session(
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
-    Ok(PreparedSession {
+    let prepared = PreparedSession {
         btw,
         ralph,
         planner,
@@ -606,7 +628,247 @@ pub fn prepare_session(
         resources: Mutex::new(resources),
         explicit_system_prompt: Mutex::new(config.system_prompt.clone()),
         config,
-    })
+        catalog: catalog.clone(),
+        desktop,
+    };
+    prepared.aperture_session_start();
+    Ok(prepared)
+}
+
+impl Drop for PreparedSession {
+    fn drop(&mut self) {
+        if let Some(desktop) = self.desktop.take() {
+            desktop.close();
+        }
+    }
+}
+
+impl PreparedSession {
+    /// Adds tools discovered after startup and re-applies every extension
+    /// layer. With a planner attached the tools join its ordinary set so a
+    /// phase change cannot unregister them; otherwise they are merged into
+    /// the live agent directly.
+    pub fn register_tools(&self, tools: Vec<agent::Tool>) {
+        (self.tool_registrar())(tools);
+    }
+
+    /// The registration callback used from background threads.
+    #[must_use]
+    pub fn tool_registrar(&self) -> ToolRegistrar {
+        if let Some(planner) = self.planner.as_ref() {
+            return planner.tool_extender();
+        }
+        let agent = self.runtime.agent().clone();
+        Arc::new(move |tools| {
+            let mut current = agent.state().tools;
+            let mut names = current
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<BTreeSet<_>>();
+            current.extend(
+                tools
+                    .into_iter()
+                    .filter(|tool| names.insert(tool.name.clone())),
+            );
+            agent.set_tools(current);
+        })
+    }
+
+    /// The session_start work of both Aperture extensions: notify pending
+    /// onboarding, refresh the dedicated catalog and gateway snapshot in the
+    /// background, surface sync warnings, and register the connector tools
+    /// once the gateway answers.
+    ///
+    /// The networked refresh must not block startup: the cached catalog keeps
+    /// models loading instantly (even offline), and this revalidates it.
+    fn aperture_session_start(&self) {
+        let paths = self.catalog.dynamic_paths().clone();
+        let (Some(config_path), Some(cache_path)) = (paths.aperture, paths.aperture_cache) else {
+            return;
+        };
+        let notices = self.runtime.notice_sender();
+        let configuration = match aperture::load_config(&config_path) {
+            Ok(configuration) => configuration,
+            Err(aperture::ApertureError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return;
+            }
+            Err(error) => {
+                notices.push("aperture", error.to_string());
+                return;
+            }
+        };
+        let resolved = configuration.resolve();
+        if resolved.onboarding_enabled && !resolved.onboarding_done {
+            notices.push(
+                "aperture",
+                "extension installed. Run /aperture onboarding to configure.",
+            );
+        }
+        if resolved.base_url.is_empty() {
+            return;
+        }
+
+        let catalog = self.catalog.clone();
+        let tools_enabled = self.config.enable_tools;
+        let reserved = self
+            .runtime
+            .agent()
+            .state()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<BTreeSet<_>>();
+        let registrar = self.tool_registrar();
+        thread::Builder::new()
+            .name("aperture-session-start".to_owned())
+            .spawn(move || {
+                aperture_session_refresh(
+                    &catalog,
+                    &configuration,
+                    &cache_path,
+                    tools_enabled,
+                    &reserved,
+                    registrar,
+                    &notices,
+                );
+            })
+            .ok();
+    }
+}
+
+fn aperture_session_refresh(
+    catalog: &Catalog,
+    configuration: &aperture::Config,
+    cache_path: &Path,
+    tools_enabled: bool,
+    reserved: &BTreeSet<String>,
+    registrar: ToolRegistrar,
+    notices: &SessionNoticeSender,
+) {
+    let resolved = configuration.resolve();
+    let local_models = available_models(catalog);
+    match aperture_cli::sync_configuration_with_models(configuration, cache_path, &local_models) {
+        Ok(result) => {
+            for warning in result.warnings {
+                notices.push("aperture", warning);
+            }
+        }
+        Err(error) => notices.push("aperture", format!("model refresh failed: {error}")),
+    }
+    // The picker reads the cache through the catalog; make sure this
+    // process's own write is seen even where mtimes are coarse.
+    catalog.refresh_dynamic();
+
+    if !resolved.connectors_enabled || !tools_enabled {
+        return;
+    }
+    let gateway = aperture::gateway_url(&resolved.base_url);
+    let session = match aperture_mcp::McpSession::connect(&gateway) {
+        Ok(session) => session,
+        Err(error) => {
+            notices.push(
+                "aperture",
+                format!("[connectors] connector session failed: {error}"),
+            );
+            return;
+        }
+    };
+    let gateway_tools = match session.list_tools() {
+        Ok(tools) => tools,
+        Err(error) => {
+            notices.push(
+                "aperture",
+                format!("[connectors] connector tools/list failed: {error}"),
+            );
+            return;
+        }
+    };
+    // Connector metadata improves grouping but is deliberately non-fatal:
+    // the list tool degrades to grouping everything under "other".
+    let connectors = aperture::GatewayClient::new(&gateway)
+        .ok()
+        .and_then(|client| client.connectors().ok())
+        .unwrap_or_default();
+    let set = aperture_tools::build_connector_agent_tools(
+        &resolved,
+        &connectors,
+        &gateway_tools,
+        reserved,
+        session,
+    );
+    if !set.missing_pins.is_empty() {
+        notices.push(
+            "aperture",
+            format!(
+                "[connectors] pinned tool(s) not found on gateway: {}",
+                set.missing_pins.join(", ")
+            ),
+        );
+    }
+    if !set.rejected.is_empty() {
+        notices.push(
+            "aperture",
+            format!(
+                "[connectors] skipped tool(s) with names a provider would reject or that collide with a session tool: {}",
+                set.rejected.join(", ")
+            ),
+        );
+    }
+    if !set.tools.is_empty() {
+        registrar(set.tools);
+    }
+}
+
+/// Registers the native computer-use-linux `mcp` proxy tool.
+///
+/// The package targets Linux desktops only (its npm manifest declares
+/// `os: linux`); elsewhere nothing registers, like the extension never
+/// installing. The server is spawned lazily on the first call. State lives
+/// under the catalog's agent directory, so a session built on a catalog with
+/// no such directory (tests, embedders) never touches the user's `mcp.json`.
+fn desktop_mcp_tool(
+    catalog: &Catalog,
+    quiet: bool,
+    notices: &mut Vec<(&'static str, String)>,
+) -> Option<(agent::Tool, computeruse::McpSession)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let agent_dir = catalog.dynamic_paths().agent_dir.clone()?;
+    let Some(binary) = computeruse::find_binary() else {
+        // The extension warns on session_start when the binary is missing.
+        notices.push((
+            computeruse::PACKAGE_NAME,
+            format!(
+                "computer-use-linux binary not found. {}",
+                computeruse::INSTALL_HINT
+            ),
+        ));
+        return None;
+    };
+    // Keep the pi-mcp-adapter-compatible mcp.json entry registered, exactly
+    // as the extension does, so other MCP hosts sharing the agent directory
+    // can spawn the server too. A malformed existing file is reported, never
+    // overwritten.
+    let mcp_config = agent_dir.join("mcp.json");
+    match computeruse::ensure_server_entry(&mcp_config, &binary) {
+        Ok(computeruse::EnsureResult::Updated) if !quiet => notices.push((
+            computeruse::PACKAGE_NAME,
+            format!("MCP server configured at {}", mcp_config.display()),
+        )),
+        Ok(_) => {}
+        Err(error) => notices.push((
+            computeruse::PACKAGE_NAME,
+            format!(
+                "failed to configure MCP server at {}: {error}",
+                mcp_config.display()
+            ),
+        )),
+    }
+    let session = computeruse::McpSession::new(binary);
+    Some((computeruse::agent_tool(session.clone()), session))
 }
 
 /// Builds the native cited web-search tool with fresh OpenAI/Codex credential

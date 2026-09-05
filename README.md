@@ -199,10 +199,9 @@ The built-in catalog covers all bundled models across nine wire protocols:
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
 
-The live Rust responder currently supports `openai-completions`,
-`anthropic-messages`, `openai-responses`, `azure-openai-responses`,
-`openai-codex-responses`, `google-generative-ai`, and
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`.
+The live responder serves every one of them, plus `omni-prompt-tools`: the
+prompt-emulated tool protocol for OmniRoute models that cannot emit native
+tool calls, layered over `openai-completions`.
 
 Model data is generated from the pi reference into `catalog.json`, which is
 replaced wholesale on every regeneration. Two hand-maintained files sit beside
@@ -274,8 +273,8 @@ is recorded in [`NOTICE`](NOTICE).
   completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. Loop state is kept in the workspace-local
-  `.ralph/` directory so existing Go and pi-ralph-wiggum loops remain
-  discoverable. `/ralph` opens loop controls in the command palette.
+  `.ralph/` directory so loops written by pi-ralph-wiggum, and by earlier
+  GoshCoder builds, remain discoverable. `/ralph` opens loop controls in the command palette.
 - **Planner** (native adaptation of
   [`@plannotator/pi-extension`](https://github.com/backnotprop/plannotator) by
   the Plannotator contributors): `/planner`,

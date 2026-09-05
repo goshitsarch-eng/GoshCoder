@@ -3,15 +3,7 @@ reference/
 
 # Build artifacts
 bin/
-# A bare `go build ./cmd/goshcoder` drops the binary here rather than in bin/.
-/goshcoder
 *.exe
-*.test
-*.out
-
-# Go workspace
-go.work
-go.work.sum
 
 # Rust workspace
 /target/
@@ -24,3 +16,6 @@ dist/
 
 # Coverage output
 coverage.out
+
+# Agent worktrees created during automated sessions
+.claude/worktrees/

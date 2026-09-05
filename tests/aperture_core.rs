@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
-// Compile the standalone Aperture port as an integration-test module without
-// wiring it into src/main.rs. The production integration is intentionally left
-// for the surrounding Rust runtime migration.
+// Compile the Aperture core as a standalone integration-test module so its
+// pure routing, cache, and metadata logic is exercised without the runtime
+// around it. The production wiring lives in src/catalog.rs (dynamic layer)
+// and src/runtime.rs (session start).
 #[path = "../src/llm.rs"]
 mod llm;
 

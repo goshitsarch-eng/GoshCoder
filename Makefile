@@ -77,7 +77,7 @@ vet:
 test:
 	CARGO_TARGET_DIR="$(TARGET_DIR)" $(CARGO) test --workspace --all-targets --locked
 
-## test-race: compatibility alias; Rust's ownership model removes Go's race flag
+## test-race: compatibility alias kept for older scripts; `test` is the gate
 test-race: test
 
 ## test-hermetic: prove tests ignore ambient provider credentials

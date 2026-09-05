@@ -1,7 +1,7 @@
 GoshCoder — attribution notices
 ===============================
 
-GoshCoder is a Go reimplementation derived from pi. It is not an original
+GoshCoder is a Rust reimplementation derived from pi. It is not an original
 work: the design, wire protocols, session format, tool surface, resource
 conventions and credential layout are all pi's. GoshCoder's own licence is in
 LICENSE; this file records the upstream copyrights it is built on.
@@ -26,7 +26,7 @@ Natively adapted extensions
 ---------------------------
 
 pi loads extensions as TypeScript modules at runtime. GoshCoder has no plugin
-host, so a selected few are reimplemented as Go built-ins. Each is an
+host, so a selected few are reimplemented as Rust built-ins. Each is an
 adaptation, not a repackaging: no upstream code, generated web asset or npm
 dependency is bundled.
 
@@ -84,30 +84,35 @@ omniroute-agent-extension — OmniRoute
   licence.
 
 
-Third-party Go dependencies
----------------------------
+Third-party Rust crates
+-----------------------
 
-The interactive interface is built on Charm's Bubble Tea and Lip Gloss, which
-are fetched as ordinary Go modules rather than vendored here. Everything else
-GoshCoder does — provider requests, SSE parsing, AWS SigV4, archive handling,
-the cross-process lock — is written against the Go standard library.
+The interactive interface is built on Ratatui and Crossterm; provider requests
+go through reqwest with rustls; serde and serde_json handle the pi-compatible
+JSON formats; the remaining crates (sha2, hmac, rsa, base64, flate2, tar,
+time, unicode-width, unicode-segmentation, url, uuid) cover hashing, signing,
+archives, and text measurement. All of them are fetched from crates.io as
+recorded in Cargo.lock rather than vendored here. Provider wire protocols, SSE
+parsing, AWS SigV4 and the event-stream framing, and the cross-process lock
+are GoshCoder's own code on top of those crates.
 
-A Go binary statically links its dependencies, so a release archive has to
-carry their notices. `make dist` collects the licence text of every module
-that survives into the build — for that platform specifically, from
-`go list -deps` rather than from go.mod — into a `licenses/` directory beside
-the binary, with `licenses/modules.txt` listing each module and version. A
-dependency with no discoverable licence fails the build rather than shipping
-silently; see scripts/collect-licenses.sh.
+A Rust binary statically links its dependencies, so a release archive has to
+carry their notices. `make dist` collects the licence text of every crate that
+survives into the build — for that platform specifically, from `cargo
+metadata --filter-platform` rather than from Cargo.lock as a whole — into a
+`licenses/` directory beside the binary, with an index listing each crate and
+version. A crate with no discoverable licence fails the build rather than
+shipping silently; see scripts/collect-licenses.sh.
 
-Building from source instead? The same texts are in your module cache, at the
-paths `go list -m -f '{{.Dir}}' <module>` prints. go.sum is not a substitute:
-it records versions and integrity hashes, not licences.
+Building from source instead? The same texts are in your Cargo registry
+cache, under the source directories `cargo metadata` reports for each
+package. Cargo.lock is not a substitute: it records versions and checksums,
+not licences.
 
-One dependency needs a note. github.com/mattn/go-localereader, reached through
-Bubble Tea on Windows, ships no licence file and declares MIT in its README
-instead. The text carried in its place is recorded by hand under
-scripts/license-exceptions/ so the notice is auditable rather than inferred.
+A few crates declare plain SPDX `MIT` in their manifest but ship no licence
+file of their own. For those the standard MIT text recorded under
+scripts/license-exceptions/MIT/ is carried in the archive, so the notice is
+auditable rather than inferred.
 
 
 MIT License

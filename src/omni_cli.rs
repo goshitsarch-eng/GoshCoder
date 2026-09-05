@@ -21,9 +21,29 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Executes `goshcoder omni [status|sync|setup|dashboard]`.
 pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let output = execute(arguments)?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// Whether a subcommand talks to the user through the terminal and so must
+/// not run behind an alternate screen.
+pub fn needs_terminal(arguments: &[String]) -> bool {
+    matches!(
+        omniroute::CliCommand::parse(arguments),
+        Ok(omniroute::CliCommand::Setup)
+    )
+}
+
+/// Runs one OmniRoute subcommand and returns what it reports. Gateway text
+/// travels through the result, so control characters are stripped before it
+/// can reach a terminal.
+pub fn execute(arguments: &[String]) -> Result<String, Box<dyn Error>> {
     let command = omniroute::CliCommand::parse(arguments)?;
     let transport = ReqwestTransport::new(HEALTH_TIMEOUT)?;
-    match command {
+    let output = match command {
         omniroute::CliCommand::Status => {
             let key = resolved_key().unwrap_or_default();
             let report = omniroute::status_command(config::omni_route_path(), &key, &transport)?;
@@ -32,27 +52,25 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     "OmniRoute credentials are missing; run `goshcoder omni setup`",
                 ));
             }
-            println!("{}", report.render());
+            report.render()
         }
         omniroute::CliCommand::Dashboard => {
-            println!(
-                "{}",
-                omniroute::dashboard_command(config::omni_route_path())?
-            );
+            omniroute::dashboard_command(config::omni_route_path())?
         }
         omniroute::CliCommand::Sync => {
             let key = resolved_key_required()?;
             let result = omniroute::sync_command_now(config::omni_route_path(), &key, &transport)?;
-            println!("{}", result.render());
+            result.render()
         }
-        omniroute::CliCommand::Setup => {
-            setup(&transport)?;
-        }
-    }
-    Ok(())
+        omniroute::CliCommand::Setup => setup(&transport)?,
+    };
+    Ok(output
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\n')
+        .collect())
 }
 
-fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
+fn setup(transport: &ReqwestTransport) -> Result<String, Box<dyn Error>> {
     let stdin = io::stdin();
     if !stdin.is_terminal() {
         return Err(command_error(
@@ -76,8 +94,7 @@ fn setup(transport: &ReqwestTransport) -> Result<(), Box<dyn Error>> {
     let message = result.render();
     config::ensure_agent_dir()?;
     CredentialStore::default_file().put("omni", Credential::api_key(result.credential_to_store))?;
-    println!("{message}");
-    Ok(())
+    Ok(message.to_owned())
 }
 
 fn resolved_key() -> Result<String, Box<dyn Error>> {

@@ -44,7 +44,12 @@ pub fn web_search_path() -> PathBuf {
 }
 
 pub fn omni_route_path() -> PathBuf {
-    agent_dir().join("omniroute.json")
+    omni_route_path_in(&agent_dir())
+}
+
+/// The OmniRoute configuration inside an explicit agent directory.
+pub fn omni_route_path_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("omniroute.json")
 }
 
 pub fn btw_path() -> PathBuf {
@@ -52,11 +57,21 @@ pub fn btw_path() -> PathBuf {
 }
 
 pub fn aperture_path() -> PathBuf {
-    agent_dir().join("extensions").join("aperture.json")
+    aperture_path_in(&agent_dir())
+}
+
+/// pi's `extensions/aperture.json` inside an explicit agent directory.
+pub fn aperture_path_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("aperture.json")
 }
 
 pub fn aperture_cache_path() -> PathBuf {
-    agent_dir().join("extensions").join("aperture-cache.json")
+    aperture_cache_path_in(&agent_dir())
+}
+
+/// The synchronized Aperture snapshot inside an explicit agent directory.
+pub fn aperture_cache_path_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("aperture-cache.json")
 }
 
 pub fn mcp_config_path() -> PathBuf {
@@ -118,7 +133,7 @@ fn expand_tilde_with_home(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-fn agent_dir_from(override_dir: Option<&OsStr>, home: Option<&Path>) -> PathBuf {
+pub(crate) fn agent_dir_from(override_dir: Option<&OsStr>, home: Option<&Path>) -> PathBuf {
     if let Some(override_dir) = override_dir.filter(|path| !path.is_empty()) {
         return expand_tilde_with_home(Path::new(override_dir), home);
     }
