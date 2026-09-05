@@ -8,7 +8,6 @@
 use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
     catalog::Catalog,
     config, llm,
     resources::{self, ResourcePaths, ResourceSet},
-    session::{self, SessionOptions, SessionRuntime, SessionSelection},
+    session::{SessionOptions, SessionRuntime, SessionSelection},
     stream,
     tools::Workspace,
 };
