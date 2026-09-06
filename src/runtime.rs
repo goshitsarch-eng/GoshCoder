@@ -63,6 +63,10 @@ pub struct SessionConfig {
     /// Distinguishes an explicit `-m` override from a model filled in from
     /// the remembered default. Resuming is allowed to restore the latter.
     pub model_from_flag: bool,
+    /// Lets an interactive session open on [`unselected_model`] when no
+    /// provider is authenticated yet, so the user can log in and pick a model
+    /// from inside the interface instead of being refused at startup.
+    pub allow_unselected_model: bool,
 }
 
 impl Default for SessionConfig {
@@ -87,6 +91,7 @@ impl Default for SessionConfig {
             session_name: None,
             sessions_dir: None,
             model_from_flag: false,
+            allow_unselected_model: false,
         }
     }
 }
@@ -408,47 +413,116 @@ pub fn default_chat_model_reference(
     environment_model: Option<&str>,
     remembered_model: &str,
 ) -> Result<String> {
+    optional_default_chat_model_reference(catalog, environment_model, remembered_model)?.ok_or_else(
+        || {
+            RuntimeError::Catalog(
+                "no authenticated model is available; run `goshcoder auth set <provider>` or set a provider API-key environment variable, then pass -m provider/model"
+                    .to_owned(),
+            )
+        },
+    )
+}
+
+/// [`default_chat_model_reference`] that reports an unconfigured setup as
+/// `Ok(None)` instead of an error, so an interactive frontend can tell "nothing
+/// is authenticated yet" apart from a catalog failure.
+pub fn optional_default_chat_model_reference(
+    catalog: &Catalog,
+    environment_model: Option<&str>,
+    remembered_model: &str,
+) -> Result<Option<String>> {
     if let Some(model) = environment_model
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        return Ok(model.to_owned());
+        return Ok(Some(model.to_owned()));
     }
 
     let remembered = remembered_model.trim();
     if !remembered.is_empty() && catalog.resolve_model(remembered).is_ok() {
-        return Ok(remembered.to_owned());
+        return Ok(Some(remembered.to_owned()));
     }
 
     let configured = catalog
         .configured_provider_ids()
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
-    let preferred = [
-        ("openai-codex", "gpt-5.6-sol"),
-        ("anthropic", "claude-sonnet-5"),
-        ("kimi-coding", "kimi-for-coding"),
-        ("openai", "gpt-5.6-terra"),
-    ];
-    for (provider, model) in preferred {
-        if configured.iter().any(|configured| configured == provider)
-            && catalog.model(provider, model).is_some()
-        {
-            return Ok(format!("{provider}/{model}"));
-        }
-    }
+    Ok(preferred_model_reference(catalog, &configured))
+}
 
+/// The model a provider starts on right after it is authenticated, for the
+/// providers where the choice is obvious. Order is priority when several are
+/// configured. A provider missing here opens the model picker instead of
+/// guessing, because "the last model in the list" is an audio model for
+/// Mistral and a router for Fireworks. A test checks every entry against the
+/// catalog so a regeneration cannot leave a stale id behind.
+pub const CURATED_MODELS: &[(&str, &str)] = &[
+    ("openai-codex", "gpt-5.6-sol"),
+    ("anthropic", "claude-sonnet-5"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("openai", "gpt-5.6-terra"),
+    ("azure-openai-responses", "gpt-5.6-terra"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("xai", "grok-build-0.1"),
+    ("meta", "muse-spark-1.2"),
+    ("google", "gemini-3.6-flash"),
+    ("google-vertex", "gemini-3.6-flash"),
+    ("zai", "glm-5.2"),
+    ("zai-coding-cn", "glm-5.2"),
+    ("moonshotai", "kimi-k3"),
+    ("moonshotai-cn", "kimi-k3"),
+    ("minimax", "MiniMax-M3"),
+    ("minimax-cn", "MiniMax-M3"),
+    ("mistral", "devstral-medium-latest"),
+    ("xiaomi", "mimo-v2.5-pro"),
+    ("github-copilot", "claude-sonnet-5"),
+    ("opencode", "claude-sonnet-5"),
+    ("opencode-go", "kimi-k3"),
+    ("amazon-bedrock", "anthropic.claude-sonnet-5"),
+    ("cloudflare-ai-gateway", "claude-sonnet-5"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
+];
+
+/// The curated model for the first configured provider that has one.
+pub fn curated_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
+    CURATED_MODELS
+        .iter()
+        .find(|(provider, model)| {
+            configured.iter().any(|configured| configured == provider)
+                && catalog.model(provider, model).is_some()
+        })
+        .map(|(provider, model)| format!("{provider}/{model}"))
+}
+
+/// The model a session starts on when nothing was remembered: the curated
+/// defaults first, then the last model the first configured provider lists.
+pub fn preferred_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
+    if let Some(reference) = curated_model_reference(catalog, configured) {
+        return Some(reference);
+    }
     for provider_id in configured {
-        if let Some(provider) = catalog.provider(&provider_id)
+        if let Some(provider) = catalog.provider(provider_id)
             && let Some(model) = provider.models().last()
         {
-            return Ok(format!("{provider_id}/{}", model.id));
+            return Some(format!("{provider_id}/{}", model.id));
         }
     }
+    None
+}
 
-    Err(RuntimeError::Catalog(
-            "no authenticated model is available; run `goshcoder auth set <provider>` or set a provider API-key environment variable, then pass -m provider/model"
-                .to_owned(),
-    ))
+/// The model an interactive session runs on before any provider is
+/// authenticated. Its empty provider and id keep it out of the session log
+/// (initial settings skip an empty model) and let the frontend hold prompts
+/// back until `/login` and `/model` have chosen a real one.
+pub fn unselected_model() -> llm::Model {
+    llm::Model {
+        name: "no model selected".to_owned(),
+        ..llm::Model::default()
+    }
+}
+
+/// Whether `model` is a real catalog model rather than [`unselected_model`].
+pub fn model_is_selected(model: &llm::Model) -> bool {
+    !model.provider.is_empty() && !model.id.is_empty()
 }
 
 /// Reads process-level default-model sources. It is split from
@@ -484,15 +558,27 @@ pub fn session_options(
     tools: Vec<agent::Tool>,
     responder: Option<agent::AssistantResponder>,
 ) -> Result<SessionOptions> {
-    let model_ref = if config.model_ref.trim().is_empty() {
-        process_default_chat_model_reference(catalog)?
+    let model_ref = if !config.model_ref.trim().is_empty() {
+        Some(config.model_ref.clone())
+    } else if config.allow_unselected_model {
+        let environment_model = env::var("GOSHCODER_MODEL").ok();
+        optional_default_chat_model_reference(
+            catalog,
+            environment_model.as_deref(),
+            &config::read_default_model(),
+        )?
     } else {
-        config.model_ref.clone()
+        Some(process_default_chat_model_reference(catalog)?)
     };
-    let resolved = catalog
-        .resolve_model(&model_ref)
-        .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
-    let (model, _) = resolved.into_parts();
+    let model = match model_ref {
+        Some(model_ref) => {
+            let resolved = catalog
+                .resolve_model(&model_ref)
+                .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
+            resolved.into_parts().0
+        }
+        None => unselected_model(),
+    };
     let thinking_level = stream::clamp_thinking_level(&model, &config.thinking);
 
     Ok(SessionOptions {
@@ -1352,6 +1438,133 @@ mod tests {
         let relative = absolute_workdir(Path::new("./src/..")).expect("relative");
         assert!(relative.is_absolute());
         assert_eq!(relative, crate::sessionlog::absolute_path(Path::new(".")));
+    }
+
+    fn catalog_with_keys(keys: &'static [&'static str]) -> Catalog {
+        Catalog::with_environment(
+            None,
+            Arc::new(move |name| keys.contains(&name).then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+    }
+
+    #[test]
+    fn unconfigured_setup_is_reported_as_no_default_model_rather_than_an_error() {
+        let catalog = catalog_with_keys(&[]);
+        assert_eq!(
+            optional_default_chat_model_reference(&catalog, None, "").expect("lookup"),
+            None
+        );
+        let error = default_chat_model_reference(&catalog, None, "")
+            .expect_err("nothing is authenticated")
+            .to_string();
+        assert!(error.contains("no authenticated model"), "{error}");
+        assert!(!model_is_selected(&unselected_model()));
+    }
+
+    #[test]
+    fn a_freshly_authenticated_provider_gets_its_preferred_model() {
+        let catalog = catalog_with_keys(&["OPENAI_API_KEY"]);
+        assert_eq!(
+            preferred_model_reference(&catalog, &["openai".to_owned()]).as_deref(),
+            Some("openai/gpt-5.6-terra")
+        );
+        assert_eq!(
+            optional_default_chat_model_reference(&catalog, None, "").expect("lookup"),
+            Some("openai/gpt-5.6-terra".to_owned())
+        );
+        assert_eq!(preferred_model_reference(&catalog, &[]), None);
+        // An uncurated provider still gets a startup default, but nothing to
+        // auto-select after a login.
+        let groq = ["groq".to_owned()];
+        assert_eq!(curated_model_reference(&catalog, &groq), None);
+        assert!(preferred_model_reference(&catalog, &groq).is_some());
+    }
+
+    /// Guards the onboarding path for every provider: a curated default must
+    /// exist in the catalog and speak a supported protocol, and a key alone
+    /// must configure every provider except the ones that need more.
+    #[test]
+    fn curated_defaults_exist_and_a_key_configures_every_plain_provider() {
+        let store = Arc::new(crate::catalog::CredentialStore::in_memory());
+        let bare = Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
+        for provider_id in bare.provider_ids() {
+            store
+                .put(
+                    &provider_id,
+                    crate::catalog::Credential::api_key("test-key"),
+                )
+                .expect("store key");
+        }
+        let catalog = Catalog::with_environment(Some(store), Arc::new(|_| None)).expect("catalog");
+
+        for (provider_id, model_id) in CURATED_MODELS {
+            let model = catalog.model(provider_id, model_id).unwrap_or_else(|| {
+                panic!("curated {provider_id}/{model_id} is not in the catalog")
+            });
+            assert!(
+                crate::providers::supports_api(&model.api),
+                "curated {provider_id}/{model_id} speaks unsupported protocol {}",
+                model.api
+            );
+        }
+
+        let mut unconfigured = Vec::new();
+        for provider_id in catalog.provider_ids() {
+            if !catalog.is_configured(&provider_id).expect("configured") {
+                unconfigured.push(provider_id);
+                continue;
+            }
+            if let Some(reference) =
+                curated_model_reference(&catalog, std::slice::from_ref(&provider_id))
+            {
+                catalog
+                    .resolve_model(&reference)
+                    .unwrap_or_else(|error| panic!("{reference}: {error}"));
+            }
+        }
+        // Cloudflare needs an account (and gateway) id, which `auth set`
+        // prompts for; Aperture is configured by its gateway; Codex is OAuth
+        // only.
+        assert_eq!(
+            unconfigured,
+            [
+                "aperture",
+                "cloudflare-ai-gateway",
+                "cloudflare-workers-ai",
+                "openai-codex"
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_opens_on_the_unselected_model_only_when_allowed() {
+        let catalog = catalog_with_keys(&[]);
+        let cwd = std::env::temp_dir();
+        let refused = SessionConfig {
+            no_session: true,
+            ..SessionConfig::default()
+        };
+        assert!(
+            session_options(
+                &catalog,
+                &refused,
+                cwd.clone(),
+                String::new(),
+                Vec::new(),
+                None
+            )
+            .is_err()
+        );
+        let allowed = SessionConfig {
+            no_session: true,
+            allow_unselected_model: true,
+            ..SessionConfig::default()
+        };
+        let options = session_options(&catalog, &allowed, cwd, String::new(), Vec::new(), None)
+            .expect("chat opens without a model");
+        assert!(!model_is_selected(&options.model));
+        assert_eq!(options.thinking_level, llm::THINKING_OFF);
     }
 
     #[test]

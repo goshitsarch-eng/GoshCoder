@@ -119,10 +119,38 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("chat") => run_interactive(&args[1..]),
         None => run_interactive(&[]),
         Some(argument) if argument.starts_with('-') => run_interactive(&args),
-        Some(command) => Err(format!(
-            "{command} is queued for runtime migration; use `goshcoder chat` to exercise the Ratatui frontend"
-        )
-        .into()),
+        Some(command) => Err(unknown_command_message(command).into()),
+    }
+}
+
+/// Names the subcommand that was probably meant (`provider` for `providers`)
+/// before pointing at the usage text.
+fn unknown_command_message(command: &str) -> String {
+    const COMMANDS: &[&str] = &[
+        "run",
+        "chat",
+        "providers",
+        "models",
+        "auth",
+        "omni",
+        "aperture",
+        "ralph",
+        "sessions",
+        "prompts",
+        "version",
+        "help",
+    ];
+    let lowered = command.to_ascii_lowercase();
+    let suggestion = COMMANDS.iter().find(|candidate| {
+        !lowered.is_empty() && (candidate.starts_with(&lowered) || lowered.starts_with(*candidate))
+    });
+    match suggestion {
+        Some(suggestion) => {
+            format!(
+                "unknown command {command:?}; did you mean `goshcoder {suggestion}`? Run `goshcoder help` for usage"
+            )
+        }
+        None => format!("unknown command {command:?}; run `goshcoder help` for usage"),
     }
 }
 
@@ -391,6 +419,9 @@ fn bold(text: &str, color: bool) -> String {
 fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut invocation = runtime::parse_chat(arguments)?;
     choose_resume_session(&mut invocation.config)?;
+    // Chat opens even before any provider is authenticated: the interface
+    // walks the user through /login and /model instead of refusing to start.
+    invocation.config.allow_unselected_model = true;
     if !invocation.config.fullscreen || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return run_line_interactive(invocation);
     }
@@ -636,14 +667,22 @@ fn line_interactive_loop(
                 "{}",
                 dim(
                     &format!(
-                        "goshcoder {} · {}/{} · /help for commands",
+                        "goshcoder {} · {} · /help for commands",
                         build_version(),
-                        state.model.provider,
-                        state.model.id
+                        model_label(&state.model)
                     ),
                     color_enabled()
                 )
             );
+            if !runtime::model_is_selected(&state.model) {
+                eprintln!(
+                    "{}",
+                    dim(
+                        "No provider is authenticated yet: run /login <provider> (see /login for the list); the first login also selects a model.",
+                        color_enabled()
+                    )
+                );
+            }
         }
     }
 
@@ -746,6 +785,10 @@ fn line_interactive_loop(
                 break;
             }
         } else {
+            if !runtime::model_is_selected(&prepared.runtime.agent().state().model) {
+                eprintln!("error: {NO_MODEL_PROMPT_REFUSED}");
+                continue;
+            }
             if let Err(error) = prepared.sync_extensions() {
                 eprintln!("error: {error}");
                 continue;
@@ -875,6 +918,10 @@ fn event_loop(
             append_view_message(&mut view, MessageRole::Notice, banner);
         }
     }
+    if !runtime::model_is_selected(&prepared.runtime.agent().state().model) {
+        append_view_message(&mut view, MessageRole::Notice, NO_MODEL_WELCOME);
+        app.set_input("/login ");
+    }
 
     // Rebuilding the view means cloning the agent transcript and re-rendering
     // it, so it happens only when something changed or a spinner is running,
@@ -994,6 +1041,15 @@ fn event_loop(
                                 Err(error) => {
                                     append_view_message(&mut view, MessageRole::Error, error);
                                 }
+                            }
+                            // A login that could not choose a model on its
+                            // own hands over to the picker, now that there
+                            // is something to pick from.
+                            if !runtime::model_is_selected(&prepared.runtime.agent().state().model)
+                                && interactive_models(catalog)
+                                    .is_ok_and(|models| !models.is_empty())
+                            {
+                                app.set_input("/model ");
                             }
                             // Whatever was typed at the child process is
                             // not input for this screen.
@@ -1236,6 +1292,11 @@ fn submit_interactive_input<'a>(
     }
 
     let agent = prepared.runtime.agent().clone();
+    if !runtime::model_is_selected(&agent.state().model) {
+        append_view_message(view, MessageRole::Error, NO_MODEL_PROMPT_REFUSED);
+        app.set_input("/login ");
+        return CommandDispatch::Handled;
+    }
     if follow_up {
         agent.follow_up(llm::Message::User(llm::UserMessage::text(
             input,
@@ -1681,11 +1742,20 @@ fn start_btw_question(
 /// replacing any other stored credential. The prompts run in a child process
 /// that owns the terminal, exactly as the previous interface did.
 fn dispatch_login_command<'a>(
+    app: &mut App,
     view: &mut InteractiveView,
+    prepared: &'a runtime::PreparedSession,
     catalog: &'a catalog::Catalog,
     rest: &str,
+    fullscreen: bool,
 ) -> CommandDispatch<'a> {
     if rest.is_empty() {
+        if fullscreen {
+            // Bare `/login` opens the provider picker; the argument palette
+            // lists every provider with its login method.
+            app.set_input("/login ");
+            return CommandDispatch::Handled;
+        }
         append_view_message(
             view,
             MessageRole::Command,
@@ -1709,6 +1779,16 @@ fn dispatch_login_command<'a>(
         );
         return CommandDispatch::Handled;
     }
+    if let Some(setup) = gateway_setup_command(provider_id) {
+        append_view_message(
+            view,
+            MessageRole::Command,
+            format!(
+                "{provider_id} is a gateway, not an API-key provider; run {setup} to configure it."
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
     let provider_id = (*provider_id).to_owned();
     let subcommand = if login_flow_available(&provider_id) {
         "login"
@@ -1718,10 +1798,55 @@ fn dispatch_login_command<'a>(
     CommandDispatch::Suspended(Box::new(move || {
         run_self_subprocess(&["auth", subcommand, &provider_id])?;
         catalog.clear_oauth_refresh_failure(&provider_id);
-        Ok(format!(
-            "Added {provider_id}. Use /model to switch providers."
-        ))
+        Ok(after_login_message(prepared, catalog, &provider_id))
     }))
+}
+
+/// The in-chat command that configures a gateway provider; `/login` would
+/// only store a key that the gateway never reads.
+fn gateway_setup_command(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "aperture" => Some("/aperture onboarding"),
+        "omni" => Some("/omni setup"),
+        _ => None,
+    }
+}
+
+/// Puts a freshly authenticated provider to use. A session that has no model
+/// yet switches to the provider's curated model straight away, so the first
+/// login is the whole onboarding; a provider without a curated model is left
+/// to the picker, which the event loop opens; an existing selection is left
+/// alone.
+fn after_login_message(
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    provider_id: &str,
+) -> String {
+    if !catalog.is_configured(provider_id).unwrap_or(false) {
+        let hint = catalog
+            .provider(provider_id)
+            .map(|provider| provider_cli::provider_setup_hint(&provider))
+            .unwrap_or_default();
+        return format!(
+            "Stored a credential for {provider_id}, but the provider is still not usable: {hint}"
+        );
+    }
+    if runtime::model_is_selected(&prepared.runtime.agent().state().model) {
+        return format!("Added {provider_id}. Use /model to switch providers.");
+    }
+    let Some(reference) = runtime::curated_model_reference(catalog, &[provider_id.to_owned()])
+    else {
+        return format!("Added {provider_id}. Pick one of its models to start.");
+    };
+    match runtime::set_model(&prepared.runtime, catalog, &reference) {
+        Ok(model) => format!(
+            "Added {provider_id}. Using {}/{}; /model switches to another model.",
+            model.provider, model.id
+        ),
+        Err(error) => format!(
+            "Added {provider_id}, but {reference} could not be selected: {error}. Pick a model to start."
+        ),
+    }
 }
 
 fn login_flow_available(provider_id: &str) -> bool {
@@ -1825,7 +1950,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Add an OAuth or API-key provider (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -1898,16 +2023,22 @@ fn dispatch_runtime_slash_command<'a>(
         }
         "/model" if rest.is_empty() => {
             let choices = configured_model_references(catalog);
-            append_view_message(
-                view,
-                MessageRole::Command,
-                if choices.is_empty() {
-                    "No authenticated models are available. Run `goshcoder auth set <provider>` outside the fullscreen interface, then reopen chat."
-                        .to_owned()
-                } else {
-                    format!("Available models:\n{}", choices.join("\n"))
-                },
-            );
+            if choices.is_empty() {
+                append_view_message(view, MessageRole::Command, NO_MODEL_PICKER_EMPTY);
+                if fullscreen {
+                    app.set_input("/login ");
+                }
+            } else if fullscreen {
+                // Bare `/model` opens the picker, as it does in pi; the
+                // argument palette lists every authenticated model.
+                app.set_input("/model ");
+            } else {
+                append_view_message(
+                    view,
+                    MessageRole::Command,
+                    format!("Available models:\n{}", choices.join("\n")),
+                );
+            }
             CommandDispatch::Handled
         }
         "/model" => {
@@ -2300,7 +2431,7 @@ fn dispatch_runtime_slash_command<'a>(
             }
             CommandDispatch::Handled
         }
-        "/login" => dispatch_login_command(view, catalog, rest),
+        "/login" => dispatch_login_command(app, view, prepared, catalog, rest, fullscreen),
         "/omni" => dispatch_omni_command(view, catalog, rest),
         "/aperture" => dispatch_aperture_command(view, catalog, rest),
         _ if command.starts_with('/') => {
@@ -2951,12 +3082,7 @@ fn refresh_runtime_app(
     app.replace_messages(messages);
     app.streaming = state.is_streaming || view.turn_pending;
     app.set_recording_active(prepared.runtime.recording());
-    app.title = format!(
-        "v{}  ·  {}/{}",
-        ui_version(),
-        state.model.provider,
-        state.model.id
-    );
+    app.title = format!("v{}  ·  {}", ui_version(), model_label(&state.model));
     app.status = interactive_status(view, app.streaming || view.background.is_some());
     app.sidebar = runtime_sidebar(prepared, &state, view);
 }
@@ -2997,7 +3123,7 @@ fn palette_suggestions(
         return view
             .model_choices
             .get_or_insert_with(|| {
-                interactive_models(catalog)
+                let choices = interactive_models(catalog)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|model| state::Suggestion {
@@ -3006,7 +3132,19 @@ fn palette_suggestions(
                         value: format!("/model {}/{}", model.provider, model.id),
                         execute: true,
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    // An empty picker is a dead end; steer to the login
+                    // picker instead.
+                    vec![state::Suggestion {
+                        label: "/login".to_owned(),
+                        description: "No authenticated models yet; add a provider".to_owned(),
+                        value: "/login ".to_owned(),
+                        execute: false,
+                    }]
+                } else {
+                    choices
+                }
             })
             .clone();
     }
@@ -3022,7 +3160,9 @@ fn palette_suggestions(
                         .any(|model| providers::supports_api(&model.api))
                 })
                 .map(|provider| state::Suggestion {
-                    description: if login_flow_available(&provider.id) {
+                    description: if let Some(setup) = gateway_setup_command(&provider.id) {
+                        format!("{}  ·  gateway, see {setup}", provider.name)
+                    } else if login_flow_available(&provider.id) {
                         format!("{}  ·  OAuth / subscription", provider.name)
                     } else {
                         format!("{}  ·  API key", provider.name)
@@ -3325,7 +3465,7 @@ fn runtime_sidebar(
     );
     let mut lines = vec![
         state::SidebarLine::title(name),
-        state::SidebarLine::accent(format!("{}/{}", state.model.provider, state.model.id)),
+        state::SidebarLine::accent(model_label(&state.model)),
         state::SidebarLine::meta(format!("{} thinking · {mode}", state.thinking_level)),
         state::SidebarLine::meta(storage),
         state::SidebarLine::blank(),
@@ -3426,6 +3566,23 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
         state.model.id,
         state.thinking_level,
     )
+}
+
+/// First-run guidance shown when chat opens without an authenticated provider.
+const NO_MODEL_WELCOME: &str = "Welcome to GoshCoder. No provider is authenticated yet.\nPick one from the list below and press Enter to log in (OAuth providers open a browser; the rest ask for an API key).\nAfterwards /model switches models, and Ctrl-L opens the model picker.";
+
+const NO_MODEL_PROMPT_REFUSED: &str = "No model is selected yet. Choose a provider with /login first; the first login also selects a model.";
+
+const NO_MODEL_PICKER_EMPTY: &str =
+    "No authenticated models are available yet. Use /login to add a provider.";
+
+/// `provider/id`, or a placeholder for the unselected model.
+fn model_label(model: &llm::Model) -> String {
+    if runtime::model_is_selected(model) {
+        format!("{}/{}", model.provider, model.id)
+    } else {
+        "no model selected".to_owned()
+    }
 }
 
 fn configured_model_references(catalog: &catalog::Catalog) -> Vec<String> {
@@ -3572,6 +3729,33 @@ mod tests {
             thinking_level: String::new(),
             reason: String::new(),
         }
+    }
+
+    #[test]
+    fn unknown_commands_suggest_the_nearest_subcommand() {
+        assert_eq!(
+            unknown_command_message("provider"),
+            "unknown command \"provider\"; did you mean `goshcoder providers`? Run `goshcoder help` for usage"
+        );
+        assert!(unknown_command_message("sessionss").contains("`goshcoder sessions`"));
+        assert_eq!(
+            unknown_command_message("bogus"),
+            "unknown command \"bogus\"; run `goshcoder help` for usage"
+        );
+    }
+
+    #[test]
+    fn the_unselected_model_is_labelled_instead_of_rendering_a_bare_slash() {
+        assert_eq!(
+            model_label(&runtime::unselected_model()),
+            "no model selected"
+        );
+        let model = llm::Model {
+            provider: "anthropic".to_owned(),
+            id: "claude-sonnet-5".to_owned(),
+            ..llm::Model::default()
+        };
+        assert_eq!(model_label(&model), "anthropic/claude-sonnet-5");
     }
 
     #[test]
