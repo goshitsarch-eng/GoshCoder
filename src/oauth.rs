@@ -4436,13 +4436,20 @@ mod tests {
                 .expect("client read timeout");
             let mut response = Vec::new();
             let mut buffer = [0_u8; 1024];
-            for byte in b"GET /callback?code=x&state=state HTTP/1.1"
+            let mut bytes = b"GET /callback?code=x&state=state HTTP/1.1"
                 .iter()
                 .cycle()
-                .take(200)
-            {
-                if stream.write_all(&[*byte]).is_err() {
-                    break;
+                .take(200);
+            let mut idle_reads = 0;
+            loop {
+                // Once the reply starts, stop trickling: on Windows a write
+                // after the server's close fails at once and would cut the
+                // read short, whereas Linux buffers it.
+                if response.is_empty() {
+                    match bytes.next() {
+                        Some(byte) if stream.write_all(&[*byte]).is_ok() => {}
+                        _ => break,
+                    }
                 }
                 match stream.read(&mut buffer) {
                     Ok(0) => break,
@@ -4451,7 +4458,13 @@ mod tests {
                         if matches!(
                             error.kind(),
                             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                        ) => {}
+                        ) =>
+                    {
+                        idle_reads += 1;
+                        if idle_reads > 100 {
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
                 if response.windows(4).any(|window| window == b"\r\n\r\n") {
