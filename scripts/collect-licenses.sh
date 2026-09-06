@@ -54,8 +54,18 @@ while pending:
     node = nodes.get(package_id, {})
     pending.extend(node.get("dependencies", []))
 
-notice_names = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*")
+# Matched case-insensitively: the microsoft/windows-rs crates ship
+# `license-mit` and `license-apache-2.0`, in lowercase.
+notice_prefixes = ("license", "licence", "copying", "notice")
 missing = []
+
+
+def offers_mit(expression):
+    """Whether an SPDX expression lets the recipient choose MIT."""
+    choices = re.split(r"\s+OR\s+|/", expression.strip(), flags=re.IGNORECASE)
+    return any(choice.strip().upper() == "MIT" for choice in choices)
+
+
 index = []
 exceptions_root = pathlib.Path("scripts/license-exceptions")
 
@@ -77,16 +87,20 @@ for package_id in sorted(reachable):
         if declared_path.is_file():
             candidates.append(declared_path)
     if not candidates:
-        for pattern in notice_names:
-            candidates.extend(path for path in package_root.glob(pattern) if path.is_file())
+        candidates.extend(
+            path
+            for path in package_root.iterdir()
+            if path.is_file() and path.name.lower().startswith(notice_prefixes)
+        )
     if not candidates:
         exception = exceptions_root / package["name"]
         if exception.is_dir():
             candidates.extend(path for path in exception.iterdir() if path.is_file())
-    if not candidates and package.get("license", "").strip() == "MIT":
-        # A few workspace-published crates declare plain SPDX MIT but omit a
-        # copied notice file from the crate archive. Pair the standard text
-        # with package metadata below rather than silently omitting the crate.
+    if not candidates and offers_mit(package.get("license", "")):
+        # A few workspace-published crates declare SPDX MIT (alone or as one
+        # side of a dual licence) but omit a copied notice file from the
+        # crate archive. Pair the standard text with package metadata below
+        # rather than silently omitting the crate.
         standard_mit = exceptions_root / "MIT" / "LICENSE"
         if standard_mit.is_file():
             candidates.append(standard_mit)
