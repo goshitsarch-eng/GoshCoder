@@ -1962,6 +1962,9 @@ mod tests {
         assert_eq!(state.status, LoopStatus::Active);
         assert_eq!(state.iteration, 1);
         assert_eq!(state.summary(), "my_loop: ▶ active (iteration 1/5)");
+        // The store keeps canonical paths; the temp directory is a symlink on
+        // macOS and an 8.3 short name on Windows, so compare like with like.
+        let workspace = crate::tools::canonicalize(&workspace).expect("canonical workspace");
         assert!(
             store
                 .state_path("my_loop", false)
