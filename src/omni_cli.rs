@@ -17,9 +17,10 @@ use crate::{
     provider_cli::read_secret,
 };
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(4);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(omniroute::HEALTH_TIMEOUT_SECS);
+const TEST_TIMEOUT: Duration = Duration::from_secs(omniroute::TEST_TIMEOUT_SECS);
 
-/// Executes `goshcoder omni [status|sync|setup|dashboard]`.
+/// Executes `goshcoder omni [status|setup|sync|models|test|dashboard|config|help]`.
 pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let output = execute(arguments)?;
     if !output.is_empty() {
@@ -42,32 +43,48 @@ pub fn needs_terminal(arguments: &[String]) -> bool {
 /// can reach a terminal.
 pub fn execute(arguments: &[String]) -> Result<String, Box<dyn Error>> {
     let command = omniroute::CliCommand::parse(arguments)?;
-    let transport = ReqwestTransport::new(HEALTH_TIMEOUT)?;
+    let timeout = match command {
+        omniroute::CliCommand::Test(_) => TEST_TIMEOUT,
+        _ => HEALTH_TIMEOUT,
+    };
+    let transport = ReqwestTransport::new(timeout)?;
     let output = match command {
-        omniroute::CliCommand::Status => {
-            let key = resolved_key().unwrap_or_default();
-            let report = omniroute::status_command(config::omni_route_path(), &key, &transport)?;
-            if report.configured && key.is_empty() {
-                return Err(command_error(
-                    "OmniRoute credentials are missing; run `goshcoder omni setup`",
-                ));
-            }
-            report.render()
-        }
-        omniroute::CliCommand::Dashboard => {
-            omniroute::dashboard_command(config::omni_route_path())?
-        }
-        omniroute::CliCommand::Sync => {
-            let key = resolved_key_required()?;
-            let result = omniroute::sync_command_now(config::omni_route_path(), &key, &transport)?;
-            result.render()
-        }
         omniroute::CliCommand::Setup => setup(&transport)?,
+        command => {
+            let config_path = config::omni_route_path();
+            let url_override = server_url_override();
+            let (api_key, credential_source) = resolved_key()?;
+            let context = omniroute::CommandContext {
+                config_path: &config_path,
+                url_override: url_override.as_deref(),
+                api_key: &api_key,
+                credential_source: &credential_source,
+                transport: &transport,
+                synced_at_millis: omniroute::unix_millis_now()?,
+            };
+            omniroute::execute_command(context, command.into())?.render()
+        }
     };
     Ok(output
         .chars()
         .filter(|character| !character.is_control() || *character == '\n')
         .collect())
+}
+
+/// Probes a configured gateway for the session-start check. The error text
+/// is what `/omni status` would show.
+pub fn probe_health(config: &omniroute::Config, api_key: &str) -> Result<(), String> {
+    let transport = ReqwestTransport::new(HEALTH_TIMEOUT).map_err(|error| error.to_string())?;
+    omniroute::Client::new(config.clone(), api_key, &transport)
+        .health()
+        .map_err(|error| error.to_string())
+}
+
+/// `OMNIROUTE_URL`, when set to something other than whitespace.
+fn server_url_override() -> Option<String> {
+    std::env::var(omniroute::ENV_SERVER_URL)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn setup(transport: &ReqwestTransport) -> Result<String, Box<dyn Error>> {
@@ -77,15 +94,30 @@ fn setup(transport: &ReqwestTransport) -> Result<String, Box<dyn Error>> {
             "OmniRoute setup requires an interactive terminal",
         ));
     }
-    eprint!("OmniRoute URL [{}]: ", omniroute::DEFAULT_SERVER_URL);
+    let current = omniroute::Config::load(config::omni_route_path())
+        .map(|config| config.server_url)
+        .unwrap_or_else(|_| omniroute::DEFAULT_SERVER_URL.to_owned());
+    eprint!("OmniRoute URL [{current}]: ");
     io::stderr().flush()?;
     let mut url = String::new();
     stdin.lock().read_line(&mut url)?;
+    let url = if url.trim().is_empty() {
+        current
+    } else {
+        url.trim().to_owned()
+    };
     let key = read_secret("OmniRoute API key (blank for local/public): ")?;
+    let key = if key.trim().is_empty() {
+        // Keep an already stored key when the prompt is skipped, as the
+        // upstream setup does; the public placeholder is replaced too.
+        stored_key().unwrap_or_default()
+    } else {
+        key
+    };
     let result = omniroute::setup_command(
         config::omni_route_path(),
         omniroute::SetupRequest {
-            server_url: url.trim().to_owned(),
+            server_url: url,
             api_key: key,
             allow_default: true,
         },
@@ -94,25 +126,32 @@ fn setup(transport: &ReqwestTransport) -> Result<String, Box<dyn Error>> {
     let message = result.render();
     config::ensure_agent_dir()?;
     CredentialStore::default_file().put("omni", Credential::api_key(result.credential_to_store))?;
-    Ok(message.to_owned())
+    Ok(message)
 }
 
-fn resolved_key() -> Result<String, Box<dyn Error>> {
+/// The key stored for `omni` in auth.json, unless it is the public
+/// placeholder.
+fn stored_key() -> Option<String> {
+    let catalog = Catalog::with_default_credentials().ok()?;
+    let credentials = catalog.credentials()?;
+    let credential = credentials.read("omni").ok()??;
+    let key = credential.key().trim().to_owned();
+    (!key.is_empty() && key != omniroute::PUBLIC_API_KEY).then_some(key)
+}
+
+/// The key the catalog resolves for `omni` and where it came from. A
+/// configured gateway without a key resolves to the public placeholder, so
+/// an empty key means the gateway is unconfigured.
+fn resolved_key() -> Result<(String, String), Box<dyn Error>> {
     let catalog = Catalog::with_default_credentials()?;
     Ok(catalog
         .resolve_auth("omni")?
-        .and_then(|authentication| authentication.api_key().map(str::to_owned))
+        .and_then(|authentication| {
+            authentication
+                .api_key()
+                .map(|key| (key.to_owned(), authentication.source().to_owned()))
+        })
         .unwrap_or_default())
-}
-
-fn resolved_key_required() -> Result<String, Box<dyn Error>> {
-    let key = resolved_key()?;
-    if key.is_empty() {
-        return Err(command_error(
-            "OmniRoute credentials are missing; run `goshcoder omni setup`",
-        ));
-    }
-    Ok(key)
 }
 
 fn command_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -143,6 +182,7 @@ impl omniroute::HttpTransport for ReqwestTransport {
     ) -> std::result::Result<omniroute::HttpResponse, omniroute::HttpTransportError> {
         let method = match request.method {
             omniroute::HttpMethod::Get => reqwest::Method::GET,
+            omniroute::HttpMethod::Post => reqwest::Method::POST,
         };
         let mut builder = self.client.request(method, &request.url);
         for (name, value) in &request.headers {
@@ -157,9 +197,18 @@ impl omniroute::HttpTransport for ReqwestTransport {
         if let Some(body) = request.body {
             builder = builder.body(body);
         }
-        let response = builder
-            .send()
-            .map_err(|_| omniroute::HttpTransportError::new("request failed"))?;
+        let response = builder.send().map_err(|error| {
+            // The cause is what a user needs to tell a stopped gateway from
+            // a slow one; the error's own text is dropped because reqwest
+            // includes the request URL in it.
+            omniroute::HttpTransportError::new(if error.is_timeout() {
+                "request timed out"
+            } else if error.is_connect() {
+                "connection failed"
+            } else {
+                "request failed"
+            })
+        })?;
         let status = response.status().as_u16();
         let mut body = Vec::new();
         response
@@ -187,7 +236,15 @@ mod tests {
         let transport = ReqwestTransport::new(Duration::from_millis(1)).expect("transport");
         let error = omniroute::HttpTransport::execute(&transport, request)
             .expect_err("connection should fail");
-        assert_eq!(error.message(), "request failed");
+        assert!(
+            matches!(
+                error.message(),
+                "request failed" | "connection failed" | "request timed out"
+            ),
+            "unexpected transport error: {}",
+            error.message()
+        );
+        assert!(!error.message().contains("private"));
     }
 
     #[test]
@@ -248,8 +305,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_has_a_clear_setup_remedy() {
-        let error = command_error("OmniRoute credentials are missing; run `goshcoder omni setup`");
-        assert!(error.to_string().contains("goshcoder omni setup"));
+    fn setup_outside_a_terminal_has_a_clear_remedy() {
+        let error = command_error("OmniRoute setup requires an interactive terminal");
+        assert!(error.to_string().contains("interactive terminal"));
     }
 }

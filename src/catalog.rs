@@ -2497,7 +2497,19 @@ impl Catalog {
         if definition.auth_kind == AuthKind::OAuthOnly {
             return Ok(None);
         }
-        Ok(self.build_api_key_auth(definition, None, ""))
+        let auth = self.build_api_key_auth(definition, None, "");
+        // A configured OmniRoute gateway needs no key: the upstream extension
+        // registers the provider with the public placeholder, so the models
+        // stay in the picker and requests carry that bearer value.
+        if auth.is_none() && provider_id == omniroute::OMNI_PROVIDER_ID && layer.omni.is_some() {
+            return Ok(Some(Auth::with_api_key(
+                omniroute::PUBLIC_API_KEY.to_owned(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                "OmniRoute public gateway",
+            )));
+        }
+        Ok(auth)
     }
 
     /// Reads a stored credential, degrading to ambient resolution when the
@@ -3031,6 +3043,9 @@ pub struct DynamicPaths {
     /// keep further state there (the pi-compatible `mcp.json`).
     pub agent_dir: Option<PathBuf>,
     pub omniroute: Option<PathBuf>,
+    /// `OMNIROUTE_URL`: overrides the server in `omniroute.json`, and stands
+    /// in for the file when there is none, as in the upstream extension.
+    pub omniroute_url: Option<String>,
     pub aperture: Option<PathBuf>,
     pub aperture_cache: Option<PathBuf>,
 }
@@ -3046,23 +3061,32 @@ impl DynamicPaths {
         Self {
             agent_dir: Some(agent_dir.to_path_buf()),
             omniroute: Some(config::omni_route_path_in(agent_dir)),
+            omniroute_url: None,
             aperture: Some(config::aperture_path_in(agent_dir)),
             aperture_cache: Some(config::aperture_cache_path_in(agent_dir)),
         }
     }
 
+    /// Sets (or clears) the `OMNIROUTE_URL` override.
+    #[must_use]
+    pub fn with_omniroute_url(mut self, url: Option<String>) -> Self {
+        self.omniroute_url = url.filter(|url| !url.trim().is_empty());
+        self
+    }
+
     fn from_environment(environment: &EnvironmentLookup) -> Self {
+        let omniroute_url = environment_value(environment, omniroute::ENV_SERVER_URL);
         let override_dir = environment_value(environment, config::ENV_AGENT_DIR);
         let home = environment_value(environment, "HOME")
             .or_else(|| environment_value(environment, "USERPROFILE"));
         if override_dir.is_none() && home.is_none() {
-            return Self::disabled();
+            return Self::disabled().with_omniroute_url(omniroute_url);
         }
         let agent_dir = config::agent_dir_from(
             override_dir.as_deref().map(OsStr::new),
             home.as_deref().map(Path::new),
         );
-        Self::for_agent_dir(&agent_dir)
+        Self::for_agent_dir(&agent_dir).with_omniroute_url(omniroute_url)
     }
 
     fn fingerprint(&self) -> DynamicFingerprint {
@@ -3109,19 +3133,20 @@ fn build_dynamic_layer(
 ) -> DynamicLayer {
     // Unconfigured and malformed both leave the catalog untouched; the
     // `/omni` and `/aperture` commands surface malformed files explicitly.
-    let omni = paths
-        .omniroute
-        .as_deref()
-        .and_then(|path| omniroute::Config::load(path).ok())
-        .map(|config| GatewayModels {
-            base_url: config.api_base_url(),
-            models: config
-                .live_catalog()
-                .models
-                .iter()
-                .map(omni_live_model)
-                .collect(),
-        });
+    let omni = match (paths.omniroute.as_deref(), paths.omniroute_url.as_deref()) {
+        (Some(path), url) => omniroute::Config::load_effective(path, url).ok(),
+        (None, Some(url)) => omniroute::Config::new(url).ok(),
+        (None, None) => None,
+    }
+    .map(|config| GatewayModels {
+        base_url: config.api_base_url(),
+        models: config
+            .live_catalog()
+            .models
+            .iter()
+            .map(omni_live_model)
+            .collect(),
+    });
     let aperture = paths
         .aperture
         .as_deref()
@@ -3304,13 +3329,20 @@ mod tests {
 
         let omni = catalog.provider("omni").expect("omni provider");
         assert_eq!(omni.base_url, "http://127.0.0.1:20999/v1");
-        assert_eq!(
-            omni.models()
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            ["gpt-x", "chat-only"]
-        );
+        let ids = omni
+            .models()
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let expected = omniroute::AUTO_MODELS
+            .iter()
+            .copied()
+            .chain(["gpt-x", "chat-only"])
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "routing aliases precede the synced models");
+        let auto = catalog.model("omni", "auto/coding").expect("routing alias");
+        assert!(auto.reasoning);
+        assert_eq!(auto.input, ["text", "image"]);
         let chat_only = catalog.model("omni", "chat-only").expect("dynamic lookup");
         assert_eq!(chat_only.api, omniroute::PROMPT_TOOLS_API);
         assert_eq!(chat_only.provider, "omni");
@@ -3329,6 +3361,90 @@ mod tests {
         // any explicit invalidation.
         write_omni_config(&agent_dir, &["gpt-x", "chat-only", "third-model"]);
         assert!(catalog.model("omni", "third-model").is_some());
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn a_configured_omni_gateway_needs_no_key() {
+        let agent_dir = test_directory("omni-public");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let unconfigured = gateway_catalog(&agent_dir, &[]);
+        assert!(
+            unconfigured
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .is_none(),
+            "without omniroute.json the provider stays unconfigured"
+        );
+
+        write_omni_config(&agent_dir, &["gpt-x"]);
+        let public = gateway_catalog(&agent_dir, &[]);
+        let auth = public
+            .resolve_auth("omni")
+            .expect("resolution succeeds")
+            .expect("a configured gateway resolves");
+        assert_eq!(auth.api_key(), Some(omniroute::PUBLIC_API_KEY));
+        let resolved = public.resolve_model("omni/gpt-x").expect("resolves");
+        assert_eq!(resolved.auth.api_key(), Some(omniroute::PUBLIC_API_KEY));
+
+        // A real key, from the environment or auth.json, still wins.
+        let keyed = gateway_catalog(&agent_dir, &[("OMNIROUTE_API_KEY", "secret")]);
+        assert_eq!(
+            keyed
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .and_then(|auth| auth.api_key().map(str::to_owned)),
+            Some("secret".to_owned())
+        );
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn omniroute_url_overrides_the_file_and_stands_in_for_it() {
+        let agent_dir = test_directory("omni-env");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let environment = [
+            (
+                config::ENV_AGENT_DIR,
+                agent_dir.to_str().expect("utf-8 path"),
+            ),
+            (
+                omniroute::ENV_SERVER_URL,
+                "http://gateway.internal:20128/v1/",
+            ),
+        ];
+        let catalog = test_catalog(&environment);
+        assert_eq!(
+            catalog.dynamic_paths().omniroute_url.as_deref(),
+            Some("http://gateway.internal:20128/v1/")
+        );
+
+        // No file yet: the override alone configures the provider with the
+        // routing aliases, exactly like the extension with OMNIROUTE_URL set.
+        let omni = catalog.provider("omni").expect("omni provider");
+        assert_eq!(omni.base_url, "http://gateway.internal:20128/v1");
+        assert_eq!(omni.models().len(), omniroute::AUTO_MODELS.len());
+        assert!(
+            catalog
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .is_some()
+        );
+
+        // With a file, the models come from it but the server is overridden.
+        write_omni_config(&agent_dir, &["gpt-x"]);
+        let model = catalog.model("omni", "gpt-x").expect("synced model");
+        assert_eq!(model.base_url, "http://gateway.internal:20128/v1");
+
+        let without_home = test_catalog(&[(omniroute::ENV_SERVER_URL, "http://gw:1")]);
+        assert_eq!(
+            without_home
+                .provider("omni")
+                .expect("omni provider")
+                .base_url,
+            "http://gw:1/v1",
+            "the override works even when no agent directory can be derived"
+        );
         fs::remove_dir_all(&agent_dir).ok();
     }
 

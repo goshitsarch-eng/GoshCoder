@@ -96,9 +96,13 @@ catalog is read on demand instead, so the equivalent is a **dynamic layer**
 computed from the integrations' files and cached by their modification time
 and size (`DynamicPaths`/`DynamicLayer` in `catalog.rs`):
 
-- `omni` takes its base URL and models from `omniroute.json`; a model whose
+- `omni` takes its base URL and models from `omniroute.json` (or from
+  `OMNIROUTE_URL`, which overrides the file and stands in for a missing one);
+  the seven routing aliases are prepended, a configured gateway resolves to
+  the `omniroute-public` placeholder when no key is stored, and a model whose
   `toolCalling` is false gets the `omni-prompt-tools` API and is served by
-  the prompt-emulated protocol.
+  the prompt-emulated protocol. Session start probes a configured gateway in
+  the background and reports an unreachable one as a notice.
 - The dedicated `aperture` provider serves the synchronized
   `extensions/aperture-cache.json`, so models load instantly even offline; a
   cache built for another gateway or selection is ignored.

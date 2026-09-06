@@ -797,6 +797,9 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/quit", "Exit GoshCoder", true),
     ];
 
+    if let Some(suggestions) = subcommand_suggestions(input) {
+        return suggestions;
+    }
     if !input.starts_with('/') || input.chars().any(char::is_whitespace) {
         return Vec::new();
     }
@@ -815,6 +818,68 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
             execute: *execute,
         })
         .collect()
+}
+
+/// Static subcommand completion for the gateway commands. The word is
+/// completed in place; subcommands that take an argument keep the cursor in
+/// the input, the rest run on selection.
+fn subcommand_suggestions(input: &str) -> Option<Vec<Suggestion>> {
+    /// A subcommand word, its description, and whether it runs on selection.
+    type Word = (&'static str, &'static str, bool);
+    const GATEWAYS: &[(&str, &[Word])] = &[
+        (
+            "/omni ",
+            &[
+                ("status", "Check the gateway and show the setup", true),
+                ("setup", "Configure server URL and API key", true),
+                ("sync", "Sync models into the /model picker", true),
+                ("models", "Browse models, optionally filtered", false),
+                ("test", "Smoke-test a model through the gateway", false),
+                ("dashboard", "Show the OmniRoute dashboard URL", true),
+                ("config", "Show config paths and settings", true),
+                ("help", "Show the OmniRoute commands", true),
+            ],
+        ),
+        (
+            "/aperture ",
+            &[
+                ("status", "Show gateway and cached configuration", true),
+                ("onboarding", "Configure an Aperture gateway", true),
+                ("settings", "Show or change configuration settings", false),
+                ("sync", "Refresh the gateway model snapshot", true),
+                ("providers", "List gateway providers and routing APIs", true),
+                ("connectors", "List gateway connector tools", true),
+                ("pin", "Pin a connector tool for the next session", false),
+                ("unpin", "Remove a pinned connector tool", false),
+                ("help", "Show the Aperture commands", true),
+            ],
+        ),
+    ];
+    let lowered = input.to_lowercase();
+    let (prefix, words) = GATEWAYS
+        .iter()
+        .find(|(prefix, _)| lowered.starts_with(prefix))?;
+    let typed = lowered[prefix.len()..].trim_start();
+    if typed.contains(char::is_whitespace) {
+        // The subcommand is complete; its argument is free text.
+        return Some(Vec::new());
+    }
+    Some(
+        words
+            .iter()
+            .filter(|(word, _, _)| word.starts_with(typed))
+            .map(|(word, description, execute)| Suggestion {
+                label: (*word).to_owned(),
+                description: (*description).to_owned(),
+                value: if *execute {
+                    format!("{prefix}{word}")
+                } else {
+                    format!("{prefix}{word} ")
+                },
+                execute: *execute,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -970,5 +1035,25 @@ mod tests {
             app.handle_key(key(KeyCode::Enter)),
             Action::Submit("/help".to_owned())
         );
+    }
+
+    #[test]
+    fn gateway_subcommands_complete_in_place() {
+        let all = suggestions_for("/omni ");
+        assert_eq!(all.len(), 8);
+        assert_eq!(all[0].value, "/omni status");
+        assert!(all[0].execute);
+        let models = suggestions_for("/omni mo");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].value, "/omni models ");
+        assert!(!models[0].execute, "models takes an optional search");
+        assert!(
+            suggestions_for("/omni test auto").is_empty(),
+            "an argument is free text"
+        );
+        let pin = suggestions_for("/aperture PI");
+        assert_eq!(pin.len(), 1);
+        assert_eq!(pin[0].value, "/aperture pin ");
+        assert!(suggestions_for("/omni").iter().any(|s| s.value == "/omni "));
     }
 }

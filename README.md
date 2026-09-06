@@ -246,16 +246,26 @@ is recorded in [`NOTICE`](NOTICE).
   The package's `fetch_content`, `get_search_content`, `source_check`, browser
   curator, video/PDF handling, and providers not listed above are not ported.
 - [`omniroute-agent-extension`](https://github.com/md-riaz/omniroute-agent-extension)
-  by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation, written against
-  the package when it was named `omniroute-pi-ext-integration`): `/omni
-  setup` validates and stores a local or remote gateway, `/omni sync` imports
-  `/v1/models` into GoshCoder's live `/model`/Ctrl+P picker, `/omni status`
-  checks health, and `/omni dashboard` reports the management URL. Synchronized
-  context, output, reasoning, vision, and native-tool metadata are retained.
-  Web/chat-only models use the package version 2.0.1 buffered `<tool_call>`
-  prompt adapter and are converted back into normal agent tool events. Config
-  is in `omniroute.json`; its API key stays independently in `auth.json` or
-  `OMNIROUTE_API_KEY`.
+  by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation of the current
+  `shared.ts` extension core): `/omni setup` validates a local or remote
+  gateway, stores it, and imports `/v1/models`; `/omni sync` re-imports them
+  into GoshCoder's live `/model`/Ctrl+P picker; `/omni status` probes health
+  (10 s, two attempts, like the extension); `/omni models [search]` browses
+  the gateway's list grouped by vendor; `/omni test <model>` smoke-tests
+  `/v1/chat/completions`; `/omni dashboard` and `/omni config` report the
+  management URL and the effective settings. The routing aliases (`auto`,
+  `auto/coding`, `auto/fast`, `auto/cheap`, `auto/offline`, `auto/smart`,
+  `auto/lkgp`) always precede the synchronized models, whose context, output,
+  reasoning, and vision metadata are retained. Every model uses native
+  tool calling, as upstream does; setting `toolCalling: false` on a model in
+  `omniroute.json` opts it into the buffered `<tool_call>` prompt adapter
+  (package version 2.0.1), whose calls are converted back into normal agent
+  tool events. A configured gateway needs no key: requests then carry the
+  extension's `omniroute-public` placeholder. Config is in `omniroute.json`;
+  `OMNIROUTE_URL` overrides (or stands in for) it and the API key stays
+  independently in `auth.json` or `OMNIROUTE_API_KEY`. Not ported: the
+  `/omni log` connection log, `OMNIROUTE_PROVIDER_NAME` (the provider is
+  always `omni`), and the `omniroute_status`/`omniroute_sync` agent tools.
 - [`@narumitw/pi-btw`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw)
   by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
   context-aware side thread without adding the question or answer to the main

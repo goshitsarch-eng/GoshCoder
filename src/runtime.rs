@@ -16,7 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
+    ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -632,6 +633,7 @@ pub fn prepare_session(
         desktop,
     };
     prepared.aperture_session_start();
+    prepared.omni_session_start();
     Ok(prepared)
 }
 
@@ -681,6 +683,48 @@ impl PreparedSession {
     ///
     /// The networked refresh must not block startup: the cached catalog keeps
     /// models loading instantly (even offline), and this revalidates it.
+    /// Mirrors the OmniRoute extension's session-start check: a configured
+    /// gateway is probed off the UI thread and an unreachable one is reported
+    /// once, with the remedy. Nothing is said when OmniRoute is not set up.
+    fn omni_session_start(&self) {
+        let paths = self.catalog.dynamic_paths().clone();
+        let loaded = match (paths.omniroute.as_deref(), paths.omniroute_url.as_deref()) {
+            (Some(path), url) => omniroute::Config::load_effective(path, url),
+            (None, Some(url)) => omniroute::Config::new(url),
+            (None, None) => return,
+        };
+        let notices = self.runtime.notice_sender();
+        let configuration = match loaded {
+            Ok(configuration) => configuration,
+            Err(error) if error.is_not_found() => return,
+            Err(error) => {
+                notices.push("omni", error.to_string());
+                return;
+            }
+        };
+        let api_key = self
+            .catalog
+            .resolve_auth(omniroute::OMNI_PROVIDER_ID)
+            .ok()
+            .flatten()
+            .and_then(|auth| auth.api_key().map(str::to_owned))
+            .unwrap_or_default();
+        thread::Builder::new()
+            .name("omni-session-start".to_owned())
+            .spawn(move || {
+                if let Err(error) = omni_cli::probe_health(&configuration, &api_key) {
+                    notices.push(
+                        "omni",
+                        format!(
+                            "OmniRoute unreachable at {}: {error}. Run /omni sync after reconnecting.",
+                            configuration.server_url
+                        ),
+                    );
+                }
+            })
+            .ok();
+    }
+
     fn aperture_session_start(&self) {
         let paths = self.catalog.dynamic_paths().clone();
         let (Some(config_path), Some(cache_path)) = (paths.aperture, paths.aperture_cache) else {

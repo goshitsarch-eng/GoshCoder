@@ -1721,7 +1721,7 @@ fn login_flow_available(provider_id: &str) -> bool {
     })
 }
 
-/// `/omni [status|sync|setup|dashboard]`. Setup prompts for a URL and key,
+/// `/omni [status|setup|sync|models|test|dashboard|config|help]`. Setup prompts for a URL and key,
 /// so it owns the terminal; the rest talk to the gateway off the UI thread.
 fn dispatch_omni_command<'a>(
     view: &mut InteractiveView,
@@ -1740,7 +1740,7 @@ fn dispatch_omni_command<'a>(
         return CommandDispatch::Suspended(Box::new(move || {
             run_self_subprocess(&["omni", "setup"])?;
             catalog.refresh_dynamic();
-            Ok("OmniRoute setup complete. Run /omni sync.".to_owned())
+            Ok("OmniRoute setup finished; its models are available under /model. Use /omni status to verify the gateway.".to_owned())
         }));
     }
     let label = format!("/omni {rest}").trim_end().to_owned();
