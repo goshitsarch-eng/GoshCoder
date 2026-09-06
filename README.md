@@ -272,12 +272,14 @@ is recorded in [`NOTICE`](NOTICE).
   by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
   context-aware side thread without adding the question or answer to the main
   transcript. The fullscreen side UI supports follow-ups, queued Steering,
-  in-memory resume, independent model/thinking settings in `pi-btw.json`,
+  resume, independent model/thinking settings in `pi-btw.json`,
   Shift+Tab thinking changes, scrolling, cancellation, and Ctrl+R to bring the
   latest Q&A into the editable main composer. GoshCoder requires the main agent
   to be idle before opening BTW rather than rendering both agents concurrently.
   `/btw` lists retained threads;
-  `/btw resume <id> <question>` resumes one. The original's exact character/
+  `/btw resume <id> <question>` resumes one. Unlike the original, threads are
+  saved with the session (as `goshcoder.btw` custom entries, the newest 50)
+  and come back with `-continue` or `/resume`. The original's exact character/
   line range selector and nested bring-preview menus are not ported; native
   line mode offers deterministic `latest`, `all`, and `from:N` export instead.
 - [`@tmustier/pi-ralph-wiggum`](https://github.com/tmustier/pi-extensions) by Thomas
@@ -463,8 +465,6 @@ rerun the gate before releases.
   `-no-session` and a `run` without `-continue` do not persist it. Two windows
   in one repository now have independent plan modes; `-continue` restores the
   phase along with the transcript.
-- BTW side threads are still memory-only. Closing a window discards them even
-  though the main conversation is saved.
 
 ## Deviations from pi
 
