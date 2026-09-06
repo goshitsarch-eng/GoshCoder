@@ -77,7 +77,8 @@ make check      # the Rust gate: rustfmt, cargo check, Clippy, and tests
 ```
 
 `make help` lists every target. `make dist` cross-compiles release archives for
-Linux, macOS, and Windows on amd64 and arm64, with checksums.
+Linux and macOS on amd64 and arm64 and for Windows on amd64 (Windows on ARM
+runs that build under emulation), with checksums.
 
 **First run**
 
