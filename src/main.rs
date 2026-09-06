@@ -940,11 +940,20 @@ fn event_loop(
                     if let Some(thread) = view.pending_btw_thread.as_deref() {
                         let _ = prepared.btw.cancel(thread);
                     }
+                    // pi restores queued messages to the editor before the
+                    // abort, so nothing queued runs after the interrupted
+                    // turn and no text is lost.
+                    let restored =
+                        restore_queued_messages_to_editor(&mut app, prepared.runtime.agent());
                     prepared.runtime.agent().abort();
                     if let Some(planner) = prepared.planner.as_ref() {
                         planner.abort_review();
                     }
-                    view.activity = "Aborting".to_owned();
+                    view.activity = if restored > 0 {
+                        format!("Aborting; {restored} queued message(s) restored to the editor")
+                    } else {
+                        "Aborting".to_owned()
+                    };
                 }
                 Action::CycleModel { direction } => {
                     match cycle_interactive_model(&prepared.runtime, catalog, direction) {
@@ -2971,6 +2980,31 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
     result
 }
 
+/// Moves every queued steering and follow-up message back into the editor,
+/// ahead of whatever was being typed, and returns how many there were.
+fn restore_queued_messages_to_editor(app: &mut App, agent: &agent::Agent) -> usize {
+    let queued = agent
+        .take_queued_messages()
+        .iter()
+        .filter_map(|message| match message {
+            llm::Message::User(user) => Some(user_message_text(user)),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if queued.is_empty() {
+        return 0;
+    }
+    let count = queued.len();
+    let mut parts = queued;
+    let current = app.input.trim();
+    if !current.is_empty() {
+        parts.push(current.to_owned());
+    }
+    app.set_input(&parts.join("\n\n"));
+    count
+}
+
 fn user_message_text(message: &llm::UserMessage) -> String {
     match &message.content {
         llm::UserContent::Text(text) => text.clone(),
@@ -3364,6 +3398,22 @@ mod tests {
             thinking_level: String::new(),
             reason: String::new(),
         }
+    }
+
+    #[test]
+    fn aborting_restores_queued_messages_to_the_editor_ahead_of_the_draft() {
+        let agent = agent::Agent::new(agent::AgentOptions::default());
+        let mut app = App::new();
+        assert_eq!(restore_queued_messages_to_editor(&mut app, &agent), 0);
+        assert!(app.input.is_empty());
+
+        agent.steer(llm::Message::User(llm::UserMessage::text("steer this", 1)));
+        agent.follow_up(llm::Message::User(llm::UserMessage::text("then this", 2)));
+        agent.follow_up(llm::Message::User(llm::UserMessage::text("   ", 3)));
+        app.set_input("half-typed draft");
+        assert_eq!(restore_queued_messages_to_editor(&mut app, &agent), 2);
+        assert_eq!(app.input, "steer this\n\nthen this\n\nhalf-typed draft");
+        assert!(!agent.has_queued_messages());
     }
 
     #[test]

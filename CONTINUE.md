@@ -188,6 +188,20 @@ regression tests. The ones worth knowing about when reading the code:
 - Loopback servers (OAuth callback, planner review) survive a malformed or
   reset connection, keep a per-connection deadline, and never lose a decision
   to a failed response write.
+- Provider streams have a connect timeout and pi's 300 s idle read deadline
+  rather than a whole-request timeout; every protocol replays history through
+  one transform (error and aborted turns skipped, missing tool results
+  synthesized, cross-model ids and thinking normalized); cancellation
+  publishes the exact partial message even while a socket read is blocked.
+- A stored OAuth credential whose refresh failed is remembered by fingerprint,
+  so a login completed by another process is honoured without a restart, and
+  an unreadable `auth.json` is reported instead of silently ignored.
+- Gateway clients never follow a redirect with a credential attached,
+  connector tool names must fit the provider grammar, and MCP replies are
+  found by request id even when the gateway interleaves notifications.
+- Escape restores queued steering and follow-up messages to the editor
+  before aborting, as pi's interactive mode does, so nothing queued runs
+  after an interrupted turn.
 
 Anything an audit found that was not fixed is recorded in the README's
 **Known gaps**.

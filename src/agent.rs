@@ -737,6 +737,16 @@ impl Agent {
         state.follow_ups.clear();
     }
 
+    /// Empties both queues and returns what they held, steering first, so an
+    /// interface can hand the text back to the user on abort (pi's
+    /// `clearQueue`) instead of letting it run after the interrupted turn.
+    pub fn take_queued_messages(&self) -> Vec<llm::Message> {
+        let mut state = lock(&self.inner.state);
+        let mut messages = std::mem::take(&mut state.steering);
+        messages.append(&mut state.follow_ups);
+        messages
+    }
+
     pub fn has_queued_messages(&self) -> bool {
         let state = lock(&self.inner.state);
         !state.steering.is_empty() || !state.follow_ups.is_empty()
@@ -2210,6 +2220,33 @@ mod tests {
         );
         assert!(!state.is_streaming);
         assert!(!agent.has_queued_messages());
+    }
+
+    #[test]
+    fn taking_the_queues_returns_steering_before_follow_ups_and_empties_both() {
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            ..AgentOptions::default()
+        });
+        agent.follow_up(user("later"));
+        agent.steer(user("now"));
+        assert_eq!(agent.queued_message_count(), 2);
+        let taken = agent.take_queued_messages();
+        assert_eq!(
+            taken
+                .iter()
+                .filter_map(|message| match message {
+                    llm::Message::User(user) => user.content.text().map(str::to_owned),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["now", "later"]
+        );
+        assert!(!agent.has_queued_messages());
+        assert!(agent.take_queued_messages().is_empty());
     }
 
     #[test]
