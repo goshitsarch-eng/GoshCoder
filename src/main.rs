@@ -80,13 +80,12 @@ Usage:
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
-The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
-model, credential, and context-compaction foundations are active. `run`
-supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
-`openai-codex-responses`, `anthropic-messages`, `google-generative-ai`, and
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`;
-the remaining provider extensions and interactive commands are still being
-migrated from the previous implementation.
+`run` and `chat` speak `openai-completions`, `openai-responses`,
+`azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`,
+`google-generative-ai`, `google-vertex`, `mistral-conversations`,
+`bedrock-converse-stream`, and the OmniRoute prompt-tools adapter. Gateways:
+`omni setup` or OMNIROUTE_URL for OmniRoute, `aperture onboarding` for
+Tailscale Aperture. Type /help inside chat for the slash commands.
 "#;
 
 fn main() {
