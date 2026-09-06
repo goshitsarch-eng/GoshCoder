@@ -118,6 +118,8 @@ goshcoder chat -resume
 goshcoder sessions list
 goshcoder sessions show <id>
 goshcoder sessions export <id> --md notes.md
+goshcoder sessions export <id> transcript.html   # self-contained page, no scripts
+goshcoder sessions share <id> --yes              # secret GitHub gist through gh
 
 # Keep a prompt you refined, and carry your collection between machines
 goshcoder prompts list
@@ -461,11 +463,6 @@ rerun the gate before releases.
   `-no-session` and a `run` without `-continue` do not persist it. Two windows
   in one repository now have independent plan modes; `-continue` restores the
   phase along with the transcript.
-- HTML export and `/share` are not implemented, and are not planned. pi's HTML
-  export inlines roughly 165 KB of vendored JavaScript into every output file;
-  `sessions export --md` writes Markdown instead. `/share` would mean sending a
-  file that by construction contains everything the agent read to a third-party
-  host.
 - BTW side threads are still memory-only. Closing a window discards them even
   though the main conversation is saved.
 
@@ -506,8 +503,17 @@ Documented at the top of each ported file. The notable ones:
   the entry tree, resume, branching, fork/clone, labels, and JSONL/Markdown
   export and import. pi's older v1 and v2 files are read and migrated in memory;
   they are never rewritten in place, so continuing one forks it into a v3 file.
-  Pi's HTML export/share, TypeScript plugin host, packages, custom `models.json`
-  loading, LSP, and MCP management are not implemented. See **Known gaps**.
+  `/export` and `sessions export` write JSONL, Markdown, or HTML by output
+  extension; the HTML page is self-contained and script-free (pi's inlines
+  about 165 KB of vendored JavaScript), renders Markdown, thinking, and
+  collapsible tool cards, and its policy blocks every network load, so a
+  transcript that quotes hostile content stays inert. `/share` (and `sessions
+  share --yes`) uploads that page as a secret gist through the GitHub CLI, as
+  pi does, but only after an explicit confirmation that spells out what
+  leaves the machine; `GOSHCODER_SHARE_VIEWER_URL` names a viewer that renders
+  a gist by id, like pi's `PI_SHARE_VIEWER_URL`. Pi's TypeScript plugin host,
+  packages, custom `models.json` loading, LSP, and MCP management are not
+  implemented.
 
   Two deliberate differences inside the format. GoshCoder takes an exclusive
   claim on a session file, which pi does not: two processes appending to one
