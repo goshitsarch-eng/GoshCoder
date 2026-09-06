@@ -13,7 +13,8 @@ make check
 ```
 
 That is the gate CI runs: `fmt-check vet lint test test-hermetic vuln`, on
-Linux, macOS and Windows, followed by a cross-compile of every release target
+Linux, macOS and Windows, followed by a build of every release target (Linux
+and Windows cross-compiled from Linux, the Apple targets natively on macOS)
 and an installer round-trip. Expected: rustfmt clean, `cargo check` clean,
 Clippy clean under `-D warnings`, every test passing, and `cargo audit` quiet
 when it is installed.
@@ -223,8 +224,13 @@ Anything an audit found that was not fixed is recorded in the README's
 
 ## Cutting a release
 
-`.github/workflows/release.yml` publishes the cross-compiled archives and the
-`checksums.txt` both installers verify against. Three ways in, one code path:
+`.github/workflows/release.yml` publishes the release archives and the
+`checksums.txt` both installers verify against. It resolves the tag once, then
+builds on two hosts -- Linux cross-compiles the Linux and Windows archives with
+cargo-zigbuild, macOS builds both Apple archives natively because reqwest's
+rustls backend links the Security framework, which needs the macOS SDK -- and
+a final job merges the archives, writes one checksums file, and publishes.
+Three ways in, one code path:
 
 - **Push a `v*` tag.** The ordinary route.
 - **Push a `release/v*` branch.** `release/v0.5.0` cuts `v0.5.0` from that

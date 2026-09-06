@@ -18,15 +18,22 @@ VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
 # installers derive from a release tag.
 DIST_VERSION := $(VERSION:v%=%)
 
-# Platforms produced by `make dist`. cargo-zigbuild supplies the native C
-# toolchains required to link Rust targets from the release builder. Windows
-# on ARM runs the amd64 build under emulation: stable Rust ships no
-# aarch64-pc-windows-gnu standard library and the MSVC target cannot be
-# linked from the Linux release builder.
-PLATFORMS := \
-	linux/amd64 linux/arm64 \
-	darwin/amd64 darwin/arm64 \
-	windows/amd64
+# Platforms produced by `make dist`, and how. Linux and Windows targets are
+# cross-compiled from a Linux host with cargo-zigbuild, which supplies the C
+# toolchains the linkers need. The Apple targets link the Security and
+# CoreFoundation frameworks (reqwest's rustls backend verifies certificates
+# through the platform), which needs the macOS SDK, so they are built natively
+# on a macOS host with plain cargo; the release workflow runs both hosts and
+# merges the archives. Windows on ARM runs the amd64 build under emulation:
+# stable Rust ships no aarch64-pc-windows-gnu standard library and the MSVC
+# target cannot be linked from Linux.
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+PLATFORMS ?= darwin/amd64 darwin/arm64
+DIST_BUILD ?= build
+else
+PLATFORMS ?= linux/amd64 linux/arm64 windows/amd64
+DIST_BUILD ?= zigbuild
+endif
 
 INSTALL_DIR ?= $(if $(CARGO_INSTALL_ROOT),$(CARGO_INSTALL_ROOT)/bin,$(HOME)/.cargo/bin)
 
@@ -117,11 +124,11 @@ vuln:
 		echo "cargo-audit is not installed; run 'make tools'"; \
 	fi
 
-## dist: cross-compile signed-release archive contents for every platform
+## dist: build release archives for this host's platforms (see PLATFORMS)
 dist: clean-dist
-	@command -v cargo-zigbuild >/dev/null 2>&1 || { \
+	@if [ "$(DIST_BUILD)" = "zigbuild" ] && ! command -v cargo-zigbuild >/dev/null 2>&1; then \
 		echo "cargo-zigbuild is required for cross-platform releases; run 'make tools'"; exit 1; \
-	}
+	fi
 	@mkdir -p dist
 	@for platform in $(PLATFORMS); do \
 		os=$${platform%/*}; arch=$${platform#*/}; \
@@ -137,7 +144,7 @@ dist: clean-dist
 		out="dist/$(BINARY)_$(DIST_VERSION)_$${os}_$${arch}"; \
 		echo "building $$out$$ext"; \
 		CARGO_TARGET_DIR="$(TARGET_DIR)/dist" GOSHCODER_VERSION="$(VERSION)" \
-			$(CARGO) zigbuild --release --locked --target "$$target" --bin "$(BINARY)" || exit 1; \
+			$(CARGO) $(DIST_BUILD) --release --locked --target "$$target" --bin "$(BINARY)" || exit 1; \
 		mkdir -p "$$out"; \
 		cp "$(TARGET_DIR)/dist/$$target/release/$(BINARY)$$ext" "$$out/$(BINARY)$$ext" || exit 1; \
 		cp README.md NOTICE LICENSE "$$out/"; \
