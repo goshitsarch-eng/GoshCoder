@@ -165,8 +165,10 @@ dist-name:
 
 ## checksums: write SHA-256 sums for release archives
 checksums:
-	@cd dist && (sha256sum *.tar.gz *.zip 2>/dev/null || shasum -a 256 *.tar.gz *.zip) \
-		| awk '$$2 != "checksums.txt" && $$2 != "*checksums.txt"' > checksums.txt
+	@cd dist && archives=""; for archive in *.tar.gz *.zip; do \
+		[ -f "$$archive" ] && archives="$$archives $$archive"; done; \
+	[ -n "$$archives" ] || { echo "no release archives in dist/" >&2; exit 1; }; \
+	(sha256sum $$archives 2>/dev/null || shasum -a 256 $$archives) > checksums.txt
 	@echo "wrote dist/checksums.txt"
 
 clean-dist:
