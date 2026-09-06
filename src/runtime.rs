@@ -63,6 +63,10 @@ pub struct SessionConfig {
     /// Distinguishes an explicit `-m` override from a model filled in from
     /// the remembered default. Resuming is allowed to restore the latter.
     pub model_from_flag: bool,
+    /// Lets an interactive session open on [`unselected_model`] when no
+    /// provider is authenticated yet, so the user can log in and pick a model
+    /// from inside the interface instead of being refused at startup.
+    pub allow_unselected_model: bool,
 }
 
 impl Default for SessionConfig {
@@ -87,6 +91,7 @@ impl Default for SessionConfig {
             session_name: None,
             sessions_dir: None,
             model_from_flag: false,
+            allow_unselected_model: false,
         }
     }
 }
@@ -408,21 +413,45 @@ pub fn default_chat_model_reference(
     environment_model: Option<&str>,
     remembered_model: &str,
 ) -> Result<String> {
+    optional_default_chat_model_reference(catalog, environment_model, remembered_model)?.ok_or_else(
+        || {
+            RuntimeError::Catalog(
+                "no authenticated model is available; run `goshcoder auth set <provider>` or set a provider API-key environment variable, then pass -m provider/model"
+                    .to_owned(),
+            )
+        },
+    )
+}
+
+/// [`default_chat_model_reference`] that reports an unconfigured setup as
+/// `Ok(None)` instead of an error, so an interactive frontend can tell "nothing
+/// is authenticated yet" apart from a catalog failure.
+pub fn optional_default_chat_model_reference(
+    catalog: &Catalog,
+    environment_model: Option<&str>,
+    remembered_model: &str,
+) -> Result<Option<String>> {
     if let Some(model) = environment_model
         .map(str::trim)
         .filter(|model| !model.is_empty())
     {
-        return Ok(model.to_owned());
+        return Ok(Some(model.to_owned()));
     }
 
     let remembered = remembered_model.trim();
     if !remembered.is_empty() && catalog.resolve_model(remembered).is_ok() {
-        return Ok(remembered.to_owned());
+        return Ok(Some(remembered.to_owned()));
     }
 
     let configured = catalog
         .configured_provider_ids()
         .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
+    Ok(preferred_model_reference(catalog, &configured))
+}
+
+/// The model a freshly authenticated provider should start on: the curated
+/// defaults first, then the newest model the provider lists.
+pub fn preferred_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
     let preferred = [
         ("openai-codex", "gpt-5.6-sol"),
         ("anthropic", "claude-sonnet-5"),
@@ -433,22 +462,34 @@ pub fn default_chat_model_reference(
         if configured.iter().any(|configured| configured == provider)
             && catalog.model(provider, model).is_some()
         {
-            return Ok(format!("{provider}/{model}"));
+            return Some(format!("{provider}/{model}"));
         }
     }
 
     for provider_id in configured {
-        if let Some(provider) = catalog.provider(&provider_id)
+        if let Some(provider) = catalog.provider(provider_id)
             && let Some(model) = provider.models().last()
         {
-            return Ok(format!("{provider_id}/{}", model.id));
+            return Some(format!("{provider_id}/{}", model.id));
         }
     }
+    None
+}
 
-    Err(RuntimeError::Catalog(
-            "no authenticated model is available; run `goshcoder auth set <provider>` or set a provider API-key environment variable, then pass -m provider/model"
-                .to_owned(),
-    ))
+/// The model an interactive session runs on before any provider is
+/// authenticated. Its empty provider and id keep it out of the session log
+/// (initial settings skip an empty model) and let the frontend hold prompts
+/// back until `/login` and `/model` have chosen a real one.
+pub fn unselected_model() -> llm::Model {
+    llm::Model {
+        name: "no model selected".to_owned(),
+        ..llm::Model::default()
+    }
+}
+
+/// Whether `model` is a real catalog model rather than [`unselected_model`].
+pub fn model_is_selected(model: &llm::Model) -> bool {
+    !model.provider.is_empty() && !model.id.is_empty()
 }
 
 /// Reads process-level default-model sources. It is split from
@@ -484,15 +525,27 @@ pub fn session_options(
     tools: Vec<agent::Tool>,
     responder: Option<agent::AssistantResponder>,
 ) -> Result<SessionOptions> {
-    let model_ref = if config.model_ref.trim().is_empty() {
-        process_default_chat_model_reference(catalog)?
+    let model_ref = if !config.model_ref.trim().is_empty() {
+        Some(config.model_ref.clone())
+    } else if config.allow_unselected_model {
+        let environment_model = env::var("GOSHCODER_MODEL").ok();
+        optional_default_chat_model_reference(
+            catalog,
+            environment_model.as_deref(),
+            &config::read_default_model(),
+        )?
     } else {
-        config.model_ref.clone()
+        Some(process_default_chat_model_reference(catalog)?)
     };
-    let resolved = catalog
-        .resolve_model(&model_ref)
-        .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
-    let (model, _) = resolved.into_parts();
+    let model = match model_ref {
+        Some(model_ref) => {
+            let resolved = catalog
+                .resolve_model(&model_ref)
+                .map_err(|error| RuntimeError::Catalog(error.to_string()))?;
+            resolved.into_parts().0
+        }
+        None => unselected_model(),
+    };
     let thinking_level = stream::clamp_thinking_level(&model, &config.thinking);
 
     Ok(SessionOptions {
@@ -1352,6 +1405,72 @@ mod tests {
         let relative = absolute_workdir(Path::new("./src/..")).expect("relative");
         assert!(relative.is_absolute());
         assert_eq!(relative, crate::sessionlog::absolute_path(Path::new(".")));
+    }
+
+    fn catalog_with_keys(keys: &'static [&'static str]) -> Catalog {
+        Catalog::with_environment(
+            None,
+            Arc::new(move |name| keys.contains(&name).then(|| "test-key".to_owned())),
+        )
+        .expect("catalog")
+    }
+
+    #[test]
+    fn unconfigured_setup_is_reported_as_no_default_model_rather_than_an_error() {
+        let catalog = catalog_with_keys(&[]);
+        assert_eq!(
+            optional_default_chat_model_reference(&catalog, None, "").expect("lookup"),
+            None
+        );
+        let error = default_chat_model_reference(&catalog, None, "")
+            .expect_err("nothing is authenticated")
+            .to_string();
+        assert!(error.contains("no authenticated model"), "{error}");
+        assert!(!model_is_selected(&unselected_model()));
+    }
+
+    #[test]
+    fn a_freshly_authenticated_provider_gets_its_preferred_model() {
+        let catalog = catalog_with_keys(&["OPENAI_API_KEY"]);
+        assert_eq!(
+            preferred_model_reference(&catalog, &["openai".to_owned()]).as_deref(),
+            Some("openai/gpt-5.6-terra")
+        );
+        assert_eq!(
+            optional_default_chat_model_reference(&catalog, None, "").expect("lookup"),
+            Some("openai/gpt-5.6-terra".to_owned())
+        );
+        assert_eq!(preferred_model_reference(&catalog, &[]), None);
+    }
+
+    #[test]
+    fn chat_opens_on_the_unselected_model_only_when_allowed() {
+        let catalog = catalog_with_keys(&[]);
+        let cwd = std::env::temp_dir();
+        let refused = SessionConfig {
+            no_session: true,
+            ..SessionConfig::default()
+        };
+        assert!(
+            session_options(
+                &catalog,
+                &refused,
+                cwd.clone(),
+                String::new(),
+                Vec::new(),
+                None
+            )
+            .is_err()
+        );
+        let allowed = SessionConfig {
+            no_session: true,
+            allow_unselected_model: true,
+            ..SessionConfig::default()
+        };
+        let options = session_options(&catalog, &allowed, cwd, String::new(), Vec::new(), None)
+            .expect("chat opens without a model");
+        assert!(!model_is_selected(&options.model));
+        assert_eq!(options.thinking_level, llm::THINKING_OFF);
     }
 
     #[test]

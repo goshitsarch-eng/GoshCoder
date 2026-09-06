@@ -67,6 +67,18 @@ something goes wrong:
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
 | Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
 
+## Starting without credentials
+
+Chat opens even when no provider is authenticated (`goshcoder` on a fresh
+install). `SessionConfig::allow_unselected_model` lets `session_options` fall
+back to `runtime::unselected_model()`, a model with an empty provider and id:
+the session layer already skips recording such a model, and the frontend
+checks `runtime::model_is_selected` before starting a turn. The fullscreen
+interface pre-fills `/login ` so the provider picker is open on first launch,
+and a successful `/login` on a session without a model switches to that
+provider's preferred model (`runtime::preferred_model_reference`). `run` keeps
+refusing to start without a model because it has nobody to ask.
+
 ## Catalog data
 
 `data/catalog.json` is generated from the pi reference (pi's

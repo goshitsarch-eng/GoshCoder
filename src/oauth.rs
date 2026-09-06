@@ -75,6 +75,11 @@ pub const KIMI_REFRESH_MAX_RETRIES: u32 = 3;
 /// The maximum token response body retained in memory.
 pub const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// Sent on every OAuth request. Meta's device-authorization endpoint answers a
+/// request without a `User-Agent` with an empty 302 instead of JSON, which
+/// surfaced as "returned an incomplete or invalid response" at login.
+pub const OAUTH_USER_AGENT: &str = concat!("goshcoder/", env!("CARGO_PKG_VERSION"));
+
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_CALLBACK_PORT: u16 = 53692;
 const ANTHROPIC_CALLBACK_PATH: &str = "/callback";
@@ -1357,6 +1362,7 @@ pub struct ReqwestOAuthTransport {
 impl ReqwestOAuthTransport {
     pub fn new() -> Result<Self> {
         Client::builder()
+            .user_agent(OAUTH_USER_AGENT)
             .build()
             .map(|client| Self { client })
             .map_err(|error| {
@@ -1933,6 +1939,7 @@ impl OAuthClient {
                         "application/x-www-form-urlencoded".to_owned(),
                     ),
                     ("Accept".to_owned(), "application/json".to_owned()),
+                    ("User-Agent".to_owned(), OAUTH_USER_AGENT.to_owned()),
                 ]),
                 body: encoder.finish().into_bytes(),
                 timeout: self.token_request_timeout,
@@ -1957,6 +1964,7 @@ impl OAuthClient {
                 headers: BTreeMap::from([
                     ("Content-Type".to_owned(), "application/json".to_owned()),
                     ("Accept".to_owned(), "application/json".to_owned()),
+                    ("User-Agent".to_owned(), OAUTH_USER_AGENT.to_owned()),
                 ]),
                 body,
                 timeout: self.token_request_timeout,
@@ -1977,6 +1985,9 @@ impl OAuthClient {
         let body = serde_json::to_vec(&payload).map_err(|_| {
             OAuthError::InvalidConfiguration("could not encode OAuth JSON request".to_owned())
         })?;
+        headers
+            .entry("User-Agent".to_owned())
+            .or_insert_with(|| OAUTH_USER_AGENT.to_owned());
         self.transport.execute(
             OAuthRequest {
                 method: Method::POST,
@@ -1999,7 +2010,10 @@ impl OAuthClient {
             OAuthRequest {
                 method: Method::GET,
                 url: url.clone(),
-                headers: BTreeMap::from([("Accept".to_owned(), "application/json".to_owned())]),
+                headers: BTreeMap::from([
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                    ("User-Agent".to_owned(), OAUTH_USER_AGENT.to_owned()),
+                ]),
                 body: Vec::new(),
                 timeout,
             },
@@ -4302,6 +4316,13 @@ mod tests {
         );
         let requests = transport.requests();
         assert_eq!(requests.len(), 3);
+        // Meta redirects a request without a User-Agent to an HTML page.
+        for request in &requests {
+            assert_eq!(
+                request.headers().get("User-Agent").map(String::as_str),
+                Some(OAUTH_USER_AGENT)
+            );
+        }
         assert_eq!(
             requests[2]
                 .headers()

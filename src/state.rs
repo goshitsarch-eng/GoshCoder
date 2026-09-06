@@ -753,8 +753,8 @@ pub fn dynamic_palette_argument(input: &str) -> Option<&str> {
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
     const COMMANDS: &[(&str, &str, bool)] = &[
         ("/help", "Show all commands", true),
-        ("/model", "Choose from authenticated models", false),
-        ("/login", "Add an OAuth or API-key provider", false),
+        ("/model", "Open the model picker", false),
+        ("/login", "Open the provider picker and log in", false),
         ("/omni", "Manage an OmniRoute gateway", false),
         (
             "/aperture",

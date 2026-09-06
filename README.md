@@ -82,10 +82,16 @@ Linux, macOS, and Windows on amd64 and arm64, with checksums.
 **First run**
 
 ```sh
-goshcoder auth login anthropic   # or: auth set <provider>, or an env var
-goshcoder providers              # shows what is configured and how to fix what is not
-goshcoder                        # start coding
+goshcoder                        # opens the provider picker; pick one, log in, start coding
 ```
+
+Chat opens even before any provider is authenticated. On a fresh install the
+`/login` picker is already open: choose a provider and press Enter, and the
+OAuth or API-key flow runs in the same terminal. The first login also selects
+that provider's default model, so the next thing you type is a prompt. `/model`
+(or Ctrl-L) opens the model picker whenever you want to switch. The same can be
+done outside chat with `goshcoder auth login <provider>` (or `auth set`, or an
+API-key environment variable); `goshcoder providers` shows what is configured.
 
 ## Use
 
@@ -140,8 +146,9 @@ goshcoder auth set meta       # then select meta/muse-spark-1.2
 
 Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
 providers are added to `auth.json` independently, so signing in to one does not
-remove existing logins. Use `/model` immediately afterward to search models
-across every authenticated provider.
+remove existing logins. A session that has no model yet switches to the new
+provider's default model as soon as the login finishes; otherwise use `/model`
+to search models across every authenticated provider.
 
 Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 

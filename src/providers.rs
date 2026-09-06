@@ -47,8 +47,8 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::{
-    agent, aperture, bedrock, catalog, google_auth, llm, mistral, omni_prompt_tools, omniroute,
-    stream,
+    agent, aperture, bedrock, catalog, google_auth, llm, mistral, oauth, omni_prompt_tools,
+    omniroute, stream,
 };
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
@@ -439,7 +439,9 @@ impl ProviderResponderFactory {
         // headers and then re-arms for every body read, which makes it an
         // idle deadline. A per-request timeout would instead become a total
         // deadline that cuts long streams off mid-response, so none is set.
-        let mut builder = Client::builder().timeout(config.read_timeout);
+        let mut builder = Client::builder()
+            .user_agent(oauth::OAUTH_USER_AGENT)
+            .timeout(config.read_timeout);
         if let Some(timeout) = config.connect_timeout {
             builder = builder.connect_timeout(timeout);
         }
