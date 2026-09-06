@@ -26,9 +26,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
@@ -43,14 +43,21 @@ use crate::agent::{self, CancellationToken};
 /// Maximum bytes returned by one `read` invocation before its notice.
 pub const MAX_READ_BYTES: usize = 50 * 1024;
 /// Maximum file prefix inspected to implement line-oriented reads.
+///
+/// `read` addresses lines, so it must scan from the start of the file to find
+/// `offset`; this cap bounds that scan (2 MiB) instead of loading a multi-GiB
+/// log into memory. Lines past the cap are not reachable through `read`: the
+/// tool says so in its trailing notice and in the `offset` error, and `bash`
+/// (`sed -n`, `tail`) remains available for the rest of such a file.
 pub const MAX_READ_SCAN_BYTES: usize = MAX_READ_BYTES * 40;
 /// Maximum bytes held for an exact `edit`.
 pub const MAX_EDIT_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum captured output from `bash`.
 pub const MAX_OUTPUT_BYTES: usize = 30 * 1024;
-/// Maximum bytes accepted from `git ls-files`.
+/// Maximum bytes accepted from `git ls-files`; a longer list is truncated.
 pub const MAX_CANDIDATE_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum candidate paths a search can inspect.
+/// Maximum candidate paths a search inspects; the rest are dropped with a
+/// notice rather than failing the whole search.
 pub const MAX_CANDIDATE_FILES: usize = 100_000;
 /// Maximum bytes read from a single file by `grep`.
 pub const MAX_SEARCH_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -65,15 +72,84 @@ pub const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Drain grace once the whole process group is known dead: only a writer that
+/// escaped the group can still hold the pipe, and it will not close it on our
+/// account, so collect what is buffered and stop.
+const KILLED_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MUTATION_WAIT_POLL: Duration = Duration::from_millis(25);
 const MAX_CONTEXT_LINES: usize = 100;
 const MAX_GLOB_PATTERN_CHARS: usize = 4_096;
+const MAX_GLOB_ALTERNATIVES: usize = 256;
 const MAX_REGEX_PATTERN_CHARS: usize = 4_096;
 const MAX_REGEX_REPEAT: usize = 1_024;
 const MAX_REGEX_STATES: usize = 8_192;
 const MAX_REGEX_STEPS: usize = 20_000_000;
+/// Longest destination-name prefix embedded in a temporary file name, so the
+/// `.<name>.goshcoder-<nonce>.tmp` sibling stays under common 255-byte limits.
+const TEMP_NAME_PREFIX_BYTES: usize = 48;
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Serialises mutations of one file, mirroring pi's file-mutation-queue: a
+/// `write` or `edit` that races another call for the same path waits for it,
+/// so neither read-modify-write can overwrite the other's result. Different
+/// files still proceed in parallel.
+static FILE_MUTATIONS: FileMutationQueue = FileMutationQueue {
+    busy: Mutex::new(Vec::new()),
+    released: Condvar::new(),
+};
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+struct FileMutationQueue {
+    busy: Mutex<Vec<PathBuf>>,
+    released: Condvar,
+}
+
+/// Holds one path in the mutation queue until dropped.
+struct FileMutationGuard {
+    key: PathBuf,
+}
+
+impl FileMutationQueue {
+    fn acquire(&self, key: PathBuf, cancellation: &CancellationToken) -> Result<FileMutationGuard> {
+        let mut busy = self.busy.lock().unwrap_or_else(|error| error.into_inner());
+        while busy.contains(&key) {
+            // Poll instead of blocking indefinitely so a cancelled tool stops
+            // queueing behind a slow mutation of the same file.
+            check_cancelled(cancellation)?;
+            let (guard, _) = self
+                .released
+                .wait_timeout(busy, MUTATION_WAIT_POLL)
+                .unwrap_or_else(|error| error.into_inner());
+            busy = guard;
+        }
+        busy.push(key.clone());
+        Ok(FileMutationGuard { key })
+    }
+
+    fn release(&self, key: &Path) {
+        let mut busy = self.busy.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = busy.iter().position(|busy_key| busy_key == key) {
+            busy.swap_remove(index);
+        }
+        self.released.notify_all();
+    }
+}
+
+impl Drop for FileMutationGuard {
+    fn drop(&mut self) {
+        FILE_MUTATIONS.release(&self.key);
+    }
+}
 
 /// Error returned by workspace construction and tool helpers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,7 +199,7 @@ impl Workspace {
     /// Creates a workspace rooted at an existing directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let requested = root.as_ref();
-        let canonical = fs::canonicalize(requested)
+        let canonical = canonicalize(requested)
             .map_err(|error| ToolError::io("resolve workspace", requested, error))?;
         let metadata = fs::metadata(&canonical)
             .map_err(|error| ToolError::io("inspect workspace", &canonical, error))?;
@@ -457,12 +533,20 @@ impl Workspace {
         let requested = required_string(parameters, "path")?;
         let content = required_string(parameters, "content")?;
         let relative = self.resolve(requested)?;
+        let _mutation = FILE_MUTATIONS.acquire(self.mutation_key(&relative), cancellation)?;
         self.write_file_atomic(&relative, content.as_bytes(), cancellation)?;
         Ok(format!(
             "Wrote {} bytes to {}",
             content.len(),
             self.display(&relative)
         ))
+    }
+
+    /// Identifies a file for the mutation queue the way pi does: by its real
+    /// path when it exists, else by the resolved path it will be created at.
+    fn mutation_key(&self, relative: &Path) -> PathBuf {
+        let absolute = self.root.join(relative);
+        canonicalize(&absolute).unwrap_or(absolute)
     }
 
     fn run_edit(
@@ -479,6 +563,7 @@ impl Workspace {
         }
 
         let relative = self.resolve(requested)?;
+        let _mutation = FILE_MUTATIONS.acquire(self.mutation_key(&relative), cancellation)?;
         let (bytes, truncated) = self.read_limited(&relative, MAX_EDIT_BYTES, cancellation)?;
         if truncated {
             return Err(ToolError::new(format!(
@@ -486,10 +571,19 @@ impl Workspace {
                 self.display(&relative)
             )));
         }
-        let content = decode_text(&bytes, false, &self.display(&relative))?;
+        let raw_content = decode_text(&bytes, false, &self.display(&relative))?;
+
+        // Match the way pi does: the model never includes an invisible BOM
+        // in old_text and writes LF regardless of the file's line endings, so
+        // compare on LF-normalised text and restore the original ending.
+        let (bom, content) = split_bom(&raw_content);
+        let line_ending = detect_line_ending(content);
+        let content = normalize_to_lf(content);
+        let old_text = normalize_to_lf(old_text);
+        let new_text = normalize_to_lf(new_text);
 
         let mut occurrences = 0usize;
-        for _ in content.match_indices(old_text) {
+        for _ in content.match_indices(old_text.as_str()) {
             occurrences += 1;
             if occurrences.is_multiple_of(1_024) {
                 check_cancelled(cancellation)?;
@@ -512,7 +606,7 @@ impl Workspace {
         }
 
         let index = content
-            .find(old_text)
+            .find(old_text.as_str())
             .expect("the unique old_text occurrence was counted");
         let mut updated = String::with_capacity(
             content
@@ -521,9 +615,12 @@ impl Workspace {
                 .saturating_add(new_text.len()),
         );
         updated.push_str(&content[..index]);
-        updated.push_str(new_text);
+        updated.push_str(&new_text);
         updated.push_str(&content[index + old_text.len()..]);
-        self.write_file_atomic(&relative, updated.as_bytes(), cancellation)?;
+        let mut restored = String::with_capacity(bom.len() + updated.len());
+        restored.push_str(bom);
+        restored.push_str(&restore_line_endings(&updated, line_ending));
+        self.write_file_atomic(&relative, restored.as_bytes(), cancellation)?;
         Ok(format!("Edited {}", self.display(&relative)))
     }
 
@@ -550,29 +647,8 @@ impl Workspace {
             )));
         }
 
-        let mut entries = Vec::new();
-        let directory = fs::read_dir(&absolute)
-            .map_err(|error| ToolError::io("read directory", &absolute, error))?;
-        for entry in directory {
-            check_cancelled(cancellation)?;
-            if entries.len() >= MAX_DIRECTORY_ENTRIES {
-                return Err(ToolError::new(format!(
-                    "{} contains more than {MAX_DIRECTORY_ENTRIES} entries",
-                    self.display(&relative)
-                )));
-            }
-            let entry =
-                entry.map_err(|error| ToolError::io("read directory entry", &absolute, error))?;
-            let mut name = entry.file_name().to_string_lossy().into_owned();
-            if entry
-                .file_type()
-                .map_err(|error| ToolError::io("inspect directory entry", &entry.path(), error))?
-                .is_dir()
-            {
-                name.push('/');
-            }
-            entries.push(name);
-        }
+        let (mut entries, overflowed) =
+            read_directory_entries(&absolute, MAX_DIRECTORY_ENTRIES, cancellation)?;
         entries.sort();
         if entries.is_empty() {
             return Ok("(empty directory)".to_owned());
@@ -588,6 +664,11 @@ impl Workspace {
         let mut output = render_lines(&entries, MAX_LIST_OUTPUT_BYTES);
         if let Some(entry_limit) = reached_limit {
             output.push_str(&format!("\n\n[{entry_limit} entries limit reached]"));
+        } else if overflowed {
+            output.push_str(&format!(
+                "\n\n[{} has more than {MAX_DIRECTORY_ENTRIES} entries; only {MAX_DIRECTORY_ENTRIES} were listed]",
+                self.display(&relative)
+            ));
         }
         Ok(output)
     }
@@ -627,7 +708,8 @@ impl Workspace {
 
         let mut output = BoundedText::new(MAX_LIST_OUTPUT_BYTES);
         let mut matches = 0usize;
-        for candidate in candidates {
+        let candidate_notice = candidate_truncation_notice(candidates.truncated);
+        for candidate in candidates.files {
             check_cancelled(cancellation)?;
             let display = match path_to_slash(&candidate) {
                 Ok(display) => display,
@@ -689,14 +771,14 @@ impl Workspace {
                     output.push(&format!(
                         "[{match_limit} matches limit reached. Refine the pattern or increase limit.]"
                     ));
-                    return Ok(output.finish());
+                    return Ok(output.finish() + &candidate_notice);
                 }
             }
         }
         if matches == 0 {
-            Ok("No matches found".to_owned())
+            Ok(format!("No matches found{candidate_notice}"))
         } else {
-            Ok(output.finish())
+            Ok(output.finish() + &candidate_notice)
         }
     }
 
@@ -719,10 +801,11 @@ impl Workspace {
         };
         let candidates = self.candidate_files(cancellation, &search_root)?;
         let limit = positive_limit(parameters, "limit", 1_000, MAX_CANDIDATE_FILES);
+        let candidate_notice = candidate_truncation_notice(candidates.truncated);
 
         let mut matches = Vec::new();
         let mut limited = false;
-        for candidate in candidates {
+        for candidate in candidates.files {
             check_cancelled(cancellation)?;
             let relative = relative_to_search(&candidate, &search_root);
             let display = match path_to_slash(&relative) {
@@ -739,7 +822,7 @@ impl Workspace {
             }
         }
         if matches.is_empty() {
-            return Ok("No files found matching pattern".to_owned());
+            return Ok(format!("No files found matching pattern{candidate_notice}"));
         }
         matches.sort();
         let mut output = render_lines(&matches, MAX_LIST_OUTPUT_BYTES);
@@ -748,6 +831,7 @@ impl Workspace {
                 "\n\n[{limit} results limit reached. Refine the pattern or increase limit.]"
             ));
         }
+        output.push_str(&candidate_notice);
         Ok(output)
     }
 
@@ -763,10 +847,26 @@ impl Workspace {
         }
 
         #[cfg(windows)]
-        let mut command = {
-            let mut command = Command::new("cmd.exe");
-            command.args(["/d", "/s", "/c", source]);
-            command
+        let mut command = match find_bash_on_path() {
+            // Like the Go port, prefer a real bash (Git for Windows, MSYS2)
+            // so commands written for pi behave the same on every platform.
+            Some(bash) => {
+                let mut command = Command::new(bash);
+                command.args(["-c", source]);
+                command
+            }
+            None => {
+                use std::os::windows::process::CommandExt;
+
+                // cmd.exe has no argv: std's per-argument quoting would
+                // mangle the command, so hand it the exact `/s /c "..."`
+                // command line that cmd itself documents.
+                let mut command = Command::new("cmd.exe");
+                command
+                    .args(["/d", "/s", "/c"])
+                    .raw_arg(format!("\"{source}\""));
+                command
+            }
         };
         #[cfg(not(windows))]
         let mut command = {
@@ -835,7 +935,7 @@ impl Workspace {
             // Canonicalize an existing absolute path first so `root/link`
             // cannot disguise an outside target. For a new path, lexical
             // prefix validation is followed by checked parent creation.
-            if let Ok(canonical) = fs::canonicalize(path) {
+            if let Ok(canonical) = canonicalize(path) {
                 canonical
                     .strip_prefix(&self.root)
                     .map_err(|_| {
@@ -863,7 +963,7 @@ impl Workspace {
     fn existing_path(&self, relative: &Path) -> Result<PathBuf> {
         let absolute = self.root.join(relative);
         self.reject_symlink_components(relative)?;
-        let canonical = fs::canonicalize(&absolute)
+        let canonical = canonicalize(&absolute)
             .map_err(|error| ToolError::io("resolve path", &absolute, error))?;
         if !canonical.starts_with(&self.root) {
             return Err(ToolError::new(format!(
@@ -947,7 +1047,7 @@ impl Workspace {
                     return Err(ToolError::io("inspect parent directory", &current, error));
                 }
             }
-            let canonical = fs::canonicalize(&current)
+            let canonical = canonicalize(&current)
                 .map_err(|error| ToolError::io("resolve parent directory", &current, error))?;
             if !canonical.starts_with(&self.root) {
                 return Err(ToolError::new(format!(
@@ -1020,7 +1120,7 @@ impl Workspace {
         check_cancelled(cancellation)?;
         let destination = self.prepare_write_path(relative)?;
         let inherited_permissions = match fs::symlink_metadata(&destination) {
-            Ok(metadata) => Some(metadata.permissions()),
+            Ok(metadata) => Some(inheritable_permissions(metadata.permissions())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(ToolError::io("inspect destination", &destination, error)),
         };
@@ -1093,13 +1193,25 @@ impl Workspace {
         &self,
         cancellation: &CancellationToken,
         search_root: &Path,
-    ) -> Result<Vec<PathBuf>> {
+    ) -> Result<Candidates> {
+        self.collect_candidates(cancellation, search_root, MAX_CANDIDATE_FILES)
+    }
+
+    fn collect_candidates(
+        &self,
+        cancellation: &CancellationToken,
+        search_root: &Path,
+        maximum_files: usize,
+    ) -> Result<Candidates> {
         check_cancelled(cancellation)?;
         let absolute = self.existing_path(search_root)?;
         let metadata = fs::symlink_metadata(&absolute)
             .map_err(|error| ToolError::io("inspect search path", &absolute, error))?;
         if metadata.is_file() {
-            return Ok(vec![search_root.to_path_buf()]);
+            return Ok(Candidates {
+                files: vec![search_root.to_path_buf()],
+                truncated: false,
+            });
         }
         if !metadata.is_dir() {
             return Err(ToolError::new(format!(
@@ -1108,10 +1220,12 @@ impl Workspace {
             )));
         }
 
-        if let Some(files) = self.git_candidate_files(cancellation, search_root)? {
-            return Ok(files);
+        if let Some(candidates) =
+            self.git_candidate_files(cancellation, search_root, maximum_files)?
+        {
+            return Ok(candidates);
         }
-        self.walk_candidate_files(cancellation, search_root)
+        self.walk_candidate_files(cancellation, search_root, maximum_files)
     }
 
     /// Uses git's ignored-file-aware index when it is available.
@@ -1119,7 +1233,8 @@ impl Workspace {
         &self,
         cancellation: &CancellationToken,
         search_root: &Path,
-    ) -> Result<Option<Vec<PathBuf>>> {
+        maximum_files: usize,
+    ) -> Result<Option<Candidates>> {
         let search_argument = search_root.as_os_str();
         let mut command = Command::new("git");
         command
@@ -1157,19 +1272,26 @@ impl Workspace {
         if result.timed_out || result.output_open || !result.status.success() {
             return Ok(None);
         }
-        if result.output.truncated {
-            return Err(ToolError::new(format!(
-                "candidate file list exceeds {MAX_CANDIDATE_BYTES} bytes"
-            )));
-        }
         if let Some(error) = result.reader_error {
             return Err(ToolError::new(format!(
                 "could not read git candidate list: {error}"
             )));
         }
+        let mut listing = result.output.bytes.as_slice();
+        let mut truncated = false;
+        if result.output.truncated {
+            // The byte cap cut the list mid-entry; keep every complete
+            // NUL-terminated entry and report the rest as dropped.
+            truncated = true;
+            let complete = listing
+                .iter()
+                .rposition(|byte| *byte == 0)
+                .map_or(0, |i| i + 1);
+            listing = &listing[..complete];
+        }
 
         let mut files = Vec::new();
-        for entry in result.output.bytes.split(|byte| *byte == 0) {
+        for entry in listing.split(|byte| *byte == 0) {
             if entry.is_empty() {
                 continue;
             }
@@ -1189,15 +1311,22 @@ impl Workspace {
                 // has an independently checked root.
                 return Ok(None);
             }
-            files.push(relative);
-            if files.len() > MAX_CANDIDATE_FILES {
-                return Err(ToolError::new(format!(
-                    "candidate file list exceeds {MAX_CANDIDATE_FILES} files"
-                )));
+            // A tracked file deleted from the worktree stays in the index
+            // until the deletion is staged; listing it would send the model
+            // to a path that no longer exists.
+            if fs::symlink_metadata(self.root.join(&relative))
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                continue;
             }
+            if files.len() >= maximum_files {
+                truncated = true;
+                break;
+            }
+            files.push(relative);
         }
         files.sort();
-        Ok(Some(files))
+        Ok(Some(Candidates { files, truncated }))
     }
 
     /// Conservative, non-symlink-following candidate discovery.
@@ -1205,30 +1334,43 @@ impl Workspace {
         &self,
         cancellation: &CancellationToken,
         search_root: &Path,
-    ) -> Result<Vec<PathBuf>> {
+        maximum_files: usize,
+    ) -> Result<Candidates> {
         let mut directories = VecDeque::from([search_root.to_path_buf()]);
         let mut files = Vec::new();
-        while let Some(directory_relative) = directories.pop_front() {
+        let mut truncated = false;
+        'directories: while let Some(directory_relative) = directories.pop_front() {
             check_cancelled(cancellation)?;
             let directory_absolute = self.root.join(&directory_relative);
-            let entries = fs::read_dir(&directory_absolute).map_err(|error| {
-                ToolError::io("read search directory", &directory_absolute, error)
-            })?;
+            let entries = match fs::read_dir(&directory_absolute) {
+                Ok(entries) => entries,
+                // The search root itself must be readable; a subdirectory
+                // that is not (permissions, removed mid-walk) is skipped so
+                // the rest of the tree still gets searched.
+                Err(error) if directory_relative == search_root => {
+                    return Err(ToolError::io(
+                        "read search directory",
+                        &directory_absolute,
+                        error,
+                    ));
+                }
+                Err(_) => continue,
+            };
             for entry in entries {
                 check_cancelled(cancellation)?;
-                let entry = entry.map_err(|error| {
-                    ToolError::io("read search directory entry", &directory_absolute, error)
-                })?;
+                let Ok(entry) = entry else {
+                    continue;
+                };
                 let name = entry.file_name();
                 let relative = join_relative(&directory_relative, &name);
-                let file_type = entry.file_type().map_err(|error| {
-                    ToolError::io("inspect search directory entry", &entry.path(), error)
-                })?;
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 if file_type.is_dir() {
                     if !skip_search_dir(&name) {
-                        let canonical = fs::canonicalize(entry.path()).map_err(|error| {
-                            ToolError::io("resolve search directory", &entry.path(), error)
-                        })?;
+                        let Ok(canonical) = canonicalize(&entry.path()) else {
+                            continue;
+                        };
                         if !canonical.starts_with(&self.root) {
                             return Err(ToolError::new(format!(
                                 "search directory {} is outside the workspace",
@@ -1239,16 +1381,15 @@ impl Workspace {
                     }
                     continue;
                 }
-                files.push(relative);
-                if files.len() > MAX_CANDIDATE_FILES {
-                    return Err(ToolError::new(format!(
-                        "candidate file list exceeds {MAX_CANDIDATE_FILES} files"
-                    )));
+                if files.len() >= maximum_files {
+                    truncated = true;
+                    break 'directories;
                 }
+                files.push(relative);
             }
         }
         files.sort();
-        Ok(files)
+        Ok(Candidates { files, truncated })
     }
 
     fn display(&self, relative: &Path) -> String {
@@ -1259,6 +1400,204 @@ impl Workspace {
 /// Convenience constructor mirroring the Go package's `NewWorkspace`.
 pub fn new_workspace(root: impl AsRef<Path>) -> Result<Workspace> {
     Workspace::new(root)
+}
+
+/// Candidate paths for a search plus whether the discovery cap dropped some.
+struct Candidates {
+    files: Vec<PathBuf>,
+    truncated: bool,
+}
+
+fn candidate_truncation_notice(truncated: bool) -> String {
+    if truncated {
+        format!(
+            "\n\n[only the first {MAX_CANDIDATE_FILES} candidate files were searched; narrow the path to search the rest]"
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Reads at most `maximum` names from a directory, reporting whether more
+/// remained so a huge directory is listed partially instead of not at all.
+fn read_directory_entries(
+    absolute: &Path,
+    maximum: usize,
+    cancellation: &CancellationToken,
+) -> Result<(Vec<String>, bool)> {
+    let mut entries = Vec::new();
+    let directory =
+        fs::read_dir(absolute).map_err(|error| ToolError::io("read directory", absolute, error))?;
+    for entry in directory {
+        check_cancelled(cancellation)?;
+        if entries.len() >= maximum {
+            return Ok((entries, true));
+        }
+        let entry =
+            entry.map_err(|error| ToolError::io("read directory entry", absolute, error))?;
+        let mut name = entry.file_name().to_string_lossy().into_owned();
+        if entry
+            .file_type()
+            .map_err(|error| ToolError::io("inspect directory entry", &entry.path(), error))?
+            .is_dir()
+        {
+            name.push('/');
+        }
+        entries.push(name);
+    }
+    Ok((entries, false))
+}
+
+/// `fs::canonicalize` with Windows verbatim prefixes (`\\?\C:\...`) reduced
+/// to ordinary paths, so canonical results compare with lexically built ones
+/// and a new file under `C:\ws` is not reported as outside `\\?\C:\ws`.
+fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        Ok(simplify_verbatim(&canonical))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(canonical)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn simplify_verbatim(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\")
+        && let Some((drive, colon)) = rest.chars().next().zip(rest.chars().nth(1))
+        && drive.is_ascii_alphabetic()
+        && colon == ':'
+    {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
+/// Locates a usable `bash.exe` on `PATH`, ignoring the legacy WSL launcher
+/// in `System32`, which pi also special-cases because it does not accept a
+/// command as `-c` argv the way a real bash does.
+#[cfg(windows)]
+fn find_bash_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("bash.exe"))
+        .find(|candidate| {
+            candidate.is_file()
+                && candidate
+                    .to_str()
+                    .is_none_or(|text| !is_legacy_wsl_bash(text))
+        })
+}
+
+#[cfg(any(windows, test))]
+fn is_legacy_wsl_bash(path: &str) -> bool {
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    let mut characters = normalized.chars();
+    let Some(drive) = characters.next() else {
+        return false;
+    };
+    if !drive.is_ascii_alphabetic() {
+        return false;
+    }
+    let rest = characters.as_str();
+    rest == r":\windows\system32\bash.exe" || rest == r":\windows\sysnative\bash.exe"
+}
+
+/// Permission bits carried over from a replaced file. The setuid, setgid and
+/// sticky bits are deliberately dropped: an atomic replace creates a new
+/// inode, and silently re-applying them would let an edit mint a setuid
+/// binary with the model's content.
+fn inheritable_permissions(permissions: fs::Permissions) -> fs::Permissions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = permissions;
+        permissions.set_mode(permissions.mode() & 0o777);
+        permissions
+    }
+    #[cfg(not(unix))]
+    {
+        permissions
+    }
+}
+
+/// Splits a leading byte-order mark off decoded text, as pi does before
+/// matching `old_text`.
+fn split_bom(content: &str) -> (&str, &str) {
+    match content.strip_prefix('\u{FEFF}') {
+        Some(text) => ("\u{FEFF}", text),
+        None => ("", content),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+/// pi's rule: the file uses CRLF when its first line break is one.
+fn detect_line_ending(content: &str) -> LineEnding {
+    match (content.find("\r\n"), content.find('\n')) {
+        (Some(crlf), Some(lf)) if crlf < lf => LineEnding::CrLf,
+        _ => LineEnding::Lf,
+    }
+}
+
+fn normalize_to_lf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn restore_line_endings(text: &str, ending: LineEnding) -> String {
+    match ending {
+        LineEnding::CrLf => text.replace('\n', "\r\n"),
+        LineEnding::Lf => text.to_owned(),
+    }
+}
+
+/// Kills the child's whole process tree, as pi's `killProcessTree` does, and
+/// returns whether the tree (not just the immediate child) is known dead.
+fn kill_process_tree(child: &mut Child) -> bool {
+    #[cfg(unix)]
+    let group_killed = {
+        // `process_group(0)` made the child lead a group whose id equals its
+        // pid, so one negative-pid signal reaches every descendant.
+        let pid = i32::try_from(child.id()).unwrap_or(0);
+        // SAFETY: kill(2) takes two plain integers and has no memory
+        // preconditions; a stale pid only yields ESRCH.
+        pid > 0 && unsafe { kill(-pid, SIGKILL) } == 0
+    };
+    #[cfg(windows)]
+    let group_killed = {
+        // Windows has no process-group signal; taskkill /T walks the tree.
+        // Use the System32 copy so cleanup does not depend on PATH.
+        let system_root =
+            std::env::var_os("SystemRoot").unwrap_or_else(|| OsStr::new(r"C:\Windows").to_owned());
+        let taskkill = Path::new(&system_root)
+            .join("System32")
+            .join("taskkill.exe");
+        Command::new(taskkill)
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    #[cfg(not(any(unix, windows)))]
+    let group_killed = false;
+    // Always also kill the immediate child: harmless when the group kill
+    // already reached it, and the only fallback when it did not.
+    let _ = child.kill();
+    group_killed
 }
 
 fn required_string<'a>(parameters: &'a BTreeMap<String, Value>, name: &str) -> Result<&'a str> {
@@ -1444,6 +1783,10 @@ fn temporary_path(parent: &Path, destination: &Path, attempt: u32) -> PathBuf {
         .file_name()
         .unwrap_or_else(|| OsStr::new("file"))
         .to_string_lossy();
+    // The nonce already makes the name unique; the destination name is only
+    // a hint, so clip it before a long name pushes the sibling past
+    // NAME_MAX and the write fails with ENAMETOOLONG.
+    let base = utf8_prefix(&base, TEMP_NAME_PREFIX_BYTES);
     parent.join(format!(
         ".{base}.goshcoder-{:x}-{timestamp:x}-{sequence:x}-{attempt:x}.tmp",
         std::process::id()
@@ -1648,10 +1991,11 @@ struct ProcessResult {
 
 /// Runs a child while polling the agent cancellation token and a deadline.
 ///
-/// `std` can terminate the immediate child with `Child::kill`, but it cannot
-/// portably kill an entire process group. A shell that backgrounds descendants
-/// may therefore keep a pipe open; the bounded drain grace detects that and
-/// returns a successful background-process notice instead of hanging.
+/// The child leads its own process group so a timeout or cancellation tears
+/// down everything it spawned, not just the shell. A command that exits
+/// normally while a descendant it backgrounded still holds the pipe is
+/// detected by the bounded drain grace and reported as a background-process
+/// notice instead of hanging.
 fn run_process(
     command: &mut Command,
     cancellation: &CancellationToken,
@@ -1659,7 +2003,25 @@ fn run_process(
     output_limit: usize,
     combine_streams: bool,
 ) -> io::Result<ProcessResult> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // A tool command must never read the agent's own terminal: an inherited
+    // stdin lets `cat` or an interactive prompt hang until the timeout and
+    // steal keystrokes meant for the UI.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Detach from this console's Ctrl+C group so a Ctrl+C aimed at the
+        // agent does not also interrupt the command the model is running.
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -1679,22 +2041,27 @@ fn run_process(
     let stderr_reader = spawn_reader(stderr, stderr_output);
 
     let started = Instant::now();
-    let (status, timed_out, cancelled) = loop {
+    let (status, timed_out, cancelled, group_killed) = loop {
         if let Some(status) = child.try_wait()? {
-            break (status, false, cancellation.is_cancelled());
+            break (status, false, cancellation.is_cancelled(), false);
         }
         if cancellation.is_cancelled() {
-            let _ = child.kill();
-            break (child.wait()?, false, true);
+            let group_killed = kill_process_tree(&mut child);
+            break (child.wait()?, false, true, group_killed);
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
-            break (child.wait()?, true, false);
+            let group_killed = kill_process_tree(&mut child);
+            break (child.wait()?, true, false, group_killed);
         }
         thread::sleep(PROCESS_POLL_INTERVAL);
     };
 
-    let drain_deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    let drain_grace = if group_killed {
+        KILLED_DRAIN_GRACE
+    } else {
+        OUTPUT_DRAIN_GRACE
+    };
+    let drain_deadline = Instant::now() + drain_grace;
     let (stdout_open, stdout_error) = await_reader(stdout_reader, drain_deadline);
     let (stderr_open, stderr_error) = await_reader(stderr_reader, drain_deadline);
     let output = output
@@ -1713,9 +2080,12 @@ fn run_process(
 }
 
 /// A compiled glob with pi-style basename fallback and Unicode-safe matching.
+///
+/// `{a,b}` groups are expanded up front into alternative token lists, which
+/// is what fd and ripgrep (pi's find/grep backends) accept.
 #[derive(Clone, Debug)]
 pub struct GlobPattern {
-    tokens: Vec<GlobToken>,
+    alternatives: Vec<Vec<GlobToken>>,
     basename_too: bool,
 }
 
@@ -1728,7 +2098,7 @@ enum GlobToken {
     GlobStarSlash,
 }
 
-/// Compiles `*`, `**`, `**/`, and `?` glob syntax.
+/// Compiles `*`, `**`, `**/`, `?`, and `{a,b}` glob syntax.
 pub fn compile_glob(pattern: &str) -> Result<GlobPattern> {
     if pattern.chars().count() > MAX_GLOB_PATTERN_CHARS {
         return Err(ToolError::new(format!(
@@ -1736,7 +2106,77 @@ pub fn compile_glob(pattern: &str) -> Result<GlobPattern> {
         )));
     }
     let normalized = normalize_glob_separators(pattern);
-    let characters = normalized.chars().collect::<Vec<_>>();
+    let mut expanded = Vec::new();
+    expand_glob_braces(&normalized, &mut expanded)?;
+    Ok(GlobPattern {
+        alternatives: expanded.iter().map(|text| tokenize_glob(text)).collect(),
+        basename_too: !normalized.contains('/'),
+    })
+}
+
+/// Expands the first balanced `{...}` group and recurses into the results so
+/// nested groups and several groups in one pattern all multiply out. An
+/// unbalanced brace is an ordinary character.
+fn expand_glob_braces(pattern: &str, output: &mut Vec<String>) -> Result<()> {
+    let Some((prefix, body, suffix)) = split_first_brace_group(pattern) else {
+        output.push(pattern.to_owned());
+        return Ok(());
+    };
+    for alternative in split_top_level_commas(body) {
+        expand_glob_braces(&format!("{prefix}{alternative}{suffix}"), output)?;
+        if output.len() > MAX_GLOB_ALTERNATIVES {
+            return Err(ToolError::new(format!(
+                "glob pattern expands to more than {MAX_GLOB_ALTERNATIVES} alternatives"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn split_first_brace_group(pattern: &str) -> Option<(&str, &str, &str)> {
+    let open = pattern.find('{')?;
+    let mut depth = 0usize;
+    for (offset, character) in pattern[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let close = open + offset;
+                    return Some((
+                        &pattern[..open],
+                        &pattern[open + 1..close],
+                        &pattern[close + 1..],
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(body: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (offset, character) in body.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&body[start..offset]);
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
+fn tokenize_glob(pattern: &str) -> Vec<GlobToken> {
+    let characters = pattern.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
     let mut index = 0usize;
     while index < characters.len() {
@@ -1764,10 +2204,7 @@ pub fn compile_glob(pattern: &str) -> Result<GlobPattern> {
             }
         }
     }
-    Ok(GlobPattern {
-        tokens,
-        basename_too: !normalized.contains('/'),
-    })
+    tokens
 }
 
 impl GlobPattern {
@@ -1783,42 +2220,47 @@ impl GlobPattern {
     }
 
     fn matches_full(&self, name: &str) -> bool {
-        let characters = name.chars().collect::<Vec<_>>();
-        let mut current = vec![false; self.tokens.len() + 1];
-        add_glob_closure(&self.tokens, &mut current, 0);
-
-        for character in characters {
-            let mut next = vec![false; self.tokens.len() + 1];
-            for (index, active) in current.iter().enumerate().take(self.tokens.len()) {
-                if !*active {
-                    continue;
-                }
-                match self.tokens[index] {
-                    GlobToken::Literal(expected) if expected == character => {
-                        add_glob_closure(&self.tokens, &mut next, index + 1);
-                    }
-                    GlobToken::One if character != '/' => {
-                        add_glob_closure(&self.tokens, &mut next, index + 1);
-                    }
-                    GlobToken::Star if character != '/' => {
-                        add_glob_closure(&self.tokens, &mut next, index);
-                    }
-                    GlobToken::GlobStar => {
-                        add_glob_closure(&self.tokens, &mut next, index);
-                    }
-                    GlobToken::GlobStarSlash => {
-                        add_glob_closure(&self.tokens, &mut next, index);
-                        if character == '/' {
-                            add_glob_closure(&self.tokens, &mut next, index + 1);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            current = next;
-        }
-        current[self.tokens.len()]
+        self.alternatives
+            .iter()
+            .any(|tokens| glob_tokens_match(tokens, name))
     }
+}
+
+fn glob_tokens_match(tokens: &[GlobToken], name: &str) -> bool {
+    let mut current = vec![false; tokens.len() + 1];
+    add_glob_closure(tokens, &mut current, 0);
+
+    for character in name.chars() {
+        let mut next = vec![false; tokens.len() + 1];
+        for (index, active) in current.iter().enumerate().take(tokens.len()) {
+            if !*active {
+                continue;
+            }
+            match tokens[index] {
+                GlobToken::Literal(expected) if expected == character => {
+                    add_glob_closure(tokens, &mut next, index + 1);
+                }
+                GlobToken::One if character != '/' => {
+                    add_glob_closure(tokens, &mut next, index + 1);
+                }
+                GlobToken::Star if character != '/' => {
+                    add_glob_closure(tokens, &mut next, index);
+                }
+                GlobToken::GlobStar => {
+                    add_glob_closure(tokens, &mut next, index);
+                }
+                GlobToken::GlobStarSlash => {
+                    add_glob_closure(tokens, &mut next, index);
+                    if character == '/' {
+                        add_glob_closure(tokens, &mut next, index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = next;
+    }
+    current[tokens.len()]
 }
 
 fn add_glob_closure(tokens: &[GlobToken], states: &mut [bool], start: usize) {
@@ -1849,9 +2291,9 @@ fn normalize_glob_separators(value: &str) -> String {
 
 // A small Thompson-NFA regex implementation avoids a new dependency while
 // supporting the practical grep subset: literals, '.', grouping, alternation,
-// anchors, character classes, escapes, and normal quantifiers. It is bounded
-// by state and work limits so model-provided patterns cannot backtrack
-// exponentially or consume unbounded CPU.
+// anchors, word boundaries, character classes, escapes, and normal (or lazy)
+// quantifiers. It is bounded by state and work limits so model-provided
+// patterns cannot backtrack exponentially or consume unbounded CPU.
 
 #[derive(Clone, Debug)]
 struct SearchRegex {
@@ -1867,6 +2309,7 @@ enum RegexState {
     Jump { next: usize },
     Start { next: usize },
     End { next: usize },
+    WordBoundary { negated: bool, next: usize },
     Accept,
 }
 
@@ -1953,6 +2396,23 @@ enum RegexExpr {
     Repeat(Box<RegexExpr>, Repetition),
     Start,
     End,
+    WordBoundary { negated: bool },
+}
+
+fn is_word_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+/// `\b` in RE2's sense: a `\w` on exactly one side of the position.
+fn at_word_boundary(characters: &[char], position: usize) -> bool {
+    let before = position
+        .checked_sub(1)
+        .and_then(|index| characters.get(index))
+        .is_some_and(|character| is_word_char(*character));
+    let after = characters
+        .get(position)
+        .is_some_and(|character| is_word_char(*character));
+    before != after
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2025,7 +2485,7 @@ impl SearchRegex {
             self.add_closure(
                 self.start,
                 position,
-                characters.len(),
+                &characters,
                 generation,
                 &mut marks,
                 &mut current,
@@ -2063,7 +2523,7 @@ impl SearchRegex {
                     self.add_closure(
                         *target,
                         position + 1,
-                        characters.len(),
+                        &characters,
                         generation,
                         &mut marks,
                         &mut next,
@@ -2082,7 +2542,7 @@ impl SearchRegex {
         &self,
         start: usize,
         position: usize,
-        text_length: usize,
+        characters: &[char],
         generation: usize,
         marks: &mut [usize],
         destination: &mut Vec<usize>,
@@ -2111,8 +2571,15 @@ impl SearchRegex {
                 }
                 RegexState::Jump { next } => pending.push(next),
                 RegexState::Start { next } if position == 0 => pending.push(next),
-                RegexState::End { next } if position == text_length => pending.push(next),
-                RegexState::Start { .. } | RegexState::End { .. } => {}
+                RegexState::End { next } if position == characters.len() => pending.push(next),
+                RegexState::WordBoundary { negated, next }
+                    if at_word_boundary(characters, position) != negated =>
+                {
+                    pending.push(next);
+                }
+                RegexState::Start { .. }
+                | RegexState::End { .. }
+                | RegexState::WordBoundary { .. } => {}
                 RegexState::Consume { .. } | RegexState::Accept => destination.push(state),
             }
         }
@@ -2206,6 +2673,10 @@ impl RegexParser {
                 return Err(ToolError::new("repeated regex quantifier"));
             }
             quantified = true;
+            // A lazy suffix (`*?`, `+?`, `??`, `{n,m}?`) changes which match
+            // is preferred, not whether a line matches, so accept and ignore
+            // it rather than rejecting a pattern any other grep takes.
+            self.consume_if('?');
             expression = RegexExpr::Repeat(Box::new(expression), repetition);
         }
         Ok(expression)
@@ -2234,7 +2705,7 @@ impl RegexParser {
             '[' => self
                 .parse_class()
                 .map(|class| RegexExpr::Consume(CharMatcher::Class(class))),
-            '\\' => self.parse_escape().map(RegexExpr::Consume),
+            '\\' => self.parse_escape(),
             '.' => Ok(RegexExpr::Consume(CharMatcher::Any)),
             '^' => Ok(RegexExpr::Start),
             '$' => Ok(RegexExpr::End),
@@ -2245,27 +2716,25 @@ impl RegexParser {
         }
     }
 
-    fn parse_escape(&mut self) -> Result<CharMatcher> {
+    fn parse_escape(&mut self) -> Result<RegexExpr> {
         let character = self
             .next()
             .ok_or_else(|| ToolError::new("trailing regex escape"))?;
         match character {
-            'd' => Ok(CharMatcher::Class(kind_class(CharacterKind::Digit, false))),
-            'D' => Ok(CharMatcher::Class(kind_class(CharacterKind::Digit, true))),
-            's' => Ok(CharMatcher::Class(kind_class(
-                CharacterKind::Whitespace,
-                false,
-            ))),
-            'S' => Ok(CharMatcher::Class(kind_class(
-                CharacterKind::Whitespace,
-                true,
-            ))),
-            'w' => Ok(CharMatcher::Class(kind_class(CharacterKind::Word, false))),
-            'W' => Ok(CharMatcher::Class(kind_class(CharacterKind::Word, true))),
-            'n' => Ok(CharMatcher::Literal('\n')),
-            'r' => Ok(CharMatcher::Literal('\r')),
-            't' => Ok(CharMatcher::Literal('\t')),
-            literal => Ok(CharMatcher::Literal(literal)),
+            'b' => Ok(RegexExpr::WordBoundary { negated: false }),
+            'B' => Ok(RegexExpr::WordBoundary { negated: true }),
+            'A' => Ok(RegexExpr::Start),
+            'z' => Ok(RegexExpr::End),
+            escaped => parse_class_escape(escaped).map(|item| {
+                RegexExpr::Consume(match item {
+                    ClassItem::Kind(kind, inverted) => {
+                        CharMatcher::Class(kind_class(kind, inverted))
+                    }
+                    ClassItem::Char(literal) | ClassItem::Range(literal, _) => {
+                        CharMatcher::Literal(literal)
+                    }
+                })
+            }),
         }
     }
 
@@ -2313,18 +2782,7 @@ impl RegexParser {
         let escaped = self
             .next()
             .ok_or_else(|| ToolError::new("trailing regex escape in character class"))?;
-        match escaped {
-            'd' => Ok(ClassItem::Kind(CharacterKind::Digit, false)),
-            'D' => Ok(ClassItem::Kind(CharacterKind::Digit, true)),
-            's' => Ok(ClassItem::Kind(CharacterKind::Whitespace, false)),
-            'S' => Ok(ClassItem::Kind(CharacterKind::Whitespace, true)),
-            'w' => Ok(ClassItem::Kind(CharacterKind::Word, false)),
-            'W' => Ok(ClassItem::Kind(CharacterKind::Word, true)),
-            'n' => Ok(ClassItem::Char('\n')),
-            'r' => Ok(ClassItem::Char('\r')),
-            't' => Ok(ClassItem::Char('\t')),
-            literal => Ok(ClassItem::Char(literal)),
-        }
+        parse_class_escape(escaped)
     }
 
     fn parse_counted_repetition(&mut self) -> Result<Option<Repetition>> {
@@ -2417,6 +2875,31 @@ fn kind_class(kind: CharacterKind, inverted: bool) -> CharClass {
     }
 }
 
+/// Escapes that stand for a character (class). Any other letter or digit is
+/// rejected: silently matching `\p{L}` or `\x41` as a literal `p` or `x`
+/// would report "no matches" for a pattern the model believed was valid.
+fn parse_class_escape(escaped: char) -> Result<ClassItem> {
+    match escaped {
+        'd' => Ok(ClassItem::Kind(CharacterKind::Digit, false)),
+        'D' => Ok(ClassItem::Kind(CharacterKind::Digit, true)),
+        's' => Ok(ClassItem::Kind(CharacterKind::Whitespace, false)),
+        'S' => Ok(ClassItem::Kind(CharacterKind::Whitespace, true)),
+        'w' => Ok(ClassItem::Kind(CharacterKind::Word, false)),
+        'W' => Ok(ClassItem::Kind(CharacterKind::Word, true)),
+        'n' => Ok(ClassItem::Char('\n')),
+        'r' => Ok(ClassItem::Char('\r')),
+        't' => Ok(ClassItem::Char('\t')),
+        'f' => Ok(ClassItem::Char('\u{000C}')),
+        'v' => Ok(ClassItem::Char('\u{000B}')),
+        'a' => Ok(ClassItem::Char('\u{0007}')),
+        'e' => Ok(ClassItem::Char('\u{001B}')),
+        unsupported if unsupported.is_ascii_alphanumeric() => Err(ToolError::new(format!(
+            "unsupported regex escape \\{unsupported}"
+        ))),
+        literal => Ok(ClassItem::Char(literal)),
+    }
+}
+
 #[derive(Default)]
 struct RegexCompiler {
     states: Vec<BuildState>,
@@ -2439,6 +2922,10 @@ enum BuildState {
         next: Option<usize>,
     },
     End {
+        next: Option<usize>,
+    },
+    WordBoundary {
+        negated: bool,
         next: Option<usize>,
     },
     Accept,
@@ -2487,6 +2974,9 @@ impl RegexCompiler {
                 BuildState::End { next } => next
                     .map(|next| RegexState::End { next })
                     .ok_or_else(|| ToolError::new("unpatched regex end anchor")),
+                BuildState::WordBoundary { negated, next } => next
+                    .map(|next| RegexState::WordBoundary { negated, next })
+                    .ok_or_else(|| ToolError::new("unpatched regex word boundary")),
                 BuildState::Accept => Ok(RegexState::Accept),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2511,6 +3001,12 @@ impl RegexCompiler {
             }
             RegexExpr::Start => self.single_out_fragment(BuildState::Start { next: None }),
             RegexExpr::End => self.single_out_fragment(BuildState::End { next: None }),
+            RegexExpr::WordBoundary { negated } => {
+                self.single_out_fragment(BuildState::WordBoundary {
+                    negated: *negated,
+                    next: None,
+                })
+            }
             RegexExpr::Concat(expressions) => {
                 let mut fragment = self.empty_fragment()?;
                 for expression in expressions {
@@ -2662,7 +3158,10 @@ impl RegexCompiler {
                 (BuildState::Consume { next, .. }, PatchSlot::Next)
                 | (BuildState::Jump { next }, PatchSlot::Next)
                 | (BuildState::Start { next }, PatchSlot::Next)
-                | (BuildState::End { next }, PatchSlot::Next) => *next = Some(destination),
+                | (BuildState::End { next }, PatchSlot::Next)
+                | (BuildState::WordBoundary { next, .. }, PatchSlot::Next) => {
+                    *next = Some(destination);
+                }
                 (BuildState::Split { right, .. }, PatchSlot::Right) => *right = Some(destination),
                 _ => unreachable!("regex patch slot does not match state"),
             }
@@ -3177,5 +3676,367 @@ mod tests {
         .expect("grep unicode git candidate");
         assert!(output.contains("café-日本.txt:1: NEEDLE"));
         assert!(!output.contains("ignored.rs"));
+    }
+
+    #[test]
+    fn file_mutations_serialize_concurrent_writes_to_one_path() {
+        let (directory, workspace) = workspace();
+        let path = directory.path.join("shared.txt");
+        fs::write(&path, "tail\n").expect("write fixture");
+        let key = workspace.mutation_key(Path::new("shared.txt"));
+
+        let held = FILE_MUTATIONS
+            .acquire(key.clone(), &CancellationToken::default())
+            .expect("hold the path");
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(FILE_MUTATIONS.acquire(key, &cancelled).is_err());
+
+        let tool = workspace.write_tool();
+        let writer = thread::spawn(move || {
+            run(
+                tool,
+                parameters([
+                    ("path", json!("shared.txt")),
+                    ("content", json!("replaced")),
+                ]),
+            )
+        });
+        thread::sleep(Duration::from_millis(150));
+        assert!(!writer.is_finished(), "write ran while the path was held");
+        assert_eq!(fs::read_to_string(&path).expect("read held file"), "tail\n");
+        drop(held);
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("write after release");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read released"),
+            "replaced"
+        );
+
+        fs::write(&path, "tail\n").expect("reset fixture");
+        let editors = (0..8)
+            .map(|index| {
+                let tool = workspace.edit_tool();
+                thread::spawn(move || {
+                    run(
+                        tool,
+                        parameters([
+                            ("path", json!("shared.txt")),
+                            ("old_text", json!("tail")),
+                            ("new_text", json!(format!("line-{index}\ntail"))),
+                        ]),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for editor in editors {
+            editor.join().expect("editor thread").expect("racing edit");
+        }
+        let content = fs::read_to_string(&path).expect("read edited file");
+        for index in 0..8 {
+            assert!(content.contains(&format!("line-{index}\n")), "{content}");
+        }
+        assert_eq!(content.matches("tail").count(), 1);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bash_kills_the_whole_process_group_without_waiting_for_orphans() {
+        let (directory, mut workspace) = workspace();
+        workspace.set_bash_timeout(Duration::from_millis(50));
+        let started = Instant::now();
+        let error = run(
+            workspace.bash_tool(),
+            parameters([(
+                "command",
+                json!("(sleep 0.3; echo alive > marker.txt; sleep 5) & wait"),
+            )]),
+        )
+        .expect_err("timeout");
+        assert!(error.contains("timed out"));
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "waited on a pipe held by a killed group: {:?}",
+            started.elapsed()
+        );
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            !directory.path.join("marker.txt").exists(),
+            "a backgrounded descendant survived the timeout"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn bash_does_not_inherit_the_agent_stdin() {
+        let (_directory, mut workspace) = workspace();
+        workspace.set_bash_timeout(Duration::from_secs(5));
+        let output = run(
+            workspace.bash_tool(),
+            parameters([("command", json!("cat; echo eof"))]),
+        )
+        .expect("cat must see EOF immediately");
+        assert_eq!(output.trim_end(), "eof");
+    }
+
+    #[test]
+    fn edit_matches_lf_text_against_crlf_files_and_keeps_their_endings_and_bom() {
+        let (directory, workspace) = workspace();
+        let path = directory.path.join("dos.txt");
+        fs::write(&path, "\u{FEFF}alpha\r\nbeta\r\ngamma\r\n").expect("write fixture");
+        run(
+            workspace.edit_tool(),
+            parameters([
+                ("path", json!("dos.txt")),
+                ("old_text", json!("beta\ngamma")),
+                ("new_text", json!("BETA\nGAMMA\nextra")),
+            ]),
+        )
+        .expect("edit CRLF file");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read edited"),
+            "\u{FEFF}alpha\r\nBETA\r\nGAMMA\r\nextra\r\n"
+        );
+
+        fs::write(&path, "one\ntwo\n").expect("write LF fixture");
+        run(
+            workspace.edit_tool(),
+            parameters([
+                ("path", json!("dos.txt")),
+                ("old_text", json!("one\r\ntwo")),
+                ("new_text", json!("x")),
+            ]),
+        )
+        .expect("CRLF old_text against LF file");
+        assert_eq!(fs::read_to_string(&path).expect("read LF edit"), "x\n");
+        assert_eq!(detect_line_ending("a\nb\r\n"), LineEnding::Lf);
+        assert_eq!(detect_line_ending("a\r\nb\n"), LineEnding::CrLf);
+    }
+
+    #[test]
+    fn regex_word_boundaries_lazy_quantifiers_and_unknown_escapes() {
+        let token = CancellationToken::default();
+        let matches = |pattern: &str, text: &str| {
+            SearchRegex::compile(pattern, false)
+                .unwrap_or_else(|error| panic!("{pattern}: {error}"))
+                .is_match(text, &token)
+                .expect("match")
+        };
+        assert!(matches(r"\bfoo\b", "a foo b"));
+        assert!(matches(r"\bfoo\b", "foo"));
+        assert!(!matches(r"\bfoo\b", "food"));
+        assert!(!matches(r"\bfoo\b", "_foo"));
+        assert!(matches(r"\Bfoo", "afoo"));
+        assert!(!matches(r"\Bfoo", "foo bar"));
+        assert!(matches(r"a+?b", "aab"));
+        assert!(matches(r"colou??r", "color"));
+        assert!(matches(r"x{1,2}?y", "xy"));
+        assert!(matches(r"\Afoo\z", "foo"));
+        assert!(matches(r"\.", "."));
+        assert!(!matches(r"\.", "a"));
+        assert!(matches(r"[\f\v]", "\u{000C}"));
+        for unsupported in [r"\p{L}", r"\x41", r"[\p]", r"\Q", r"[\b]", r"\1"] {
+            let error = SearchRegex::compile(unsupported, false).expect_err(unsupported);
+            assert!(error.to_string().contains("unsupported regex escape"));
+        }
+        assert!(SearchRegex::compile("a**", false).is_err());
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_simplified_to_ordinary_paths() {
+        let cases = [
+            (r"\\?\C:\ws\file.txt", r"C:\ws\file.txt"),
+            (r"\\?\UNC\server\share\dir", r"\\server\share\dir"),
+            (r"\\?\Volume{guid}\x", r"\\?\Volume{guid}\x"),
+            ("/plain/path", "/plain/path"),
+        ];
+        for (verbatim, expected) in cases {
+            assert_eq!(
+                simplify_verbatim(Path::new(verbatim)),
+                PathBuf::from(expected),
+                "{verbatim}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_wsl_bash_launcher_is_recognised() {
+        assert!(is_legacy_wsl_bash(r"C:\Windows\System32\bash.exe"));
+        assert!(is_legacy_wsl_bash("c:/windows/sysnative/bash.exe"));
+        assert!(is_legacy_wsl_bash(r"D:\WINDOWS\System32\BASH.EXE"));
+        assert!(!is_legacy_wsl_bash(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_legacy_wsl_bash(r"C:\Windows\System32\wsl\bash.exe"));
+    }
+
+    #[test]
+    fn huge_directories_are_listed_partially_instead_of_failing() {
+        let directory = TempDirectory::new();
+        for index in 0..5 {
+            fs::write(directory.path.join(format!("file-{index}")), "").expect("write entry");
+        }
+        let token = CancellationToken::default();
+        let (entries, overflowed) =
+            read_directory_entries(&directory.path, 3, &token).expect("capped listing");
+        assert_eq!(entries.len(), 3);
+        assert!(overflowed);
+        let (entries, overflowed) =
+            read_directory_entries(&directory.path, 10, &token).expect("full listing");
+        assert_eq!(entries.len(), 5);
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn temporary_names_stay_short_for_long_destinations() {
+        let (directory, workspace) = workspace();
+        let long_name = "n".repeat(200);
+        let temporary = temporary_path(&directory.path, &directory.path.join(&long_name), 0);
+        let name = temporary.file_name().expect("name").to_string_lossy();
+        assert!(name.len() < 128, "{name}");
+        assert!(name.starts_with(&format!(".{}", "n".repeat(TEMP_NAME_PREFIX_BYTES))));
+
+        run(
+            workspace.write_tool(),
+            parameters([("path", json!(long_name)), ("content", json!("ok"))]),
+        )
+        .expect("write to a long but valid file name");
+        assert_eq!(
+            fs::read_to_string(directory.path.join(&long_name)).expect("read long name"),
+            "ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_do_not_carry_setuid_bits_onto_the_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, workspace) = workspace();
+        let path = directory.path.join("tool");
+        fs::write(&path, "old").expect("write fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).expect("set setuid");
+        run(
+            workspace.write_tool(),
+            parameters([("path", json!("tool")), ("content", json!("new"))]),
+        )
+        .expect("write");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o7777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn git_candidates_skip_tracked_files_deleted_from_the_worktree() {
+        let (directory, workspace) = workspace();
+        let git = |arguments: &[&str]| {
+            Command::new("git")
+                .args(arguments)
+                .current_dir(&directory.path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        fs::write(directory.path.join("kept.txt"), "").expect("write kept");
+        fs::write(directory.path.join("gone.txt"), "").expect("write gone");
+        if !(git(&["init", "-q"])
+            && git(&["add", "."])
+            && git(&[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ]))
+        {
+            return;
+        }
+        fs::remove_file(directory.path.join("gone.txt")).expect("delete tracked file");
+        let output = run(
+            workspace.find_tool(),
+            parameters([("pattern", json!("*.txt"))]),
+        )
+        .expect("find");
+        assert!(output.contains("kept.txt"));
+        assert!(!output.contains("gone.txt"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_unreadable_subdirectories_instead_of_aborting() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestoreMode(PathBuf);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let (directory, workspace) = workspace();
+        let locked = directory.path.join("locked");
+        fs::create_dir(&locked).expect("make locked");
+        fs::write(locked.join("hidden.txt"), "").expect("write hidden");
+        fs::write(directory.path.join("open.txt"), "").expect("write open");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("lock directory");
+        let _restore = RestoreMode(locked.clone());
+        if fs::read_dir(&locked).is_ok() {
+            // Root ignores directory modes, so the failure cannot be staged.
+            return;
+        }
+
+        let candidates = workspace
+            .walk_candidate_files(&CancellationToken::default(), Path::new("."), 100)
+            .expect("walk past the unreadable directory");
+        assert_eq!(candidates.files, [PathBuf::from("open.txt")]);
+        assert!(
+            workspace
+                .walk_candidate_files(&CancellationToken::default(), Path::new("locked"), 100)
+                .is_err(),
+            "an unreadable search root is still an error"
+        );
+    }
+
+    #[test]
+    fn glob_braces_expand_to_alternatives() {
+        let cases = [
+            ("*.{rs,toml}", "src/main.rs", true),
+            ("*.{rs,toml}", "Cargo.toml", true),
+            ("*.{rs,toml}", "notes.md", false),
+            ("src/{a,b}/*.rs", "src/b/lib.rs", true),
+            ("src/{a,b}/*.rs", "src/c/lib.rs", false),
+            ("{x,{y,z}}.txt", "z.txt", true),
+            ("lit{eral.txt", "lit{eral.txt", true),
+            ("{only}.rs", "only.rs", true),
+        ];
+        for (pattern, name, expected) in cases {
+            assert_eq!(
+                compile_glob(pattern).expect("compile glob").is_match(name),
+                expected,
+                "{pattern:?} against {name:?}"
+            );
+        }
+        let explosive = "{a,b}".repeat(9);
+        assert!(compile_glob(&explosive).is_err());
+    }
+
+    #[test]
+    fn candidate_caps_truncate_with_a_notice_instead_of_failing() {
+        let (directory, workspace) = workspace();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(directory.path.join(name), "").expect("write candidate");
+        }
+        let candidates = workspace
+            .collect_candidates(&CancellationToken::default(), Path::new("."), 2)
+            .expect("capped candidates");
+        assert_eq!(candidates.files.len(), 2);
+        assert!(candidates.truncated);
+        assert!(candidate_truncation_notice(true).contains("candidate files"));
+        assert!(candidate_truncation_notice(false).is_empty());
     }
 }

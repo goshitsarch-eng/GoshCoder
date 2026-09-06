@@ -21,10 +21,10 @@ use std::{
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex, MutexGuard},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -47,6 +47,13 @@ pub const MAX_REVIEW_DIFF_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REVIEW_HEADER_BYTES: usize = 16 * 1024;
 /// Maximum form or JSON decision body accepted by the local review server.
 pub const MAX_REVIEW_DECISION_BYTES: usize = 2 * 1024 * 1024;
+/// Longest one review connection may take from accept to its response. A
+/// browser that stalls mid-request would otherwise pin the review thread
+/// while the tab the user actually submits from waits in the accept backlog.
+const REVIEW_CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
+/// Bounds one socket read so cancellation and the connection deadline are
+/// rechecked between reads.
+const REVIEW_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// System-prompt suffix used while the planner is collecting a plan.
 pub const PLANNING_PROMPT: &str = r#"
@@ -120,9 +127,15 @@ pub struct ChecklistItem {
     pub completed: bool,
 }
 
-/// Durable planner state.  Store it in a session's `custom` slot, not in a
-/// workspace-global file, so multiple sessions in one repository stay
-/// independent.
+/// Durable planner state.
+///
+/// The state belongs to a workspace rather than to one session.  The runtime
+/// keeps the authoritative copy in a per-workspace file under the agent
+/// directory ([`crate::planner_runtime::WorkspaceStateStore`]), so every
+/// window open on one repository shares one plan mode and a `-no-session`
+/// run keeps it.  The same state is also recorded in the session's `custom`
+/// slot in the pi-compatible shape; that entry is the fallback when the
+/// workspace file does not exist.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct State {
     #[serde(default)]
@@ -375,11 +388,7 @@ impl Manager {
             });
         }
 
-        let mut state = options.initial.unwrap_or_default();
-        let invalid_phase = (!state.phase.is_known()).then(|| state.phase.as_str().to_owned());
-        if invalid_phase.is_some() {
-            state = State::default();
-        }
+        let (state, invalid_phase) = known_or_idle(options.initial.unwrap_or_default());
         let manager = Self {
             inner: Arc::new(Mutex::new(ManagerInner {
                 root: canonical,
@@ -622,6 +631,14 @@ impl Manager {
 
         let (state, callback) = {
             let mut inner = lock(&self.inner);
+            // The review can outlast planning: `/planner` may have toggled
+            // the phase while the browser tab was open, and an approval must
+            // not then start execution behind the user's back.
+            if inner.state.phase != Phase::Planning {
+                return Ok(SubmitResult::message(
+                    "Error: Not in Planner mode. Planning ended while the plan was under review, so it was not approved; enter Planner mode and resubmit.",
+                ));
+            }
             inner.state = State {
                 phase: Phase::Executing,
                 plan_path: portable_input_path(input_path),
@@ -723,6 +740,27 @@ impl Manager {
                 format!("Planner: executing {completed}/{}", state.items.len())
             }
             Phase::Idle | Phase::Unknown(_) => "Planner: idle".to_owned(),
+        }
+    }
+
+    /// Replaces the current state with one saved by another process on the
+    /// same workspace.
+    ///
+    /// An executing plan's checklist is re-read from the plan file exactly as
+    /// on construction.  The change callback is deliberately not invoked: the
+    /// state already exists in the shared store, and writing it back would
+    /// make two windows overwrite each other's file in turn.
+    pub fn adopt_state(&self, state: State) {
+        let (state, invalid_phase) = known_or_idle(state);
+        let needs_rehydrate = state.phase == Phase::Executing && !state.plan_path.is_empty();
+        lock(&self.inner).state = state;
+        if let Some(phase) = invalid_phase {
+            self.warn(format!(
+                "ignoring an unrecognized shared Planner phase {phase:?}; now idle"
+            ));
+        }
+        if needs_rehydrate {
+            self.rehydrate_checklist();
         }
     }
 
@@ -935,7 +973,8 @@ fn relative_plan_path(root: &Path, input_path: &str) -> Option<PathBuf> {
         if !source.is_absolute() {
             return None;
         }
-        normalize_absolute(source)?
+        let normalized = normalize_absolute(source)?;
+        canonical_ancestor_path(&normalized).unwrap_or(normalized)
     } else {
         normalize_absolute(&root.join(source))?
     };
@@ -978,6 +1017,27 @@ fn normalize_absolute(path: &Path) -> Option<PathBuf> {
         }
     }
     normalized.is_absolute().then_some(normalized)
+}
+
+/// Canonicalizes the longest existing prefix of a lexically normalized
+/// absolute path and re-appends the rest. The workspace root is stored
+/// canonical, so a rooted input has to be compared in the same spelling:
+/// macOS reaches `/private/tmp` through the `/tmp` symlink and Windows
+/// canonical paths carry a `\\?\` prefix, and neither survives a lexical
+/// `strip_prefix` against the root.
+fn canonical_ancestor_path(path: &Path) -> Option<PathBuf> {
+    let mut existing = path;
+    let mut trailing = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return Some(trailing.iter().rev().fold(canonical, |mut resolved, name| {
+                resolved.push(name);
+                resolved
+            }));
+        }
+        trailing.push(existing.file_name()?.to_owned());
+        existing = existing.parent()?;
+    }
 }
 
 fn read_plan_file(root: &Path, relative: &Path) -> PlannerResult<Vec<u8>> {
@@ -1057,6 +1117,16 @@ fn portable_input_path(path: &str) -> String {
 fn publish(callback: Option<StateCallback>, state: State) {
     if let Some(callback) = callback {
         callback(state);
+    }
+}
+
+/// Replaces a phase this build does not understand with idle, returning the
+/// rejected spelling so the caller can warn about it.
+fn known_or_idle(state: State) -> (State, Option<String>) {
+    if state.phase.is_known() {
+        (state, None)
+    } else {
+        (State::default(), Some(state.phase.as_str().to_owned()))
     }
 }
 
@@ -1460,7 +1530,14 @@ impl BrowserReviewer {
             .set_nonblocking(true)
             .map_err(|error| ReviewError::Failed(format!("configure review server: {error}")))?;
 
-        let token = Uuid::now_v7().simple().to_string();
+        let token = generate_review_token();
+        let session = ReviewSession {
+            address,
+            token: &token,
+            title,
+            markdown,
+            previous,
+        };
         let review_url = format!("http://{address}/");
         let opener_result = match &self.open_browser {
             Some(opener) => opener.open(&review_url),
@@ -1486,28 +1563,22 @@ impl BrowserReviewer {
                         let _ = write_plain_response(&mut stream, 421, "unexpected peer");
                         continue;
                     }
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .map_err(|error| {
-                            ReviewError::Failed(format!("configure review connection: {error}"))
-                        })?;
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(5)))
-                        .map_err(|error| {
-                            ReviewError::Failed(format!("configure review connection: {error}"))
-                        })?;
-                    if let Some(decision) = serve_review_connection(
-                        &mut stream,
-                        address,
-                        &token,
-                        title,
-                        markdown,
-                        previous,
-                    )? {
+                    // A socket that cannot be configured is dropped, not
+                    // fatal: the browser retries and the review keeps waiting.
+                    if configure_review_stream(&stream).is_err() {
+                        continue;
+                    }
+                    let deadline = Instant::now() + REVIEW_CONNECTION_DEADLINE;
+                    if let Some(decision) =
+                        serve_review_connection(&mut stream, &session, cancellation, deadline)?
+                    {
                         return Ok(decision);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(interval),
+                // A peer that vanished between connect and accept must not
+                // end a review that another tab can still complete.
+                Err(error) if accept_error_is_transient(error.kind()) => {}
                 Err(error) => {
                     return Err(ReviewError::Failed(format!(
                         "accept review connection: {error}"
@@ -1549,6 +1620,40 @@ fn validate_review_host(host: &str) -> Result<(), ReviewError> {
     }
 }
 
+/// Builds the CSRF token for one review. OS entropy is mixed with several
+/// UUIDv7 values through a digest, so the token neither depends on a random
+/// number crate nor exposes a UUID's guessable timestamp bits.
+fn generate_review_token() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"goshcoder/plannotator/review-token");
+    digest.update(os_entropy());
+    for _ in 0..8 {
+        digest.update(Uuid::now_v7().as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut token = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut token, "{byte:02x}");
+    }
+    token
+}
+
+#[cfg(unix)]
+fn os_entropy() -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    // A short or failed read leaves zeros behind; the UUIDs still make the
+    // digest unpredictable enough for a loopback-only token.
+    if let Ok(mut source) = File::open("/dev/urandom") {
+        let _ = source.read_exact(&mut bytes);
+    }
+    bytes
+}
+
+#[cfg(not(unix))]
+fn os_entropy() -> [u8; 32] {
+    [0_u8; 32]
+}
+
 fn open_system_browser(target: &str) -> io::Result<()> {
     let parsed =
         Url::parse(target).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -1576,7 +1681,53 @@ fn open_system_browser(target: &str) -> io::Result<()> {
         command.arg(target);
         command
     };
-    command.spawn().map(|_| ())
+    spawn_detached(&mut command).map(|_| ())
+}
+
+/// Starts a helper whose output nobody reads and whose exit nobody waits
+/// for. Inherited stdio would let it write over the terminal UI or block on
+/// its stdin, and a child nobody waits for stays a zombie for the life of
+/// the session. Returns the child's process id.
+fn spawn_detached(command: &mut Command) -> io::Result<u32> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let id = child.id();
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(id)
+}
+
+/// Everything one review connection needs to answer a request.
+struct ReviewSession<'a> {
+    address: SocketAddr,
+    token: &'a str,
+    title: &'a str,
+    markdown: &'a str,
+    previous: &'a str,
+}
+
+/// Puts an accepted socket into the mode the request reader expects. The
+/// listener polls in non-blocking mode, and BSD-derived kernels (macOS
+/// included) hand that flag down to accepted sockets, where the first read
+/// would fail with WouldBlock and the browser would be answered 400 before
+/// it had sent a byte.
+fn configure_review_stream(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(REVIEW_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(REVIEW_READ_TIMEOUT))
+}
+
+fn accept_error_is_transient(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    )
 }
 
 struct HttpRequest {
@@ -1587,49 +1738,58 @@ struct HttpRequest {
 }
 
 fn serve_review_connection(
-    stream: &mut TcpStream,
-    address: SocketAddr,
-    token: &str,
-    title: &str,
-    markdown: &str,
-    previous: &str,
+    stream: &mut (impl Read + Write),
+    session: &ReviewSession<'_>,
+    cancellation: &agent::CancellationToken,
+    deadline: Instant,
 ) -> Result<Option<Decision>, ReviewError> {
-    let request = match read_http_request(stream) {
+    let request = match read_http_request(stream, cancellation, deadline) {
         Ok(request) => request,
+        Err(_) if cancellation.is_cancelled() => return Err(ReviewError::Cancelled),
         Err(error) => {
             let _ = write_plain_response(stream, 400, &format!("bad request: {error}"));
             return Ok(None);
         }
     };
-    if !allowed_review_host(request.headers.get("host").map(String::as_str), address) {
+    if !allowed_review_host(
+        request.headers.get("host").map(String::as_str),
+        session.address,
+    ) {
         let _ = write_plain_response(stream, 421, "unexpected Host header");
         return Ok(None);
     }
     let path = request.target.split('?').next().unwrap_or_default();
     match (request.method.as_str(), path) {
         ("GET", "/") => {
-            let page = render_review_page(title, markdown, previous, token);
-            write_html_response(stream, 200, &page)
-                .map_err(|error| ReviewError::Failed(format!("write review page: {error}")))?;
+            let page = render_review_page(
+                session.title,
+                session.markdown,
+                session.previous,
+                session.token,
+            );
+            // A browser that gives up mid-page simply reloads; the review
+            // itself must go on.
+            let _ = write_html_response(stream, 200, &page);
             Ok(None)
         }
         ("POST", "/api/decision") => {
-            let Some(decision) = parse_form_decision(&request.body, token) else {
+            let Some(decision) = parse_form_decision(&request.body, session.token) else {
                 let _ = write_plain_response(stream, 403, "invalid review decision");
                 return Ok(None);
             };
+            // The decision is what the user submitted. A tab closed before
+            // the confirmation page arrives must not discard it, so the
+            // response is best effort.
             let page = render_review_complete_page(decision.approved);
-            write_html_response(stream, 200, &page)
-                .map_err(|error| ReviewError::Failed(format!("write review response: {error}")))?;
+            let _ = write_html_response(stream, 200, &page);
             Ok(Some(decision))
         }
         ("POST", "/api/decision.json") => {
-            let Some(decision) = parse_json_decision(&request.body, token) else {
+            let Some(decision) = parse_json_decision(&request.body, session.token) else {
                 let _ = write_plain_response(stream, 403, "invalid review decision");
                 return Ok(None);
             };
-            write_empty_response(stream, 204)
-                .map_err(|error| ReviewError::Failed(format!("write review response: {error}")))?;
+            let _ = write_empty_response(stream, 204);
             Ok(Some(decision))
         }
         ("GET", _) => {
@@ -1643,7 +1803,45 @@ fn serve_review_connection(
     }
 }
 
-fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
+/// One bounded socket read. Cancellation and the connection deadline are
+/// rechecked before every read, and a read timeout only triggers that
+/// recheck: browsers open speculative connections that sit idle before the
+/// first request, and such a socket must not be answered 400 for silence.
+fn read_review_chunk(
+    stream: &mut impl Read,
+    chunk: &mut [u8],
+    cancellation: &agent::CancellationToken,
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "review cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "review connection deadline passed",
+            ));
+        }
+        match stream.read(chunk) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            result => return result,
+        }
+    }
+}
+
+fn read_http_request(
+    stream: &mut impl Read,
+    cancellation: &agent::CancellationToken,
+    deadline: Instant,
+) -> io::Result<HttpRequest> {
     let mut bytes = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
     let header_end = loop {
@@ -1663,7 +1861,7 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
                 "request headers exceed the limit",
             ));
         }
-        let read = stream.read(&mut chunk)?;
+        let read = read_review_chunk(stream, &mut chunk, cancellation, deadline)?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1733,7 +1931,7 @@ fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
     }
     let mut body = bytes[header_end..].to_vec();
     while body.len() < content_length {
-        let read = stream.read(&mut chunk)?;
+        let read = read_review_chunk(stream, &mut chunk, cancellation, deadline)?;
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -1816,7 +2014,7 @@ fn parse_json_decision(body: &[u8], token: &str) -> Option<Decision> {
 }
 
 fn write_review_headers(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     status: u16,
     content_type: &str,
     length: usize,
@@ -1829,16 +2027,16 @@ fn write_review_headers(
     )
 }
 
-fn write_html_response(stream: &mut TcpStream, status: u16, page: &str) -> io::Result<()> {
+fn write_html_response(stream: &mut impl Write, status: u16, page: &str) -> io::Result<()> {
     write_review_headers(stream, status, "text/html; charset=utf-8", page.len())?;
     stream.write_all(page.as_bytes())
 }
 
-fn write_empty_response(stream: &mut TcpStream, status: u16) -> io::Result<()> {
+fn write_empty_response(stream: &mut impl Write, status: u16) -> io::Result<()> {
     write_review_headers(stream, status, "text/plain; charset=utf-8", 0)
 }
 
-fn write_plain_response(stream: &mut TcpStream, status: u16, body: &str) -> io::Result<()> {
+fn write_plain_response(stream: &mut impl Write, status: u16, body: &str) -> io::Result<()> {
     write_review_headers(stream, status, "text/plain; charset=utf-8", body.len())?;
     stream.write_all(body.as_bytes())
 }
@@ -2338,8 +2536,9 @@ impl TextCollector {
             if !source.is_absolute() {
                 return Err(CollectionError::UnsafePath(input.to_owned()));
             }
-            normalize_absolute(source)
-                .ok_or_else(|| CollectionError::UnsafePath(input.to_owned()))?
+            let normalized = normalize_absolute(source)
+                .ok_or_else(|| CollectionError::UnsafePath(input.to_owned()))?;
+            canonical_ancestor_path(&normalized).unwrap_or(normalized)
         } else {
             normalize_absolute(&self.root.join(source))
                 .ok_or_else(|| CollectionError::UnsafePath(input.to_owned()))?
@@ -3015,6 +3214,53 @@ mod tests {
             .expect("model-facing rejection");
         assert!(result.text.contains("cannot be read"));
         assert!(result.text.contains("not a regular file"));
+    }
+
+    #[test]
+    fn adopted_state_rehydrates_its_checklist_without_publishing_a_change() {
+        let root = Scratch::new();
+        root.write("PLAN.md", "- [ ] one\n- [ ] two\n");
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let capture = changes.clone();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let warned = warnings.clone();
+        let planner = Manager::new(
+            &root.0,
+            None,
+            Options {
+                initial: None,
+                on_change: Some(Arc::new(move |state| lock(&capture).push(state))),
+                warn: Some(Arc::new(move |message| lock(&warned).push(message))),
+            },
+        )
+        .expect("manager");
+        let content = fs::read(root.0.join("PLAN.md")).expect("read plan");
+
+        planner.adopt_state(State {
+            phase: Phase::Executing,
+            plan_path: "PLAN.md".to_owned(),
+            items: vec![ChecklistItem {
+                step: 1,
+                text: "one".to_owned(),
+                completed: true,
+            }],
+            plan_hash: hash_plan(&content),
+        });
+        let state = planner.state();
+        assert_eq!(state.phase, Phase::Executing);
+        assert_eq!(state.items.len(), 2);
+        assert!(state.items[0].completed);
+        assert!(!state.items[1].completed);
+        assert!(lock(&changes).is_empty());
+        assert!(lock(&warnings).is_empty());
+
+        planner.adopt_state(State {
+            phase: Phase::Unknown("future".to_owned()),
+            ..State::default()
+        });
+        assert_eq!(planner.state(), State::default());
+        assert!(lock(&changes).is_empty());
+        assert!(lock(&warnings)[0].contains("future"));
     }
 
     #[test]
@@ -3744,6 +3990,369 @@ mod tests {
             collect_last_assistant_response(&[]),
             Err(CollectionError::NoAssistantResponse)
         ));
+    }
+
+    fn review_session(address: SocketAddr) -> ReviewSession<'static> {
+        ReviewSession {
+            address,
+            token: "secret",
+            title: "Review",
+            markdown: "# Plan\n- [ ] step",
+            previous: "",
+        }
+    }
+
+    /// Serves a request from memory and refuses every response write, like
+    /// a tab closed the instant its decision was posted.
+    struct BrokenResponseStream(io::Cursor<Vec<u8>>);
+
+    impl Read for BrokenResponseStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buffer)
+        }
+    }
+
+    impl Write for BrokenResponseStream {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sends part of a request and then stalls. The second read cancels the
+    /// review the way a user aborting the turn would, and reports the kind of
+    /// error a socket read timeout produces.
+    struct StalledStream {
+        reads: usize,
+        cancellation: agent::CancellationToken,
+    }
+
+    impl Read for StalledStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 1 {
+                let partial = b"GET / HTTP/1.1\r\nHost: 127.0.0.1:1\r\n";
+                buffer[..partial.len()].copy_from_slice(partial);
+                return Ok(partial.len());
+            }
+            self.cancellation.cancel();
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+    }
+
+    impl Write for StalledStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Delivers one header byte per read without ever finishing the request.
+    struct DrippingStream;
+
+    impl Read for DrippingStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_millis(1));
+            buffer[0] = b'x';
+            Ok(1)
+        }
+    }
+
+    impl Write for DrippingStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn accepted_review_sockets_are_switched_back_to_blocking_mode() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        let address = listener.local_addr().expect("address");
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            release_receiver.recv().expect("server ready");
+            write!(
+                stream,
+                "GET / HTTP/1.1\r\nHost: {address}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .expect("write request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("read response");
+            response
+        });
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        // Stand in for a BSD kernel handing the listener's O_NONBLOCK down.
+        stream
+            .set_nonblocking(true)
+            .expect("inherit non-blocking mode");
+        configure_review_stream(&stream).expect("configure");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("short timeout");
+        let mut stream = stream;
+        let started = Instant::now();
+        assert!(stream.read(&mut [0_u8; 1]).is_err());
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "a blocking read must wait for its timeout instead of failing at once"
+        );
+        release_sender.send(()).expect("release client");
+        let served = serve_review_connection(
+            &mut stream,
+            &review_session(address),
+            &agent::CancellationToken::default(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("serve");
+        assert!(served.is_none());
+        drop(stream);
+        let response = client.join().expect("client");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[test]
+    fn a_submitted_decision_survives_a_failed_response_write() {
+        let address: SocketAddr = "127.0.0.1:4321".parse().expect("address");
+        let body = "action=approve&feedback=ship+it&token=secret";
+        let request = format!(
+            "POST /api/decision HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = BrokenResponseStream(io::Cursor::new(request.into_bytes()));
+        let decision = serve_review_connection(
+            &mut stream,
+            &review_session(address),
+            &agent::CancellationToken::default(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("serve")
+        .expect("decision");
+        assert_eq!(
+            decision,
+            Decision {
+                approved: true,
+                feedback: "ship it".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn accept_failures_from_a_vanished_peer_are_transient() {
+        assert!(accept_error_is_transient(io::ErrorKind::ConnectionAborted));
+        assert!(accept_error_is_transient(io::ErrorKind::ConnectionReset));
+        assert!(accept_error_is_transient(io::ErrorKind::Interrupted));
+        assert!(!accept_error_is_transient(io::ErrorKind::Other));
+    }
+
+    #[test]
+    fn a_stalled_review_connection_notices_cancellation_between_reads() {
+        let cancellation = agent::CancellationToken::default();
+        let mut stream = StalledStream {
+            reads: 0,
+            cancellation: cancellation.clone(),
+        };
+        let address: SocketAddr = "127.0.0.1:1".parse().expect("address");
+        let result = serve_review_connection(
+            &mut stream,
+            &review_session(address),
+            &cancellation,
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(result, Err(ReviewError::Cancelled));
+        assert_eq!(
+            stream.reads, 2,
+            "a cancelled review must stop reading at once"
+        );
+    }
+
+    #[test]
+    fn a_review_connection_is_closed_at_its_deadline() {
+        let cancellation = agent::CancellationToken::default();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let Err(error) = read_http_request(&mut DrippingStream, &cancellation, deadline) else {
+            panic!("the deadline must end the request");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= deadline);
+
+        let address: SocketAddr = "127.0.0.1:1".parse().expect("address");
+        let served = serve_review_connection(
+            &mut DrippingStream,
+            &review_session(address),
+            &cancellation,
+            Instant::now() + Duration::from_millis(30),
+        )
+        .expect("a timed-out request is answered and the review continues");
+        assert!(served.is_none());
+    }
+
+    #[test]
+    fn review_tokens_are_distinct_hex_digests() {
+        let first = generate_review_token();
+        let second = generate_review_token();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_helpers_get_null_stdio_and_are_reaped() {
+        let root = Scratch::new();
+        let marker = root.0.join("stdin.txt");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#"if read -r line; then echo "got:$line" > "$1"; else echo eof > "$1"; fi"#)
+            .arg("sh")
+            .arg(&marker);
+        let id = spawn_detached(&mut command).expect("spawn helper");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut contents = String::new();
+        while Instant::now() < deadline {
+            contents = fs::read_to_string(&marker).unwrap_or_default();
+            if !contents.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            contents.trim(),
+            "eof",
+            "the helper must not inherit the session's stdin"
+        );
+        assert_helper_reaped(id);
+    }
+
+    /// A reaped child loses its `/proc` entry; a zombie keeps it in state Z.
+    #[cfg(target_os = "linux")]
+    fn assert_helper_reaped(id: u32) {
+        let entry = PathBuf::from(format!("/proc/{id}"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while entry.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!entry.exists(), "the helper was left as a zombie");
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn assert_helper_reaped(_: u32) {}
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_inputs_through_a_symlinked_root_spelling_are_confined_correctly() {
+        use std::os::unix::fs::symlink;
+
+        let real = Scratch::new();
+        real.write("plans/plan.md", "# Plan\n- [ ] step");
+        real.write("docs/a.md", "notes");
+        let aliases = Scratch::new();
+        aliases.write("outside.md", "outside");
+        // The same workspace spelled through a symlink, the way macOS spells
+        // `/private/tmp` as `/tmp`.
+        let alias = aliases.0.join("workspace");
+        symlink(&real.0, &alias).expect("alias root");
+        let spelled = |relative: &str| {
+            alias
+                .join(relative)
+                .to_str()
+                .expect("utf-8 path")
+                .to_owned()
+        };
+        let outside = aliases.0.join("outside.md");
+        let outside = outside.to_str().expect("utf-8 path");
+
+        let manager = Manager::new(&alias, None, Options::default()).expect("manager");
+        assert_ne!(manager.root(), alias, "the root is stored canonical");
+        assert!(manager.is_plan_path_allowed(&spelled("plans/plan.md")));
+        assert!(manager.is_plan_path_allowed(&spelled("plans/unwritten.md")));
+        assert_eq!(
+            manager
+                .read_plan(&spelled("plans/plan.md"))
+                .expect("read plan"),
+            b"# Plan\n- [ ] step"
+        );
+        assert!(!manager.is_plan_path_allowed(outside));
+
+        let collector = TextCollector::with_fetcher(
+            &alias,
+            fake_fetcher(UrlTextResponse {
+                status: 200,
+                final_url: Url::parse("https://example.test").expect("url"),
+                content_type: None,
+                body: Vec::new(),
+            }),
+        )
+        .expect("collector");
+        let collected = collector
+            .collect(&spelled("docs/a.md"))
+            .expect("collect through the alias");
+        assert_eq!(collected.text, "notes");
+        assert!(matches!(
+            collector.collect(outside),
+            Err(CollectionError::UnsafePath(_))
+        ));
+    }
+
+    /// Approves, but only after leaving planner mode the way `/planner` does
+    /// while a browser tab is still open.
+    struct PhaseFlippingReviewer(Manager);
+
+    impl Reviewer for PhaseFlippingReviewer {
+        fn review(
+            &self,
+            _: &agent::CancellationToken,
+            _: &ReviewRequest,
+        ) -> Result<Decision, ReviewError> {
+            self.0.exit();
+            Ok(Decision {
+                approved: true,
+                feedback: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn an_approval_after_planning_ended_does_not_start_execution() {
+        let root = Scratch::new();
+        root.write("plan.md", "# Plan\n- [ ] step");
+        let manager = manager(&root, None);
+        manager.set_reviewer(Some(Arc::new(PhaseFlippingReviewer(manager.clone()))));
+        manager.enter();
+        let result = manager
+            .submit(&agent::CancellationToken::default(), "plan.md")
+            .expect("submit");
+        assert!(!result.approved);
+        assert!(
+            result.text.contains("Not in Planner mode"),
+            "{}",
+            result.text
+        );
+        assert_eq!(manager.state().phase, Phase::Idle);
+        // Break the reviewer/manager reference cycle before the scratch drops.
+        manager.set_reviewer(None);
     }
 
     fn fake_fetcher(response: UrlTextResponse) -> Arc<dyn UrlTextFetcher> {

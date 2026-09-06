@@ -16,7 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, planner_runtime, plannotator, ralph, ralph_runtime,
+    computeruse, config, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
+    ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -570,7 +571,7 @@ pub fn prepare_session(
     let btw = btw_runtime::Runtime::with_catalog(
         runtime.agent().responder(),
         catalog.clone(),
-        btw_runtime::Options::default(),
+        btw_options(&runtime),
     );
     let ralph_store = config
         .enable_ralph
@@ -632,6 +633,7 @@ pub fn prepare_session(
         desktop,
     };
     prepared.aperture_session_start();
+    prepared.omni_session_start();
     Ok(prepared)
 }
 
@@ -681,6 +683,48 @@ impl PreparedSession {
     ///
     /// The networked refresh must not block startup: the cached catalog keeps
     /// models loading instantly (even offline), and this revalidates it.
+    /// Mirrors the OmniRoute extension's session-start check: a configured
+    /// gateway is probed off the UI thread and an unreachable one is reported
+    /// once, with the remedy. Nothing is said when OmniRoute is not set up.
+    fn omni_session_start(&self) {
+        let paths = self.catalog.dynamic_paths().clone();
+        let loaded = match (paths.omniroute.as_deref(), paths.omniroute_url.as_deref()) {
+            (Some(path), url) => omniroute::Config::load_effective(path, url),
+            (None, Some(url)) => omniroute::Config::new(url),
+            (None, None) => return,
+        };
+        let notices = self.runtime.notice_sender();
+        let configuration = match loaded {
+            Ok(configuration) => configuration,
+            Err(error) if error.is_not_found() => return,
+            Err(error) => {
+                notices.push("omni", error.to_string());
+                return;
+            }
+        };
+        let api_key = self
+            .catalog
+            .resolve_auth(omniroute::OMNI_PROVIDER_ID)
+            .ok()
+            .flatten()
+            .and_then(|auth| auth.api_key().map(str::to_owned))
+            .unwrap_or_default();
+        thread::Builder::new()
+            .name("omni-session-start".to_owned())
+            .spawn(move || {
+                if let Err(error) = omni_cli::probe_health(&configuration, &api_key) {
+                    notices.push(
+                        "omni",
+                        format!(
+                            "OmniRoute unreachable at {}: {error}. Run /omni sync after reconnecting.",
+                            configuration.server_url
+                        ),
+                    );
+                }
+            })
+            .ok();
+    }
+
     fn aperture_session_start(&self) {
         let paths = self.catalog.dynamic_paths().clone();
         let (Some(config_path), Some(cache_path)) = (paths.aperture, paths.aperture_cache) else {
@@ -869,6 +913,54 @@ fn desktop_mcp_tool(
     }
     let session = computeruse::McpSession::new(binary);
     Some((computeruse::agent_tool(session.clone()), session))
+}
+
+/// Joins the side-thread runtime to the session log. Threads are restored from
+/// the latest `goshcoder.btw` entry on the current path, and every durable
+/// change is recorded back while the session is writable; a no-session or
+/// read-only session keeps them in memory only.
+fn btw_options(runtime: &SessionRuntime) -> btw_runtime::Options {
+    let notices = runtime.notice_sender();
+    let restored = runtime
+        .restored()
+        .custom
+        .get(btw_runtime::CUSTOM_TYPE)
+        .map_or_else(Vec::new, |payload| {
+            btw_runtime::decode_threads(payload).unwrap_or_else(|error| {
+                notices.push(
+                    "BTW",
+                    format!("ignoring unreadable saved side threads: {error}"),
+                );
+                Vec::new()
+            })
+        });
+    let recorder = runtime.custom_recorder();
+    let persist: btw_runtime::PersistHook = Arc::new(move |threads| {
+        if !recorder.recording() {
+            return;
+        }
+        let payload = match btw_runtime::encode_threads(threads) {
+            Ok(payload) => payload,
+            Err(error) => {
+                notices.push(
+                    "BTW",
+                    format!("could not encode side threads for the session: {error}"),
+                );
+                return;
+            }
+        };
+        if let Err(error) = recorder.record(btw_runtime::CUSTOM_TYPE, payload) {
+            notices.push(
+                "BTW",
+                format!("could not save side threads to the session: {error}"),
+            );
+        }
+    });
+    btw_runtime::Options {
+        persist: Some(persist),
+        restored,
+        ..btw_runtime::Options::default()
+    }
 }
 
 /// Builds the native cited web-search tool with fresh OpenAI/Codex credential
@@ -1083,11 +1175,10 @@ fn thinking_level_names() -> [&'static str; 7] {
 
 /// Resolves the configured working directory exactly as session construction
 /// does, without canonicalizing it away from the persisted session shard.
+/// Sharing the session store's normalisation is what keeps `-workdir ./x/`
+/// and `-workdir x` on one shard.
 pub fn absolute_workdir(workdir: &Path) -> Result<PathBuf> {
-    if workdir.is_absolute() {
-        return Ok(workdir.to_path_buf());
-    }
-    Ok(env::current_dir()?.join(workdir))
+    Ok(crate::sessionlog::try_absolute_path(workdir)?)
 }
 
 fn short_id(id: &str) -> &str {
@@ -1245,6 +1336,25 @@ mod tests {
     }
 
     #[test]
+    fn absolute_workdir_normalizes_exactly_like_the_session_store() {
+        let temp = std::env::temp_dir();
+        let spelled = temp.join("work").join("..").join("project").join(".");
+        let cleaned = absolute_workdir(&spelled).expect("absolute");
+        assert_eq!(
+            cleaned,
+            crate::sessionlog::clean_path(&temp.join("project"))
+        );
+        assert_eq!(
+            crate::sessionlog::Store::dir_name(&spelled),
+            crate::sessionlog::Store::dir_name(&cleaned)
+        );
+
+        let relative = absolute_workdir(Path::new("./src/..")).expect("relative");
+        assert!(relative.is_absolute());
+        assert_eq!(relative, crate::sessionlog::absolute_path(Path::new(".")));
+    }
+
+    #[test]
     fn coding_sessions_register_native_web_search_in_the_prompt_and_tool_set() {
         let catalog = Catalog::with_environment(
             None,
@@ -1360,9 +1470,161 @@ mod tests {
             );
         }
 
+        // The toggle above wrote this workspace's planner state under the
+        // real agent directory; do not leave a file for a temporary root.
+        let planner_state = prepared
+            .planner
+            .as_ref()
+            .map(|planner| planner.workspace_state_path().to_path_buf());
         prepared.runtime.close().expect("close session");
         drop(prepared);
+        if let Some(path) = planner_state {
+            let _ = std::fs::remove_file(path);
+        }
         let _ = std::fs::remove_dir_all(storage);
+        std::fs::remove_dir_all(directory).expect("remove workspace");
+    }
+
+    #[test]
+    fn btw_threads_persist_in_the_session_and_survive_continue() {
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog");
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-btw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("workspace");
+        let responder: agent::AssistantResponder = Arc::new(|_, _, _| {
+            Ok(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::text("side answer")],
+                api: "test".to_owned(),
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                stop_reason: "stop".to_owned(),
+                timestamp: 1,
+                ..llm::AssistantMessage::default()
+            })
+        });
+        let config = SessionConfig {
+            model_ref: format!("openai/{model_id}"),
+            workdir: directory.clone(),
+            sessions_dir: Some(directory.join("sessions")),
+            ..SessionConfig::default()
+        };
+
+        let mut prepared = prepare_session(
+            &catalog,
+            config.clone(),
+            Some(Arc::clone(&responder)),
+            Vec::new(),
+        )
+        .expect("prepare recording session");
+        assert!(prepared.runtime.recording());
+        // A session without an assistant message is discarded on close, so the
+        // main conversation needs one turn before side threads can outlive it.
+        prepared
+            .runtime
+            .agent()
+            .prompt("main question")
+            .expect("main turn");
+        let state = prepared.runtime.agent().state();
+        let created = prepared.btw.create_thread(&state);
+        prepared
+            .btw
+            .enqueue_prompt(&created.thread, "what was decided?")
+            .expect("queue prompt");
+        let outcome = prepared
+            .btw
+            .run_next(&state, &created.thread)
+            .expect("dispatch")
+            .expect("prompt");
+        assert!(matches!(
+            outcome.status,
+            btw_runtime::DispatchStatus::Answered { .. }
+        ));
+        assert!(
+            prepared
+                .runtime
+                .restored()
+                .custom
+                .contains_key(btw_runtime::CUSTOM_TYPE)
+        );
+        assert!(
+            drain_session_notices(&prepared.runtime)
+                .iter()
+                .all(|notice| !notice.starts_with("BTW:"))
+        );
+        prepared.runtime.close().expect("close session");
+        drop(prepared);
+
+        let mut continued = prepare_session(
+            &catalog,
+            SessionConfig {
+                continue_session: true,
+                ..config.clone()
+            },
+            Some(Arc::clone(&responder)),
+            Vec::new(),
+        )
+        .expect("continue session");
+        assert!(continued.runtime.resumed());
+        let summaries = continued.btw.list_threads();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, created.thread.id);
+        let restored = continued
+            .btw
+            .resume_thread(&created.thread)
+            .expect("resume persisted thread");
+        assert_eq!(restored.turns.len(), 1);
+        assert_eq!(restored.turns[0].answer, "side answer");
+        assert_eq!(
+            restored.conversation_context,
+            created.thread.conversation_context
+        );
+        let next = continued
+            .btw
+            .create_thread(&continued.runtime.agent().state());
+        assert_eq!(next.thread.id, "btw-2");
+        continued
+            .runtime
+            .custom_recorder()
+            .record(
+                btw_runtime::CUSTOM_TYPE,
+                serde_json::json!({"version": 99, "threads": []}),
+            )
+            .expect("record an unreadable payload");
+        continued.runtime.close().expect("close session");
+        drop(continued);
+
+        let mut reopened = prepare_session(
+            &catalog,
+            SessionConfig {
+                continue_session: true,
+                ..config
+            },
+            Some(responder),
+            Vec::new(),
+        )
+        .expect("reopen session with an unreadable payload");
+        assert!(reopened.btw.list_threads().is_empty());
+        assert!(
+            drain_session_notices(&reopened.runtime)
+                .iter()
+                .any(|notice| notice.starts_with("BTW: ignoring unreadable saved side threads"))
+        );
+        reopened.runtime.close().expect("close session");
+        drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove workspace");
     }
 }

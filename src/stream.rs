@@ -328,6 +328,15 @@ impl AssistantMessageEventStream {
         state.ended || state.terminal_result.is_some()
     }
 
+    /// Returns true when this handle is the last one alive.
+    ///
+    /// Every consumer reaches the queue through a clone of this handle, so a
+    /// producer holding the only remaining handle can never be drained and
+    /// should stop waiting for room.
+    pub fn is_orphaned(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
+    }
+
     /// Attempts an enqueue without blocking if the bounded queue is full.
     pub fn try_push(&self, event: AssistantMessageEvent) -> Result<(), EventStreamPushError> {
         self.push_inner(event, Some(Duration::ZERO))
@@ -641,7 +650,6 @@ impl Error for SseConfigurationError {}
 #[derive(Debug)]
 pub enum SseError {
     Io(io::Error),
-    InvalidUtf8(std::string::FromUtf8Error),
     LineTooLarge { limit: usize },
     EventTooLarge { limit: usize },
 }
@@ -650,7 +658,6 @@ impl fmt::Display for SseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "failed to read SSE stream: {error}"),
-            Self::InvalidUtf8(error) => write!(formatter, "SSE stream is not valid UTF-8: {error}"),
             Self::LineTooLarge { limit } => {
                 write!(formatter, "SSE line exceeds the {limit}-byte size limit")
             }
@@ -665,7 +672,6 @@ impl Error for SseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidUtf8(error) => Some(error),
             Self::LineTooLarge { .. } | Self::EventTooLarge { .. } => None,
         }
     }
@@ -693,6 +699,9 @@ impl<R: Read> Read for LimitedReader<R> {
 pub struct SseReader<R> {
     reader: BufReader<LimitedReader<R>>,
     limits: SseLimits,
+    /// Set when a line ended with a CR at the very end of a buffer fill; the
+    /// LF of a CRLF pair may then arrive with the next fill.
+    skip_line_feed: bool,
 }
 
 /// Alias for callers that prefer parser terminology.
@@ -720,6 +729,7 @@ impl<R: Read> SseReader<R> {
                 remaining: limits.max_stream_bytes,
             }),
             limits,
+            skip_line_feed: false,
         })
     }
 
@@ -727,9 +737,11 @@ impl<R: Read> SseReader<R> {
         self.limits
     }
 
-    /// Reads one event dispatched by a blank line. `Ok(None)` denotes EOF; a
-    /// partial record at EOF is deliberately discarded per the SSE framing
-    /// rules.
+    /// Reads one event dispatched by a blank line. `Ok(None)` denotes EOF.
+    ///
+    /// Like pi's decoder, a record that EOF cuts off before its blank line is
+    /// still dispatched: providers do end a response on the final `data:` line
+    /// and dropping it would lose the terminal event.
     pub fn next_event(&mut self) -> Result<Option<SseEvent>, SseError> {
         let mut event = SseEvent::default();
         let mut data = String::new();
@@ -737,19 +749,25 @@ impl<R: Read> SseReader<R> {
 
         loop {
             let Some((line, terminated)) = self.read_line()? else {
-                return Ok(None);
+                return Ok(Self::flush_record(event, data, have_data));
             };
-            // A final unterminated line cannot dispatch an SSE record. Any
-            // preceding fields belong to that same incomplete record.
-            if !terminated {
-                return Ok(None);
-            }
             if let Some(dispatched) =
                 self.process_line(&line, &mut event, &mut data, &mut have_data)?
             {
                 return Ok(Some(dispatched));
             }
+            if !terminated {
+                return Ok(Self::flush_record(event, data, have_data));
+            }
         }
+    }
+
+    fn flush_record(mut event: SseEvent, data: String, have_data: bool) -> Option<SseEvent> {
+        if !have_data && event.event.is_empty() {
+            return None;
+        }
+        event.data = data;
+        Some(event)
     }
 
     pub fn events(&mut self) -> SseEvents<'_, R> {
@@ -759,42 +777,46 @@ impl<R: Read> SseReader<R> {
         }
     }
 
+    /// Reads one line terminated by LF, CRLF, or a lone CR, the same line
+    /// breaks pi's decoder accepts. Invalid UTF-8 is replaced with U+FFFD
+    /// rather than failing the stream, matching `TextDecoder`.
     fn read_line(&mut self) -> Result<Option<(String, bool)>, SseError> {
         let mut line = Vec::new();
 
         loop {
-            let (fragment_len, terminated) = {
-                let buffer = self.reader.fill_buf().map_err(SseError::Io)?;
-                if buffer.is_empty() {
-                    if line.is_empty() {
-                        return Ok(None);
-                    }
-                    let text = String::from_utf8(line).map_err(SseError::InvalidUtf8)?;
-                    return Ok(Some((text, false)));
+            let buffer = self.reader.fill_buf().map_err(SseError::Io)?;
+            if buffer.is_empty() {
+                if line.is_empty() {
+                    return Ok(None);
                 }
-                let fragment_len = buffer
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map_or(buffer.len(), |index| index + 1);
-                if line.len().saturating_add(fragment_len) > self.limits.max_line_bytes {
-                    return Err(SseError::LineTooLarge {
-                        limit: self.limits.max_line_bytes,
-                    });
-                }
-                line.extend_from_slice(&buffer[..fragment_len]);
-                (fragment_len, buffer[fragment_len - 1] == b'\n')
-            };
-            self.reader.consume(fragment_len);
-
-            if terminated {
-                debug_assert_eq!(line.last(), Some(&b'\n'));
-                line.pop();
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                let text = String::from_utf8(line).map_err(SseError::InvalidUtf8)?;
-                return Ok(Some((text, true)));
+                return Ok(Some((String::from_utf8_lossy(&line).into_owned(), false)));
             }
+            if std::mem::take(&mut self.skip_line_feed) && buffer[0] == b'\n' {
+                self.reader.consume(1);
+                continue;
+            }
+            let terminator = buffer.iter().position(|byte| matches!(byte, b'\n' | b'\r'));
+            let fragment_len = terminator.unwrap_or(buffer.len());
+            if line.len().saturating_add(fragment_len) > self.limits.max_line_bytes {
+                return Err(SseError::LineTooLarge {
+                    limit: self.limits.max_line_bytes,
+                });
+            }
+            line.extend_from_slice(&buffer[..fragment_len]);
+            let Some(index) = terminator else {
+                self.reader.consume(fragment_len);
+                continue;
+            };
+            let mut consumed = index + 1;
+            if buffer[index] == b'\r' {
+                match buffer.get(index + 1) {
+                    Some(b'\n') => consumed += 1,
+                    Some(_) => {}
+                    None => self.skip_line_feed = true,
+                }
+            }
+            self.reader.consume(consumed);
+            return Ok(Some((String::from_utf8_lossy(&line).into_owned(), true)));
         }
     }
 
@@ -806,7 +828,9 @@ impl<R: Read> SseReader<R> {
         have_data: &mut bool,
     ) -> Result<Option<SseEvent>, SseError> {
         if line.is_empty() {
-            if !*have_data {
+            // A record carrying only an `event:` name still dispatches, as in
+            // pi's decoder; consumers decide what an empty payload means.
+            if !*have_data && event.event.is_empty() {
                 *event = SseEvent::default();
                 return Ok(None);
             }
@@ -1804,6 +1828,7 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
 
 const RETRYABLE_ASSISTANT_PATTERNS: &[&str] = &[
     "overloaded",
+    "rate limit",
     "too many requests",
     "429",
     "500",
@@ -1850,24 +1875,27 @@ pub fn is_retryable_assistant_error(message: &llm::AssistantMessage) -> bool {
     if message.stop_reason != STOP_ERROR || message.error_message.is_empty() {
         return false;
     }
-    let lower = message.error_message.to_ascii_lowercase();
+    let key = retry_pattern_key(&message.error_message);
     if NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS
         .iter()
-        .any(|pattern| lower.contains(pattern))
+        .any(|pattern| key.contains(&retry_pattern_key(pattern)))
     {
         return false;
     }
-    has_rate_limit_marker(&lower)
-        || RETRYABLE_ASSISTANT_PATTERNS
-            .iter()
-            .any(|pattern| lower.contains(pattern))
+    RETRYABLE_ASSISTANT_PATTERNS
+        .iter()
+        .any(|pattern| key.contains(&retry_pattern_key(pattern)))
 }
 
-fn has_rate_limit_marker(message: &str) -> bool {
-    message.contains("rate limit")
-        || message.contains("rate-limit")
-        || message.contains("rate_limit")
-        || message.contains("ratelimit")
+/// Collapses text to lowercase alphanumerics. pi's patterns are regexes such
+/// as `service.?unavailable` and `timed? out`; comparing normalized forms lets
+/// `service_unavailable`, `Service Unavailable`, and `timedout` all match
+/// without a regex engine.
+fn retry_pattern_key(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 /// Configuration for retrying a protocol-independent assistant operation.
@@ -2417,13 +2445,20 @@ mod tests {
     }
 
     #[test]
-    fn sse_parser_discards_unterminated_records_and_enforces_caps() {
+    fn sse_parser_flushes_trailing_records_and_enforces_caps() {
+        // pi dispatches a record that EOF cuts off before its blank line.
         assert_eq!(
             collect_sse("data: complete\n\ndata: dangling"),
-            vec![SseEvent {
-                data: "complete".to_owned(),
-                ..SseEvent::default()
-            }]
+            vec![
+                SseEvent {
+                    data: "complete".to_owned(),
+                    ..SseEvent::default()
+                },
+                SseEvent {
+                    data: "dangling".to_owned(),
+                    ..SseEvent::default()
+                },
+            ]
         );
 
         let limits = SseLimits {
@@ -2684,5 +2719,81 @@ mod tests {
         assert_eq!(estimate.usage_tokens, 100);
         assert_eq!(estimate.trailing_tokens, 1);
         assert_eq!(estimate.tokens, 101);
+    }
+
+    /// Hands out one byte per read so line breaks land on buffer boundaries.
+    struct ByteAtATime<'a>(&'a [u8]);
+
+    impl Read for ByteAtATime<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match (self.0.split_first(), buffer.first_mut()) {
+                (Some((byte, rest)), Some(slot)) => {
+                    *slot = *byte;
+                    self.0 = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn sse_parser_accepts_lone_cr_and_replaces_invalid_utf8() {
+        assert_eq!(
+            collect_sse("data: a\rdata: b\r\n\r\nevent: ping\r\r"),
+            vec![
+                SseEvent {
+                    data: "a\nb".to_owned(),
+                    ..SseEvent::default()
+                },
+                SseEvent {
+                    event: "ping".to_owned(),
+                    ..SseEvent::default()
+                },
+            ]
+        );
+
+        let mut lossy = SseReader::new(Cursor::new(b"data: caf\xc3\n\n".as_slice()));
+        assert_eq!(
+            lossy
+                .next_event()
+                .expect("lossy record")
+                .expect("event")
+                .data,
+            "caf\u{FFFD}"
+        );
+
+        // A CRLF split across two reads is still one line break.
+        let mut split = SseReader::new(ByteAtATime(b"data: x\r\ndata: y\n\n"));
+        assert_eq!(
+            split
+                .next_event()
+                .expect("split record")
+                .expect("event")
+                .data,
+            "x\ny"
+        );
+        assert_eq!(split.next_event().expect("eof"), None);
+    }
+
+    #[test]
+    fn retry_classifier_matches_pi_patterns_across_separators() {
+        let error = |message: &str| llm::AssistantMessage {
+            stop_reason: STOP_ERROR.to_owned(),
+            error_message: message.to_owned(),
+            ..llm::AssistantMessage::default()
+        };
+        for message in [
+            "service_unavailable",
+            "Internal Server-Error",
+            "request timedout",
+            "RATE-LIMIT exceeded",
+            "connection_refused",
+        ] {
+            assert!(is_retryable_assistant_error(&error(message)), "{message}");
+        }
+        for message in ["INSUFFICIENT QUOTA", "quota_exceeded", "all good"] {
+            assert!(!is_retryable_assistant_error(&error(message)), "{message}");
+        }
     }
 }

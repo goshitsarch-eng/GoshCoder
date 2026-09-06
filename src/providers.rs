@@ -28,7 +28,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
-    io::Read,
+    io::{self, Read},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -81,6 +81,21 @@ static GOOGLE_TOOL_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub const MAX_REQUEST_RETRIES: u32 = 8;
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 1_024;
 pub const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Characters of a response error body kept in an error message, as pi's
+/// `MAX_PROVIDER_ERROR_BODY_CHARS`.
+pub const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4_000;
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default idle deadline; see [`ProviderConfig::read_timeout`].
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often a blocked producer or consumer re-checks cancellation.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long a terminal event may wait for a slow consumer before the worker
+/// gives up on delivering it, and how long a cancelled consumer waits for
+/// the worker's own aborted partial before synthesizing one.
+const TERMINAL_DELIVERY_BUDGET: Duration = Duration::from_secs(1);
+/// Body chunks buffered between the socket reader thread and the stream
+/// worker before the reader applies backpressure.
+const BODY_CHUNK_QUEUE: usize = 64;
 
 /// The supported provider wire protocol chosen from `llm::Model::api`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,7 +274,18 @@ impl From<serde_json::Error> for ProviderAdapterError {
 
 impl From<stream::SseError> for ProviderAdapterError {
     fn from(error: stream::SseError) -> Self {
-        Self::Sse(error)
+        match error {
+            // `CancellableBody` reports cancellation as a read error carrying
+            // the abort marker; it is the turn's cancellation, not a fault.
+            stream::SseError::Io(error)
+                if error.get_ref().is_some_and(|inner| {
+                    inner.downcast_ref::<stream::RequestAborted>().is_some()
+                }) =>
+            {
+                Self::Cancelled
+            }
+            other => Self::Sse(other),
+        }
     }
 }
 
@@ -328,12 +354,15 @@ pub struct ProviderConfig {
     pub max_retries: u32,
     /// Maximum accepted server-directed retry delay.
     pub retry_delay_limit: stream::RetryDelayLimit,
-    /// Whole-request timeout for standard request/response protocols.
+    /// Deadline for establishing a connection, including TLS.
+    pub connect_timeout: Option<Duration>,
+    /// Idle deadline: it bounds the wait for response headers and then every
+    /// individual body read, re-arming after each read.
     ///
-    /// Mistral streaming intentionally does not use a whole-request deadline:
-    /// it may stream longer than this setting. A caller-provided client
-    /// retains its own timeout policy.
-    pub request_timeout: Option<Duration>,
+    /// Streaming completions legitimately run for many minutes, so no
+    /// whole-request deadline is ever applied; only a silent connection
+    /// times out. A caller-provided client retains its own timeout policy.
+    pub read_timeout: Option<Duration>,
     /// Deadline for Mistral to return HTTP response headers.
     ///
     /// This bounds time to first byte without truncating an active SSE
@@ -341,7 +370,9 @@ pub struct ProviderConfig {
     pub mistral_response_header_timeout: Option<Duration>,
     /// Capacity of the externally visible normalized event stream.
     pub event_buffer_capacity: usize,
-    /// Maximum response-error body retained in an error message.
+    /// Maximum response-error body read from a failed request; the text
+    /// kept in the error message is further capped at
+    /// [`MAX_PROVIDER_ERROR_BODY_CHARS`].
     pub max_error_body_bytes: usize,
 }
 
@@ -350,7 +381,8 @@ impl Default for ProviderConfig {
         Self {
             max_retries: 2,
             retry_delay_limit: stream::RetryDelayLimit::Default,
-            request_timeout: Some(Duration::from_secs(120)),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
             mistral_response_header_timeout: Some(DEFAULT_MISTRAL_RESPONSE_HEADER_TIMEOUT),
             event_buffer_capacity: DEFAULT_EVENT_BUFFER_CAPACITY,
             max_error_body_bytes: DEFAULT_MAX_ERROR_BODY_BYTES,
@@ -403,12 +435,12 @@ impl ProviderResponderFactory {
     /// Builds a factory with explicit credentials and policy.
     pub fn configured(credentials: ProviderCredentials, config: ProviderConfig) -> Result<Self> {
         config.validate()?;
-        // A blocking reqwest client applies its timeout to the entire
-        // response body. Keep the client deadline-free so Mistral's active
-        // SSE stream cannot be cut off; standard protocols install their
-        // configured deadline on each individual request below.
-        let mut builder = Client::builder().timeout(None);
-        if let Some(timeout) = config.request_timeout {
+        // The blocking client's own timeout bounds the wait for response
+        // headers and then re-arms for every body read, which makes it an
+        // idle deadline. A per-request timeout would instead become a total
+        // deadline that cuts long streams off mid-response, so none is set.
+        let mut builder = Client::builder().timeout(config.read_timeout);
+        if let Some(timeout) = config.connect_timeout {
             builder = builder.connect_timeout(timeout);
         }
         let client = builder.build().map_err(ProviderAdapterError::Request)?;
@@ -491,17 +523,40 @@ impl ProviderResponderFactory {
         credentials: ProviderCredentials,
     ) -> Result<llm::AssistantMessage> {
         let assistant_event_listener = options.assistant_event_listener.clone();
+        let cancellation = options.cancellation.clone();
         let events = self.stream_with_credentials(model, context, options, credentials);
-        while let Some(event) = events.next() {
-            let terminal_message = event.terminal_message();
-            if let Some(listener) = &assistant_event_listener {
-                listener(event);
-            }
-            if let Some(message) = terminal_message {
-                return Ok((*message).clone());
+        // Cancellation is honoured by polling rather than blocking on the
+        // next event. The worker checks the token at every point it can
+        // block, so it normally publishes the exact aborted partial itself;
+        // the budget below only guards against a wedged worker.
+        let mut abort_deadline = None;
+        loop {
+            match events.next_timeout(STREAM_POLL_INTERVAL) {
+                Ok(Some(event)) => {
+                    let terminal_message = event.terminal_message();
+                    if let Some(listener) = &assistant_event_listener {
+                        listener(event);
+                    }
+                    if let Some(message) = terminal_message {
+                        return Ok((*message).clone());
+                    }
+                }
+                Ok(None) => return Err(ProviderAdapterError::StreamClosed),
+                Err(stream::EventStreamWaitError::TimedOut) => {
+                    if !cancellation.is_cancelled() {
+                        continue;
+                    }
+                    let deadline = *abort_deadline.get_or_insert_with(|| {
+                        Instant::now()
+                            .checked_add(TERMINAL_DELIVERY_BUDGET)
+                            .unwrap_or_else(Instant::now)
+                    });
+                    if Instant::now() >= deadline {
+                        return Ok(aborted_message(model));
+                    }
+                }
             }
         }
-        Err(ProviderAdapterError::StreamClosed)
     }
 
     fn stream_with_credentials(
@@ -523,15 +578,15 @@ impl ProviderResponderFactory {
         let model = model.clone();
         let context = context.clone();
         thread::spawn(move || {
-            let cancellation = options.cancellation.clone();
-            let mut emitter = MessageEmitter::new(worker_events, &model);
+            let mut emitter =
+                MessageEmitter::new(worker_events, &model, options.cancellation.clone());
             let outcome = if prompt_tools {
                 factory.run_omni_prompt_tools(&model, &context, options, credentials, &mut emitter)
             } else {
                 factory.run_stream(&model, &context, options, credentials, &mut emitter)
             };
             if let Err(error) = outcome {
-                let _ = emitter.fail(error, &cancellation);
+                let _ = emitter.fail(error);
             }
         });
         events
@@ -567,10 +622,13 @@ impl ProviderResponderFactory {
             inner_options,
             credentials,
         )?;
-        emitter.message.usage = result.usage.clone();
-        emitter.message.response_id = result.response_id.clone();
-        emitter.message.response_model = result.response_model.clone();
-        emitter.message.raw_stop_reason = result.raw_stop_reason.clone();
+        {
+            let message = emitter.message_mut();
+            message.usage = result.usage.clone();
+            message.response_id = result.response_id.clone();
+            message.response_model = result.response_model.clone();
+            message.raw_stop_reason = result.raw_stop_reason.clone();
+        }
         if result.stop_reason == stream::STOP_ERROR || result.stop_reason == stream::STOP_ABORTED {
             let message = if result.error_message.is_empty() {
                 "OmniRoute returned no assistant message".to_owned()
@@ -601,7 +659,7 @@ impl ProviderResponderFactory {
         // Keep a truncated reply's stop reason: tool calls parsed out of a
         // response cut off mid-generation must not run as if the model had
         // finished asking for them.
-        emitter.message.stop_reason = if result.stop_reason == stream::STOP_LENGTH {
+        emitter.message_mut().stop_reason = if result.stop_reason == stream::STOP_LENGTH {
             stream::STOP_LENGTH.to_owned()
         } else if had_calls {
             stream::STOP_TOOL_USE.to_owned()
@@ -629,7 +687,9 @@ impl ProviderResponderFactory {
                 request: bedrock::BedrockOptions {
                     api_key: credentials.api_key,
                     headers: credentials.headers,
-                    timeout: self.config.request_timeout,
+                    // Bedrock owns its client and still applies this as its
+                    // own request deadline.
+                    timeout: self.config.read_timeout,
                     max_retries: self.config.max_retries,
                     max_retry_delay: bedrock_retry_delay_limit(self.config.retry_delay_limit),
                     environment: credentials.environment,
@@ -667,6 +727,7 @@ impl ProviderResponderFactory {
     ) -> Result<()> {
         ensure_not_cancelled(&options.cancellation)?;
         let protocol = ProviderProtocol::from_api(&model.api)?;
+        let anthropic_shape = anthropic_request_shape(model, &credentials, &options);
         let responses_grammar_tool_input_properties = match protocol {
             ProviderProtocol::AzureOpenAiResponses | ProviderProtocol::OpenAiCodexResponses => {
                 grammar_tool_input_properties(
@@ -703,7 +764,7 @@ impl ProviderResponderFactory {
                 &responses_grammar_tool_input_properties,
             ),
             ProviderProtocol::AnthropicMessages => {
-                build_anthropic_messages_request(model, context, &options)
+                build_anthropic_messages_request(model, context, &options, &anthropic_shape)
             }
             ProviderProtocol::GoogleGenerativeAi => Ok(build_google_generate_content_request(
                 model, context, &options,
@@ -718,8 +779,18 @@ impl ProviderResponderFactory {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
         }?;
-        let response =
-            self.send_streaming_request(protocol, model, &payload, &credentials, &options)?;
+        let anthropic_beta = (protocol == ProviderProtocol::AnthropicMessages)
+            .then(|| anthropic_beta_features(model, context, &anthropic_shape).join(","))
+            .filter(|features| !features.is_empty());
+        let response = self.send_streaming_request(
+            protocol,
+            model,
+            &payload,
+            &credentials,
+            &options,
+            anthropic_beta.as_deref(),
+        )?;
+        let response = CancellableBody::spawn(response, options.cancellation.clone());
 
         emitter.start()?;
         match protocol {
@@ -747,9 +818,13 @@ impl ProviderResponderFactory {
                 emitter,
                 &responses_grammar_tool_input_properties,
             )?,
-            ProviderProtocol::AnthropicMessages => {
-                consume_anthropic_messages(response, model, &options.cancellation, emitter)?
-            }
+            ProviderProtocol::AnthropicMessages => consume_anthropic_messages(
+                response,
+                &context.tools,
+                anthropic_shape.oauth,
+                &options.cancellation,
+                emitter,
+            )?,
             ProviderProtocol::GoogleGenerativeAi => {
                 consume_google_generate_content(response, model, &options.cancellation, emitter)?
             }
@@ -764,18 +839,18 @@ impl ProviderResponderFactory {
             }
         }
         ensure_not_cancelled(&options.cancellation)?;
-        if emitter.message.stop_reason.is_empty()
-            || emitter.message.stop_reason == stream::STOP_PENDING
+        if emitter.message().stop_reason.is_empty()
+            || emitter.message().stop_reason == stream::STOP_PENDING
         {
             return Err(ProviderAdapterError::Protocol(
                 "stream ended without a terminal stop reason".to_owned(),
             ));
         }
-        if emitter.message.stop_reason == stream::STOP_ERROR
-            || emitter.message.stop_reason == stream::STOP_ABORTED
+        if emitter.message().stop_reason == stream::STOP_ERROR
+            || emitter.message().stop_reason == stream::STOP_ABORTED
         {
             return Err(ProviderAdapterError::Protocol(
-                emitter.message.error_message.clone(),
+                emitter.message().error_message.clone(),
             ));
         }
         emitter.finish()
@@ -788,6 +863,7 @@ impl ProviderResponderFactory {
         payload: &Value,
         credentials: &ProviderCredentials,
         options: &agent::RequestOptions,
+        anthropic_beta: Option<&str>,
     ) -> Result<Response> {
         let endpoint = protocol_endpoint(model, protocol, credentials)?;
         let headers = build_request_headers(
@@ -797,22 +873,25 @@ impl ProviderResponderFactory {
             &options.session_id,
             options.cache_retention,
             &options.cancellation,
+            anthropic_beta,
         )?;
         let body = serde_json::to_vec(payload)?;
 
         let mut retry_index = 0;
         loop {
             ensure_not_cancelled(&options.cancellation)?;
-            let sent = if protocol == ProviderProtocol::MistralConversations {
-                self.send_mistral_request(
-                    endpoint.clone(),
-                    headers.clone(),
-                    body.clone(),
-                    &options.cancellation,
-                )
-            } else {
-                self.send_standard_request(endpoint.clone(), headers.clone(), body.clone())
-            };
+            // Only Mistral has a separate time-to-headers deadline; the
+            // client's idle deadline bounds the wait for every protocol.
+            let header_deadline = (protocol == ProviderProtocol::MistralConversations)
+                .then_some(self.config.mistral_response_header_timeout)
+                .flatten();
+            let sent = self.send_request(
+                endpoint.clone(),
+                headers.clone(),
+                body.clone(),
+                &options.cancellation,
+                header_deadline,
+            );
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
@@ -849,25 +928,17 @@ impl ProviderResponderFactory {
         }
     }
 
-    fn send_standard_request(
-        &self,
-        endpoint: Url,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    ) -> Result<Response> {
-        let mut request = self.client.post(endpoint).headers(headers).body(body);
-        if let Some(timeout) = self.config.request_timeout {
-            request = request.timeout(timeout);
-        }
-        request.send().map_err(provider_network_error)
-    }
-
-    fn send_mistral_request(
+    /// Sends on a helper thread and polls for the response so cancellation is
+    /// noticed while waiting for headers. No per-request timeout is set: it
+    /// would be a whole-request deadline, whereas the client-level deadline
+    /// configured in `configured` only bounds idle time.
+    fn send_request(
         &self,
         endpoint: Url,
         headers: HeaderMap,
         body: Vec<u8>,
         cancellation: &agent::CancellationToken,
+        header_deadline: Option<Duration>,
     ) -> Result<Response> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let client = self.client.clone();
@@ -876,18 +947,10 @@ impl ProviderResponderFactory {
             let _ = sender.send(response);
         });
 
-        let deadline = self
-            .config
-            .mistral_response_header_timeout
-            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let deadline = header_deadline.and_then(|timeout| Instant::now().checked_add(timeout));
         loop {
             ensure_not_cancelled(cancellation)?;
-            let wait = deadline
-                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_millis(25))
-                .min(Duration::from_millis(25));
             if let Some(deadline) = deadline
-                && wait.is_zero()
                 && Instant::now() >= deadline
             {
                 return Err(ProviderAdapterError::Provider(stream::ProviderError::new(
@@ -895,13 +958,13 @@ impl ProviderResponderFactory {
                     "Mistral response headers timed out",
                 )));
             }
-            match receiver.recv_timeout(wait) {
+            match receiver.recv_timeout(STREAM_POLL_INTERVAL) {
                 Ok(Ok(response)) => return Ok(response),
                 Ok(Err(error)) => return Err(provider_network_error(error)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(ProviderAdapterError::Protocol(
-                        "Mistral request worker exited before returning a response".to_owned(),
+                        "request worker exited before returning a response".to_owned(),
                     ));
                 }
             }
@@ -971,6 +1034,120 @@ fn ensure_not_cancelled(cancellation: &agent::CancellationToken) -> Result<()> {
         Err(ProviderAdapterError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+/// The aborted message a cancelled consumer falls back to when the worker
+/// never delivers its own.
+fn aborted_message(model: &llm::Model) -> llm::AssistantMessage {
+    let mut message = initial_assistant_message(model);
+    message.stop_reason = stream::STOP_ABORTED.to_owned();
+    message.error_message = ProviderAdapterError::Cancelled.to_string();
+    message
+}
+
+/// A response body whose blocking socket reads happen on a helper thread, so
+/// the stream worker can keep checking cancellation between chunks.
+///
+/// The helper thread finishes on EOF, on a read error (including the idle
+/// deadline), or when the worker stops consuming; cancellation therefore
+/// never waits on the socket.
+struct CancellableBody {
+    chunks: mpsc::Receiver<io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    offset: usize,
+    cancellation: agent::CancellationToken,
+    finished: bool,
+}
+
+impl CancellableBody {
+    fn spawn(mut response: Response, cancellation: agent::CancellationToken) -> Self {
+        let (sender, chunks) = mpsc::sync_channel(BODY_CHUNK_QUEUE);
+        thread::spawn(move || {
+            let mut buffer = vec![0_u8; 16 * 1024];
+            loop {
+                let chunk = match response.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => Ok(buffer[..read].to_vec()),
+                    Err(error) => Err(describe_body_read_error(error)),
+                };
+                let failed = chunk.is_err();
+                if sender.send(chunk).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Self {
+            chunks,
+            pending: Vec::new(),
+            offset: 0,
+            cancellation,
+            finished: false,
+        }
+    }
+}
+
+/// reqwest reports the idle deadline as an opaque "error decoding response
+/// body"; naming the timeout keeps the failure readable and lets pi's retry
+/// classifier recognize it as transient.
+fn describe_body_read_error(error: io::Error) -> io::Error {
+    let timed_out = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        .is_some_and(reqwest::Error::is_timeout);
+    if timed_out {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("provider stream timed out waiting for data: {error}"),
+        )
+    } else {
+        error
+    }
+}
+
+impl Read for CancellableBody {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.offset < self.pending.len() {
+                let length = (self.pending.len() - self.offset).min(buffer.len());
+                buffer[..length].copy_from_slice(&self.pending[self.offset..self.offset + length]);
+                self.offset += length;
+                return Ok(length);
+            }
+            if self.finished {
+                return Ok(0);
+            }
+            if self.cancellation.is_cancelled() {
+                return Err(io::Error::other(stream::RequestAborted));
+            }
+            match self.chunks.recv_timeout(STREAM_POLL_INTERVAL) {
+                Ok(Ok(chunk)) => {
+                    self.pending = chunk;
+                    self.offset = 0;
+                }
+                Ok(Err(error)) => {
+                    self.finished = true;
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+fn initial_assistant_message(model: &llm::Model) -> llm::AssistantMessage {
+    llm::AssistantMessage {
+        role: "assistant".to_owned(),
+        api: model.api.clone(),
+        provider: model.provider.clone(),
+        model: model.id.clone(),
+        stop_reason: stream::STOP_PENDING.to_owned(),
+        timestamp: now_millis(),
+        ..llm::AssistantMessage::default()
     }
 }
 
@@ -1360,13 +1537,19 @@ fn provider_error_from_response(
         .by_ref()
         .take(maximum_body_bytes.saturating_add(1) as u64)
         .read_to_end(&mut body);
-    let truncated = body.len() > maximum_body_bytes;
+    let read_capped = body.len() > maximum_body_bytes;
     body.truncate(maximum_body_bytes);
-    let body = String::from_utf8_lossy(&body).trim().to_owned();
+    let text = String::from_utf8_lossy(&body);
+    let text = text.trim();
+    let body = if text.chars().count() > MAX_PROVIDER_ERROR_BODY_CHARS {
+        truncate_error_text(text, MAX_PROVIDER_ERROR_BODY_CHARS)
+    } else if read_capped {
+        format!("{text}…")
+    } else {
+        text.to_owned()
+    };
     let suffix = if body.is_empty() {
         String::new()
-    } else if truncated {
-        format!(": {body}…")
     } else {
         format!(": {body}")
     };
@@ -1378,6 +1561,18 @@ fn provider_error_from_response(
     }
 }
 
+/// pi's `truncateErrorText`: keeps the first `max_chars` characters and says
+/// how much was cut.
+fn truncate_error_text(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_owned();
+    }
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    truncated.push_str(&format!("... [truncated {} chars]", total - max_chars));
+    truncated
+}
+
 fn build_request_headers(
     protocol: ProviderProtocol,
     model: &llm::Model,
@@ -1385,6 +1580,7 @@ fn build_request_headers(
     session_id: &str,
     cache_retention: agent::CacheRetention,
     cancellation: &agent::CancellationToken,
+    anthropic_beta: Option<&str>,
 ) -> Result<HeaderMap> {
     let mut overrides = BTreeMap::<String, Option<String>>::new();
     set_header_override(
@@ -1417,6 +1613,18 @@ fn build_request_headers(
                 "anthropic-version".to_owned(),
                 Some("2023-06-01".to_owned()),
             );
+            set_header_override(
+                &mut overrides,
+                "anthropic-dangerous-direct-browser-access".to_owned(),
+                Some("true".to_owned()),
+            );
+            if let Some(features) = anthropic_beta {
+                set_header_override(
+                    &mut overrides,
+                    "anthropic-beta".to_owned(),
+                    Some(features.to_owned()),
+                );
+            }
         }
         ProviderProtocol::BedrockConverseStream => {
             unreachable!("Bedrock uses its own signed request builder")
@@ -1514,11 +1722,27 @@ fn build_request_headers(
                 );
             }
             ProviderProtocol::AnthropicMessages => {
-                set_header_override(
-                    &mut overrides,
-                    "x-api-key".to_owned(),
-                    Some(api_key.to_owned()),
-                );
+                if anthropic_is_oauth_token(api_key) {
+                    // pi sends an OAuth token as a bearer credential under
+                    // the Claude Code client identity.
+                    set_header_override(
+                        &mut overrides,
+                        "authorization".to_owned(),
+                        Some(format!("Bearer {api_key}")),
+                    );
+                    set_header_override(
+                        &mut overrides,
+                        "user-agent".to_owned(),
+                        Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
+                    );
+                    set_header_override(&mut overrides, "x-app".to_owned(), Some("cli".to_owned()));
+                } else {
+                    set_header_override(
+                        &mut overrides,
+                        "x-api-key".to_owned(),
+                        Some(api_key.to_owned()),
+                    );
+                }
             }
             ProviderProtocol::GoogleGenerativeAi => {
                 set_header_override(
@@ -1697,64 +1921,177 @@ fn has_header_override(headers: &BTreeMap<String, Option<String>>, name: &str) -
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
-#[derive(Clone, Copy)]
+/// pi's resolved `OpenAICompletionsCompat`: detected from the provider and
+/// base URL, then overridden by explicit `model.compat` entries.
+#[derive(Clone, Debug)]
 struct OpenAiCompletionsCompat {
     supports_store: bool,
+    supports_developer_role: bool,
+    supports_reasoning_effort: bool,
     supports_usage_in_streaming: bool,
     supports_finish_reason: bool,
-    supports_developer_role: bool,
+    max_tokens_field: &'static str,
     requires_tool_result_name: bool,
     requires_assistant_after_tool_result: bool,
-    max_tokens_field: &'static str,
+    requires_thinking_as_text: bool,
+    requires_reasoning_content_on_assistant_messages: bool,
+    thinking_format: String,
+    chat_template_kwargs: Map<String, Value>,
+    chat_template_args: Map<String, Value>,
+    supports_thinking_token_budget: bool,
+    thinking_token_budget_field: Option<String>,
+    supports_strict_mode: bool,
 }
 
 impl OpenAiCompletionsCompat {
     fn from_model(model: &llm::Model) -> Self {
+        let provider = model.provider.as_str();
         let base_url = model.base_url.as_str();
-        let non_standard = matches!(
-            model.provider.as_str(),
-            "cerebras"
-                | "cloudflare-ai-gateway"
-                | "cloudflare-workers-ai"
-                | "deepseek"
-                | "moonshotai"
-                | "moonshotai-cn"
-                | "nvidia"
-                | "together"
-                | "zai"
-                | "zai-coding-cn"
-        ) || base_url.contains("cerebras.ai")
-            || base_url.contains("deepseek.com")
-            || base_url.contains("openrouter.ai");
-        let default_max_tokens = if matches!(
-            model.provider.as_str(),
-            "deepseek" | "moonshotai" | "moonshotai-cn" | "together" | "zai" | "zai-coding-cn"
-        ) {
-            "max_tokens"
+        let is_zai = matches!(provider, "zai" | "zai-coding-cn")
+            || base_url.contains("api.z.ai")
+            || base_url.contains("open.bigmodel.cn");
+        let is_together = provider == "together"
+            || base_url.contains("api.together.ai")
+            || base_url.contains("api.together.xyz");
+        let is_moonshot = matches!(provider, "moonshotai" | "moonshotai-cn")
+            || base_url.contains("api.moonshot.");
+        let is_openrouter = provider == "openrouter" || base_url.contains("openrouter.ai");
+        let is_cloudflare_workers_ai =
+            provider == "cloudflare-workers-ai" || base_url.contains("api.cloudflare.com");
+        let is_cloudflare_ai_gateway =
+            provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
+        let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
+        let is_ant_ling = provider == "ant-ling" || base_url.contains("api.ant-ling.com");
+        let is_deepseek =
+            provider == "deepseek" || base_url.to_ascii_lowercase().contains("deepseek.com");
+        let is_grok = provider == "xai" || base_url.contains("api.x.ai");
+        let non_standard = is_nvidia
+            || provider == "cerebras"
+            || base_url.contains("cerebras.ai")
+            || is_grok
+            || is_together
+            || base_url.contains("chutes.ai")
+            || is_deepseek
+            || is_zai
+            || is_moonshot
+            || provider == "opencode"
+            || base_url.contains("opencode.ai")
+            || is_cloudflare_workers_ai
+            || is_cloudflare_ai_gateway
+            || is_ant_ling;
+        let use_max_tokens = base_url.contains("chutes.ai")
+            || is_deepseek
+            || is_moonshot
+            || is_cloudflare_ai_gateway
+            || is_together
+            || is_nvidia
+            || is_ant_ling
+            || is_zai;
+        let openrouter_developer_role_model = is_openrouter
+            && (model.id.starts_with("anthropic/") || model.id.starts_with("openai/"));
+        let detected_thinking_format = if is_deepseek {
+            "deepseek"
+        } else if is_zai {
+            "zai"
+        } else if is_together {
+            "together"
+        } else if is_ant_ling {
+            "ant-ling"
+        } else if is_openrouter {
+            "openrouter"
         } else {
-            "max_completion_tokens"
+            "openai"
         };
         let max_tokens_field = match compat_string(model, "maxTokensField").as_deref() {
             Some("max_tokens") => "max_tokens",
-            _ => default_max_tokens,
+            Some("max_completion_tokens") => "max_completion_tokens",
+            _ if use_max_tokens => "max_tokens",
+            _ => "max_completion_tokens",
         };
         Self {
             supports_store: compat_bool(model, "supportsStore", !non_standard),
-            supports_usage_in_streaming: compat_bool(model, "supportsUsageInStreaming", true),
-            supports_finish_reason: compat_bool(model, "supportsFinishReason", true),
             supports_developer_role: compat_bool(
                 model,
                 "supportsDeveloperRole",
-                !non_standard || model.provider == "openrouter",
+                openrouter_developer_role_model || (!non_standard && !is_openrouter),
             ),
+            supports_reasoning_effort: compat_bool(
+                model,
+                "supportsReasoningEffort",
+                !is_grok
+                    && !is_zai
+                    && !is_moonshot
+                    && !is_together
+                    && !is_cloudflare_ai_gateway
+                    && !is_nvidia
+                    && !is_ant_ling,
+            ),
+            supports_usage_in_streaming: compat_bool(model, "supportsUsageInStreaming", true),
+            supports_finish_reason: compat_bool(model, "supportsFinishReason", true),
+            max_tokens_field,
             requires_tool_result_name: compat_bool(model, "requiresToolResultName", false),
             requires_assistant_after_tool_result: compat_bool(
                 model,
                 "requiresAssistantAfterToolResult",
                 false,
             ),
-            max_tokens_field,
+            requires_thinking_as_text: compat_bool(model, "requiresThinkingAsText", false),
+            requires_reasoning_content_on_assistant_messages: compat_bool(
+                model,
+                "requiresReasoningContentOnAssistantMessages",
+                is_deepseek,
+            ),
+            thinking_format: compat_string(model, "thinkingFormat")
+                .unwrap_or_else(|| detected_thinking_format.to_owned()),
+            chat_template_kwargs: compat_map(model, "chatTemplateKwargs"),
+            chat_template_args: compat_map(model, "chatTemplateArgs"),
+            supports_thinking_token_budget: compat_bool(
+                model,
+                "supportsThinkingTokenBudget",
+                false,
+            ),
+            thinking_token_budget_field: compat_string(model, "thinkingTokenBudgetField")
+                .filter(|field| !field.is_empty()),
+            supports_strict_mode: compat_bool(
+                model,
+                "supportsStrictMode",
+                !is_moonshot && !is_together && !is_cloudflare_ai_gateway && !is_nvidia,
+            ),
         }
+    }
+
+    /// pi's `resolveThinkingTokenBudgetField`.
+    fn thinking_token_budget_field(&self) -> Option<&str> {
+        self.thinking_token_budget_field.as_deref().or_else(|| {
+            self.supports_thinking_token_budget
+                .then_some("thinking_token_budget")
+        })
+    }
+}
+
+/// A `thinkingLevelMap` lookup keeping JavaScript's three outcomes, because
+/// pi's thinking formats treat an explicit `null` differently from an absent
+/// entry.
+#[derive(Clone, Copy)]
+enum LevelMapping<'a> {
+    Undefined,
+    Null,
+    Value(&'a str),
+}
+
+fn level_mapping<'a>(model: &'a llm::Model, level: &str) -> LevelMapping<'a> {
+    match model.thinking_level_map.get(level) {
+        None => LevelMapping::Undefined,
+        Some(None) => LevelMapping::Null,
+        Some(Some(value)) => LevelMapping::Value(value),
+    }
+}
+
+/// `model.thinkingLevelMap?.[level] ?? level`.
+fn level_or_mapped(model: &llm::Model, level: &str) -> String {
+    match level_mapping(model, level) {
+        LevelMapping::Value(value) => value.to_owned(),
+        LevelMapping::Undefined | LevelMapping::Null => level.to_owned(),
     }
 }
 
@@ -1777,6 +2114,14 @@ fn compat_string(model: &llm::Model, name: &str) -> Option<String> {
         .and_then(|object| object.get(name))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+fn compat_map(model: &llm::Model, name: &str) -> Map<String, Value> {
+    compat_object(model)
+        .and_then(|object| object.get(name))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn requested_max_tokens(model: &llm::Model, context: &llm::Context) -> Option<u64> {
@@ -1809,7 +2154,7 @@ fn build_openai_completions_request(
     body.insert("model".to_owned(), Value::String(model.id.clone()));
     body.insert(
         "messages".to_owned(),
-        Value::Array(openai_chat_messages(model, context, compat)),
+        Value::Array(openai_chat_messages(model, context, &compat)),
     );
     body.insert("stream".to_owned(), Value::Bool(true));
     if compat.supports_usage_in_streaming {
@@ -1818,14 +2163,12 @@ fn build_openai_completions_request(
     if compat.supports_store {
         body.insert("store".to_owned(), Value::Bool(false));
     }
-    if let Some(max_tokens) = requested_max_tokens(model, context) {
+    let max_tokens = requested_max_tokens(model, context);
+    if let Some(max_tokens) = max_tokens {
         body.insert(
             compat.max_tokens_field.to_owned(),
             Value::Number(max_tokens.into()),
         );
-    }
-    if let Some(effort) = mapped_thinking_level(model, &options.thinking_level) {
-        body.insert("reasoning_effort".to_owned(), Value::String(effort));
     }
     if !options.session_id.is_empty() && model.provider == "openai" {
         body.insert(
@@ -1836,26 +2179,285 @@ fn build_openai_completions_request(
     if !context.tools.is_empty() || context_has_tool_history(context) {
         body.insert(
             "tools".to_owned(),
-            Value::Array(openai_chat_tools(&context.tools)),
+            Value::Array(openai_chat_tools(&context.tools, &compat)?),
         );
     }
+    let reasoning_effort = completions_reasoning_effort(model, &options.thinking_level);
+    let thinking_budget = resolve_clamped_thinking_budget(
+        model,
+        reasoning_effort.as_deref(),
+        options.thinking_budgets.as_ref(),
+        max_tokens,
+    );
+    apply_completions_thinking(
+        &mut body,
+        model,
+        &compat,
+        reasoning_effort.as_deref(),
+        thinking_budget,
+    );
     merge_sampling_params(&mut body, model);
     Ok(Value::Object(body))
 }
 
-fn openai_chat_tools(tools: &[llm::Tool]) -> Vec<Value> {
+/// pi's `streamSimple` reasoning: the clamped level, absent when off.
+fn completions_reasoning_effort(model: &llm::Model, requested: &str) -> Option<String> {
+    let level = stream::clamp_thinking_level(model, requested);
+    (level != llm::THINKING_OFF).then_some(level)
+}
+
+/// pi's `resolveClampedThinkingBudget`: reasoning and the answer share the
+/// response ceiling here, so the budget always leaves answer room.
+fn resolve_clamped_thinking_budget(
+    model: &llm::Model,
+    reasoning_effort: Option<&str>,
+    custom_budgets: Option<&llm::ThinkingBudgets>,
+    max_tokens: Option<u64>,
+) -> Option<u64> {
+    let level = reasoning_effort?;
+    if !model.reasoning {
+        return None;
+    }
+    let ceiling = max_tokens.unwrap_or(model.max_tokens);
+    let budget = thinking_budget(level, custom_budgets)
+        .min(ceiling.saturating_sub(stream::MIN_ANSWER_TOKENS));
+    (budget > 0).then_some(budget)
+}
+
+/// Ports the `thinkingFormat` chain of pi's Chat Completions `buildParams`.
+fn apply_completions_thinking(
+    body: &mut Map<String, Value>,
+    model: &llm::Model,
+    compat: &OpenAiCompletionsCompat,
+    effort: Option<&str>,
+    thinking_budget: Option<u64>,
+) {
+    let reasoning = model.reasoning;
+    let off_is_null = matches!(level_mapping(model, llm::THINKING_OFF), LevelMapping::Null);
+    match compat.thinking_format.as_str() {
+        "zai" if reasoning => {
+            body.insert(
+                "thinking".to_owned(),
+                if effort.is_some() {
+                    json!({"type": "enabled", "clear_thinking": false})
+                } else {
+                    json!({"type": "disabled"})
+                },
+            );
+            if let Some(effort) = effort
+                && compat.supports_reasoning_effort
+            {
+                // An explicit null mapping suppresses the field here.
+                let value = match level_mapping(model, effort) {
+                    LevelMapping::Undefined => Some(effort.to_owned()),
+                    LevelMapping::Null => None,
+                    LevelMapping::Value(value) => Some(value.to_owned()),
+                };
+                if let Some(value) = value {
+                    body.insert("reasoning_effort".to_owned(), Value::String(value));
+                }
+            }
+        }
+        "qwen" if reasoning => {
+            body.insert("enable_thinking".to_owned(), Value::Bool(effort.is_some()));
+            if let Some(effort) = effort
+                && compat.supports_reasoning_effort
+            {
+                body.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(level_or_mapped(model, effort)),
+                );
+            }
+        }
+        "qwen-chat-template" if reasoning => {
+            body.insert(
+                "chat_template_kwargs".to_owned(),
+                json!({"enable_thinking": effort.is_some(), "preserve_thinking": true}),
+            );
+        }
+        "chat-template" if reasoning => {
+            if let Some(values) = build_chat_template_values(
+                model,
+                effort,
+                &compat.chat_template_kwargs,
+                thinking_budget,
+            ) {
+                body.insert("chat_template_kwargs".to_owned(), Value::Object(values));
+            }
+        }
+        "baseten" if reasoning => {
+            if let Some(values) = build_chat_template_values(
+                model,
+                effort,
+                &compat.chat_template_args,
+                thinking_budget,
+            ) {
+                body.insert("chat_template_args".to_owned(), Value::Object(values));
+            }
+            if compat.supports_reasoning_effort {
+                let mapped = level_mapping(model, effort.unwrap_or(llm::THINKING_OFF));
+                let value = match mapped {
+                    LevelMapping::Undefined => effort.map(str::to_owned),
+                    LevelMapping::Null => None,
+                    LevelMapping::Value(value) => Some(value.to_owned()),
+                };
+                if let Some(value) = value {
+                    body.insert("reasoning_effort".to_owned(), Value::String(value));
+                }
+            }
+        }
+        "deepseek" if reasoning => {
+            if effort.is_some() {
+                body.insert("thinking".to_owned(), json!({"type": "enabled"}));
+            } else if !off_is_null {
+                body.insert("thinking".to_owned(), json!({"type": "disabled"}));
+            }
+            if let Some(effort) = effort
+                && compat.supports_reasoning_effort
+            {
+                body.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(level_or_mapped(model, effort)),
+                );
+            }
+        }
+        "openrouter" if reasoning => {
+            if let Some(effort) = effort {
+                body.insert(
+                    "reasoning".to_owned(),
+                    json!({"effort": level_or_mapped(model, effort)}),
+                );
+            } else if !off_is_null {
+                let off = match level_mapping(model, llm::THINKING_OFF) {
+                    LevelMapping::Value(value) => value,
+                    LevelMapping::Undefined | LevelMapping::Null => "none",
+                };
+                body.insert("reasoning".to_owned(), json!({"effort": off}));
+            }
+        }
+        "ant-ling" if reasoning && effort.is_some() => {
+            if let Some(effort) = effort
+                && let LevelMapping::Value(value) = level_mapping(model, effort)
+            {
+                body.insert("reasoning".to_owned(), json!({"effort": value}));
+            }
+        }
+        "together" if reasoning => {
+            body.insert("reasoning".to_owned(), json!({"enabled": effort.is_some()}));
+            if let Some(effort) = effort
+                && compat.supports_reasoning_effort
+            {
+                body.insert(
+                    "reasoning_effort".to_owned(),
+                    Value::String(level_or_mapped(model, effort)),
+                );
+            }
+        }
+        "string-thinking" if reasoning => {
+            if let Some(effort) = effort {
+                body.insert(
+                    "thinking".to_owned(),
+                    Value::String(level_or_mapped(model, effort)),
+                );
+            } else if !off_is_null {
+                let off = match level_mapping(model, llm::THINKING_OFF) {
+                    LevelMapping::Value(value) => value,
+                    LevelMapping::Undefined | LevelMapping::Null => "none",
+                };
+                body.insert("thinking".to_owned(), Value::String(off.to_owned()));
+            }
+        }
+        _ => {
+            if reasoning && compat.supports_reasoning_effort {
+                match effort {
+                    Some(effort) => {
+                        body.insert(
+                            "reasoning_effort".to_owned(),
+                            Value::String(level_or_mapped(model, effort)),
+                        );
+                    }
+                    None => {
+                        if let LevelMapping::Value(off) = level_mapping(model, llm::THINKING_OFF) {
+                            body.insert(
+                                "reasoning_effort".to_owned(),
+                                Value::String(off.to_owned()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Independent of the format: the same server can host several model
+    // families, and an uncapped reasoning phase could consume the whole
+    // response.
+    if let Some(field) = compat.thinking_token_budget_field()
+        && let Some(budget) = thinking_budget
+    {
+        body.insert(field.to_owned(), Value::Number(budget.into()));
+    }
+}
+
+/// pi's `buildChatTemplateValues`.
+fn build_chat_template_values(
+    model: &llm::Model,
+    effort: Option<&str>,
+    values: &Map<String, Value>,
+    thinking_budget: Option<u64>,
+) -> Option<Map<String, Value>> {
+    let mut resolved = Map::new();
+    for (key, value) in values {
+        if let Some(value) = resolve_chat_template_value(model, effort, value, thinking_budget) {
+            resolved.insert(key.clone(), value);
+        }
+    }
+    (!resolved.is_empty()).then_some(resolved)
+}
+
+fn resolve_chat_template_value(
+    model: &llm::Model,
+    effort: Option<&str>,
+    value: &Value,
+    thinking_budget: Option<u64>,
+) -> Option<Value> {
+    let Some(object) = value.as_object() else {
+        return Some(value.clone());
+    };
+    if effort.is_none() && object.get("omitWhenOff").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    match object.get("$var").and_then(Value::as_str) {
+        Some("thinking.enabled") => return Some(Value::Bool(effort.is_some())),
+        Some("thinking.budget") => {
+            return thinking_budget.map(|budget| Value::Number(budget.into()));
+        }
+        _ => {}
+    }
+    match level_mapping(model, effort.unwrap_or(llm::THINKING_OFF)) {
+        LevelMapping::Undefined => effort.map(|effort| Value::String(effort.to_owned())),
+        LevelMapping::Null => None,
+        LevelMapping::Value(value) => Some(Value::String(value.to_owned())),
+    }
+}
+
+fn openai_chat_tools(tools: &[llm::Tool], compat: &OpenAiCompletionsCompat) -> Result<Vec<Value>> {
     tools
         .iter()
         .map(|tool| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": schema_or_empty(&tool.parameters),
-                    "strict": false,
-                }
-            })
+            let strict = requested_json_schema_strict(tool, compat.supports_strict_mode)?;
+            let mut function = json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": schema_or_empty(&tool.parameters),
+            });
+            // Providers that do not know `strict` reject unknown fields.
+            if compat.supports_strict_mode {
+                function
+                    .as_object_mut()
+                    .expect("JSON object")
+                    .insert("strict".to_owned(), Value::Bool(strict.unwrap_or(false)));
+            }
+            Ok(json!({"type": "function", "function": function}))
         })
         .collect()
 }
@@ -1863,8 +2465,13 @@ fn openai_chat_tools(tools: &[llm::Tool]) -> Vec<Value> {
 fn openai_chat_messages(
     model: &llm::Model,
     context: &llm::Context,
-    compat: OpenAiCompletionsCompat,
+    compat: &OpenAiCompletionsCompat,
 ) -> Vec<Value> {
+    const BRIDGE_MESSAGE: &str = "I have processed the tool results.";
+    let mut normalize =
+        |id: &str, _: &llm::AssistantMessage| normalize_completions_tool_call_id(id, model);
+    let transformed = transform_messages(&context.messages, model, Some(&mut normalize));
+
     let mut messages = Vec::new();
     if !context.system_prompt.is_empty() {
         let role = if model.reasoning && compat.supports_developer_role {
@@ -1875,113 +2482,209 @@ fn openai_chat_messages(
         messages.push(json!({"role": role, "content": context.system_prompt}));
     }
 
-    let mut ids = WireIdNormalizer::default();
-    let mut pending = BTreeMap::<String, String>::new();
-    for message in &context.messages {
-        if matches!(message, llm::Message::User(_)) {
-            flush_missing_openai_tool_results(&mut messages, &mut pending, compat);
+    let mut last_role = None;
+    let mut index = 0;
+    while index < transformed.len() {
+        let message = &transformed[index];
+        // Some providers reject a user message directly after tool results.
+        if compat.requires_assistant_after_tool_result
+            && last_role == Some("toolResult")
+            && matches!(message, llm::Message::User(_))
+        {
+            messages.push(json!({"role": "assistant", "content": BRIDGE_MESSAGE}));
         }
         match message {
             llm::Message::User(user) => {
-                messages.push(json!({
-                    "role": "user",
-                    "content": openai_user_content(&user.content, model.supports_images()),
-                }));
+                let content = openai_user_content(&user.content, model.supports_images());
+                if content.as_array().is_some_and(Vec::is_empty) {
+                    index += 1;
+                    continue;
+                }
+                messages.push(json!({"role": "user", "content": content}));
             }
             llm::Message::Assistant(assistant) => {
-                if assistant.stop_reason == stream::STOP_ERROR {
+                if let Some(item) = openai_chat_assistant_message(model, compat, assistant) {
+                    messages.push(item);
+                } else {
+                    index += 1;
                     continue;
                 }
-                let mut item = Map::new();
-                item.insert("role".to_owned(), Value::String("assistant".to_owned()));
-                let text = text_from_blocks(&assistant.content);
-                item.insert(
-                    "content".to_owned(),
-                    if text.is_empty() {
-                        Value::Null
-                    } else {
-                        Value::String(text)
-                    },
-                );
-                let thinking = thinking_from_blocks(&assistant.content);
-                if !thinking.is_empty() {
-                    item.insert("reasoning_content".to_owned(), Value::String(thinking));
-                }
-                let calls = assistant
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        llm::ContentBlock::ToolCall(call) => Some(call),
-                        _ => None,
-                    })
-                    .map(|call| {
-                        let id = ids.normalize(&call.id, 64);
-                        pending.insert(id.clone(), call.name.clone());
-                        json!({
-                            "id": id,
-                            "type": "function",
-                            "function": {
-                                "name": call.name,
-                                "arguments": serde_json::to_string(&call.arguments)
-                                    .unwrap_or_else(|_| "{}".to_owned()),
-                            }
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if !calls.is_empty() {
-                    item.insert("tool_calls".to_owned(), Value::Array(calls));
-                }
-                if item.get("content").is_some_and(|content| content.is_null())
-                    && !item.contains_key("tool_calls")
-                {
-                    continue;
-                }
-                messages.push(Value::Object(item));
             }
-            llm::Message::ToolResult(result) => {
-                let id = ids.normalize(&result.tool_call_id, 64);
-                pending.remove(&id);
-                let mut item = Map::new();
-                item.insert("role".to_owned(), Value::String("tool".to_owned()));
-                item.insert("tool_call_id".to_owned(), Value::String(id));
-                item.insert(
-                    "content".to_owned(),
-                    Value::String(tool_result_text(&result.content)),
-                );
-                if compat.requires_tool_result_name {
-                    item.insert("name".to_owned(), Value::String(result.tool_name.clone()));
+            llm::Message::ToolResult(_) => {
+                let mut image_blocks = Vec::new();
+                while let Some(llm::Message::ToolResult(result)) = transformed.get(index) {
+                    let text = text_from_blocks(&result.content);
+                    let has_images = result
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, llm::ContentBlock::Image(_)));
+                    let content = if !text.is_empty() {
+                        text
+                    } else if has_images {
+                        "(see attached image)".to_owned()
+                    } else {
+                        "(no tool output)".to_owned()
+                    };
+                    let mut item = Map::new();
+                    item.insert("role".to_owned(), Value::String("tool".to_owned()));
+                    item.insert("content".to_owned(), Value::String(content));
+                    item.insert(
+                        "tool_call_id".to_owned(),
+                        Value::String(result.tool_call_id.clone()),
+                    );
+                    if compat.requires_tool_result_name && !result.tool_name.is_empty() {
+                        item.insert("name".to_owned(), Value::String(result.tool_name.clone()));
+                    }
+                    messages.push(Value::Object(item));
+                    if has_images && model.supports_images() {
+                        image_blocks.extend(result.content.iter().filter_map(
+                            |block| match block {
+                                llm::ContentBlock::Image(image) => Some(json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": data_uri(image)},
+                                })),
+                                _ => None,
+                            },
+                        ));
+                    }
+                    index += 1;
                 }
-                messages.push(Value::Object(item));
-                if compat.requires_assistant_after_tool_result {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": "I have processed the tool results."
-                    }));
+                // Tool messages cannot carry images, so they follow as a user
+                // turn.
+                if image_blocks.is_empty() {
+                    last_role = Some("toolResult");
+                } else {
+                    if compat.requires_assistant_after_tool_result {
+                        messages.push(json!({"role": "assistant", "content": BRIDGE_MESSAGE}));
+                    }
+                    let mut content = vec![json!({
+                        "type": "text",
+                        "text": "Attached image(s) from tool result:",
+                    })];
+                    content.extend(image_blocks);
+                    messages.push(json!({"role": "user", "content": content}));
+                    last_role = Some("user");
                 }
+                continue;
             }
         }
+        last_role = Some(message.role());
+        index += 1;
     }
     messages
 }
 
-fn flush_missing_openai_tool_results(
-    messages: &mut Vec<Value>,
-    pending: &mut BTreeMap<String, String>,
-    compat: OpenAiCompletionsCompat,
-) {
-    for (id, name) in std::mem::take(pending) {
-        let mut item = Map::new();
-        item.insert("role".to_owned(), Value::String("tool".to_owned()));
-        item.insert("tool_call_id".to_owned(), Value::String(id));
-        item.insert(
-            "content".to_owned(),
-            Value::String("No result provided".to_owned()),
-        );
-        if compat.requires_tool_result_name {
-            item.insert("name".to_owned(), Value::String(name));
+/// Converts one assistant turn; `None` when it has neither content nor tool
+/// calls, which several providers reject.
+fn openai_chat_assistant_message(
+    model: &llm::Model,
+    compat: &OpenAiCompletionsCompat,
+    assistant: &llm::AssistantMessage,
+) -> Option<Value> {
+    const REASONING_FIELDS: [&str; 3] = ["reasoning", "reasoning_content", "reasoning_text"];
+    let mut item = Map::new();
+    item.insert("role".to_owned(), Value::String("assistant".to_owned()));
+    // Providers needing a bridge message also refuse null content.
+    let mut content = if compat.requires_assistant_after_tool_result {
+        Value::String(String::new())
+    } else {
+        Value::Null
+    };
+    let text_parts = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::Text(text) if !text.text.trim().is_empty() => {
+                Some(text.text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let assistant_text = text_parts.concat();
+    let thinking_blocks = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
+                Some(thinking)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !thinking_blocks.is_empty() {
+        if compat.requires_thinking_as_text {
+            // Plain text without tags so the model does not mimic them.
+            let thinking = thinking_blocks
+                .iter()
+                .map(|block| block.thinking.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let mut parts = vec![json!({"type": "text", "text": thinking})];
+            parts.extend(
+                text_parts
+                    .iter()
+                    .map(|text| json!({"type": "text", "text": text})),
+            );
+            content = Value::Array(parts);
+        } else {
+            // Assistant text always goes as a plain string: some models mirror
+            // a content-block array literally in their output.
+            if !assistant_text.is_empty() {
+                content = Value::String(assistant_text.clone());
+            }
+            // The signature records which reasoning field the provider used,
+            // so the same field carries it back.
+            let mut signature = thinking_blocks[0].thinking_signature.as_str();
+            if model.provider == "opencode-go" && signature == "reasoning" {
+                signature = "reasoning_content";
+            }
+            if REASONING_FIELDS.contains(&signature) {
+                let thinking = thinking_blocks
+                    .iter()
+                    .map(|block| block.thinking.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                item.insert(signature.to_owned(), Value::String(thinking));
+            }
         }
-        messages.push(Value::Object(item));
+    } else if !assistant_text.is_empty() {
+        content = Value::String(assistant_text);
     }
+    let tool_calls = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::ToolCall(call) => Some(json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": serde_json::to_string(&call.arguments)
+                        .unwrap_or_else(|_| "{}".to_owned()),
+                }
+            })),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !tool_calls.is_empty() {
+        item.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+    }
+    if compat.requires_reasoning_content_on_assistant_messages
+        && model.reasoning
+        && !item.contains_key("reasoning_content")
+    {
+        item.insert("reasoning_content".to_owned(), Value::String(String::new()));
+    }
+    let has_content = match &content {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(parts) => !parts.is_empty(),
+        _ => false,
+    };
+    if !has_content && !item.contains_key("tool_calls") {
+        return None;
+    }
+    item.insert("content".to_owned(), content);
+    Some(Value::Object(item))
 }
 
 fn openai_user_content(content: &llm::UserContent, supports_images: bool) -> Value {
@@ -2163,23 +2866,45 @@ fn google_contents(model: &llm::Model, context: &llm::Context) -> Vec<Value> {
 /// thought signatures are opaque, only valid for an identical source model,
 /// and Google requires a complete function-response sequence.
 fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> Vec<llm::Message> {
-    let image_aware = messages
-        .iter()
-        .cloned()
-        .map(|message| downgrade_google_message_images(message, model))
-        .collect::<Vec<_>>();
-    let mut tool_call_ids = BTreeMap::new();
-    let mut transformed = Vec::with_capacity(image_aware.len());
+    let requires_tool_call_id = google_requires_tool_call_id(&model.id);
+    let mut normalize = |id: &str, _: &llm::AssistantMessage| {
+        if requires_tool_call_id {
+            sanitize_tool_call_id(id)
+        } else {
+            id.to_owned()
+        }
+    };
+    transform_messages(messages, model, Some(&mut normalize))
+}
 
-    for message in image_aware {
-        match message {
+/// Rewrites a cross-model tool-call id for the target protocol; the source
+/// turn is provided for provider and API checks.
+type ToolCallIdNormalizer<'a> = &'a mut dyn FnMut(&str, &llm::AssistantMessage) -> String;
+
+/// pi's `transformMessages`: the one history pass every protocol applies
+/// before converting to its wire format.
+///
+/// Cross-model turns lose provider-specific replay data (thinking becomes
+/// plain text, text and thought signatures are dropped, tool-call ids are
+/// normalized); same-model turns replay verbatim. Errored or aborted turns
+/// are skipped entirely, and tool calls left without a result get a
+/// synthetic error result so every protocol sees a well-formed transcript.
+pub(crate) fn transform_messages(
+    messages: &[llm::Message],
+    model: &llm::Model,
+    mut normalize_tool_call_id: Option<ToolCallIdNormalizer<'_>>,
+) -> Vec<llm::Message> {
+    let mut tool_call_ids = BTreeMap::new();
+    let mut transformed = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        match downgrade_unsupported_images(message.clone(), model) {
             llm::Message::Assistant(assistant) => {
                 let same_model = assistant.provider == model.provider
                     && assistant.api == model.api
                     && assistant.model == model.id;
-                let mut copy = (*assistant).clone();
-                copy.content = copy
-                    .content
+                let mut copy = *assistant;
+                let content = std::mem::take(&mut copy.content)
                     .into_iter()
                     .filter_map(|block| match block {
                         llm::ContentBlock::Thinking(thinking) => {
@@ -2198,11 +2923,16 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
                                 Some(llm::ContentBlock::text(thinking.thinking))
                             }
                         }
+                        llm::ContentBlock::Text(text) => Some(if same_model {
+                            llm::ContentBlock::Text(text)
+                        } else {
+                            llm::ContentBlock::text(text.text)
+                        }),
                         llm::ContentBlock::ToolCall(mut tool_call) => {
                             if !same_model {
                                 tool_call.thought_signature.clear();
-                                if google_requires_tool_call_id(&model.id) {
-                                    let normalized = google_normalize_tool_call_id(&tool_call.id);
+                                if let Some(normalize) = normalize_tool_call_id.as_deref_mut() {
+                                    let normalized = normalize(&tool_call.id, &copy);
                                     if normalized != tool_call.id {
                                         tool_call_ids
                                             .insert(tool_call.id.clone(), normalized.clone());
@@ -2215,14 +2945,14 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
                         other => Some(other),
                     })
                     .collect();
+                copy.content = content;
                 transformed.push(llm::Message::Assistant(Box::new(copy)));
             }
-            llm::Message::ToolResult(tool_result) => {
-                let mut copy = (*tool_result).clone();
-                if let Some(normalized) = tool_call_ids.get(&copy.tool_call_id) {
-                    copy.tool_call_id = normalized.clone();
+            llm::Message::ToolResult(mut tool_result) => {
+                if let Some(normalized) = tool_call_ids.get(&tool_result.tool_call_id) {
+                    tool_result.tool_call_id = normalized.clone();
                 }
-                transformed.push(llm::Message::ToolResult(Box::new(copy)));
+                transformed.push(llm::Message::ToolResult(tool_result));
             }
             other => transformed.push(other),
         }
@@ -2234,11 +2964,13 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
     for message in transformed {
         match message {
             llm::Message::Assistant(assistant) => {
-                flush_missing_google_tool_results(
+                flush_missing_tool_results(
                     &mut result,
                     &mut pending_tool_calls,
                     &mut existing_tool_results,
                 );
+                // Incomplete turns are not replayed: partial reasoning or
+                // half-finished tool calls make providers reject the request.
                 if matches!(
                     assistant.stop_reason.as_str(),
                     stream::STOP_ERROR | stream::STOP_ABORTED
@@ -2264,7 +2996,7 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
                 result.push(llm::Message::ToolResult(tool_result));
             }
             llm::Message::User(user) => {
-                flush_missing_google_tool_results(
+                flush_missing_tool_results(
                     &mut result,
                     &mut pending_tool_calls,
                     &mut existing_tool_results,
@@ -2273,7 +3005,7 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
             }
         }
     }
-    flush_missing_google_tool_results(
+    flush_missing_tool_results(
         &mut result,
         &mut pending_tool_calls,
         &mut existing_tool_results,
@@ -2281,33 +3013,32 @@ fn transform_google_messages(messages: &[llm::Message], model: &llm::Model) -> V
     result
 }
 
-fn downgrade_google_message_images(message: llm::Message, model: &llm::Model) -> llm::Message {
+fn downgrade_unsupported_images(message: llm::Message, model: &llm::Model) -> llm::Message {
     if model.supports_images() {
         return message;
     }
     match message {
         llm::Message::User(mut user) => {
             if let llm::UserContent::Blocks(blocks) = user.content {
-                user.content = llm::UserContent::Blocks(google_replace_images_with_placeholder(
+                user.content = llm::UserContent::Blocks(replace_images_with_placeholder(
                     blocks,
                     "(image omitted: model does not support images)",
                 ));
             }
             llm::Message::User(user)
         }
-        llm::Message::ToolResult(tool_result) => {
-            let mut copy = (*tool_result).clone();
-            copy.content = google_replace_images_with_placeholder(
-                copy.content,
+        llm::Message::ToolResult(mut tool_result) => {
+            tool_result.content = replace_images_with_placeholder(
+                tool_result.content,
                 "(tool image omitted: model does not support images)",
             );
-            llm::Message::ToolResult(Box::new(copy))
+            llm::Message::ToolResult(tool_result)
         }
         other => other,
     }
 }
 
-fn google_replace_images_with_placeholder(
+fn replace_images_with_placeholder(
     blocks: Vec<llm::ContentBlock>,
     placeholder: &str,
 ) -> Vec<llm::ContentBlock> {
@@ -2328,7 +3059,7 @@ fn google_replace_images_with_placeholder(
     output
 }
 
-fn flush_missing_google_tool_results(
+fn flush_missing_tool_results(
     result: &mut Vec<llm::Message>,
     pending_tool_calls: &mut Vec<llm::ToolCall>,
     existing_tool_results: &mut BTreeSet<String>,
@@ -2348,8 +3079,9 @@ fn flush_missing_google_tool_results(
     existing_tool_results.clear();
 }
 
-fn google_normalize_tool_call_id(id: &str) -> String {
-    id.chars()
+/// Replaces every character outside `[A-Za-z0-9_-]` with an underscore.
+fn sanitize_id_part(part: &str) -> String {
+    part.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
                 character
@@ -2357,8 +3089,82 @@ fn google_normalize_tool_call_id(id: &str) -> String {
                 '_'
             }
         })
-        .take(64)
         .collect()
+}
+
+/// The Anthropic and Google tool-call id rule: sanitized and at most 64
+/// characters.
+fn sanitize_tool_call_id(id: &str) -> String {
+    sanitize_id_part(id).chars().take(64).collect()
+}
+
+/// pi's Chat Completions normalizer. Responses-style `call_id|item_id` pairs
+/// collapse into one id within OpenAI's 40-character limit, keeping the
+/// item part so parallel calls sharing a `call_id` stay distinct.
+fn normalize_completions_tool_call_id(id: &str, model: &llm::Model) -> String {
+    const MAX_LENGTH: usize = 40;
+    if let Some((call_id, item_id)) = id.split_once('|') {
+        let call_id = sanitize_id_part(call_id);
+        let item_id = sanitize_id_part(item_id);
+        let combined = if item_id.is_empty() {
+            call_id.clone()
+        } else {
+            format!("{call_id}_{item_id}")
+        };
+        if combined.len() <= MAX_LENGTH {
+            return combined;
+        }
+        let hash = responses_short_hash(id).chars().take(8).collect::<String>();
+        let prefix = call_id
+            .chars()
+            .take((MAX_LENGTH - hash.len() - 1).max(1))
+            .collect::<String>();
+        return format!("{prefix}_{hash}");
+    }
+    if model.provider == "openai" && id.chars().count() > MAX_LENGTH {
+        return id.chars().take(MAX_LENGTH).collect();
+    }
+    id.to_owned()
+}
+
+/// pi's Responses normalizer. Providers that validate `fc_` item ids get a
+/// deterministic `fc_` item derived from foreign ids; everything else is
+/// simply sanitized.
+fn normalize_responses_tool_call_id(
+    id: &str,
+    model: &llm::Model,
+    source: &llm::AssistantMessage,
+    allowed_tool_call_providers: &[&str],
+) -> String {
+    fn normalize_part(part: &str) -> String {
+        sanitize_id_part(part)
+            .chars()
+            .take(64)
+            .collect::<String>()
+            .trim_end_matches('_')
+            .to_owned()
+    }
+    if !allowed_tool_call_providers.contains(&model.provider.as_str()) {
+        return normalize_part(id);
+    }
+    let Some((call_id, remainder)) = id.split_once('|') else {
+        return normalize_part(id);
+    };
+    let item_id = remainder.split('|').next().unwrap_or_default();
+    let call_id = normalize_part(call_id);
+    let foreign = source.provider != model.provider || source.api != model.api;
+    let mut item_id = if foreign {
+        format!("fc_{}", responses_short_hash(item_id))
+            .chars()
+            .take(64)
+            .collect::<String>()
+    } else {
+        normalize_part(item_id)
+    };
+    if !item_id.starts_with("fc_") {
+        item_id = normalize_part(&format!("fc_{item_id}"));
+    }
+    format!("{call_id}|{item_id}")
 }
 
 fn google_user_parts(content: &llm::UserContent, supports_images: bool) -> Vec<Value> {
@@ -2813,6 +3619,7 @@ fn build_azure_openai_responses_request(
             ResponsesInputOptions {
                 include_system_prompt: true,
                 supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
+                allowed_tool_call_providers: AZURE_TOOL_CALL_PROVIDERS,
                 grammar_tool_input_properties,
                 deferred_tools: &deferred_tools,
                 deferred_tools_mode: None,
@@ -2914,6 +3721,7 @@ fn build_openai_codex_responses_request(
             ResponsesInputOptions {
                 include_system_prompt: false,
                 supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
+                allowed_tool_call_providers: CODEX_TOOL_CALL_PROVIDERS,
                 grammar_tool_input_properties,
                 deferred_tools: &deferred_tools,
                 deferred_tools_mode,
@@ -2971,6 +3779,8 @@ enum ResponsesDeferredToolsMode {
 struct ResponsesInputOptions<'a> {
     include_system_prompt: bool,
     supports_developer_role: bool,
+    /// Providers whose Responses endpoint validates `fc_` item ids.
+    allowed_tool_call_providers: &'static [&'static str],
     grammar_tool_input_properties: &'a BTreeMap<String, String>,
     deferred_tools: &'a BTreeMap<String, llm::Tool>,
     deferred_tools_mode: Option<ResponsesDeferredToolsMode>,
@@ -3252,6 +4062,15 @@ fn responses_base36(mut value: u32) -> String {
     String::from_utf8(characters[index..].to_vec()).expect("base36 output is ASCII")
 }
 
+const OPENAI_TOOL_CALL_PROVIDERS: &[&str] = &["openai", "openai-codex", "opencode"];
+const AZURE_TOOL_CALL_PROVIDERS: &[&str] = &[
+    "openai",
+    "openai-codex",
+    "opencode",
+    "azure-openai-responses",
+];
+const CODEX_TOOL_CALL_PROVIDERS: &[&str] = &["openai", "openai-codex", "opencode"];
+
 fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<Vec<Value>> {
     let grammar_tool_input_properties = BTreeMap::new();
     let deferred_tools = BTreeMap::new();
@@ -3261,6 +4080,7 @@ fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<
         ResponsesInputOptions {
             include_system_prompt: true,
             supports_developer_role: true,
+            allowed_tool_call_providers: OPENAI_TOOL_CALL_PROVIDERS,
             grammar_tool_input_properties: &grammar_tool_input_properties,
             deferred_tools: &deferred_tools,
             deferred_tools_mode: None,
@@ -3282,11 +4102,16 @@ fn responses_input(
     let ResponsesInputOptions {
         include_system_prompt,
         supports_developer_role,
+        allowed_tool_call_providers,
         grammar_tool_input_properties,
         deferred_tools,
         deferred_tools_mode,
         tool_options,
     } = options;
+    let mut normalize = |id: &str, source: &llm::AssistantMessage| {
+        normalize_responses_tool_call_id(id, model, source, allowed_tool_call_providers)
+    };
+    let transformed = transform_messages(&context.messages, model, Some(&mut normalize));
     let mut input = Vec::new();
     if include_system_prompt && !context.system_prompt.is_empty() {
         input.push(json!({
@@ -3300,7 +4125,7 @@ fn responses_input(
     }
 
     let mut loaded_tools = BTreeSet::new();
-    for (message_index, message) in context.messages.iter().enumerate() {
+    for (message_index, message) in transformed.iter().enumerate() {
         match message {
             llm::Message::User(user) => {
                 let content = responses_user_content(&user.content, model.supports_images());
@@ -3309,15 +4134,17 @@ fn responses_input(
                 }
             }
             llm::Message::Assistant(assistant) => {
-                if assistant.stop_reason == stream::STOP_ERROR {
-                    continue;
-                }
-                for (block_index, block) in assistant.content.iter().enumerate() {
+                let same_protocol =
+                    assistant.provider == model.provider && assistant.api == model.api;
+                let same_model = same_protocol && assistant.model == model.id;
+                let different_model = same_protocol && !same_model;
+                let mut text_block_index = 0;
+                for block in &assistant.content {
                     match block {
+                        // The transform keeps signatures only for the same
+                        // model, so every surviving one is a replayable item.
                         llm::ContentBlock::Thinking(thinking)
-                            if assistant.provider == model.provider
-                                && assistant.api == model.api
-                                && !thinking.thinking_signature.is_empty() =>
+                            if !thinking.thinking_signature.is_empty() =>
                         {
                             if let Ok(item) =
                                 serde_json::from_str::<Value>(&thinking.thinking_signature)
@@ -3328,12 +4155,19 @@ fn responses_input(
                         }
                         llm::ContentBlock::Text(text) => {
                             let (signature_id, phase) = parse_text_signature(&text.text_signature);
-                            let fallback = if block_index == 0 {
+                            let fallback = if text_block_index == 0 {
                                 format!("msg_pi_{message_index}")
                             } else {
-                                format!("msg_pi_{message_index}_{block_index}")
+                                format!("msg_pi_{message_index}_{text_block_index}")
                             };
-                            let id = signature_id.filter(|id| id.len() <= 64).unwrap_or(fallback);
+                            text_block_index += 1;
+                            let id = signature_id.map_or(fallback, |id| {
+                                if id.len() > 64 {
+                                    format!("msg_{}", responses_short_hash(&id))
+                                } else {
+                                    id
+                                }
+                            });
                             let mut item = json!({
                                 "type": "message",
                                 "id": id,
@@ -3354,19 +4188,17 @@ fn responses_input(
                         }
                         llm::ContentBlock::ToolCall(call) => {
                             let (call_id, item_id) = split_responses_tool_id(&call.id);
-                            let same_protocol =
-                                assistant.provider == model.provider && assistant.api == model.api;
-                            let same_model = same_protocol && assistant.model == model.id;
                             let grammar_input_property =
                                 grammar_tool_input_properties.get(&call.name);
-                            let item_id = if grammar_input_property.is_some() {
-                                same_protocol.then_some(item_id).flatten()
-                            } else {
-                                same_protocol
-                                    .then_some(item_id)
-                                    .flatten()
-                                    .filter(|id| id.starts_with("fc_"))
-                            };
+                            // OpenAI pairs `fc_` items with the reasoning items
+                            // of the model that produced them, so another
+                            // model's ids are omitted to skip that validation;
+                            // a function_call item id must also be `fc_`.
+                            let item_id = item_id.filter(|item_id| {
+                                let function_call_id = item_id.starts_with("fc_");
+                                !((different_model && function_call_id)
+                                    || (grammar_input_property.is_none() && !function_call_id))
+                            });
                             let mut item = if let Some(input_property) = grammar_input_property {
                                 json!({
                                     "type": "custom_tool_call",
@@ -3545,10 +4377,137 @@ fn responses_tool_result_output(model: &llm::Model, blocks: &[llm::ContentBlock]
     Value::Array(output)
 }
 
+const CLAUDE_CODE_VERSION: &str = "2.1.251";
+const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+/// Claude Code 2.x tool names; an OAuth session mirrors their casing.
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+const ANTHROPIC_OAUTH_BETAS: &[&str] = &["claude-code-20250219", "oauth-2025-04-20"];
+const ANTHROPIC_FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// Anthropic request shape derived from the credential and turn options.
+struct AnthropicRequestShape {
+    /// The API key is a Claude Code OAuth token, which pi sends as a bearer
+    /// credential with the Claude Code identity and tool naming.
+    oauth: bool,
+    cache_control: Option<Value>,
+    allow_empty_signature: bool,
+    /// The clamped thinking level when thinking is on for this request.
+    thinking_level: Option<String>,
+}
+
+fn anthropic_request_shape(
+    model: &llm::Model,
+    credentials: &ProviderCredentials,
+    options: &agent::RequestOptions,
+) -> AnthropicRequestShape {
+    let api_key = credentials.api_key_value().unwrap_or_default();
+    AnthropicRequestShape {
+        oauth: api_key != catalog::AUTHENTICATED_SENTINEL && anthropic_is_oauth_token(api_key),
+        cache_control: anthropic_cache_control(model, options.cache_retention),
+        allow_empty_signature: compat_bool(model, "allowEmptySignature", false),
+        thinking_level: anthropic_thinking_level(model, &options.thinking_level),
+    }
+}
+
+fn anthropic_is_oauth_token(api_key: &str) -> bool {
+    api_key.contains("sk-ant-oat")
+}
+
+fn to_claude_code_name(name: &str) -> String {
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|tool| tool.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |tool| (*tool).to_owned())
+}
+
+fn from_claude_code_name(name: &str, tools: &[llm::Tool]) -> String {
+    tools
+        .iter()
+        .find(|tool| tool.name.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_owned(), |tool| tool.name.clone())
+}
+
+fn anthropic_cache_control(model: &llm::Model, retention: agent::CacheRetention) -> Option<Value> {
+    match retention {
+        agent::CacheRetention::None => None,
+        agent::CacheRetention::Long if compat_bool(model, "supportsLongCacheRetention", true) => {
+            Some(json!({"type": "ephemeral", "ttl": "1h"}))
+        }
+        agent::CacheRetention::Short | agent::CacheRetention::Long => {
+            Some(json!({"type": "ephemeral"}))
+        }
+    }
+}
+
+fn anthropic_thinking_level(model: &llm::Model, requested: &str) -> Option<String> {
+    if !model.reasoning {
+        return None;
+    }
+    let level = stream::clamp_thinking_level(model, requested);
+    (level != llm::THINKING_OFF).then_some(level)
+}
+
+/// pi's `mapThinkingLevelToEffort` for adaptive-thinking models.
+fn anthropic_effort(model: &llm::Model, level: &str) -> String {
+    if let LevelMapping::Value(mapped) = level_mapping(model, level) {
+        return mapped.to_owned();
+    }
+    match level {
+        llm::THINKING_MINIMAL | llm::THINKING_LOW => "low",
+        llm::THINKING_MEDIUM => "medium",
+        _ => "high",
+    }
+    .to_owned()
+}
+
+/// pi's `getBetaFeatures`, less any `anthropic-beta` header configured on the
+/// model or credential, which replaces this default wholesale.
+fn anthropic_beta_features(
+    model: &llm::Model,
+    context: &llm::Context,
+    shape: &AnthropicRequestShape,
+) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if shape.oauth {
+        features.extend_from_slice(ANTHROPIC_OAUTH_BETAS);
+    }
+    if !context.tools.is_empty() && !compat_bool(model, "supportsEagerToolInputStreaming", true) {
+        features.push(ANTHROPIC_FINE_GRAINED_TOOL_STREAMING_BETA);
+    }
+    // Adaptive-thinking models interleave thinking without the beta.
+    if model.reasoning
+        && shape.thinking_level.is_some()
+        && !compat_bool(model, "forceAdaptiveThinking", false)
+    {
+        features.push(ANTHROPIC_INTERLEAVED_THINKING_BETA);
+    }
+    features
+}
+
 fn build_anthropic_messages_request(
     model: &llm::Model,
     context: &llm::Context,
     options: &agent::RequestOptions,
+    shape: &AnthropicRequestShape,
 ) -> Result<Value> {
     let max_tokens = requested_max_tokens(model, context)
         .or_else(|| (!model.max_tokens.eq(&0)).then_some(model.max_tokens))
@@ -3557,73 +4516,136 @@ fn build_anthropic_messages_request(
     body.insert("model".to_owned(), Value::String(model.id.clone()));
     body.insert(
         "messages".to_owned(),
-        Value::Array(anthropic_messages(model, context)),
+        Value::Array(anthropic_messages(model, context, shape)),
     );
     body.insert("max_tokens".to_owned(), Value::Number(max_tokens.into()));
     body.insert("stream".to_owned(), Value::Bool(true));
+
+    let system_block = |text: &str| {
+        let mut block = json!({"type": "text", "text": text});
+        if let Some(cache_control) = &shape.cache_control {
+            block
+                .as_object_mut()
+                .expect("JSON object")
+                .insert("cache_control".to_owned(), cache_control.clone());
+        }
+        block
+    };
+    let mut system = Vec::new();
+    // An OAuth token is only accepted with the Claude Code identity.
+    if shape.oauth {
+        system.push(system_block(CLAUDE_CODE_IDENTITY));
+    }
     if !context.system_prompt.is_empty() {
-        body.insert(
-            "system".to_owned(),
-            Value::Array(vec![json!({
-                "type": "text",
-                "text": context.system_prompt,
-            })]),
-        );
+        system.push(system_block(&context.system_prompt));
+    }
+    if !system.is_empty() {
+        body.insert("system".to_owned(), Value::Array(system));
+    }
+
+    let thinking_enabled = shape.thinking_level.is_some();
+    // Temperature is incompatible with extended thinking.
+    if let Some(temperature) = options.temperature
+        && !thinking_enabled
+        && compat_bool(model, "supportsTemperature", true)
+        && let Some(temperature) = serde_json::Number::from_f64(temperature)
+    {
+        body.insert("temperature".to_owned(), Value::Number(temperature));
     }
     if !context.tools.is_empty() {
-        let eager = compat_bool(model, "supportsEagerToolInputStreaming", true);
         body.insert(
             "tools".to_owned(),
-            Value::Array(
-                context
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        let mut item = json!({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": schema_or_empty(&tool.parameters),
-                        });
-                        if eager {
-                            item.as_object_mut()
-                                .expect("JSON object")
-                                .insert("eager_input_streaming".to_owned(), Value::Bool(true));
-                        }
-                        item
-                    })
-                    .collect(),
-            ),
+            Value::Array(anthropic_tools(&context.tools, model, shape)),
         );
     }
-    if let Some(level) = mapped_thinking_level(model, &options.thinking_level) {
-        let budget =
-            thinking_budget(&level).min(max_tokens.saturating_sub(stream::MIN_ANSWER_TOKENS));
-        if budget > 0 {
-            body.insert(
-                "thinking".to_owned(),
-                json!({"type": "enabled", "budget_tokens": budget, "display": "summarized"}),
-            );
+    if model.reasoning {
+        if let Some(level) = &shape.thinking_level {
+            if compat_bool(model, "forceAdaptiveThinking", false) {
+                // Adaptive thinking: Claude decides when and how much to think.
+                body.insert(
+                    "thinking".to_owned(),
+                    json!({"type": "adaptive", "display": "summarized"}),
+                );
+                body.insert(
+                    "output_config".to_owned(),
+                    json!({"effort": anthropic_effort(model, level)}),
+                );
+            } else {
+                let budget = thinking_budget(level, options.thinking_budgets.as_ref())
+                    .min(max_tokens.saturating_sub(stream::MIN_ANSWER_TOKENS));
+                body.insert(
+                    "thinking".to_owned(),
+                    json!({
+                        "type": "enabled",
+                        "budget_tokens": if budget == 0 { 1_024 } else { budget },
+                        "display": "summarized",
+                    }),
+                );
+            }
+        } else if !matches!(level_mapping(model, llm::THINKING_OFF), LevelMapping::Null) {
+            body.insert("thinking".to_owned(), json!({"type": "disabled"}));
         }
     }
     merge_sampling_params(&mut body, model);
     Ok(Value::Object(body))
 }
 
-fn thinking_budget(level: &str) -> u64 {
-    match level {
-        llm::THINKING_MINIMAL => 1_024,
-        llm::THINKING_LOW => 2_048,
-        llm::THINKING_MEDIUM => 8_192,
-        _ => 16_384,
-    }
+fn anthropic_tools(
+    tools: &[llm::Tool],
+    model: &llm::Model,
+    shape: &AnthropicRequestShape,
+) -> Vec<Value> {
+    let eager = compat_bool(model, "supportsEagerToolInputStreaming", true);
+    let cache_control = compat_bool(model, "supportsCacheControlOnTools", true)
+        .then(|| shape.cache_control.clone())
+        .flatten();
+    tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let mut item = json!({
+                "name": if shape.oauth { to_claude_code_name(&tool.name) } else { tool.name.clone() },
+                "description": tool.description,
+                "input_schema": schema_or_empty(&tool.parameters),
+            });
+            let object = item.as_object_mut().expect("JSON object");
+            if eager {
+                object.insert("eager_input_streaming".to_owned(), Value::Bool(true));
+            }
+            // The cache breakpoint on the last tool covers the whole set.
+            if let Some(cache_control) = &cache_control
+                && index + 1 == tools.len()
+            {
+                object.insert("cache_control".to_owned(), cache_control.clone());
+            }
+            item
+        })
+        .collect()
 }
 
-fn anthropic_messages(model: &llm::Model, context: &llm::Context) -> Vec<Value> {
+/// pi's `thinkingBudgetForLevel`: the caller's budgets override the defaults.
+fn thinking_budget(level: &str, custom: Option<&llm::ThinkingBudgets>) -> u64 {
+    let level = stream::clamp_reasoning_level(level);
+    let (default, custom) = match level.as_str() {
+        llm::THINKING_MINIMAL => (1_024, custom.and_then(|budgets| budgets.minimal)),
+        llm::THINKING_LOW => (2_048, custom.and_then(|budgets| budgets.low)),
+        llm::THINKING_MEDIUM => (8_192, custom.and_then(|budgets| budgets.medium)),
+        _ => (16_384, custom.and_then(|budgets| budgets.high)),
+    };
+    custom.map_or(default, u64::from)
+}
+
+fn anthropic_messages(
+    model: &llm::Model,
+    context: &llm::Context,
+    shape: &AnthropicRequestShape,
+) -> Vec<Value> {
+    let mut normalize = |id: &str, _: &llm::AssistantMessage| sanitize_tool_call_id(id);
+    let transformed = transform_messages(&context.messages, model, Some(&mut normalize));
     let mut messages = Vec::new();
-    let mut ids = WireIdNormalizer::default();
     let mut index = 0;
-    while index < context.messages.len() {
-        match &context.messages[index] {
+    while index < transformed.len() {
+        match &transformed[index] {
             llm::Message::User(user) => {
                 if let Some(content) =
                     anthropic_user_content(&user.content, model.supports_images())
@@ -3633,60 +4655,69 @@ fn anthropic_messages(model: &llm::Model, context: &llm::Context) -> Vec<Value> 
                 index += 1;
             }
             llm::Message::Assistant(assistant) => {
-                if assistant.stop_reason != stream::STOP_ERROR {
-                    let same_protocol =
-                        assistant.provider == model.provider && assistant.api == model.api;
-                    let mut blocks = Vec::new();
-                    for block in &assistant.content {
-                        match block {
-                            llm::ContentBlock::Text(text) if !text.text.trim().is_empty() => {
-                                blocks.push(json!({"type": "text", "text": text.text}));
+                let mut blocks = Vec::new();
+                for block in &assistant.content {
+                    match block {
+                        llm::ContentBlock::Text(text) if !text.text.trim().is_empty() => {
+                            blocks.push(json!({"type": "text", "text": text.text}));
+                        }
+                        llm::ContentBlock::Thinking(thinking) if thinking.redacted => {
+                            blocks.push(json!({
+                                "type": "redacted_thinking",
+                                "data": thinking.thinking_signature,
+                            }));
+                        }
+                        llm::ContentBlock::Thinking(thinking) => {
+                            let has_signature = !thinking.thinking_signature.trim().is_empty();
+                            if thinking.thinking.trim().is_empty() && !has_signature {
+                                continue;
                             }
-                            llm::ContentBlock::Thinking(thinking) if thinking.redacted => {
-                                blocks.push(json!({
-                                    "type": "redacted_thinking",
-                                    "data": thinking.thinking_signature,
-                                }));
-                            }
-                            llm::ContentBlock::Thinking(thinking)
-                                if same_protocol && !thinking.thinking_signature.is_empty() =>
-                            {
+                            // The transform keeps signatures only for the
+                            // same model. A missing one (an aborted stream,
+                            // say) is replayed as text unless the provider
+                            // accepts empty signatures.
+                            if has_signature {
                                 blocks.push(json!({
                                     "type": "thinking",
                                     "thinking": thinking.thinking,
                                     "signature": thinking.thinking_signature,
                                 }));
-                            }
-                            llm::ContentBlock::Thinking(thinking)
-                                if !thinking.thinking.trim().is_empty() =>
-                            {
+                            } else if shape.allow_empty_signature {
+                                blocks.push(json!({
+                                    "type": "thinking",
+                                    "thinking": thinking.thinking,
+                                    "signature": "",
+                                }));
+                            } else {
                                 blocks.push(json!({"type": "text", "text": thinking.thinking}));
                             }
-                            llm::ContentBlock::ToolCall(call) => {
-                                blocks.push(json!({
-                                    "type": "tool_use",
-                                    "id": ids.normalize(&call.id, 64),
-                                    "name": call.name,
-                                    "input": call.arguments,
-                                }));
-                            }
-                            llm::ContentBlock::Image(_)
-                            | llm::ContentBlock::Text(_)
-                            | llm::ContentBlock::Thinking(_) => {}
                         }
+                        llm::ContentBlock::ToolCall(call) => {
+                            blocks.push(json!({
+                                "type": "tool_use",
+                                "id": call.id,
+                                "name": if shape.oauth {
+                                    to_claude_code_name(&call.name)
+                                } else {
+                                    call.name.clone()
+                                },
+                                "input": call.arguments,
+                            }));
+                        }
+                        llm::ContentBlock::Image(_) | llm::ContentBlock::Text(_) => {}
                     }
-                    if !blocks.is_empty() {
-                        messages.push(json!({"role": "assistant", "content": blocks}));
-                    }
+                }
+                if !blocks.is_empty() {
+                    messages.push(json!({"role": "assistant", "content": blocks}));
                 }
                 index += 1;
             }
             llm::Message::ToolResult(_) => {
                 let mut blocks = Vec::new();
-                while let Some(llm::Message::ToolResult(result)) = context.messages.get(index) {
+                while let Some(llm::Message::ToolResult(result)) = transformed.get(index) {
                     blocks.push(json!({
                         "type": "tool_result",
-                        "tool_use_id": ids.normalize(&result.tool_call_id, 64),
+                        "tool_use_id": result.tool_call_id,
                         "content": anthropic_tool_result_content(
                             &result.content,
                             model.supports_images(),
@@ -3697,6 +4728,35 @@ fn anthropic_messages(model: &llm::Model, context: &llm::Context) -> Vec<Value> 
                 }
                 messages.push(json!({"role": "user", "content": blocks}));
             }
+        }
+    }
+    // A cache breakpoint on the last user block caches the conversation so
+    // far for the next turn.
+    if let Some(cache_control) = &shape.cache_control
+        && let Some(last) = messages.last_mut()
+        && last["role"] == "user"
+    {
+        match &mut last["content"] {
+            Value::Array(blocks) => {
+                if let Some(block) = blocks.last_mut()
+                    && matches!(
+                        block["type"].as_str(),
+                        Some("text" | "image" | "tool_result")
+                    )
+                    && let Some(block) = block.as_object_mut()
+                {
+                    block.insert("cache_control".to_owned(), cache_control.clone());
+                }
+            }
+            Value::String(text) => {
+                let text = std::mem::take(text);
+                last["content"] = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control,
+                }]);
+            }
+            _ => {}
         }
     }
     messages
@@ -3815,33 +4875,6 @@ fn text_from_blocks(blocks: &[llm::ContentBlock]) -> String {
         .join("\n")
 }
 
-fn thinking_from_blocks(blocks: &[llm::ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            llm::ContentBlock::Thinking(thinking) if !thinking.redacted => {
-                Some(thinking.thinking.as_str())
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn tool_result_text(blocks: &[llm::ContentBlock]) -> String {
-    let text = text_from_blocks(blocks);
-    if !text.is_empty() {
-        text
-    } else if blocks
-        .iter()
-        .any(|block| matches!(block, llm::ContentBlock::Image(_)))
-    {
-        "(see attached image)".to_owned()
-    } else {
-        "(no tool output)".to_owned()
-    }
-}
-
 fn data_uri(image: &llm::ImageContent) -> String {
     format!("data:{};base64,{}", image.mime_type, image.data)
 }
@@ -3885,71 +4918,43 @@ fn split_responses_tool_id(id: &str) -> (String, Option<String>) {
     }
 }
 
-#[derive(Default)]
-struct WireIdNormalizer {
-    values: BTreeMap<String, String>,
-    used: BTreeSet<String>,
-}
-
-impl WireIdNormalizer {
-    fn normalize(&mut self, source: &str, maximum_length: usize) -> String {
-        if let Some(value) = self.values.get(source) {
-            return value.clone();
-        }
-        let mut value = source
-            .bytes()
-            .map(|byte| match byte {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => byte as char,
-                _ => '_',
-            })
-            .collect::<String>();
-        if value.is_empty() {
-            value = "call".to_owned();
-        }
-        value.truncate(maximum_length.max(1));
-        let base = value.clone();
-        let mut attempt = 1_u64;
-        while self.used.contains(&value) {
-            let suffix = format!("_{attempt}");
-            let prefix_length = maximum_length.saturating_sub(suffix.len()).max(1);
-            value = base.chars().take(prefix_length).collect::<String>();
-            value.push_str(&suffix);
-            attempt += 1;
-        }
-        self.used.insert(value.clone());
-        self.values.insert(source.to_owned(), value.clone());
-        value
-    }
-}
-
 /// Mutable output plus safe snapshot publication for one provider turn.
 pub(crate) struct MessageEmitter {
     events: stream::AssistantMessageEventStream,
     model: llm::Model,
-    pub(crate) message: llm::AssistantMessage,
+    cancellation: agent::CancellationToken,
+    /// Shared with every published snapshot. Mutation goes through
+    /// `Arc::make_mut`, so the message is copied only while a consumer still
+    /// holds the previous snapshot rather than on every delta.
+    message: Arc<llm::AssistantMessage>,
     usage_cost_multiplier: f64,
 }
 
 impl MessageEmitter {
-    fn new(events: stream::AssistantMessageEventStream, model: &llm::Model) -> Self {
+    fn new(
+        events: stream::AssistantMessageEventStream,
+        model: &llm::Model,
+        cancellation: agent::CancellationToken,
+    ) -> Self {
         Self {
             events,
             model: model.clone(),
-            message: llm::AssistantMessage {
-                role: "assistant".to_owned(),
-                api: model.api.clone(),
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-                stop_reason: stream::STOP_PENDING.to_owned(),
-                timestamp: now_millis(),
-                ..llm::AssistantMessage::default()
-            },
+            cancellation,
+            message: Arc::new(initial_assistant_message(model)),
             usage_cost_multiplier: 1.0,
         }
     }
 
+    pub(crate) fn message(&self) -> &llm::AssistantMessage {
+        &self.message
+    }
+
+    pub(crate) fn message_mut(&mut self) -> &mut llm::AssistantMessage {
+        Arc::make_mut(&mut self.message)
+    }
+
     fn snapshot(&self) -> Arc<llm::AssistantMessage> {
-        Arc::new(self.message.clone())
+        Arc::clone(&self.message)
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
@@ -3958,7 +4963,7 @@ impl MessageEmitter {
 
     pub(crate) fn start_text(&mut self, initial: &str) -> Result<usize> {
         let index = self.message.content.len();
-        self.message
+        self.message_mut()
             .content
             .push(llm::ContentBlock::Text(llm::TextContent {
                 text: initial.to_owned(),
@@ -3973,7 +4978,7 @@ impl MessageEmitter {
     }
 
     pub(crate) fn append_text(&mut self, index: usize, delta: &str) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Text(text)) => text.text.push_str(delta),
             _ => {
                 return Err(ProviderAdapterError::Protocol(
@@ -3990,7 +4995,7 @@ impl MessageEmitter {
     }
 
     fn replace_text(&mut self, index: usize, text: &str) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Text(content)) => content.text = text.to_owned(),
             _ => {
                 return Err(ProviderAdapterError::Protocol(
@@ -4002,7 +5007,7 @@ impl MessageEmitter {
     }
 
     fn set_text_signature(&mut self, index: usize, signature: String) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Text(content)) => content.text_signature = signature,
             _ => {
                 return Err(ProviderAdapterError::Protocol(
@@ -4037,7 +5042,7 @@ impl MessageEmitter {
         redacted: bool,
     ) -> Result<usize> {
         let index = self.message.content.len();
-        self.message
+        self.message_mut()
             .content
             .push(llm::ContentBlock::Thinking(llm::ThinkingContent {
                 thinking: initial.to_owned(),
@@ -4053,7 +5058,7 @@ impl MessageEmitter {
     }
 
     pub(crate) fn append_thinking(&mut self, index: usize, delta: &str) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking.push_str(delta),
             _ => {
                 return Err(ProviderAdapterError::Protocol(
@@ -4070,7 +5075,7 @@ impl MessageEmitter {
     }
 
     fn replace_thinking(&mut self, index: usize, text: &str) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking = text.to_owned(),
             _ => {
                 return Err(ProviderAdapterError::Protocol(
@@ -4082,7 +5087,7 @@ impl MessageEmitter {
     }
 
     fn append_thinking_signature(&mut self, index: usize, delta: &str) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => {
                 thinking.thinking_signature.push_str(delta);
                 Ok(())
@@ -4094,7 +5099,7 @@ impl MessageEmitter {
     }
 
     fn set_thinking_signature(&mut self, index: usize, signature: String) -> Result<()> {
-        match self.message.content.get_mut(index) {
+        match self.message_mut().content.get_mut(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => {
                 thinking.thinking_signature = signature;
                 Ok(())
@@ -4124,7 +5129,7 @@ impl MessageEmitter {
 
     pub(crate) fn start_tool(&mut self, id: &str, name: &str) -> Result<usize> {
         let index = self.message.content.len();
-        self.message
+        self.message_mut()
             .content
             .push(llm::ContentBlock::ToolCall(llm::ToolCall {
                 id: id.to_owned(),
@@ -4148,7 +5153,8 @@ impl MessageEmitter {
         name: Option<&str>,
         namespace: Option<&str>,
     ) -> Result<()> {
-        let Some(llm::ContentBlock::ToolCall(call)) = self.message.content.get_mut(index) else {
+        let Some(llm::ContentBlock::ToolCall(call)) = self.message_mut().content.get_mut(index)
+        else {
             return Err(ProviderAdapterError::Protocol(
                 "tool metadata did not match a tool-call content block".to_owned(),
             ));
@@ -4166,7 +5172,8 @@ impl MessageEmitter {
     }
 
     fn set_tool_thought_signature(&mut self, index: usize, signature: &str) -> Result<()> {
-        let Some(llm::ContentBlock::ToolCall(call)) = self.message.content.get_mut(index) else {
+        let Some(llm::ContentBlock::ToolCall(call)) = self.message_mut().content.get_mut(index)
+        else {
             return Err(ProviderAdapterError::Protocol(
                 "tool thought signature did not match a tool-call content block".to_owned(),
             ));
@@ -4182,7 +5189,8 @@ impl MessageEmitter {
         index: usize,
         arguments: BTreeMap<String, Value>,
     ) -> Result<()> {
-        let Some(llm::ContentBlock::ToolCall(call)) = self.message.content.get_mut(index) else {
+        let Some(llm::ContentBlock::ToolCall(call)) = self.message_mut().content.get_mut(index)
+        else {
             return Err(ProviderAdapterError::Protocol(
                 "tool arguments did not match a tool-call content block".to_owned(),
             ));
@@ -4222,55 +5230,100 @@ impl MessageEmitter {
     }
 
     fn calculate_usage_cost(&mut self) {
-        stream::calculate_usage_cost(&self.model, &mut self.message.usage);
-        if self.usage_cost_multiplier != 1.0 {
-            let cost = &mut self.message.usage.cost;
-            cost.input *= self.usage_cost_multiplier;
-            cost.output *= self.usage_cost_multiplier;
-            cost.cache_read *= self.usage_cost_multiplier;
-            cost.cache_write *= self.usage_cost_multiplier;
+        let Self {
+            model,
+            message,
+            usage_cost_multiplier,
+            ..
+        } = self;
+        let usage = &mut Arc::make_mut(message).usage;
+        stream::calculate_usage_cost(model, usage);
+        if *usage_cost_multiplier != 1.0 {
+            let cost = &mut usage.cost;
+            cost.input *= *usage_cost_multiplier;
+            cost.output *= *usage_cost_multiplier;
+            cost.cache_read *= *usage_cost_multiplier;
+            cost.cache_write *= *usage_cost_multiplier;
             cost.total = cost.input + cost.output + cost.cache_read + cost.cache_write;
         }
     }
 
     fn finish(&mut self) -> Result<()> {
         self.calculate_usage_cost();
-        self.events
-            .push(stream::AssistantMessageEvent::done(
-                self.message.stop_reason.clone(),
-                self.snapshot(),
-            ))
-            .map_err(|error| ProviderAdapterError::EventStream(error.to_string()))?;
+        let event =
+            stream::AssistantMessageEvent::done(self.message.stop_reason.clone(), self.snapshot());
+        let result = self.deliver_terminal(event);
         self.events.end();
-        Ok(())
+        result
     }
 
-    fn fail(
-        &mut self,
-        error: ProviderAdapterError,
-        cancellation: &agent::CancellationToken,
-    ) -> Result<()> {
-        self.message.stop_reason =
-            if cancellation.is_cancelled() || matches!(&error, ProviderAdapterError::Cancelled) {
+    fn fail(&mut self, error: ProviderAdapterError) -> Result<()> {
+        let aborted =
+            self.cancellation.is_cancelled() || matches!(&error, ProviderAdapterError::Cancelled);
+        {
+            let message = self.message_mut();
+            message.stop_reason = if aborted {
                 stream::STOP_ABORTED.to_owned()
             } else {
                 stream::STOP_ERROR.to_owned()
             };
-        self.message.error_message = error.to_string();
+            message.error_message = error.to_string();
+        }
         self.calculate_usage_cost();
-        let result = self.events.push(stream::AssistantMessageEvent::error(
-            self.message.stop_reason.clone(),
-            self.snapshot(),
-        ));
+        let event =
+            stream::AssistantMessageEvent::error(self.message.stop_reason.clone(), self.snapshot());
+        let result = self.deliver_terminal(event);
         self.events.end();
-        result.map_err(|error| ProviderAdapterError::EventStream(error.to_string()))
+        result
     }
 
     fn publish(&self, mut event: stream::AssistantMessageEvent) -> Result<()> {
         event.partial = Some(self.snapshot());
-        self.events
-            .push(event)
-            .map_err(|error| ProviderAdapterError::EventStream(error.to_string()))
+        let mut pending = event;
+        loop {
+            match self.events.push_timeout(pending, STREAM_POLL_INTERVAL) {
+                Ok(()) => return Ok(()),
+                Err(stream::EventStreamPushError::TimedOut(event)) => {
+                    // A consumer that stopped draining must not pin this
+                    // worker: stop once the turn is cancelled or the last
+                    // consumer handle is gone.
+                    if self.cancellation.is_cancelled() {
+                        return Err(ProviderAdapterError::Cancelled);
+                    }
+                    if self.events.is_orphaned() {
+                        return Err(ProviderAdapterError::EventStream(
+                            "no consumer remains for the assistant event stream".to_owned(),
+                        ));
+                    }
+                    pending = *event;
+                }
+                Err(error) => return Err(ProviderAdapterError::EventStream(error.to_string())),
+            }
+        }
+    }
+
+    /// Terminal events are still delivered after cancellation so a consumer
+    /// that is draining sees the final message, but a stalled one only holds
+    /// this worker for a bounded time.
+    fn deliver_terminal(&self, event: stream::AssistantMessageEvent) -> Result<()> {
+        let deadline = Instant::now()
+            .checked_add(TERMINAL_DELIVERY_BUDGET)
+            .unwrap_or_else(Instant::now);
+        let mut pending = event;
+        loop {
+            match self.events.push_timeout(pending, STREAM_POLL_INTERVAL) {
+                Ok(()) => return Ok(()),
+                Err(stream::EventStreamPushError::TimedOut(event)) => {
+                    if self.events.is_orphaned() || Instant::now() >= deadline {
+                        return Err(ProviderAdapterError::EventStream(
+                            "consumer did not accept the terminal assistant event".to_owned(),
+                        ));
+                    }
+                    pending = *event;
+                }
+                Err(error) => return Err(ProviderAdapterError::EventStream(error.to_string())),
+            }
+        }
     }
 }
 
@@ -4317,6 +5370,8 @@ fn apply_openai_usage(usage: &mut llm::Usage, raw: &Value) {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .or_else(|| value_u64(raw, "prompt_cache_hit_tokens"))
+        // Kimi documents cache hits as a top-level `cached_tokens`.
+        .or_else(|| value_u64(raw, "cached_tokens"))
         .unwrap_or(usage.cache_read);
     let cache_write = details
         .and_then(|details| details.get("cache_write_tokens"))
@@ -4425,14 +5480,33 @@ struct OpenAiToolState {
     arguments: stream::IncrementalJsonObjectParser,
 }
 
+/// Formats a Chat Completions `{"error": …}` chunk the way pi surfaces it:
+/// the provider's message, plus OpenRouter's raw upstream metadata when it
+/// adds something.
+fn openai_stream_error_message(error: &Value) -> String {
+    let mut message = value_string(error, "message")
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| error.to_string());
+    if let Some(raw) = value_object(error, "metadata")
+        .and_then(|metadata| metadata.get("raw"))
+        .and_then(Value::as_str)
+        .filter(|raw| !raw.is_empty() && !message.contains(raw))
+    {
+        message.push('\n');
+        message.push_str(raw);
+    }
+    message
+}
+
 fn consume_openai_completions(
-    response: Response,
+    body: impl Read,
     model: &llm::Model,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
 ) -> Result<()> {
     let compat = OpenAiCompletionsCompat::from_model(model);
-    let mut reader = stream::SseReader::new(response);
+    let mut reader = stream::SseReader::new(body);
     let mut text_index = None;
     let mut thinking_index = None;
     let mut tool_calls = BTreeMap::<usize, OpenAiToolState>::new();
@@ -4452,20 +5526,28 @@ fn consume_openai_completions(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             continue;
         };
-        if emitter.message.response_id.is_empty()
+        // The OpenAI SDK raises a chunk carrying an `error` object as the
+        // request's failure; treating it as a truncated stream would hide the
+        // provider's message behind a retryable "ended without finish_reason".
+        if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+            return Err(ProviderAdapterError::Protocol(openai_stream_error_message(
+                error,
+            )));
+        }
+        if emitter.message().response_id.is_empty()
             && let Some(id) = value_string(&chunk, "id")
         {
-            emitter.message.response_id = id.to_owned();
+            emitter.message_mut().response_id = id.to_owned();
         }
         if let Some(response_model) = value_string(&chunk, "model")
             && response_model != model.id
             && !response_model.is_empty()
-            && emitter.message.response_model.is_empty()
+            && emitter.message().response_model.is_empty()
         {
-            emitter.message.response_model = response_model.to_owned();
+            emitter.message_mut().response_model = response_model.to_owned();
         }
         if let Some(usage) = chunk.get("usage") {
-            apply_openai_usage(&mut emitter.message.usage, usage);
+            apply_openai_usage(&mut emitter.message_mut().usage, usage);
         }
 
         let Some(choice) = chunk
@@ -4476,17 +5558,17 @@ fn consume_openai_completions(
             continue;
         };
         if let Some(usage) = choice.get("usage") {
-            apply_openai_usage(&mut emitter.message.usage, usage);
+            apply_openai_usage(&mut emitter.message_mut().usage, usage);
         }
         if let Some(reason) =
             value_string(choice, "finish_reason").filter(|reason| !reason.is_empty())
         {
             saw_finish_reason = true;
-            emitter.message.raw_stop_reason = reason.to_owned();
+            emitter.message_mut().raw_stop_reason = reason.to_owned();
             let (stop_reason, error_message) = map_openai_stop_reason(reason);
-            emitter.message.stop_reason = stop_reason;
+            emitter.message_mut().stop_reason = stop_reason;
             if !error_message.is_empty() {
-                emitter.message.error_message = error_message;
+                emitter.message_mut().error_message = error_message;
             }
         }
 
@@ -4598,15 +5680,15 @@ fn consume_openai_completions(
         emitter.end_tool(state.content_index)?;
     }
     if !saw_finish_reason && !compat.supports_finish_reason {
-        emitter.message.stop_reason = if tool_calls.is_empty() {
+        emitter.message_mut().stop_reason = if tool_calls.is_empty() {
             stream::STOP_STOP.to_owned()
         } else {
             stream::STOP_TOOL_USE.to_owned()
         };
     }
-    if emitter.message.stop_reason == stream::STOP_ERROR {
+    if emitter.message().stop_reason == stream::STOP_ERROR {
         return Err(ProviderAdapterError::Protocol(
-            emitter.message.error_message.clone(),
+            emitter.message().error_message.clone(),
         ));
     }
     if !saw_finish_reason && compat.supports_finish_reason {
@@ -4618,12 +5700,12 @@ fn consume_openai_completions(
 }
 
 fn consume_google_generate_content(
-    response: Response,
+    body: impl Read,
     _model: &llm::Model,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
 ) -> Result<()> {
-    let mut reader = stream::SseReader::new(response);
+    let mut reader = stream::SseReader::new(body);
     let mut text_index = None;
     let mut thinking_index = None;
     let mut used_tool_call_ids = BTreeSet::new();
@@ -4639,14 +5721,14 @@ fn consume_google_generate_content(
             continue;
         }
         let chunk = serde_json::from_str::<Value>(data)?;
-        if emitter.message.response_id.is_empty()
+        if emitter.message().response_id.is_empty()
             && let Some(response_id) =
                 value_string(&chunk, "responseId").filter(|response_id| !response_id.is_empty())
         {
-            emitter.message.response_id = response_id.to_owned();
+            emitter.message_mut().response_id = response_id.to_owned();
         }
         if let Some(usage) = chunk.get("usageMetadata") {
-            apply_google_usage(&mut emitter.message.usage, usage);
+            apply_google_usage(&mut emitter.message_mut().usage, usage);
         }
 
         let Some(candidate) = chunk
@@ -4660,10 +5742,10 @@ fn consume_google_generate_content(
             value_string(candidate, "finishReason").filter(|reason| !reason.is_empty())
         {
             saw_finish_reason = true;
-            emitter.message.raw_stop_reason = reason.to_owned();
+            emitter.message_mut().raw_stop_reason = reason.to_owned();
             let (stop_reason, error_message) = map_google_stop_reason(reason);
-            emitter.message.stop_reason = stop_reason;
-            emitter.message.error_message = if error_message.is_empty() {
+            emitter.message_mut().stop_reason = stop_reason;
+            emitter.message_mut().error_message = if error_message.is_empty() {
                 String::new()
             } else {
                 format!("provider stopped with: {reason}")
@@ -4729,18 +5811,18 @@ fn consume_google_generate_content(
             "Google stream ended without finishReason".to_owned(),
         ));
     }
-    if emitter.message.stop_reason == stream::STOP_STOP
+    if emitter.message().stop_reason == stream::STOP_STOP
         && emitter
             .message
             .content
             .iter()
             .any(|block| matches!(block, llm::ContentBlock::ToolCall(_)))
     {
-        emitter.message.stop_reason = stream::STOP_TOOL_USE.to_owned();
+        emitter.message_mut().stop_reason = stream::STOP_TOOL_USE.to_owned();
     }
-    if emitter.message.stop_reason == stream::STOP_ERROR {
+    if emitter.message().stop_reason == stream::STOP_ERROR {
         return Err(ProviderAdapterError::Protocol(
-            emitter.message.error_message.clone(),
+            emitter.message().error_message.clone(),
         ));
     }
     Ok(())
@@ -5204,7 +6286,7 @@ fn backfill_responses_reasoning_signatures(
         let Some(index) = reasoning_blocks.get(id).copied() else {
             continue;
         };
-        let previous = match emitter.message.content.get(index) {
+        let previous = match emitter.message().content.get(index) {
             Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking_signature.clone(),
             _ => continue,
         };
@@ -5234,13 +6316,13 @@ fn finalize_responses_response(
     codex_requested_service_tier: Option<&str>,
 ) -> Result<()> {
     if let Some(id) = value_string(response, "id").filter(|id| !id.is_empty()) {
-        emitter.message.response_id = id.to_owned();
+        emitter.message_mut().response_id = id.to_owned();
     }
     if let Some(usage) = response.get("usage") {
-        apply_responses_usage(&mut emitter.message.usage, usage);
+        apply_responses_usage(&mut emitter.message_mut().usage, usage);
     }
     if let Some(end_turn) = response.get("end_turn").and_then(Value::as_bool) {
-        emitter.message.end_turn = Some(end_turn);
+        emitter.message_mut().end_turn = Some(end_turn);
     }
     if let Some(requested_service_tier) = codex_requested_service_tier {
         let service_tier = resolve_codex_service_tier(
@@ -5258,65 +6340,65 @@ fn finalize_responses_response(
         .and_then(|details| details.get("reason"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    emitter.message.raw_stop_reason = if incomplete_reason.is_empty() {
+    emitter.message_mut().raw_stop_reason = if incomplete_reason.is_empty() {
         status.to_owned()
     } else {
         format!("{status}.{incomplete_reason}")
     };
     match status {
         "" | "completed" => {
-            emitter.message.stop_reason = stream::STOP_STOP.to_owned();
-            emitter.message.error_message.clear();
+            emitter.message_mut().stop_reason = stream::STOP_STOP.to_owned();
+            emitter.message_mut().error_message.clear();
         }
         "incomplete" if incomplete_reason == "max_output_tokens" => {
-            emitter.message.stop_reason = stream::STOP_LENGTH.to_owned();
-            emitter.message.error_message.clear();
+            emitter.message_mut().stop_reason = stream::STOP_LENGTH.to_owned();
+            emitter.message_mut().error_message.clear();
         }
         "incomplete" => {
-            emitter.message.stop_reason = stream::STOP_ERROR.to_owned();
-            emitter.message.error_message = if incomplete_reason.is_empty() {
+            emitter.message_mut().stop_reason = stream::STOP_ERROR.to_owned();
+            emitter.message_mut().error_message = if incomplete_reason.is_empty() {
                 "Response incomplete without a provider reason".to_owned()
             } else {
                 format!("Response incomplete: {incomplete_reason}")
             };
         }
         "failed" | "cancelled" => {
-            emitter.message.stop_reason = stream::STOP_ERROR.to_owned();
-            emitter.message.error_message = value_object(response, "error")
+            emitter.message_mut().stop_reason = stream::STOP_ERROR.to_owned();
+            emitter.message_mut().error_message = value_object(response, "error")
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Response {status}"));
         }
         "in_progress" | "queued" => {
-            emitter.message.stop_reason = stream::STOP_STOP.to_owned();
+            emitter.message_mut().stop_reason = stream::STOP_STOP.to_owned();
         }
         other => {
-            emitter.message.stop_reason = stream::STOP_ERROR.to_owned();
-            emitter.message.error_message = format!("Unhandled response status: {other}");
+            emitter.message_mut().stop_reason = stream::STOP_ERROR.to_owned();
+            emitter.message_mut().error_message = format!("Unhandled response status: {other}");
         }
     }
-    if emitter.message.stop_reason == stream::STOP_STOP
+    if emitter.message().stop_reason == stream::STOP_STOP
         && emitter
             .message
             .content
             .iter()
             .any(|block| matches!(block, llm::ContentBlock::ToolCall(_)))
     {
-        emitter.message.stop_reason = stream::STOP_TOOL_USE.to_owned();
+        emitter.message_mut().stop_reason = stream::STOP_TOOL_USE.to_owned();
     }
     Ok(())
 }
 
 fn consume_openai_responses(
-    response: Response,
+    body: impl Read,
     _model: &llm::Model,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
     grammar_tool_input_properties: &BTreeMap<String, String>,
 ) -> Result<()> {
     consume_responses(
-        response,
+        body,
         cancellation,
         emitter,
         false,
@@ -5326,7 +6408,7 @@ fn consume_openai_responses(
 }
 
 fn consume_codex_responses(
-    response: Response,
+    body: impl Read,
     model: &llm::Model,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
@@ -5334,7 +6416,7 @@ fn consume_codex_responses(
 ) -> Result<()> {
     let requested_service_tier = requested_responses_service_tier(model);
     consume_responses(
-        response,
+        body,
         cancellation,
         emitter,
         true,
@@ -5344,14 +6426,14 @@ fn consume_codex_responses(
 }
 
 fn consume_responses(
-    response: Response,
+    body: impl Read,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
     codex: bool,
     grammar_tool_input_properties: &BTreeMap<String, String>,
     codex_requested_service_tier: Option<&str>,
 ) -> Result<()> {
-    let mut reader = stream::SseReader::new(response);
+    let mut reader = stream::SseReader::new(body);
     let mut slots = BTreeMap::<usize, ResponsesSlot>::new();
     let mut reasoning_blocks = BTreeMap::<String, usize>::new();
     let mut saw_terminal_response = false;
@@ -5392,7 +6474,7 @@ fn consume_responses(
                 if let Some(response) = payload.get("response")
                     && let Some(id) = value_string(response, "id")
                 {
-                    emitter.message.response_id = id.to_owned();
+                    emitter.message_mut().response_id = id.to_owned();
                 }
             }
             "response.output_item.added" => {
@@ -5590,9 +6672,9 @@ fn consume_responses(
         ));
     }
     close_responses_slots(&mut slots, emitter)?;
-    if emitter.message.stop_reason == stream::STOP_ERROR {
+    if emitter.message().stop_reason == stream::STOP_ERROR {
         return Err(ProviderAdapterError::Protocol(
-            emitter.message.error_message.clone(),
+            emitter.message().error_message.clone(),
         ));
     }
     Ok(())
@@ -5687,12 +6769,13 @@ fn anthropic_error_message(payload: &Value) -> String {
 }
 
 fn consume_anthropic_messages(
-    response: Response,
-    _model: &llm::Model,
+    body: impl Read,
+    tools: &[llm::Tool],
+    oauth: bool,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
 ) -> Result<()> {
-    let mut reader = stream::SseReader::new(response);
+    let mut reader = stream::SseReader::new(body);
     let mut slots = BTreeMap::<usize, AnthropicSlot>::new();
     let mut saw_message_start = false;
     let mut saw_message_stop = false;
@@ -5730,15 +6813,15 @@ fn consume_anthropic_messages(
                 saw_message_start = true;
                 if let Some(message) = payload.get("message") {
                     if let Some(id) = value_string(message, "id") {
-                        emitter.message.response_id = id.to_owned();
+                        emitter.message_mut().response_id = id.to_owned();
                     }
                     if let Some(response_model) = value_string(message, "model")
                         && !response_model.is_empty()
                     {
-                        emitter.message.response_model = response_model.to_owned();
+                        emitter.message_mut().response_model = response_model.to_owned();
                     }
                     if let Some(usage) = message.get("usage") {
-                        apply_anthropic_usage(&mut emitter.message.usage, usage);
+                        apply_anthropic_usage(&mut emitter.message_mut().usage, usage);
                     }
                 }
             }
@@ -5766,10 +6849,14 @@ fn consume_anthropic_messages(
                         )?,
                     },
                     "tool_use" => {
-                        let content_index = emitter.start_tool(
-                            value_string(block, "id").unwrap_or_default(),
-                            value_string(block, "name").unwrap_or_default(),
-                        )?;
+                        let name = value_string(block, "name").unwrap_or_default();
+                        let name = if oauth {
+                            from_claude_code_name(name, tools)
+                        } else {
+                            name.to_owned()
+                        };
+                        let content_index = emitter
+                            .start_tool(value_string(block, "id").unwrap_or_default(), &name)?;
                         emitter.set_tool_arguments(
                             content_index,
                             btree_arguments(block.get("input").and_then(Value::as_object)),
@@ -5864,20 +6951,20 @@ fn consume_anthropic_messages(
                     && let Some(reason) =
                         value_string(delta, "stop_reason").filter(|reason| !reason.is_empty())
                 {
-                    emitter.message.raw_stop_reason = reason.to_owned();
+                    emitter.message_mut().raw_stop_reason = reason.to_owned();
                     let refusal_explanation = value_object(delta, "stop_details")
                         .and_then(|details| details.get("explanation"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     let (stop_reason, error_message) =
                         map_anthropic_stop_reason(reason, refusal_explanation);
-                    emitter.message.stop_reason = stop_reason;
+                    emitter.message_mut().stop_reason = stop_reason;
                     if !error_message.is_empty() {
-                        emitter.message.error_message = error_message;
+                        emitter.message_mut().error_message = error_message;
                     }
                 }
                 if let Some(usage) = payload.get("usage") {
-                    apply_anthropic_usage(&mut emitter.message.usage, usage);
+                    apply_anthropic_usage(&mut emitter.message_mut().usage, usage);
                 }
             }
             "message_stop" => saw_message_stop = true,
@@ -5894,14 +6981,14 @@ fn consume_anthropic_messages(
             "Anthropic stream ended before message_start".to_owned(),
         ));
     }
-    if emitter.message.stop_reason == stream::STOP_PENDING {
+    if emitter.message().stop_reason == stream::STOP_PENDING {
         return Err(ProviderAdapterError::Protocol(
             "Anthropic stream ended without a stop reason".to_owned(),
         ));
     }
-    if emitter.message.stop_reason == stream::STOP_ERROR {
+    if emitter.message().stop_reason == stream::STOP_ERROR {
         return Err(ProviderAdapterError::Protocol(
-            emitter.message.error_message.clone(),
+            emitter.message().error_message.clone(),
         ));
     }
     Ok(())
@@ -6047,7 +7134,7 @@ mod tests {
             credentials,
             ProviderConfig {
                 max_retries,
-                request_timeout: Some(Duration::from_secs(2)),
+                read_timeout: Some(Duration::from_secs(2)),
                 ..ProviderConfig::default()
             },
         )
@@ -7297,6 +8384,7 @@ mod tests {
             "session-1",
             agent::CacheRetention::Short,
             &cancellation,
+            None,
         )
         .expect("Mistral accepts an intentional bearer-header suppression");
         assert!(!suppressed_authorization.contains_key("authorization"));
@@ -7314,6 +8402,7 @@ mod tests {
             "session-1",
             agent::CacheRetention::None,
             &cancellation,
+            None,
         )
         .expect("Mistral headers without prompt caching");
         assert!(!no_cache.contains_key("x-affinity"));
@@ -7352,7 +8441,7 @@ mod tests {
             ProviderCredentials::api_key("mistral-key"),
             ProviderConfig {
                 max_retries: 0,
-                request_timeout: Some(Duration::from_millis(50)),
+                read_timeout: Some(Duration::from_secs(2)),
                 mistral_response_header_timeout: Some(Duration::from_millis(50)),
                 ..ProviderConfig::default()
             },
@@ -7407,6 +8496,7 @@ mod tests {
             "",
             agent::CacheRetention::Short,
             &cancellation,
+            None,
         )
         .expect("override Azure headers");
         assert_eq!(
@@ -7423,6 +8513,7 @@ mod tests {
             "",
             agent::CacheRetention::Short,
             &cancellation,
+            None,
         )
         .expect("suppress Azure header");
         assert!(!suppressed.contains_key("api-key"));
@@ -7766,5 +8857,845 @@ mod tests {
         assert_eq!(params["input"][3]["type"], "tool_search_output");
         assert_eq!(params["input"][3]["tools"][0]["name"], "later");
         assert_eq!(params["input"][3]["tools"][0]["defer_loading"], true);
+    }
+
+    /// Streams a chunked response with pauses so idle and total deadlines can
+    /// be told apart. The client may drop a stalled stream, so writes are
+    /// allowed to fail.
+    fn paced_sse_server(
+        chunks: Vec<(Duration, Vec<u8>)>,
+    ) -> (String, Receiver<CapturedRequest>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind paced server");
+        let address = listener.local_addr().expect("paced server address");
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept paced request");
+            sender
+                .send(read_request(&mut stream))
+                .expect("capture paced request");
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for (pause, chunk) in chunks {
+                thread::sleep(pause);
+                if stream
+                    .write_all(&chunk)
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (format!("http://{address}"), receiver, handle)
+    }
+
+    fn completions_text_chunk(text: &str) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chat_paced",
+                "choices": [{"delta": {"content": text}, "finish_reason": null}],
+            })
+        )
+        .into_bytes()
+    }
+
+    fn completions_finish_chunks() -> Vec<u8> {
+        b"data: {\"id\":\"chat_paced\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            .to_vec()
+    }
+
+    fn factory_with_read_timeout(read_timeout: Duration) -> ProviderResponderFactory {
+        ProviderResponderFactory::configured(
+            ProviderCredentials::api_key("test-key"),
+            ProviderConfig {
+                max_retries: 0,
+                read_timeout: Some(read_timeout),
+                ..ProviderConfig::default()
+            },
+        )
+        .expect("provider factory")
+    }
+
+    fn assistant_turn(
+        source: &llm::Model,
+        stop_reason: &str,
+        content: Vec<llm::ContentBlock>,
+    ) -> llm::Message {
+        llm::Message::Assistant(Box::new(llm::AssistantMessage {
+            api: source.api.clone(),
+            provider: source.provider.clone(),
+            model: source.id.clone(),
+            stop_reason: stop_reason.to_owned(),
+            content,
+            timestamp: 2,
+            ..llm::AssistantMessage::default()
+        }))
+    }
+
+    fn weather_call(id: &str) -> llm::ContentBlock {
+        llm::ContentBlock::ToolCall(llm::ToolCall {
+            id: id.to_owned(),
+            name: "weather".to_owned(),
+            arguments: BTreeMap::from([("city".to_owned(), json!("Paris"))]),
+            ..llm::ToolCall::default()
+        })
+    }
+
+    fn weather_result(id: &str) -> llm::Message {
+        llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+            tool_call_id: id.to_owned(),
+            tool_name: "weather".to_owned(),
+            content: vec![llm::ContentBlock::text("sunny")],
+            timestamp: 3,
+            ..llm::ToolResultMessage::default()
+        }))
+    }
+
+    fn thinking(text: &str, signature: &str) -> llm::ContentBlock {
+        llm::ContentBlock::Thinking(llm::ThinkingContent {
+            thinking: text.to_owned(),
+            thinking_signature: signature.to_owned(),
+            redacted: false,
+        })
+    }
+
+    #[test]
+    fn streaming_has_an_idle_read_deadline_but_no_whole_request_deadline() {
+        let pause = Duration::from_millis(120);
+        let (base_url, requests, server) = paced_sse_server(vec![
+            (pause, completions_text_chunk("one ")),
+            (pause, completions_text_chunk("two ")),
+            (pause, completions_text_chunk("three")),
+            (pause, completions_finish_chunks()),
+        ]);
+        // The pauses add up to more than the idle deadline; no single gap does.
+        let response = factory_with_read_timeout(Duration::from_millis(300))
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("a flowing stream outlives the idle deadline");
+        requests.recv().expect("captured paced request");
+        server.join().expect("paced server finishes");
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.content[0].plain_text(), Some("one two three"));
+
+        let (base_url, requests, server) = paced_sse_server(vec![
+            (Duration::ZERO, completions_text_chunk("partial ")),
+            (Duration::from_millis(1_500), completions_finish_chunks()),
+        ]);
+        let started = Instant::now();
+        let stalled = factory_with_read_timeout(Duration::from_millis(200))
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("an idle stream becomes a normalized error message");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the idle deadline fires before the server resumes"
+        );
+        requests.recv().expect("captured stalled request");
+        assert_eq!(stalled.stop_reason, stream::STOP_ERROR);
+        assert!(
+            stalled.error_message.contains("timed out"),
+            "{}",
+            stalled.error_message
+        );
+        assert!(stream::is_retryable_assistant_error(&stalled));
+        server.join().expect("stalled server finishes");
+    }
+
+    #[test]
+    fn cancellation_yields_the_exact_partial_while_the_socket_read_is_blocked() {
+        let (base_url, requests, server) = paced_sse_server(vec![
+            (Duration::ZERO, completions_text_chunk("partial ")),
+            (Duration::from_millis(1_200), completions_finish_chunks()),
+        ]);
+        let cancellation = agent::CancellationToken::default();
+        let canceller = {
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                cancellation.cancel();
+            })
+        };
+        let started = Instant::now();
+        let aborted = factory_with_read_timeout(Duration::from_secs(5))
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(cancellation),
+            )
+            .expect("cancellation is a normalized aborted message");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation must not wait for the socket read"
+        );
+        assert_eq!(aborted.stop_reason, stream::STOP_ABORTED);
+        assert_eq!(aborted.error_message, "request aborted");
+        assert_eq!(aborted.content[0].plain_text(), Some("partial "));
+        canceller.join().expect("canceller finishes");
+        requests.recv().expect("captured request");
+        server.join().expect("paced server finishes");
+    }
+
+    #[test]
+    fn history_transform_skips_incomplete_turns_and_synthesizes_missing_tool_results() {
+        let request_options = options(agent::CancellationToken::default());
+        for api in [
+            API_OPENAI_COMPLETIONS,
+            API_OPENAI_RESPONSES,
+            API_ANTHROPIC_MESSAGES,
+        ] {
+            let request_model = model(api, "https://example.test".to_owned());
+            let mut context = text_context();
+            context.messages = vec![
+                llm::Message::User(llm::UserMessage::text("start", 1)),
+                assistant_turn(
+                    &request_model,
+                    stream::STOP_TOOL_USE,
+                    vec![weather_call("call_orphan")],
+                ),
+                llm::Message::User(llm::UserMessage::text("next", 3)),
+                assistant_turn(
+                    &request_model,
+                    stream::STOP_ABORTED,
+                    vec![
+                        llm::ContentBlock::text("half"),
+                        weather_call("call_aborted"),
+                    ],
+                ),
+                assistant_turn(
+                    &request_model,
+                    stream::STOP_ERROR,
+                    vec![llm::ContentBlock::text("failed")],
+                ),
+                llm::Message::User(llm::UserMessage::text("final", 5)),
+            ];
+            let payload = match api {
+                API_OPENAI_COMPLETIONS => {
+                    build_openai_completions_request(&request_model, &context, &request_options)
+                }
+                API_OPENAI_RESPONSES => {
+                    build_openai_responses_request(&request_model, &context, &request_options)
+                }
+                _ => build_anthropic_messages_request(
+                    &request_model,
+                    &context,
+                    &request_options,
+                    &anthropic_request_shape(
+                        &request_model,
+                        &ProviderCredentials::api_key("sk-ant-api"),
+                        &request_options,
+                    ),
+                ),
+            }
+            .expect("request body");
+            let serialized = payload.to_string();
+            assert!(
+                !serialized.contains("call_aborted"),
+                "{api}: aborted turn replayed: {serialized}"
+            );
+            assert!(
+                !serialized.contains("\"half\"") && !serialized.contains("\"failed\""),
+                "{api}: incomplete turns replayed: {serialized}"
+            );
+            let synthetic = serialized
+                .find("No result provided")
+                .unwrap_or_else(|| panic!("{api}: orphan tool call lacks a synthetic result"));
+            let next = serialized.find("\"next\"").expect("interrupting user turn");
+            assert!(
+                synthetic < next,
+                "{api}: the synthetic result must precede the interrupting user turn"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_model_replay_normalizes_ids_and_thinking_while_same_model_replays_verbatim() {
+        let request_options = options(agent::CancellationToken::default());
+        let long_id = format!("call_{}", "x".repeat(60));
+        let foreign = llm::Model {
+            id: "gpt-foreign".to_owned(),
+            api: API_OPENAI_CODEX_RESPONSES.to_owned(),
+            provider: "openai-codex".to_owned(),
+            ..llm::Model::default()
+        };
+        let history = |source: &llm::Model, id: &str| {
+            vec![
+                llm::Message::User(llm::UserMessage::text("go", 1)),
+                assistant_turn(
+                    source,
+                    stream::STOP_TOOL_USE,
+                    vec![
+                        thinking(
+                            "deliberating",
+                            r#"{"type":"reasoning","id":"rs_1","summary":[]}"#,
+                        ),
+                        llm::ContentBlock::Text(llm::TextContent {
+                            text: "calling".to_owned(),
+                            text_signature: r#"{"v":1,"id":"msg_signed"}"#.to_owned(),
+                        }),
+                        weather_call(id),
+                    ],
+                ),
+                weather_result(id),
+            ]
+        };
+
+        // Chat Completions: pipe ids collapse within 40 characters and
+        // cross-model thinking becomes text.
+        let completions_model = model(API_OPENAI_COMPLETIONS, "https://example.test".to_owned());
+        let mut context = text_context();
+        context.messages = history(&foreign, &format!("call_1|fc_{}", "y".repeat(50)));
+        let sent = build_openai_completions_request(&completions_model, &context, &request_options)
+            .expect("completions body");
+        let assistant = &sent["messages"][2];
+        let call_id = assistant["tool_calls"][0]["id"].as_str().expect("tool id");
+        assert!(
+            call_id.len() <= 40 && call_id.starts_with("call_1_"),
+            "{call_id}"
+        );
+        assert_eq!(sent["messages"][3]["tool_call_id"], call_id);
+        assert_eq!(assistant["content"], "deliberatingcalling");
+        assert!(assistant.get("reasoning_content").is_none());
+
+        context.messages = history(&completions_model, &long_id);
+        let sent = build_openai_completions_request(&completions_model, &context, &request_options)
+            .expect("same-model completions body");
+        assert_eq!(sent["messages"][2]["tool_calls"][0]["id"], long_id);
+
+        // Responses: a different model of the same provider loses its fc_ item
+        // id and reasoning item; the same model replays both.
+        let responses_model = model(API_OPENAI_RESPONSES, "https://example.test".to_owned());
+        let mut sibling = responses_model.clone();
+        sibling.id = "other-model".to_owned();
+        context.messages = history(&sibling, "call_1|fc_1");
+        let sent = build_openai_responses_request(&responses_model, &context, &request_options)
+            .expect("responses body");
+        let items = sent["input"].as_array().expect("input items");
+        assert!(items.iter().all(|item| item["type"] != "reasoning"));
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call item");
+        assert!(call["id"].is_null(), "{call}");
+        assert_eq!(call["call_id"], "call_1");
+        let message = items
+            .iter()
+            .find(|item| item["type"] == "message")
+            .expect("message item");
+        assert_eq!(message["content"][0]["text"], "deliberating");
+        assert!(
+            message["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_pi_"))
+        );
+
+        context.messages = history(&responses_model, "call_1|fc_1");
+        let sent = build_openai_responses_request(&responses_model, &context, &request_options)
+            .expect("same-model responses body");
+        let items = sent["input"].as_array().expect("input items");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["type"] == "reasoning" && item["id"] == "rs_1")
+        );
+        let call = items
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .expect("function call item");
+        assert_eq!(call["id"], "fc_1");
+        assert!(
+            items
+                .iter()
+                .any(|item| item["type"] == "message" && item["id"] == "msg_signed")
+        );
+
+        // Anthropic: foreign ids are sanitized to its alphabet, foreign
+        // thinking is text, and same-model signatures replay.
+        let anthropic_model = model(API_ANTHROPIC_MESSAGES, "https://example.test".to_owned());
+        let shape = anthropic_request_shape(
+            &anthropic_model,
+            &ProviderCredentials::api_key("sk-ant-api"),
+            &request_options,
+        );
+        context.messages = history(&foreign, "call with spaces|fc_1");
+        let sent =
+            build_anthropic_messages_request(&anthropic_model, &context, &request_options, &shape)
+                .expect("anthropic body");
+        let blocks = sent["messages"][1]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "deliberating");
+        assert_eq!(blocks[2]["id"], "call_with_spaces_fc_1");
+        assert_eq!(
+            sent["messages"][2]["content"][0]["tool_use_id"],
+            "call_with_spaces_fc_1"
+        );
+
+        context.messages = history(&anthropic_model, "toolu_1");
+        let sent =
+            build_anthropic_messages_request(&anthropic_model, &context, &request_options, &shape)
+                .expect("same-model anthropic body");
+        let blocks = sent["messages"][1]["content"]
+            .as_array()
+            .expect("assistant blocks");
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(
+            blocks[0]["signature"],
+            r#"{"type":"reasoning","id":"rs_1","summary":[]}"#
+        );
+        assert_eq!(blocks[2]["id"], "toolu_1");
+    }
+
+    #[test]
+    fn anthropic_requests_carry_cache_control_beta_features_and_adaptive_thinking() {
+        let mut request_model = model(API_ANTHROPIC_MESSAGES, "https://example.test".to_owned());
+        request_model.reasoning = true;
+        let credentials = ProviderCredentials::api_key("sk-ant-api-key");
+        let context = text_context();
+        let request_options = options(agent::CancellationToken::default());
+        let ephemeral = json!({"type": "ephemeral"});
+
+        let shape = anthropic_request_shape(&request_model, &credentials, &request_options);
+        assert!(!shape.oauth);
+        assert_eq!(
+            anthropic_beta_features(&request_model, &context, &shape),
+            vec![ANTHROPIC_INTERLEAVED_THINKING_BETA]
+        );
+        let sent =
+            build_anthropic_messages_request(&request_model, &context, &request_options, &shape)
+                .expect("body");
+        assert_eq!(sent["system"][0]["cache_control"], ephemeral);
+        assert_eq!(sent["tools"][0]["cache_control"], ephemeral);
+        assert_eq!(sent["messages"][0]["content"][0]["text"], "weather?");
+        assert_eq!(
+            sent["messages"][0]["content"][0]["cache_control"],
+            ephemeral
+        );
+        assert_eq!(sent["thinking"]["type"], "enabled");
+        assert_eq!(sent["thinking"]["budget_tokens"], 3_072);
+
+        let mut long_options = request_options.clone();
+        long_options.cache_retention = agent::CacheRetention::Long;
+        let shape = anthropic_request_shape(&request_model, &credentials, &long_options);
+        assert_eq!(
+            shape.cache_control,
+            Some(json!({"type": "ephemeral", "ttl": "1h"}))
+        );
+        let mut limited = request_model.clone();
+        limited.compat = Some(json!({
+            "supportsLongCacheRetention": false,
+            "supportsEagerToolInputStreaming": false,
+            "supportsCacheControlOnTools": false,
+        }));
+        let shape = anthropic_request_shape(&limited, &credentials, &long_options);
+        assert_eq!(shape.cache_control, Some(ephemeral.clone()));
+        assert_eq!(
+            anthropic_beta_features(&limited, &context, &shape),
+            vec![
+                ANTHROPIC_FINE_GRAINED_TOOL_STREAMING_BETA,
+                ANTHROPIC_INTERLEAVED_THINKING_BETA
+            ]
+        );
+        let sent = build_anthropic_messages_request(&limited, &context, &long_options, &shape)
+            .expect("body");
+        assert!(sent["tools"][0].get("cache_control").is_none());
+        assert!(sent["tools"][0].get("eager_input_streaming").is_none());
+
+        let mut none_options = request_options.clone();
+        none_options.cache_retention = agent::CacheRetention::None;
+        let shape = anthropic_request_shape(&request_model, &credentials, &none_options);
+        let sent =
+            build_anthropic_messages_request(&request_model, &context, &none_options, &shape)
+                .expect("body");
+        assert!(!sent.to_string().contains("cache_control"));
+        assert_eq!(sent["messages"][0]["content"], "weather?");
+
+        let mut adaptive = request_model.clone();
+        adaptive.compat = Some(json!({"forceAdaptiveThinking": true}));
+        adaptive.thinking_level_map =
+            BTreeMap::from([(llm::THINKING_XHIGH.to_owned(), Some("xhigh".to_owned()))]);
+        let mut xhigh_options = request_options.clone();
+        xhigh_options.thinking_level = llm::THINKING_XHIGH.to_owned();
+        let shape = anthropic_request_shape(&adaptive, &credentials, &xhigh_options);
+        assert!(anthropic_beta_features(&adaptive, &context, &shape).is_empty());
+        let sent = build_anthropic_messages_request(&adaptive, &context, &xhigh_options, &shape)
+            .expect("body");
+        assert_eq!(
+            sent["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(sent["output_config"]["effort"], "xhigh");
+        let mut minimal_options = request_options.clone();
+        minimal_options.thinking_level = llm::THINKING_MINIMAL.to_owned();
+        let shape = anthropic_request_shape(&adaptive, &credentials, &minimal_options);
+        let sent = build_anthropic_messages_request(&adaptive, &context, &minimal_options, &shape)
+            .expect("body");
+        assert_eq!(sent["output_config"]["effort"], "low");
+
+        let mut off_options = request_options.clone();
+        off_options.thinking_level = llm::THINKING_OFF.to_owned();
+        let shape = anthropic_request_shape(&request_model, &credentials, &off_options);
+        assert!(anthropic_beta_features(&request_model, &context, &shape).is_empty());
+        let sent = build_anthropic_messages_request(&request_model, &context, &off_options, &shape)
+            .expect("body");
+        assert_eq!(sent["thinking"], json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn anthropic_oauth_tokens_use_the_claude_code_request_shape() {
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_oauth\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":5}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{\"path\":\"a.rs\"}}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let request_model = model(API_ANTHROPIC_MESSAGES, base_url);
+        let mut context = text_context();
+        context.tools[0].name = "read".to_owned();
+        context.messages.push(assistant_turn(
+            &request_model,
+            stream::STOP_TOOL_USE,
+            vec![llm::ContentBlock::ToolCall(llm::ToolCall {
+                id: "toolu_0".to_owned(),
+                name: "read".to_owned(),
+                ..llm::ToolCall::default()
+            })],
+        ));
+        context
+            .messages
+            .push(llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: "toolu_0".to_owned(),
+                tool_name: "read".to_owned(),
+                content: vec![llm::ContentBlock::text("contents")],
+                timestamp: 3,
+                ..llm::ToolResultMessage::default()
+            })));
+        let response =
+            factory_with_credentials(0, ProviderCredentials::api_key("sk-ant-oat01-secret"))
+                .respond(
+                    &request_model,
+                    &context,
+                    options(agent::CancellationToken::default()),
+                )
+                .expect("Anthropic OAuth response");
+        let request = requests.recv().expect("captured OAuth request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-oat01-secret")
+        );
+        assert!(!request.headers.contains_key("x-api-key"));
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some("claude-cli/2.1.251")
+        );
+        assert_eq!(
+            request.headers.get("x-app").map(String::as_str),
+            Some("cli")
+        );
+        let betas = request.headers.get("anthropic-beta").expect("beta header");
+        assert!(
+            betas.contains("claude-code-20250219") && betas.contains("oauth-2025-04-20"),
+            "{betas}"
+        );
+        let sent: Value = serde_json::from_slice(&request.body).expect("Anthropic JSON body");
+        assert_eq!(sent["system"][0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(sent["system"][1]["text"], "be concise");
+        assert_eq!(sent["tools"][0]["name"], "Read");
+        assert_eq!(sent["messages"][1]["content"][0]["name"], "Read");
+        let llm::ContentBlock::ToolCall(call) = &response.content[0] else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(call.name, "read");
+    }
+
+    #[test]
+    fn completions_error_chunks_surface_the_provider_message() {
+        let body = concat!(
+            "data: {\"id\":\"chat_err\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{\"message\":\"Provider returned error\",\"code\":502,\"metadata\":{\"raw\":\"upstream exploded\"}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let failed = factory(0)
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("normalized error message");
+        requests.recv().expect("captured request");
+        server.join().expect("test server finishes");
+        assert_eq!(failed.stop_reason, stream::STOP_ERROR);
+        assert_eq!(
+            failed.error_message,
+            "provider protocol error: Provider returned error\nupstream exploded"
+        );
+        assert_eq!(failed.content[0].plain_text(), Some("hi"));
+    }
+
+    #[test]
+    fn emitter_snapshots_are_copied_only_while_a_consumer_holds_one() {
+        let events = stream::AssistantMessageEventStream::with_capacity(8).expect("stream");
+        let request_model = model(API_OPENAI_COMPLETIONS, "https://example.test".to_owned());
+        let mut emitter = MessageEmitter::new(
+            events.clone(),
+            &request_model,
+            agent::CancellationToken::default(),
+        );
+        let index = emitter.start_text("").expect("text start");
+        drop(events.try_next().expect("text_start event"));
+        let before = Arc::as_ptr(&emitter.message);
+        emitter.append_text(index, "a").expect("delta");
+        assert_eq!(
+            Arc::as_ptr(&emitter.message),
+            before,
+            "no consumer held the snapshot, so it is mutated in place"
+        );
+        let held = events
+            .try_next()
+            .expect("delta event")
+            .partial
+            .expect("partial snapshot");
+        emitter.append_text(index, "b").expect("delta");
+        assert_ne!(
+            Arc::as_ptr(&emitter.message),
+            Arc::as_ptr(&held),
+            "a held snapshot forces a copy"
+        );
+        assert_eq!(held.content[0].plain_text(), Some("a"));
+        assert_eq!(emitter.message().content[0].plain_text(), Some("ab"));
+    }
+
+    #[test]
+    fn publishing_into_a_stalled_stream_stops_on_cancellation_or_when_orphaned() {
+        let request_model = model(API_OPENAI_COMPLETIONS, "https://example.test".to_owned());
+        let events = stream::AssistantMessageEventStream::with_capacity(1).expect("stream");
+        let cancellation = agent::CancellationToken::default();
+        let mut emitter = MessageEmitter::new(events.clone(), &request_model, cancellation.clone());
+        emitter.start().expect("first event fills the queue");
+        let canceller = {
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(100));
+                cancellation.cancel();
+            })
+        };
+        let started = Instant::now();
+        let error = emitter
+            .start_text("")
+            .expect_err("a full queue must not pin the worker once cancelled");
+        assert!(matches!(error, ProviderAdapterError::Cancelled), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        canceller.join().expect("canceller finishes");
+
+        // With the last consumer handle gone the worker gives up on its own.
+        let orphaned = stream::AssistantMessageEventStream::with_capacity(1).expect("stream");
+        let mut emitter = MessageEmitter::new(
+            orphaned,
+            &request_model,
+            agent::CancellationToken::default(),
+        );
+        emitter.start().expect("first event fills the queue");
+        let error = emitter.start_text("").expect_err("orphaned stream");
+        assert!(
+            matches!(error, ProviderAdapterError::EventStream(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn completions_compat_ports_thinking_formats_reasoning_effort_and_strict_mode() {
+        let request_options = options(agent::CancellationToken::default());
+        let turn = |provider: &str, content: Vec<llm::ContentBlock>| {
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                api: API_OPENAI_COMPLETIONS.to_owned(),
+                provider: provider.to_owned(),
+                model: "test-model".to_owned(),
+                stop_reason: stream::STOP_STOP.to_owned(),
+                content,
+                timestamp: 2,
+                ..llm::AssistantMessage::default()
+            }))
+        };
+        let build =
+            |provider: &str, compat: Option<Value>, level: &str, extra: Vec<llm::Message>| {
+                let mut request_model =
+                    model(API_OPENAI_COMPLETIONS, "https://example.test/v1".to_owned());
+                request_model.provider = provider.to_owned();
+                request_model.reasoning = true;
+                request_model.compat = compat;
+                let mut context = text_context();
+                context.messages.extend(extra);
+                let mut request_options = request_options.clone();
+                request_options.thinking_level = level.to_owned();
+                build_openai_completions_request(&request_model, &context, &request_options)
+                    .expect("completions body")
+            };
+
+        let zai = build("zai", None, llm::THINKING_HIGH, vec![]);
+        assert_eq!(
+            zai["thinking"],
+            json!({"type": "enabled", "clear_thinking": false})
+        );
+        assert!(zai.get("reasoning_effort").is_none());
+        assert!(zai.get("store").is_none());
+        assert_eq!(zai["max_tokens"], 4_096);
+        assert_eq!(zai["tools"][0]["function"]["strict"], false);
+        let zai_off = build("zai", None, llm::THINKING_OFF, vec![]);
+        assert_eq!(zai_off["thinking"], json!({"type": "disabled"}));
+
+        let deepseek = build(
+            "deepseek",
+            None,
+            llm::THINKING_HIGH,
+            vec![turn("deepseek", vec![llm::ContentBlock::text("earlier")])],
+        );
+        assert_eq!(deepseek["thinking"], json!({"type": "enabled"}));
+        assert_eq!(deepseek["reasoning_effort"], "high");
+        assert_eq!(deepseek["messages"][2]["content"], "earlier");
+        assert_eq!(deepseek["messages"][2]["reasoning_content"], "");
+
+        let moonshot = build("moonshotai", None, llm::THINKING_HIGH, vec![]);
+        assert!(moonshot["tools"][0]["function"].get("strict").is_none());
+        assert!(moonshot.get("reasoning_effort").is_none());
+
+        let openrouter = build("openrouter", None, llm::THINKING_MEDIUM, vec![]);
+        assert_eq!(openrouter["reasoning"], json!({"effort": "medium"}));
+        assert!(openrouter.get("reasoning_effort").is_none());
+        let openrouter_off = build("openrouter", None, llm::THINKING_OFF, vec![]);
+        assert_eq!(openrouter_off["reasoning"], json!({"effort": "none"}));
+
+        let no_effort = build(
+            "openai",
+            Some(json!({"supportsReasoningEffort": false})),
+            llm::THINKING_HIGH,
+            vec![],
+        );
+        assert!(no_effort.get("reasoning_effort").is_none());
+        let qwen = build(
+            "openai",
+            Some(json!({"thinkingFormat": "qwen"})),
+            llm::THINKING_LOW,
+            vec![],
+        );
+        assert_eq!(qwen["enable_thinking"], true);
+        assert_eq!(qwen["reasoning_effort"], "low");
+        let budgeted = build(
+            "openai",
+            Some(json!({
+                "thinkingFormat": "chat-template",
+                "thinkingTokenBudgetField": "thinking_budget",
+                "chatTemplateKwargs": {
+                    "enable_thinking": {"$var": "thinking.enabled"},
+                    "budget": {"$var": "thinking.budget"},
+                    "mode": {"omitWhenOff": true},
+                },
+            })),
+            llm::THINKING_LOW,
+            vec![],
+        );
+        assert_eq!(budgeted["thinking_budget"], 2_048);
+        assert_eq!(
+            budgeted["chat_template_kwargs"],
+            json!({"enable_thinking": true, "budget": 2_048, "mode": "low"})
+        );
+
+        let as_text = build(
+            "openai",
+            Some(json!({"requiresThinkingAsText": true})),
+            llm::THINKING_HIGH,
+            vec![turn(
+                "openai",
+                vec![
+                    thinking("why", "reasoning_content"),
+                    llm::ContentBlock::text("answer"),
+                ],
+            )],
+        );
+        assert_eq!(
+            as_text["messages"][2]["content"],
+            json!([{"type": "text", "text": "why"}, {"type": "text", "text": "answer"}])
+        );
+        let field_replay = build(
+            "openai",
+            None,
+            llm::THINKING_HIGH,
+            vec![turn(
+                "openai",
+                vec![
+                    thinking("why", "reasoning_content"),
+                    llm::ContentBlock::text("answer"),
+                ],
+            )],
+        );
+        assert_eq!(field_replay["messages"][2]["reasoning_content"], "why");
+        assert_eq!(field_replay["messages"][2]["content"], "answer");
+        let opaque = build(
+            "openai",
+            None,
+            llm::THINKING_HIGH,
+            vec![turn(
+                "openai",
+                vec![thinking("why", "opaque"), llm::ContentBlock::text("answer")],
+            )],
+        );
+        assert!(opaque["messages"][2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn provider_error_bodies_are_capped_like_pi() {
+        let body = "x".repeat(10_000);
+        let (base_url, requests, server) = test_server(vec![http_response(500, &body)]);
+        let failed = factory(0)
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("normalized error");
+        requests.recv().expect("captured request");
+        server.join().expect("test server finishes");
+        assert_eq!(failed.stop_reason, stream::STOP_ERROR);
+        assert!(
+            failed.error_message.ends_with("... [truncated 6000 chars]"),
+            "{}",
+            &failed.error_message[failed.error_message.len().saturating_sub(60)..]
+        );
+        assert!(failed.error_message.len() < MAX_PROVIDER_ERROR_BODY_CHARS + 100);
+    }
+
+    #[test]
+    fn completions_usage_accepts_top_level_cached_tokens() {
+        let body = concat!(
+            "data: {\"id\":\"chat_kimi\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cached_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let response = factory(0)
+            .respond(
+                &model(API_OPENAI_COMPLETIONS, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("completion response");
+        requests.recv().expect("captured request");
+        server.join().expect("test server finishes");
+        assert_eq!(response.usage.cache_read, 4);
+        assert_eq!(response.usage.input, 6);
+        assert_eq!(response.usage.output, 2);
+        assert_eq!(response.usage.total_tokens, 12);
     }
 }

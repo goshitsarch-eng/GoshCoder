@@ -1326,9 +1326,14 @@ fn validate_tool_name(name: &str) -> CliResult<()> {
             aperture_mcp::MAX_TOOL_NAME_BYTES
         )));
     }
-    if name.chars().any(char::is_control) {
+    // The same grammar the MCP session enforces: a pin outside it could never
+    // be called, so reject it before it is written to the configuration.
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return Err(command_error(
-            "MCP tool name must not contain control characters",
+            "MCP tool name must contain only ASCII letters, digits, '_' and '-'",
         ));
     }
     Ok(())

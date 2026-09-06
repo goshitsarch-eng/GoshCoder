@@ -251,8 +251,11 @@ impl Service {
         config_path: impl Into<PathBuf>,
         resolve_openai: Option<ResolveOpenAIAuth>,
     ) -> WebAccessResult<Self> {
+        // Provider requests carry API keys in headers; following a redirect
+        // would hand them to whichever host the provider named.
         let client = Client::builder()
             .timeout(SEARCH_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| WebAccessError::new("initialize web-search HTTP client"))?;
         Ok(Self {
@@ -1123,7 +1126,14 @@ pub fn normalize_citation_url(value: &str) -> Option<String> {
         .query_pairs()
         .any(|(name, value)| name == "utm_source" && value == "openai");
     if !has_openai_tracking {
-        return Some(value.to_owned());
+        // The WHATWG parser silently drops embedded tabs and newlines, so the
+        // serialized form is what was validated; returning the raw text would
+        // put those control characters back into a Markdown citation.
+        return Some(if value.chars().any(char::is_control) {
+            parsed.to_string()
+        } else {
+            value.to_owned()
+        });
     }
     let retained = parsed
         .query_pairs()
@@ -1986,6 +1996,7 @@ mod tests {
         status: u16,
         content_type: &'static str,
         body: String,
+        location: Option<String>,
     }
 
     impl TestResponse {
@@ -1994,6 +2005,7 @@ mod tests {
                 status: 200,
                 content_type: "application/json",
                 body: body.into(),
+                location: None,
             }
         }
 
@@ -2002,6 +2014,16 @@ mod tests {
                 status: 200,
                 content_type: "text/event-stream",
                 body: body.into(),
+                location: None,
+            }
+        }
+
+        fn redirect(location: impl Into<String>) -> Self {
+            Self {
+                status: 302,
+                content_type: "text/plain",
+                body: String::new(),
+                location: Some(location.into()),
             }
         }
     }
@@ -2126,8 +2148,13 @@ mod tests {
 
     fn write_response(stream: &mut TcpStream, response: TestResponse) {
         let status_text = if response.status < 300 { "OK" } else { "Error" };
+        let location = response
+            .location
+            .as_ref()
+            .map(|location| format!("Location: {location}\r\n"))
+            .unwrap_or_default();
         let head = format!(
-            "HTTP/1.1 {} {status_text}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {status_text}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{location}Connection: close\r\n\r\n",
             response.status,
             response.content_type,
             response.body.len()
@@ -2226,6 +2253,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_redirects_are_not_followed_with_the_api_key() {
+        let victim = TestServer::new(|_| TestResponse::ok_json(r#"{"results":[]}"#));
+        let victim_url = format!("{}/search", victim.url());
+        let redirecting = TestServer::new(move |_| TestResponse::redirect(victim_url.clone()));
+        let config = scratch_file("exa-redirect", r#"{"exaApiKey":"exa-secret"}"#);
+        let mut service = Service::with_config_path(&config, None).expect("service");
+        service.set_endpoints(endpoints_with(|endpoints| {
+            endpoints.exa_search_url = redirecting.url();
+        }));
+
+        let error = service
+            .search(
+                "redirect",
+                Options {
+                    provider: "exa".to_owned(),
+                    ..Options::default()
+                },
+            )
+            .expect_err("a redirect must be reported as a failed request");
+        assert!(
+            error.to_string().contains("HTTP 302"),
+            "unexpected error: {error}"
+        );
+        let request = redirecting.requests().pop().expect("original request");
+        assert_eq!(request.header("x-api-key"), Some("exa-secret"));
+        assert!(
+            victim.requests().is_empty(),
+            "the redirect target must never receive the keyed request"
+        );
+        let _ = std::fs::remove_file(config);
+    }
+
+    #[test]
     fn kagi_search_uses_config_credential_and_normalizes_results() {
         let server = TestServer::new(|_| {
             TestResponse::ok_json(
@@ -2312,6 +2372,7 @@ mod tests {
                     status: 503,
                     content_type: "text/plain",
                     body: "temporarily unavailable".to_owned(),
+                    location: None,
                 }
             } else {
                 TestResponse::sse(
@@ -2498,6 +2559,15 @@ mod tests {
         );
         assert_eq!(normalize_citation_url("javascript:alert(1)"), None);
         assert_eq!(
+            normalize_citation_url("https://go.dev/doc\t/faq\n"),
+            Some("https://go.dev/doc/faq".to_owned()),
+            "control characters the parser drops must not resurface in the citation"
+        );
+        assert_eq!(
+            normalize_citation_url("https://go.dev/?utm_source=openai&q=a\tb"),
+            Some("https://go.dev/?q=ab".to_owned())
+        );
+        assert_eq!(
             codex_account_id(&test_codex_jwt("acct")),
             Some("acct".to_owned())
         );
@@ -2508,6 +2578,7 @@ mod tests {
             status: 401,
             content_type: "text/plain",
             body: "invalid key secret-token and Bearer secret-token".to_owned(),
+            location: None,
         });
         let config = scratch_file(
             "redaction",

@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -54,7 +54,8 @@ static SETTINGS_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceL
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A successful or failed request in an in-memory side discussion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TurnKind {
     Answered,
     Error,
@@ -65,12 +66,46 @@ pub enum TurnKind {
 /// `response` is populated for [`TurnKind::Answered`] turns.  Error turns
 /// retain the default response only to preserve the same shape as the
 /// original in-memory Go model; callers should use `answer` for display.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(from = "TurnRecord", into = "TurnRecord")]
 pub struct Turn {
     pub kind: TurnKind,
     pub question: String,
     pub answer: String,
     pub response: llm::AssistantMessage,
+}
+
+/// Wire shape of a persisted [`Turn`].  Error turns carry no response.
+#[derive(Deserialize, Serialize)]
+struct TurnRecord {
+    kind: TurnKind,
+    question: String,
+    answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<llm::AssistantMessage>,
+}
+
+impl From<Turn> for TurnRecord {
+    fn from(turn: Turn) -> Self {
+        let response = (turn.kind == TurnKind::Answered).then_some(turn.response);
+        Self {
+            kind: turn.kind,
+            question: turn.question,
+            answer: turn.answer,
+            response,
+        }
+    }
+}
+
+impl From<TurnRecord> for Turn {
+    fn from(record: TurnRecord) -> Self {
+        Self {
+            kind: record.kind,
+            question: record.question,
+            answer: record.answer,
+            response: record.response.unwrap_or_default(),
+        }
+    }
 }
 
 impl Turn {
@@ -98,7 +133,8 @@ impl Turn {
 }
 
 /// An in-memory, session-independent side discussion.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(from = "ThreadRecord", into = "ThreadRecord")]
 pub struct Thread {
     pub id: String,
     pub title: String,
@@ -113,6 +149,55 @@ pub struct Thread {
 impl AsRef<str> for Thread {
     fn as_ref(&self) -> &str {
         &self.id
+    }
+}
+
+/// Wire shape of a persisted [`Thread`].  Timestamps are Unix milliseconds
+/// and the in-memory ordering sequence is reassigned on restore, never stored.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadRecord {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    conversation_context: String,
+    #[serde(default)]
+    thinking_level: llm::ThinkingLevel,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    turns: Vec<Turn>,
+}
+
+impl From<Thread> for ThreadRecord {
+    fn from(thread: Thread) -> Self {
+        Self {
+            id: thread.id,
+            title: thread.title,
+            conversation_context: thread.conversation_context,
+            thinking_level: thread.thinking_level,
+            created_at: unix_millis(thread.created_at),
+            updated_at: unix_millis(thread.updated_at),
+            turns: thread.turns,
+        }
+    }
+}
+
+impl From<ThreadRecord> for Thread {
+    fn from(record: ThreadRecord) -> Self {
+        Self {
+            id: record.id,
+            title: record.title,
+            conversation_context: record.conversation_context,
+            turns: record.turns,
+            thinking_level: record.thinking_level,
+            created_at: from_unix_millis(record.created_at),
+            updated_at: from_unix_millis(record.updated_at),
+            update_sequence: 0,
+        }
     }
 }
 
@@ -311,6 +396,54 @@ impl Manager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         summaries.into_iter().map(|(_, summary)| summary).collect()
+    }
+
+    /// Returns snapshots of every thread, empty ones included, from most
+    /// recently updated to least recently updated using the same deterministic
+    /// order as [`list`](Self::list).
+    pub fn snapshot_threads(&self) -> Vec<Thread> {
+        let state = lock(&self.state);
+        let mut threads = state.threads.values().cloned().collect::<Vec<_>>();
+        threads.sort_by(|left, right| {
+            right
+                .update_sequence
+                .cmp(&left.update_sequence)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        threads
+    }
+
+    /// Inserts previously persisted threads.
+    ///
+    /// A thread whose ID already exists in memory is left untouched, so a
+    /// restore can never discard live turns.  Restored threads are ordered by
+    /// their saved `updated_at`, and the ID counter moves past the highest
+    /// restored `btw-N` so later [`new_thread`](Self::new_thread) calls cannot
+    /// collide with them.
+    pub fn restore_threads(&self, mut threads: Vec<Thread>) {
+        threads.sort_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let mut state = lock(&self.state);
+        for mut thread in threads {
+            if thread.id.is_empty() {
+                continue;
+            }
+            if let Some(number) = thread
+                .id
+                .strip_prefix("btw-")
+                .and_then(|number| number.parse::<u64>().ok())
+            {
+                state.next_id = state.next_id.max(number.saturating_add(1));
+            }
+            if state.threads.contains_key(&thread.id) {
+                continue;
+            }
+            thread.update_sequence = next_update_sequence(&mut state);
+            state.threads.insert(thread.id.clone(), thread);
+        }
     }
 }
 
@@ -1373,10 +1506,24 @@ fn path_lock(path: &Path) -> Arc<Mutex<()>> {
 }
 
 fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
+    unix_millis(SystemTime::now())
+}
+
+fn unix_millis(time: SystemTime) -> i64 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+        Err(error) => -(error.duration().as_millis().min(i64::MAX as u128) as i64),
+    }
+}
+
+fn from_unix_millis(millis: i64) -> SystemTime {
+    let offset = Duration::from_millis(millis.unsigned_abs());
+    if millis >= 0 {
+        UNIX_EPOCH.checked_add(offset)
+    } else {
+        UNIX_EPOCH.checked_sub(offset)
+    }
+    .unwrap_or(UNIX_EPOCH)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1392,7 +1539,7 @@ mod tests {
         process,
         sync::{Arc, Barrier},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::json;
@@ -1440,6 +1587,100 @@ mod tests {
             reasoning,
             ..llm::Model::default()
         }
+    }
+
+    #[test]
+    fn turns_and_threads_serialize_with_pi_style_names_and_round_trip() {
+        let created_at = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let mut thread = thread_with_turns(vec![
+            Turn::answered("first?", "first answer", response("first answer")),
+            Turn::error("bad?", "provider failed"),
+        ]);
+        thread.created_at = created_at;
+        thread.updated_at = created_at + Duration::from_millis(5);
+        thread.update_sequence = 0;
+
+        let value = serde_json::to_value(&thread).expect("serialize");
+        assert_eq!(value["id"], "btw-test");
+        assert_eq!(value["title"], "test");
+        assert_eq!(value["conversationContext"], "User: main task");
+        assert_eq!(value["thinkingLevel"], llm::THINKING_LOW);
+        assert_eq!(value["createdAt"], 1_700_000_000_123_i64);
+        assert_eq!(value["updatedAt"], 1_700_000_000_128_i64);
+        assert_eq!(value["turns"][0]["kind"], "answered");
+        assert_eq!(value["turns"][0]["question"], "first?");
+        assert_eq!(value["turns"][0]["answer"], "first answer");
+        assert!(value["turns"][0]["response"].is_object());
+        assert_eq!(value["turns"][1]["kind"], "error");
+        assert_eq!(value["turns"][1]["answer"], "provider failed");
+        assert!(
+            value["turns"][1].get("response").is_none(),
+            "error turns omit the placeholder response"
+        );
+
+        let restored: Thread = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(restored, thread);
+        assert_eq!(
+            restored.turns[1].response,
+            llm::AssistantMessage::default(),
+            "an omitted response restores the in-memory placeholder"
+        );
+
+        let minimal: Thread =
+            serde_json::from_value(json!({"id": "btw-9"})).expect("optional fields default");
+        assert_eq!(minimal.id, "btw-9");
+        assert!(minimal.turns.is_empty());
+        assert_eq!(minimal.created_at, UNIX_EPOCH);
+    }
+
+    #[test]
+    fn restore_threads_keeps_ids_unique_and_never_overwrites_live_threads() {
+        let manager = Manager::new();
+        let live = manager.new_thread("live context", llm::THINKING_OFF);
+        assert_eq!(live.id, "btw-1");
+        manager
+            .record_answered(&live, "live question", response("live answer"))
+            .expect("record live turn");
+
+        let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut stale_copy = thread_with_turns(vec![Turn::error("stale", "stale error")]);
+        stale_copy.id = "btw-1".to_owned();
+        let mut older =
+            thread_with_turns(vec![Turn::answered("older?", "older", response("older"))]);
+        older.id = "btw-7".to_owned();
+        older.updated_at = base;
+        let mut newer =
+            thread_with_turns(vec![Turn::answered("newer?", "newer", response("newer"))]);
+        newer.id = "btw-3".to_owned();
+        newer.updated_at = base + Duration::from_secs(60);
+        let mut custom = thread_with_turns(Vec::new());
+        custom.id = "side-custom".to_owned();
+
+        manager.restore_threads(vec![stale_copy, older.clone(), newer, custom]);
+
+        let kept = manager.get("btw-1").expect("live thread");
+        assert_eq!(kept.turns.len(), 1);
+        assert_eq!(kept.turns[0].question, "live question");
+        assert_eq!(manager.get("btw-7").expect("restored").turns, older.turns);
+        assert!(manager.get("side-custom").is_some());
+        assert_eq!(
+            manager.new_thread("", llm::THINKING_OFF).id,
+            "btw-8",
+            "new IDs continue above the highest restored btw-N"
+        );
+        let listed = manager
+            .list()
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            ["btw-3", "btw-7", "btw-1"],
+            "restored threads order by their saved updated_at"
+        );
+
+        manager.restore_threads(vec![older]);
+        assert_eq!(manager.list().len(), 3, "restoring twice is a no-op");
     }
 
     #[test]

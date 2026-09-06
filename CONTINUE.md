@@ -96,9 +96,13 @@ catalog is read on demand instead, so the equivalent is a **dynamic layer**
 computed from the integrations' files and cached by their modification time
 and size (`DynamicPaths`/`DynamicLayer` in `catalog.rs`):
 
-- `omni` takes its base URL and models from `omniroute.json`; a model whose
+- `omni` takes its base URL and models from `omniroute.json` (or from
+  `OMNIROUTE_URL`, which overrides the file and stands in for a missing one);
+  the seven routing aliases are prepended, a configured gateway resolves to
+  the `omniroute-public` placeholder when no key is stored, and a model whose
   `toolCalling` is false gets the `omni-prompt-tools` API and is served by
-  the prompt-emulated protocol.
+  the prompt-emulated protocol. Session start probes a configured gateway in
+  the background and reports an unreachable one as a notice.
 - The dedicated `aperture` provider serves the synchronized
   `extensions/aperture-cache.json`, so models load instantly even offline; a
   cache built for another gateway or selection is ignored.
@@ -148,9 +152,12 @@ is installed; the server is spawned lazily and closed with the session.
 
 Sessions are pi's **v3** JSONL: header, entries with `parentId` links,
 `YYYY-MM-DDTHH:MM:SS.mmmZ` timestamps, `<stamp>_<id>.jsonl` names in a
-per-workspace shard. Resume, branching, fork/clone, labels and JSONL/Markdown
-export/import are implemented; v1 and v2 pi files are migrated in memory and
-never rewritten, so continuing one forks it into a v3 file.
+per-workspace shard. Resume, branching, fork/clone, labels and
+JSONL/Markdown/HTML export and import are implemented; v1 and v2 pi files are
+migrated in memory and never rewritten, so continuing one forks it into a v3
+file. The HTML export (`src/export_html.rs`) is deliberately script-free and
+self-contained, with its own small Markdown renderer; `/share` and `sessions
+share --yes` upload it as a secret gist through `gh` after a confirmation.
 
 Two deliberate differences: GoshCoder takes an exclusive claim on a session
 file (a lock file with a heartbeat; a claim that is taken over stops the
@@ -158,6 +165,18 @@ writer rather than letting two processes interleave), and `/clear` appends a
 `transcript_reset` marker instead of rotating to a new file — pi tolerates the
 entry but replays the cleared prefix, which is the one documented interop
 divergence.
+
+## Planner and BTW state
+
+Planner phase and checklist are written to
+`<agent_dir>/planner/<sha256[..16] of the canonical root>-<basename>.json`
+(0600, atomic rename) on every change and to the session as a
+`goshcoder.planner` custom entry when one is recording. The file is
+authoritative at attach and is re-read (by mtime and size) before each turn
+and on `/planner`, so two windows on one repository share a phase;
+`plannotator::Manager::adopt_state` applies another window's change without
+re-publishing it. BTW threads are `goshcoder.btw` custom entries (newest 50
+threads, 200 turns each, under 4 MiB) restored on `-continue` and `/resume`.
 
 ## Audit
 
@@ -184,6 +203,20 @@ regression tests. The ones worth knowing about when reading the code:
 - Loopback servers (OAuth callback, planner review) survive a malformed or
   reset connection, keep a per-connection deadline, and never lose a decision
   to a failed response write.
+- Provider streams have a connect timeout and pi's 300 s idle read deadline
+  rather than a whole-request timeout; every protocol replays history through
+  one transform (error and aborted turns skipped, missing tool results
+  synthesized, cross-model ids and thinking normalized); cancellation
+  publishes the exact partial message even while a socket read is blocked.
+- A stored OAuth credential whose refresh failed is remembered by fingerprint,
+  so a login completed by another process is honoured without a restart, and
+  an unreadable `auth.json` is reported instead of silently ignored.
+- Gateway clients never follow a redirect with a credential attached,
+  connector tool names must fit the provider grammar, and MCP replies are
+  found by request id even when the gateway interleaves notifications.
+- Escape restores queued steering and follow-up messages to the editor
+  before aborting, as pi's interactive mode does, so nothing queued runs
+  after an interrupted turn.
 
 Anything an audit found that was not fixed is recorded in the README's
 **Known gaps**.

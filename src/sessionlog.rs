@@ -5,19 +5,34 @@
 //! Rust runtime incrementally grows strongly typed protocol support.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     error::Error as StdError,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, DirBuilder, File, OpenOptions},
     io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    sync::mpsc,
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+// std links libc, so kill(2) is reachable without a crate. Signal zero only
+// checks whether the pid exists, which is what stale-lock detection needs.
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+#[cfg(unix)]
+const ESRCH: i32 = 3;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,7 +199,11 @@ pub struct Header {
     #[serde(default)]
     pub version: u32,
     pub id: String,
+    // pi validates only `type` and `id` on a header; sessions written by other
+    // clients or hand-edited files may omit the rest and must still be found.
+    #[serde(default)]
     pub timestamp: String,
+    #[serde(default)]
     pub cwd: String,
     #[serde(
         rename = "parentSession",
@@ -252,6 +271,7 @@ pub struct Entry {
     pub id: String,
     #[serde(rename = "parentId", default)]
     pub parent_id: Option<String>,
+    #[serde(default)]
     pub timestamp: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,7 +365,10 @@ impl Entry {
 #[derive(Clone, Debug, Default)]
 pub struct Tree {
     entries: HashMap<String, Entry>,
-    raw: HashMap<String, Vec<u8>>,
+    /// Verbatim lines, retained only for a tree built by [`Tree::retaining_raw`]:
+    /// forking is the one consumer, and holding a second copy of every entry
+    /// for the lifetime of a live writer doubled its memory for nothing.
+    raw: Option<HashMap<String, Vec<u8>>>,
     order: Vec<String>,
     labels: HashMap<String, String>,
     name: String,
@@ -357,7 +380,21 @@ impl Tree {
         Self::default()
     }
 
-    pub fn add(&mut self, entry: Entry, raw: impl AsRef<[u8]>) -> Result<()> {
+    /// A tree that also keeps every entry's original bytes.
+    pub fn retaining_raw() -> Self {
+        Self {
+            raw: Some(HashMap::new()),
+            ..Self::default()
+        }
+    }
+
+    pub fn add(&mut self, entry: Entry) -> Result<()> {
+        self.add_raw(entry, &[])
+    }
+
+    /// Adds an entry along with its source line. The line is kept only when
+    /// this tree retains raw bytes.
+    pub fn add_raw(&mut self, entry: Entry, raw: &[u8]) -> Result<()> {
         if self.entries.contains_key(&entry.id) {
             return Err(SessionError::DuplicateEntryId(entry.id));
         }
@@ -375,7 +412,9 @@ impl Tree {
         } else if entry.kind == TYPE_SESSION_INFO {
             self.name = entry.name.clone();
         }
-        self.raw.insert(id.clone(), raw.as_ref().to_vec());
+        if let Some(lines) = self.raw.as_mut() {
+            lines.insert(id.clone(), raw.to_vec());
+        }
         self.order.push(id.clone());
         self.entries.insert(id.clone(), entry);
         self.leaf_id = Some(id);
@@ -402,8 +441,21 @@ impl Tree {
         self.entries.get_mut(id)
     }
 
+    /// The original line of an entry, when this tree retains raw bytes.
     pub fn raw(&self, id: &str) -> Option<&[u8]> {
-        self.raw.get(id).map(Vec::as_slice)
+        self.raw.as_ref()?.get(id).map(Vec::as_slice)
+    }
+
+    /// Counts direct children of every entry in one pass, for callers that
+    /// would otherwise ask [`Tree::children`] once per entry on a path.
+    pub fn child_counts(&self) -> HashMap<&str, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.entries.values() {
+            if let Some(parent) = entry.parent_id.as_deref() {
+                *counts.entry(parent).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     pub fn all(&self) -> Vec<&Entry> {
@@ -691,9 +743,7 @@ impl Store {
         validate_session_id(&id)?;
         let cwd = absolute_path(cwd.as_ref());
         let directory = self.directory(&cwd);
-        fs::create_dir_all(&directory)?;
-        #[cfg(unix)]
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        create_private_dir(&directory)?;
 
         let header = Header::new(id.clone(), cwd.to_string_lossy(), parent_session);
         let path = directory.join(format!(
@@ -737,7 +787,15 @@ impl Store {
     pub fn load(&self, path: impl AsRef<Path>) -> Result<(Tree, Header, LoadReport)> {
         let path = path.as_ref();
         let mut file = File::open(path)?;
-        let (tree, header, report, _) = read_into(&mut file, path)?;
+        let (tree, header, report, _) = read_into(&mut file, false)?;
+        Ok((tree, header, report))
+    }
+
+    /// Like [`Store::load`], but the tree keeps every entry's original bytes
+    /// so a fork can copy lines verbatim.
+    fn load_with_raw(&self, path: &Path) -> Result<(Tree, Header, LoadReport)> {
+        let mut file = File::open(path)?;
+        let (tree, header, report, _) = read_into(&mut file, true)?;
         Ok((tree, header, report))
     }
 
@@ -747,8 +805,11 @@ impl Store {
     pub fn attach(&self, path: impl AsRef<Path>) -> Result<(Writer, LoadReport)> {
         let path = path.as_ref();
         let claim = claim(path)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let (tree, header, mut report, offset) = read_into(&mut file, path)?;
+        // O_APPEND makes every write land at the current end of file even if
+        // another writer got in, so a takeover can never produce torn lines
+        // in the middle of the log.
+        let mut file = OpenOptions::new().read(true).append(true).open(path)?;
+        let (tree, header, mut report, offset) = read_into(&mut file, false)?;
         if report.migrated {
             return Err(SessionError::LegacyFormat(report.source_version));
         }
@@ -772,7 +833,10 @@ impl Store {
                 header,
                 tree,
                 size,
-                keep: false,
+                // The file already existed before this process touched it, so
+                // it is never this writer's to discard: a resumed session that
+                // is closed again without a new reply must survive intact.
+                keep: true,
                 claim: Some(claim),
                 read_only: false,
                 degraded: None,
@@ -807,47 +871,16 @@ impl Store {
     /// Lists sessions belonging to one workspace by default, or every known
     /// workspace when `all_workspaces` is selected.
     pub fn list(&self, cwd: impl AsRef<Path>, options: ListOptions) -> Result<Vec<SessionInfo>> {
-        let cwd = cwd.as_ref();
-        let target_cwd = absolute_path(cwd).to_string_lossy().into_owned();
-        let directories = if options.all_workspaces {
-            match fs::read_dir(&self.root) {
-                Ok(entries) => entries
-                    .filter_map(std::result::Result::ok)
-                    .filter_map(|entry| {
-                        entry
-                            .file_type()
-                            .ok()
-                            .filter(|kind| kind.is_dir())
-                            .map(|_| entry.path())
-                    })
-                    .collect::<Vec<_>>(),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            vec![self.directory(cwd)]
-        };
-
+        let target_cwd = absolute_path(cwd.as_ref());
         let mut sessions = Vec::new();
-        for directory in directories {
-            let entries = match fs::read_dir(directory) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            for entry in entries.filter_map(std::result::Result::ok) {
-                let path = entry.path();
-                if entry.file_type().map_or(true, |kind| kind.is_dir())
-                    || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
-                {
-                    continue;
-                }
+        for directory in self.shard_directories(&target_cwd, options.all_workspaces)? {
+            for path in session_files(&directory)? {
                 let Ok(info) = self.describe(&path, options.with_text) else {
                     // A malformed or inaccessible file must not hide usable
                     // sessions in the same directory.
                     continue;
                 };
-                if options.all_workspaces || info.cwd.is_empty() || info.cwd == target_cwd {
+                if options.all_workspaces || cwd_matches(&info.cwd, &target_cwd) {
                     sessions.push(info);
                 }
             }
@@ -864,17 +897,30 @@ impl Store {
         Ok(sessions)
     }
 
+    /// Finds the newest session of a workspace from headers and mtimes alone,
+    /// the way pi's `findMostRecentSession` does, so a `-continue` start does
+    /// not parse every transcript in the shard.
     pub fn most_recent(&self, cwd: impl AsRef<Path>) -> Result<Option<SessionInfo>> {
-        Ok(self
-            .list(
-                cwd,
-                ListOptions {
-                    limit: 1,
-                    ..ListOptions::default()
-                },
-            )?
+        let target_cwd = absolute_path(cwd.as_ref());
+        let mut candidates = Vec::new();
+        for path in session_files(&self.directory(&target_cwd))? {
+            let Ok(header) = read_header(&path) else {
+                continue;
+            };
+            if !cwd_matches(&header.cwd, &target_cwd) {
+                continue;
+            }
+            let modified = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((modified, header.id, path));
+        }
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        // Only the winner is parsed in full. A newest file whose body is
+        // unreadable falls through to the next one, as `list` would skip it.
+        Ok(candidates
             .into_iter()
-            .next())
+            .find_map(|(_, _, path)| self.describe(&path, false).ok()))
     }
 
     /// Resolves an explicit path, exact ID, or unambiguous ID prefix.
@@ -888,29 +934,57 @@ impl Store {
                 .map_err(|_| SessionError::NotFound(reference.to_owned()));
         }
 
+        let cwd = absolute_path(cwd.as_ref());
         for all_workspaces in [false, true] {
+            let mut files = Vec::new();
+            for directory in self.shard_directories(&cwd, all_workspaces)? {
+                files.extend(session_files(&directory)?);
+            }
+            // Files are named `<stamp>_<id>.jsonl`, so an exact id is usually
+            // settled by one header read instead of a scan of the shard.
+            if let Some(path) = files
+                .iter()
+                .find(|path| filename_session_id(path) == Some(reference))
+                && read_header(path).is_ok_and(|header| header.id == reference)
+            {
+                return self.describe(path, false);
+            }
+            // The header is the authority on ids, and it is all a prefix
+            // match needs; transcripts are parsed only for the chosen file.
             let mut matches = Vec::new();
-            for candidate in self.list(
-                cwd.as_ref(),
-                ListOptions {
-                    all_workspaces,
-                    ..ListOptions::default()
-                },
-            )? {
-                if candidate.id == reference {
-                    return Ok(candidate);
+            for path in &files {
+                let Ok(header) = read_header(path) else {
+                    continue;
+                };
+                if header.id == reference {
+                    return self.describe(path, false);
                 }
-                if candidate.id.starts_with(reference) {
-                    matches.push(candidate);
+                if header.id.starts_with(reference) {
+                    matches.push(path);
                 }
             }
-            match matches.len() {
-                0 => {}
-                1 => return Ok(matches.remove(0)),
+            match matches.as_slice() {
+                [] => {}
+                [path] => return self.describe(path, false),
                 _ => return Err(SessionError::Ambiguous(reference.to_owned())),
             }
         }
         Err(SessionError::NotFound(reference.to_owned()))
+    }
+
+    fn shard_directories(&self, cwd: &Path, all_workspaces: bool) -> Result<Vec<PathBuf>> {
+        if !all_workspaces {
+            return Ok(vec![self.directory(cwd)]);
+        }
+        match fs::read_dir(&self.root) {
+            Ok(entries) => Ok(entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Removes a session only after it has been claimed, so a live writer
@@ -929,7 +1003,7 @@ impl Store {
         at: Option<&str>,
         target_cwd: impl AsRef<Path>,
     ) -> Result<Writer> {
-        let (tree, header, report) = self.load(&source.path)?;
+        let (tree, header, report) = self.load_with_raw(&source.path)?;
         let path = tree.path(at);
         if path.is_empty()
             && let Some(at) = at
@@ -942,8 +1016,10 @@ impl Store {
         } else {
             target_cwd
         };
-        let mut writer =
-            self.create_with_id(target_cwd, Some(header.id.clone()), new_session_id())?;
+        // pi records the source file rather than its id, which stays
+        // traceable even when ids repeat across workspaces or imports.
+        let parent_session = absolute_path(&source.path).to_string_lossy().into_owned();
+        let mut writer = self.create_with_id(target_cwd, Some(parent_session), new_session_id())?;
         let on_path = path
             .iter()
             .map(|entry| entry.id.as_str())
@@ -1078,11 +1154,13 @@ impl SessionInfo {
     }
 
     pub fn short_id(&self) -> &str {
-        &self.id[..self.id.len().min(SHORT_ID_LENGTH)]
+        truncate_utf8(&self.id, SHORT_ID_LENGTH)
     }
 }
 
-/// Returns unique, readable ID prefixes for a list of sessions.
+/// Returns unique, readable ID prefixes for a list of sessions. Ids written
+/// by other clients are not restricted to ASCII, so prefixes are cut at
+/// character boundaries.
 pub fn short_ids(sessions: &[SessionInfo]) -> Vec<String> {
     let mut length = SHORT_ID_LENGTH;
     loop {
@@ -1091,8 +1169,7 @@ pub fn short_ids(sessions: &[SessionInfo]) -> Vec<String> {
         let mut longest = 0;
         for session in sessions {
             longest = longest.max(session.id.len());
-            let end = session.id.len().min(length);
-            if !prefixes.insert(&session.id[..end]) {
+            if !prefixes.insert(truncate_utf8(&session.id, length)) {
                 collision = true;
                 break;
             }
@@ -1100,7 +1177,7 @@ pub fn short_ids(sessions: &[SessionInfo]) -> Vec<String> {
         if !collision || length >= longest {
             return sessions
                 .iter()
-                .map(|session| session.id[..session.id.len().min(length)].to_owned())
+                .map(|session| truncate_utf8(&session.id, length).to_owned())
                 .collect();
         }
         length += 4;
@@ -1155,15 +1232,29 @@ impl Writer {
     }
 
     pub fn recording(&self) -> bool {
-        !self.read_only && !self.closed && self.degraded.is_none() && self.file.is_some()
+        !self.read_only
+            && !self.closed
+            && self.degraded.is_none()
+            && self.file.is_some()
+            && !self.claim_lost()
     }
 
     pub fn degraded(&self) -> Option<&str> {
         self.degraded.as_deref()
     }
 
+    /// The live tree. Prefer this over [`Writer::snapshot`] for lookups that
+    /// do not need to outlive the borrow.
+    pub fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
     pub fn snapshot(&self) -> Tree {
         self.tree.clone()
+    }
+
+    fn claim_lost(&self) -> bool {
+        self.claim.as_ref().is_some_and(LockClaim::lost)
     }
 
     pub fn leaf(&self) -> Option<&str> {
@@ -1199,7 +1290,7 @@ impl Writer {
         self.write_line(&line)?;
         self.size = new_size;
         let id = entry.id.clone();
-        self.tree.add(entry, &line)?;
+        self.tree.add(entry)?;
         Ok(id)
     }
 
@@ -1240,8 +1331,11 @@ impl Writer {
         {
             first_error = Some(SessionError::Io(error));
         }
+        // A file whose claim was taken over now belongs to another writer;
+        // unlinking it would leave that process appending to a dead inode.
         if !self.read_only
             && !self.keep
+            && !self.claim_lost()
             && !self.tree.has_assistant_message()
             && let Err(error) = fs::remove_file(&self.path)
             && error.kind() != io::ErrorKind::NotFound
@@ -1253,12 +1347,18 @@ impl Writer {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn ensure_writable(&self) -> Result<()> {
+    fn ensure_writable(&mut self) -> Result<()> {
         if self.closed {
             return Err(SessionError::Closed);
         }
         if self.read_only {
             return Err(SessionError::ReadOnly);
+        }
+        // Re-check the claim before every append rather than trusting the
+        // last heartbeat: a takeover during a long stall must stop this
+        // writer at its next line, not two seconds later.
+        if self.claim.as_ref().is_some_and(|claim| !claim.verify()) {
+            self.stop("another process took over this session");
         }
         if let Some(reason) = &self.degraded {
             return Err(SessionError::Degraded(reason.clone()));
@@ -1286,7 +1386,7 @@ impl Writer {
         }
         self.write_line(&line)?;
         self.size = new_size;
-        self.tree.add(entry, &line)
+        self.tree.add(entry)
     }
 
     fn write_line(&mut self, line: &[u8]) -> Result<()> {
@@ -1326,6 +1426,9 @@ impl Drop for Writer {
 struct LockClaim {
     path: PathBuf,
     token: String,
+    /// Set once the lock file stops carrying this claim's token. A takeover is
+    /// permanent: the successor owns the file from then on.
+    lost: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     heartbeat: Option<JoinHandle<()>>,
 }
@@ -1333,25 +1436,26 @@ struct LockClaim {
 impl LockClaim {
     fn new(path: PathBuf, token: String) -> Self {
         let (stop, receiver) = mpsc::channel();
+        let lost = Arc::new(AtomicBool::new(false));
         let heartbeat_path = path.clone();
         let heartbeat_token = token.clone();
+        let heartbeat_lost = lost.clone();
         let heartbeat = thread::spawn(move || {
             loop {
                 match receiver.recv_timeout(LOCK_HEARTBEAT) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if fs::read(&heartbeat_path)
-                            .is_ok_and(|contents| contents.as_slice() == heartbeat_token.as_bytes())
-                        {
-                            let _ = OpenOptions::new()
-                                .write(true)
-                                .open(&heartbeat_path)
-                                .and_then(|file| {
-                                    file.set_times(
-                                        fs::FileTimes::new().set_modified(SystemTime::now()),
-                                    )
-                                });
+                        // A lost lock is never touched again: refreshing it
+                        // would keep a successor's claim alive on its behalf.
+                        if !still_held(&heartbeat_path, &heartbeat_token, &heartbeat_lost) {
+                            break;
                         }
+                        let _ = OpenOptions::new()
+                            .write(true)
+                            .open(&heartbeat_path)
+                            .and_then(|file| {
+                                file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+                            });
                     }
                 }
             }
@@ -1359,9 +1463,39 @@ impl LockClaim {
         Self {
             path,
             token,
+            lost,
             stop: Some(stop),
             heartbeat: Some(heartbeat),
         }
+    }
+
+    /// Re-reads the lock file and reports whether this claim still owns it.
+    fn verify(&self) -> bool {
+        still_held(&self.path, &self.token, &self.lost)
+    }
+
+    fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
+
+fn still_held(path: &Path, token: &str, lost: &AtomicBool) -> bool {
+    if lost.load(Ordering::Relaxed) {
+        return false;
+    }
+    match fs::read(path) {
+        Ok(contents) if contents == token.as_bytes() => true,
+        // Rewritten or gone: a waiter declared this claim stale and took it.
+        // Any other read error is transient and proves nothing.
+        Ok(_) => {
+            lost.store(true, Ordering::Relaxed);
+            false
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            lost.store(true, Ordering::Relaxed);
+            false
+        }
+        Err(_) => true,
     }
 }
 
@@ -1385,13 +1519,10 @@ fn lock_path(path: &Path) -> PathBuf {
     lock_path.into()
 }
 
+/// Claims a session that already exists on disk (or whose directory was just
+/// created by this store), so no directory is created or re-moded here.
 fn claim(path: &Path) -> Result<LockClaim> {
     let path = lock_path(path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
     let token = format!("{} {}\n", std::process::id(), Uuid::now_v7());
     loop {
         let mut options = OpenOptions::new();
@@ -1422,12 +1553,37 @@ fn claim(path: &Path) -> Result<LockClaim> {
     }
 }
 
+/// A lock is stale once its heartbeat has stopped, or sooner when the process
+/// that wrote it is known to be gone on this host: a crash followed by an
+/// immediate relaunch should not leave the user silently read-only for the
+/// rest of the heartbeat window.
 fn lock_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
+    let heartbeat_stopped = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|elapsed| elapsed > LOCK_STALE)
+        .is_some_and(|elapsed| elapsed > LOCK_STALE);
+    heartbeat_stopped || read_lock_owner(path).pid.is_some_and(pid_is_dead)
+}
+
+#[cfg(unix)]
+fn pid_is_dead(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // Signal zero delivers nothing. ESRCH is the one answer that proves the
+    // pid is unused; EPERM means it is alive under another user, and a pid
+    // from another host cannot be judged at all, so only ESRCH counts.
+    let result = unsafe { kill(pid, 0) };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+}
+
+#[cfg(not(unix))]
+fn pid_is_dead(_pid: u32) -> bool {
+    false
 }
 
 fn read_lock_owner(path: &Path) -> LockOwner {
@@ -1451,7 +1607,24 @@ fn probe_claim(path: &Path) -> (bool, LockOwner) {
     (true, read_lock_owner(&path))
 }
 
-fn read_into(file: &mut File, _path: &Path) -> Result<(Tree, Header, LoadReport, u64)> {
+/// Reads the header line only. Discovery paths use it so that finding or
+/// naming a session never pays for parsing its transcript.
+fn read_header(path: &Path) -> Result<Header> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(4 << 10, file);
+    let first = read_line_bounded(&mut reader, MAX_ENTRY_BYTES)?;
+    if first.consumed == 0 {
+        return Err(SessionError::EmptySession);
+    }
+    if first.too_large {
+        return Err(SessionError::InvalidHeader(format!(
+            "line exceeds the {MAX_ENTRY_BYTES}-byte entry limit"
+        )));
+    }
+    Header::decode(trim_line(&first.bytes))
+}
+
+fn read_into(file: &mut File, keep_raw: bool) -> Result<(Tree, Header, LoadReport, u64)> {
     let metadata = file.metadata()?;
     if metadata.len() > MAX_SESSION_BYTES {
         return Err(SessionError::SessionTooLarge(metadata.len()));
@@ -1482,7 +1655,11 @@ fn read_into(file: &mut File, _path: &Path) -> Result<(Tree, Header, LoadReport,
         ));
     }
 
-    let mut tree = Tree::new();
+    let mut tree = if keep_raw {
+        Tree::retaining_raw()
+    } else {
+        Tree::new()
+    };
     let mut last_added = None::<String>;
     let mut line_number = 1_usize;
     let mut total = first.consumed;
@@ -1537,29 +1714,45 @@ fn read_into(file: &mut File, _path: &Path) -> Result<(Tree, Header, LoadReport,
                 if migration.needed() {
                     migration.apply(&mut entry, body);
                 }
+                let mut raw = Cow::Borrowed(line.bytes.as_slice());
                 if let Some(parent) = entry.parent_id.as_deref()
                     && !tree.has(parent)
                 {
                     entry.parent_id = last_added.clone();
+                    // The retained bytes must agree with the repaired parent,
+                    // or a fork copies the dangling reference and the copy
+                    // reattaches differently on its next load.
+                    if keep_raw {
+                        raw = Cow::Owned(with_parent_id(body, entry.parent_id.as_deref()));
+                    }
                     report.warnings.push(format!(
                         "line {line_number} referenced an entry that is not in the file; it was reattached so earlier conversation stays reachable"
                     ));
                 }
-                match tree.add(entry.clone(), &line.bytes) {
+                match tree.add_raw(entry.clone(), &raw) {
                     Ok(()) => {
                         last_added = Some(entry.id);
                         if !line.complete {
                             report.unterminated_tail = true;
                         }
+                        keep_bytes = total;
                     }
                     Err(error) => {
                         report.skipped_lines += 1;
                         report
                             .warnings
                             .push(format!("line {line_number} was skipped: {error}"));
+                        // A rejected line that never got its newline has to be
+                        // cut, or the next append is glued onto it and both
+                        // lines are lost on the following load.
+                        if line.complete {
+                            keep_bytes = total;
+                        } else {
+                            keep_bytes = line_start;
+                            report.repaired_tail = true;
+                        }
                     }
                 }
-                keep_bytes = total;
             }
         }
         if !line.complete {
@@ -1681,14 +1874,108 @@ fn new_unique_entry_id(taken: impl Fn(&str) -> bool) -> String {
     Uuid::now_v7().simple().to_string()
 }
 
-fn absolute_path(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|current_dir| current_dir.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+/// Rewrites an entry line with a different `parentId`, keeping every other
+/// field byte-for-byte so provider data from newer clients survives.
+fn with_parent_id(body: &[u8], parent: Option<&str>) -> Vec<u8> {
+    let Ok(Value::Object(mut fields)) = serde_json::from_slice::<Value>(body) else {
+        return [body, b"\n"].concat();
+    };
+    fields.insert(
+        "parentId".to_owned(),
+        parent.map_or(Value::Null, |parent| Value::String(parent.to_owned())),
+    );
+    let mut line = serde_json::to_vec(&Value::Object(fields)).unwrap_or_else(|_| body.to_vec());
+    line.push(b'\n');
+    line
+}
+
+/// Folds `.` and `..` segments and trailing separators out of a path without
+/// touching the filesystem, as pi's `resolvePath` does. Session shards are
+/// keyed by the spelled path, so `/w/` and `/w/./x/..` must name one shard.
+pub fn clean_path(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => cleaned.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match cleaned.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    cleaned.pop();
+                }
+                // Above the root there is nothing to climb to.
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => cleaned.push(".."),
+            },
+            Component::Normal(segment) => cleaned.push(segment),
+        }
     }
+    cleaned
+}
+
+/// Resolves a path against the current directory and cleans it, failing only
+/// when the current directory itself cannot be read.
+pub fn try_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(clean_path(path));
+    }
+    Ok(clean_path(&std::env::current_dir()?.join(path)))
+}
+
+/// [`try_absolute_path`] with a lexical fallback for callers that cannot
+/// report an unreadable current directory.
+pub fn absolute_path(path: &Path) -> PathBuf {
+    try_absolute_path(path).unwrap_or_else(|_| clean_path(path))
+}
+
+/// Compares a header's recorded workspace against a resolved one. A header
+/// without a workspace stays visible in the shard it was found in.
+fn cwd_matches(header_cwd: &str, target: &Path) -> bool {
+    header_cwd.is_empty() || absolute_path(Path::new(header_cwd)) == target
+}
+
+/// Creates a directory and its missing parents as owner-only, leaving the
+/// mode of anything that already exists alone: a shared or system-owned
+/// parent is not this code's to lock down, and chmod there fails with EPERM.
+fn create_private_dir(directory: &Path) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(directory)
+}
+
+/// Writes a file that only its owner can read. Transcripts carry the same
+/// content as the 0600 session log, so an export must not widen that.
+pub fn write_private(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(contents)
+}
+
+/// The `.jsonl` files directly inside one shard directory.
+fn session_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("jsonl"))
+        .collect())
+}
+
+/// The id encoded in a `<stamp>_<id>.jsonl` name, when the name follows the
+/// convention. The stamp never contains an underscore.
+fn filename_session_id(path: &Path) -> Option<&str> {
+    path.file_stem()?
+        .to_str()?
+        .split_once('_')
+        .map(|(_, id)| id)
 }
 
 fn trim_line(line: &[u8]) -> &[u8] {
@@ -1755,14 +2042,15 @@ mod tests {
             .append(assistant("answer"))
             .expect("append assistant");
         writer.sync().expect("sync");
-        let raw = writer.snapshot().raw(&first).expect("raw entry").to_vec();
+        let path = writer.path().to_path_buf();
         writer.close().expect("close");
 
-        assert!(
-            String::from_utf8(raw)
-                .expect("utf8")
-                .contains("\"parentId\":null")
-        );
+        let contents = fs::read_to_string(path).expect("read session");
+        let raw = contents
+            .lines()
+            .find(|line| line.contains(&format!("\"id\":\"{first}\"")))
+            .expect("raw entry");
+        assert!(raw.contains("\"parentId\":null"));
         fs::remove_dir_all(root).expect("clean test root");
     }
 
@@ -1801,17 +2089,14 @@ mod tests {
             ("five", TYPE_TRANSCRIPT_RESET, Some("four")),
             ("six", TYPE_MESSAGE, Some("five")),
         ] {
-            tree.add(
-                Entry {
-                    kind: kind.to_owned(),
-                    id: id.to_owned(),
-                    parent_id: parent.map(str::to_owned),
-                    timestamp: now(),
-                    first_kept_entry_id: "two".to_owned(),
-                    ..Entry::default()
-                },
-                [],
-            )
+            tree.add(Entry {
+                kind: kind.to_owned(),
+                id: id.to_owned(),
+                parent_id: parent.map(str::to_owned),
+                timestamp: now(),
+                first_kept_entry_id: "two".to_owned(),
+                ..Entry::default()
+            })
             .expect("add");
         }
 
@@ -1909,7 +2194,11 @@ mod tests {
         let (forked, header, report) = store.load(&fork_path).expect("load fork");
         assert!(!report.migrated);
         assert_eq!(header.version, FORMAT_VERSION);
-        assert_eq!(header.parent_session.as_deref(), Some("legacy"));
+        assert_eq!(
+            header.parent_session.as_deref(),
+            Some(legacy.to_string_lossy().as_ref()),
+            "pi records the source file, not its id"
+        );
         assert_eq!(forked.len(), 4);
         fs::remove_dir_all(root).expect("clean test root");
     }
@@ -2038,6 +2327,384 @@ mod tests {
 
         let (tree, _, _) = store.load(&fork_path).expect("reload fork");
         assert_eq!(tree.label(&first), Some(label.as_str()));
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn attach_keeps_a_resumed_session_that_is_closed_without_a_new_reply() {
+        let root = temp_root("attach-keep");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        writer.append(user("question")).expect("append user");
+        writer.keep();
+        let path = writer.path().to_path_buf();
+        writer.close().expect("close");
+
+        let (mut resumed, _) = store.attach(&path).expect("attach");
+        resumed.append(user("still no answer")).expect("append");
+        resumed.close().expect("close resumed");
+
+        assert!(
+            path.exists(),
+            "a session that existed before attach is never discarded by it"
+        );
+        let (tree, _, _) = store.load(&path).expect("reload");
+        assert_eq!(tree.len(), 2);
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_a_session_never_changes_the_mode_of_an_existing_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("dir-mode");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("make sessions dir");
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o755)).expect("set mode");
+        let store = Store::new(&sessions);
+
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        writer.append(assistant("answer")).expect("append");
+        let shard = writer.path().parent().expect("shard").to_path_buf();
+        writer.close().expect("close");
+
+        let mode = |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&sessions),
+            0o755,
+            "an existing directory keeps its mode"
+        );
+        assert_eq!(
+            mode(&shard),
+            0o700,
+            "a directory this store creates is private"
+        );
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn a_claim_taken_over_by_another_process_stops_the_writer_and_keeps_the_file() {
+        let root = temp_root("takeover");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        writer
+            .append(user("question"))
+            .expect("append before takeover");
+        let path = writer.path().to_path_buf();
+        let lock = lock_path(&path);
+        // A waiter that declared this claim stale rewrites the lock with its
+        // own token; from then on the file is its to append to and remove.
+        fs::write(&lock, "999999 successor\n").expect("rewrite lock");
+
+        assert!(matches!(
+            writer.append(user("after takeover")),
+            Err(SessionError::Degraded(_))
+        ));
+        assert!(!writer.recording());
+        writer.close().expect("close");
+        assert!(path.exists(), "the successor's file must not be unlinked");
+        assert_eq!(
+            fs::read_to_string(&lock).expect("lock"),
+            "999999 successor\n",
+            "the successor's lock must not be removed"
+        );
+
+        let (tree, _, report) = store.load(&path).expect("reload");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(report.skipped_lines, 0);
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_lock_from_a_dead_process_is_reclaimed() {
+        let root = temp_root("dead-pid");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        writer.append(assistant("answer")).expect("append");
+        let path = writer.path().to_path_buf();
+        writer.close().expect("close");
+
+        // A process that has already exited leaves a pid nothing answers for.
+        let dead = std::process::Command::new("true")
+            .spawn()
+            .and_then(|mut child| {
+                let id = child.id();
+                child.wait()?;
+                Ok(id)
+            })
+            .expect("run a short-lived process");
+        fs::write(lock_path(&path), format!("{dead} crashed\n")).expect("write stale lock");
+
+        assert!(
+            !store.describe(&path, false).expect("describe").locked,
+            "a lock whose holder is gone does not show as open"
+        );
+        let (mut resumed, _) = store
+            .attach(&path)
+            .expect("attach reclaims the dead holder's lock inside the heartbeat window");
+        resumed.append(user("continued")).expect("append");
+        resumed.close().expect("close");
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn headers_without_cwd_or_timestamp_are_still_discoverable() {
+        let root = temp_root("bare-header");
+        let store = Store::new(root.join("sessions"));
+        let workspace = root.join("workspace");
+        let shard = store.directory(&workspace);
+        fs::create_dir_all(&shard).expect("make shard");
+        let path = shard.join("bare.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"bare-header\"}\n",
+                "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}}\n"
+            ),
+        )
+        .expect("write fixture");
+
+        let (tree, header, _) = store.load(&path).expect("load without cwd or timestamps");
+        assert_eq!(header.id, "bare-header");
+        assert!(header.cwd.is_empty());
+        assert_eq!(tree.len(), 1);
+        let listed = store
+            .list(&workspace, ListOptions::default())
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].first_message, "hello");
+        assert_eq!(
+            store
+                .most_recent(&workspace)
+                .expect("most recent")
+                .map(|info| info.id)
+                .as_deref(),
+            Some("bare-header")
+        );
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn workspace_paths_are_cleaned_before_they_name_a_shard() {
+        assert_eq!(
+            clean_path(Path::new("/a/b/../c/./d/")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(clean_path(Path::new("/../x")), PathBuf::from("/x"));
+        assert_eq!(clean_path(Path::new("../x/./y")), PathBuf::from("../x/y"));
+        assert_eq!(
+            Store::dir_name("/work/project/"),
+            Store::dir_name("/work/project")
+        );
+        assert_eq!(
+            Store::dir_name("/work/other/../project"),
+            Store::dir_name("/work/project")
+        );
+        assert_eq!(Store::dir_name("./relative"), Store::dir_name("relative"));
+    }
+
+    #[test]
+    fn discovery_settles_on_headers_and_file_names_before_parsing_a_transcript() {
+        let root = temp_root("discovery");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut older = store
+            .create_with_id(&workspace, None, "older-session")
+            .expect("create older");
+        older.append(assistant("first")).expect("append");
+        let older_path = older.path().to_path_buf();
+        older.close().expect("close older");
+        let mut newer = store
+            .create_with_id(&workspace, None, "newer-session")
+            .expect("create newer");
+        newer.append(assistant("second")).expect("append");
+        let newer_path = newer.path().to_path_buf();
+        newer.close().expect("close newer");
+
+        let shard = older_path.parent().expect("shard").to_path_buf();
+        // A file that does not follow the naming convention is still found
+        // through its header, which is the authority on ids.
+        let imported = shard.join("imported.jsonl");
+        fs::write(
+            &imported,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session",
+                    "version": 3,
+                    "id": "imported-session",
+                    "timestamp": "2026-01-01T00:00:00.000Z",
+                    "cwd": workspace.to_string_lossy()
+                })
+            ),
+        )
+        .expect("write imported");
+        // A name that promises an id its header does not carry is not a match.
+        fs::write(
+            shard.join("2026-01-01T00-00-00-000Z_decoy.jsonl"),
+            "{\"type\":\"message\",\"id\":\"x\"}\n",
+        )
+        .expect("write decoy");
+        let now = SystemTime::now();
+        for (path, age) in [(&imported, 120), (&older_path, 60), (&newer_path, 0)] {
+            File::options()
+                .write(true)
+                .open(path)
+                .and_then(|file| {
+                    file.set_times(
+                        fs::FileTimes::new().set_modified(now - Duration::from_secs(age)),
+                    )
+                })
+                .expect("set mtime");
+        }
+
+        assert_eq!(
+            store
+                .most_recent(&workspace)
+                .expect("most recent")
+                .map(|info| info.id)
+                .as_deref(),
+            Some("newer-session")
+        );
+        assert_eq!(
+            store
+                .resolve(&workspace, "older-session")
+                .expect("exact id via file name")
+                .id,
+            "older-session"
+        );
+        assert_eq!(
+            store
+                .resolve(&workspace, "imported-session")
+                .expect("exact id via header")
+                .id,
+            "imported-session"
+        );
+        assert_eq!(
+            store.resolve(&workspace, "newer").expect("prefix").id,
+            "newer-session"
+        );
+        assert!(matches!(
+            store.resolve(&workspace, "decoy"),
+            Err(SessionError::NotFound(_))
+        ));
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn short_ids_cut_at_character_boundaries() {
+        let info = |id: &str| SessionInfo {
+            id: id.to_owned(),
+            path: PathBuf::new(),
+            cwd: String::new(),
+            name: String::new(),
+            first_message: String::new(),
+            created: None,
+            modified: SystemTime::UNIX_EPOCH,
+            messages: 0,
+            cleared: 0,
+            size: 0,
+            search_text: String::new(),
+            locked: false,
+            owner: LockOwner::default(),
+        };
+        let sessions = [info("会話セッション一"), info("会話セッション二")];
+        assert_eq!(sessions[0].short_id(), "会話");
+        assert_eq!(
+            short_ids(&sessions),
+            ["会話セッション一", "会話セッション二"]
+        );
+    }
+
+    #[test]
+    fn attach_cuts_a_rejected_unterminated_tail_instead_of_appending_onto_it() {
+        let root = temp_root("rejected-tail");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store.create(root.join("workspace")).expect("create");
+        let first = writer.append(user("question")).expect("append user");
+        writer
+            .append(assistant("answer"))
+            .expect("append assistant");
+        let path = writer.path().to_path_buf();
+        writer.close().expect("close");
+
+        // A duplicate id parses but is rejected by the tree. Without its
+        // newline it has to be cut, or the next append is glued onto it.
+        let duplicate = format!(
+            "{{\"type\":\"message\",\"id\":\"{first}\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"dup\"}}}}"
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(duplicate.as_bytes()))
+            .expect("append rejected tail");
+
+        let (mut recovered, report) = store.attach(&path).expect("attach");
+        assert!(report.repaired_tail);
+        assert_eq!(report.skipped_lines, 1);
+        recovered.append(user("after")).expect("append");
+        recovered.close().expect("close");
+
+        let (tree, _, report) = store.load(&path).expect("reload");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(report.skipped_lines, 0);
+        assert!(!report.repaired_tail);
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writes_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("private-write");
+        fs::create_dir_all(&root).expect("make root");
+        let path = root.join("export.md");
+        write_private(&path, b"secret").expect("write");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+        write_private(&path, b"replaced").expect("overwrite");
+        assert_eq!(fs::read(&path).expect("read"), b"replaced");
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn fork_copies_a_reattached_entry_with_its_repaired_parent() {
+        let root = temp_root("fork-reattach");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let source = root.join("source.jsonl");
+        fs::create_dir_all(&root).expect("make root");
+        fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"src\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"/w\"}\n",
+                "{\"type\":\"message\",\"id\":\"a\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"q\",\"timestamp\":1}}\n",
+                "{\"type\":\"message\",\"id\":\"b\",\"parentId\":\"missing\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"a\"}],\"timestamp\":2},\"usage\":{\"extra\":true}}\n"
+            ),
+        )
+        .expect("write source");
+        let info = store.describe(&source, false).expect("describe");
+        let fork = store.fork(&info, None, &workspace).expect("fork");
+        let fork_path = fork.path().to_path_buf();
+        drop(fork);
+
+        let (tree, _, report) = store.load(&fork_path).expect("reload fork");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(
+            tree.entry("b").and_then(|entry| entry.parent_id.as_deref()),
+            Some("a")
+        );
+        // Fields this build does not model survive the repair byte-for-byte.
+        assert!(
+            fs::read_to_string(&fork_path)
+                .expect("read fork")
+                .contains("\"usage\":{\"extra\":true}")
+        );
         fs::remove_dir_all(root).expect("clean test root");
     }
 }

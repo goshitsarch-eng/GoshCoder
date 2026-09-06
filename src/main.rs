@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod compaction;
 pub mod computeruse;
 pub mod config;
+pub mod export_html;
 pub mod google_auth;
 pub mod llm;
 pub mod markdown;
@@ -80,13 +81,12 @@ Usage:
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
-The Ratatui frontend, persistent-session, prompt, planner, Ralph, provider,
-model, credential, and context-compaction foundations are active. `run`
-supports `openai-completions`, `openai-responses`, `azure-openai-responses`,
-`openai-codex-responses`, `anthropic-messages`, `google-generative-ai`, and
-`google-vertex`, `mistral-conversations`, and `bedrock-converse-stream`;
-the remaining provider extensions and interactive commands are still being
-migrated from the previous implementation.
+`run` and `chat` speak `openai-completions`, `openai-responses`,
+`azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`,
+`google-generative-ai`, `google-vertex`, `mistral-conversations`,
+`bedrock-converse-stream`, and the OmniRoute prompt-tools adapter. Gateways:
+`omni setup` or OMNIROUTE_URL for OmniRoute, `aperture onboarding` for
+Tailscale Aperture. Type /help inside chat for the slash commands.
 "#;
 
 fn main() {
@@ -189,7 +189,7 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            let _ = render_run_event(event, &mut stdout, &mut stderr, color);
         }
     });
 
@@ -414,7 +414,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let (agent_event_sender, agent_event_receiver) = mpsc::channel();
     let (turn_sender, turn_receiver) = mpsc::channel();
     let _agent_event_subscription = agent.subscribe(move |event| {
-        let _ = agent_event_sender.send(event);
+        let _ = agent_event_sender.send(event.clone());
     });
 
     // A panic anywhere on the UI thread must not leave the shell in raw mode
@@ -606,7 +606,7 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            let _ = render_run_event(event, &mut stdout, &mut stderr, color);
         }
     });
 
@@ -941,11 +941,20 @@ fn event_loop(
                     if let Some(thread) = view.pending_btw_thread.as_deref() {
                         let _ = prepared.btw.cancel(thread);
                     }
+                    // pi restores queued messages to the editor before the
+                    // abort, so nothing queued runs after the interrupted
+                    // turn and no text is lost.
+                    let restored =
+                        restore_queued_messages_to_editor(&mut app, prepared.runtime.agent());
                     prepared.runtime.agent().abort();
                     if let Some(planner) = prepared.planner.as_ref() {
                         planner.abort_review();
                     }
-                    view.activity = "Aborting".to_owned();
+                    view.activity = if restored > 0 {
+                        format!("Aborting; {restored} queued message(s) restored to the editor")
+                    } else {
+                        "Aborting".to_owned()
+                    };
                 }
                 Action::CycleModel { direction } => {
                     match cycle_interactive_model(&prepared.runtime, catalog, direction) {
@@ -1721,7 +1730,7 @@ fn login_flow_available(provider_id: &str) -> bool {
     })
 }
 
-/// `/omni [status|sync|setup|dashboard]`. Setup prompts for a URL and key,
+/// `/omni [status|setup|sync|models|test|dashboard|config|help]`. Setup prompts for a URL and key,
 /// so it owns the terminal; the rest talk to the gateway off the UI thread.
 fn dispatch_omni_command<'a>(
     view: &mut InteractiveView,
@@ -1740,7 +1749,7 @@ fn dispatch_omni_command<'a>(
         return CommandDispatch::Suspended(Box::new(move || {
             run_self_subprocess(&["omni", "setup"])?;
             catalog.refresh_dynamic();
-            Ok("OmniRoute setup complete. Run /omni sync.".to_owned())
+            Ok("OmniRoute setup finished; its models are available under /model. Use /omni status to verify the gateway.".to_owned())
         }));
     }
     let label = format!("/omni {rest}").trim_end().to_owned();
@@ -1816,7 +1825,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Add an OAuth or API-key provider (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          List or choose an authenticated model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Add an OAuth or API-key provider (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2084,6 +2093,9 @@ fn dispatch_runtime_slash_command<'a>(
             }
             CommandDispatch::Handled
         }
+        "/export" => dispatch_export_command(view, prepared, rest),
+        "/import" => dispatch_import_command(app, view, prepared, rest),
+        "/share" => dispatch_share_command(view, prepared, rest),
         "/clone" => {
             match prepared.runtime.clone_session() {
                 Ok(handle) => {
@@ -2607,6 +2619,7 @@ fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
         "clone",
         "export",
         "import",
+        "share",
         "prompt",
         "prompts",
         "sessions",
@@ -2654,6 +2667,175 @@ fn last_user_prompt(messages: &[llm::Message]) -> Option<String> {
         let text = user_message_text(user).trim().to_owned();
         (!text.is_empty()).then_some(text)
     })
+}
+
+/// The session store and workspace the chat commands resolve sessions in.
+fn interactive_session_store(
+    prepared: &runtime::PreparedSession,
+) -> Result<(sessionlog::Store, std::path::PathBuf), String> {
+    let cwd =
+        runtime::absolute_workdir(&prepared.config.workdir).map_err(|error| error.to_string())?;
+    let store = sessionlog::Store::new(
+        prepared
+            .config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(config::sessions_dir),
+    );
+    Ok((store, cwd))
+}
+
+/// The saved session behind this chat, or why there is none to export.
+fn current_session_info(
+    prepared: &runtime::PreparedSession,
+) -> Result<
+    (
+        sessionlog::Store,
+        std::path::PathBuf,
+        sessionlog::SessionInfo,
+    ),
+    String,
+> {
+    let Some(path) = prepared.runtime.path() else {
+        return Err(
+            "Nothing to export: this session is not being saved (chat started with -no-session)."
+                .to_owned(),
+        );
+    };
+    let (store, cwd) = interactive_session_store(prepared)?;
+    let info = store
+        .resolve(&cwd, &path.to_string_lossy())
+        .map_err(|error| error.to_string())?;
+    Ok((store, cwd, info))
+}
+
+/// `/export [path]`: `.jsonl` keeps the lossless log, `.md` writes Markdown,
+/// anything else (and no path at all) writes the self-contained HTML page
+/// into the workspace, as pi's `/export` does.
+fn dispatch_export_command<'a>(
+    view: &mut InteractiveView,
+    prepared: &'a runtime::PreparedSession,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    let outcome = current_session_info(prepared).and_then(|(store, cwd, info)| {
+        let destination = if rest.trim().is_empty() {
+            cwd.join(sessions::default_export_name(
+                &info,
+                sessions::ExportFormat::Html,
+            ))
+        } else {
+            let requested = config::expand_tilde(rest.trim());
+            if requested.is_absolute() {
+                requested
+            } else {
+                cwd.join(requested)
+            }
+        };
+        let format = sessions::ExportFormat::for_destination(&destination);
+        sessions::export_to_file(&store, &info, format, &destination)
+            .map(|()| destination)
+            .map_err(|error| error.to_string())
+    });
+    match outcome {
+        Ok(destination) => {
+            view.activity = "Session exported".to_owned();
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("Session exported to: {}", destination.display()),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error),
+    }
+    CommandDispatch::Handled
+}
+
+/// `/import <path.jsonl>`: adopts a session file into the store and switches
+/// to the copy, leaving the current session on disk to resume later.
+fn dispatch_import_command<'a>(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &'a runtime::PreparedSession,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    let source = rest.trim();
+    if source.is_empty() {
+        append_view_message(view, MessageRole::Error, "usage: /import <path.jsonl>");
+        return CommandDispatch::Handled;
+    }
+    let outcome = interactive_session_store(prepared).and_then(|(store, cwd)| {
+        let requested = config::expand_tilde(source);
+        let requested = if requested.is_absolute() {
+            requested
+        } else {
+            cwd.join(requested)
+        };
+        let info = store
+            .resolve(&cwd, &requested.to_string_lossy())
+            .map_err(|error| format!("read {source}: {error}"))?;
+        let mut writer = store
+            .fork(&info, None, &cwd)
+            .map_err(|error| error.to_string())?;
+        let id = writer.id().to_owned();
+        writer.close().map_err(|error| error.to_string())?;
+        prepared.runtime.switch_to(&id).map_err(|error| {
+            format!(
+                "imported as {} but could not switch: {error}",
+                short_id(&id)
+            )
+        })
+    });
+    match outcome {
+        Ok(handle) => {
+            app.scroll = 0;
+            view.activity = format!("Imported session {}", short_id(&handle.id));
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "Session imported from {source} as {} and switched to it.",
+                    handle.id
+                ),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error),
+    }
+    CommandDispatch::Handled
+}
+
+/// `/share`: explains what would leave the machine; `/share confirm` uploads
+/// the HTML export as a secret gist through `gh`, off the UI thread.
+fn dispatch_share_command<'a>(
+    view: &mut InteractiveView,
+    prepared: &'a runtime::PreparedSession,
+    rest: &str,
+) -> CommandDispatch<'a> {
+    let (store, _cwd, info) = match current_session_info(prepared) {
+        Ok(found) => found,
+        Err(error) => {
+            append_view_message(view, MessageRole::Error, error.replace("export", "share"));
+            return CommandDispatch::Handled;
+        }
+    };
+    match rest.trim().to_ascii_lowercase().as_str() {
+        "" => append_view_message(
+            view,
+            MessageRole::Notice,
+            format!(
+                "{}\nType /share confirm to upload.",
+                sessions::share_warning(&info)
+            ),
+        ),
+        "confirm" | "yes" => {
+            start_background_command(view, "/share", move || {
+                sessions::share_session(&store, &info)
+                    .map(|outcome| outcome.render())
+                    .map_err(|error| error.to_string())
+            });
+        }
+        _ => append_view_message(view, MessageRole::Error, "usage: /share [confirm]"),
+    }
+    CommandDispatch::Handled
 }
 
 fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<String, String> {
@@ -2970,6 +3152,31 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
         }
     }
     result
+}
+
+/// Moves every queued steering and follow-up message back into the editor,
+/// ahead of whatever was being typed, and returns how many there were.
+fn restore_queued_messages_to_editor(app: &mut App, agent: &agent::Agent) -> usize {
+    let queued = agent
+        .take_queued_messages()
+        .iter()
+        .filter_map(|message| match message {
+            llm::Message::User(user) => Some(user_message_text(user)),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if queued.is_empty() {
+        return 0;
+    }
+    let count = queued.len();
+    let mut parts = queued;
+    let current = app.input.trim();
+    if !current.is_empty() {
+        parts.push(current.to_owned());
+    }
+    app.set_input(&parts.join("\n\n"));
+    count
 }
 
 fn user_message_text(message: &llm::UserMessage) -> String {
@@ -3368,8 +3575,25 @@ mod tests {
     }
 
     #[test]
+    fn aborting_restores_queued_messages_to_the_editor_ahead_of_the_draft() {
+        let agent = agent::Agent::new(agent::AgentOptions::default());
+        let mut app = App::new();
+        assert_eq!(restore_queued_messages_to_editor(&mut app, &agent), 0);
+        assert!(app.input.is_empty());
+
+        agent.steer(llm::Message::User(llm::UserMessage::text("steer this", 1)));
+        agent.follow_up(llm::Message::User(llm::UserMessage::text("then this", 2)));
+        agent.follow_up(llm::Message::User(llm::UserMessage::text("   ", 3)));
+        app.set_input("half-typed draft");
+        assert_eq!(restore_queued_messages_to_editor(&mut app, &agent), 2);
+        assert_eq!(app.input, "steer this\n\nthen this\n\nhalf-typed draft");
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[test]
     fn help_and_version_are_non_interactive() {
-        assert!(USAGE.contains("Ratatui"));
+        assert!(USAGE.contains("goshcoder omni <subcommand>"));
+        assert!(USAGE.contains("OMNIROUTE_URL"));
         assert!(env!("CARGO_PKG_VERSION").starts_with("0."));
     }
 

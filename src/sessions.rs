@@ -9,13 +9,14 @@ use std::{
     fs,
     io::{self, Write},
     path::Path,
+    process::{Command, Stdio},
     time::{Duration, SystemTime},
 };
 
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
 use crate::{
-    config,
+    config, export_html,
     llm::{self, ContentBlock},
     sessionlog::{self, ListOptions, SessionInfo, Store, Tree},
 };
@@ -51,8 +52,9 @@ pub fn run(
             "gc" => gc(store, cwd, rest, output, diagnostics),
             "export" => export(store, cwd, rest, output, diagnostics),
             "import" => import(store, cwd, rest, output, diagnostics),
+            "share" => share(store, cwd, rest, output, diagnostics),
             other => Err(format!(
-                "unknown sessions subcommand {other:?}; use list, show, rm, gc, export or import"
+                "unknown sessions subcommand {other:?}; use list, show, rm, gc, export, import or share"
             )
             .into()),
         },
@@ -218,13 +220,14 @@ fn export(
     output: &mut dyn Write,
     diagnostics: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
-    let mut format = ExportFormat::Jsonl;
+    let mut format = None;
     let mut reference = None;
     let mut destination = None;
     for argument in args {
         match argument.as_str() {
-            "--jsonl" | "-jsonl" => format = ExportFormat::Jsonl,
-            "--md" | "-md" | "--markdown" => format = ExportFormat::Markdown,
+            "--jsonl" | "-jsonl" => format = Some(ExportFormat::Jsonl),
+            "--md" | "-md" | "--markdown" => format = Some(ExportFormat::Markdown),
+            "--html" | "-html" => format = Some(ExportFormat::Html),
             _ if reference.is_none() => reference = Some(argument.as_str()),
             _ if destination.is_none() => destination = Some(argument.as_str()),
             _ => return Err("sessions export takes one session and one output path".into()),
@@ -232,18 +235,22 @@ fn export(
     }
     let reference = reference
         .ok_or_else(|| "sessions export needs a session id, prefix, or path".to_owned())?;
+    // Without a flag the output name decides, as pi's `/export` does; a
+    // stream gets the lossless JSONL.
+    let format = format.unwrap_or_else(|| {
+        destination
+            .filter(|destination| *destination != "-")
+            .map(|destination| ExportFormat::for_destination(Path::new(destination)))
+            .unwrap_or(ExportFormat::Jsonl)
+    });
     let info = store.resolve(cwd, reference)?;
-    let content = match format {
-        ExportFormat::Jsonl => fs::read(&info.path)?,
-        ExportFormat::Markdown => {
-            let (tree, header, _) = store.load(&info.path)?;
-            export_markdown(&info, &header, &tree).into_bytes()
-        }
-    };
+    let content = export_content(store, &info, format)?;
     match destination {
         None | Some("-") => output.write_all(&content)?,
         Some(destination) => {
-            fs::write(destination, &content)?;
+            // The export carries the whole transcript, so it gets the same
+            // owner-only mode as the session log.
+            sessionlog::write_private(destination, &content)?;
             writeln!(diagnostics, "exported {} to {destination}", info.short_id())?;
         }
     }
@@ -348,10 +355,219 @@ fn gc(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum ExportFormat {
+/// The shapes a session can be exported in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportFormat {
     Jsonl,
     Markdown,
+    Html,
+}
+
+impl ExportFormat {
+    /// Picks the format from an output name: `.jsonl` keeps the lossless
+    /// log, `.md` writes Markdown, anything else (pi's default) is HTML.
+    pub fn for_destination(destination: &Path) -> Self {
+        match destination
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("jsonl") | Some("json") => Self::Jsonl,
+            Some("md") | Some("markdown") => Self::Markdown,
+            _ => Self::Html,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            Self::Markdown => "md",
+            Self::Html => "html",
+        }
+    }
+}
+
+/// Renders one session in the requested format.
+pub fn export_content(
+    store: &Store,
+    info: &SessionInfo,
+    format: ExportFormat,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    Ok(match format {
+        ExportFormat::Jsonl => fs::read(&info.path)?,
+        ExportFormat::Markdown => {
+            let (tree, header, _) = store.load(&info.path)?;
+            export_markdown(info, &header, &tree).into_bytes()
+        }
+        ExportFormat::Html => {
+            let (tree, header, _) = store.load(&info.path)?;
+            export_html(info, &header, &tree).into_bytes()
+        }
+    })
+}
+
+/// Exports a session to `destination` with the session log's owner-only
+/// mode, returning the path written.
+pub fn export_to_file(
+    store: &Store,
+    info: &SessionInfo,
+    format: ExportFormat,
+    destination: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let content = export_content(store, info, format)?;
+    sessionlog::write_private(destination, &content)?;
+    Ok(())
+}
+
+/// pi names its exports `pi-session-<id>.html`; this follows suit.
+pub fn default_export_name(info: &SessionInfo, format: ExportFormat) -> String {
+    format!(
+        "goshcoder-session-{}.{}",
+        info.short_id(),
+        format.extension()
+    )
+}
+
+/// Where a shared session ends up and how to view it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShareOutcome {
+    pub gist_url: String,
+    pub viewer_url: Option<String>,
+}
+
+impl ShareOutcome {
+    pub fn render(&self) -> String {
+        let mut lines = vec![format!("Secret gist: {}", self.gist_url)];
+        match &self.viewer_url {
+            Some(viewer) => lines.push(format!("Share URL: {viewer}")),
+            None => lines.push(
+                "Open the gist's raw file in a browser, or set GOSHCODER_SHARE_VIEWER_URL to a viewer that renders a gist by id."
+                    .to_owned(),
+            ),
+        }
+        lines.join("\n")
+    }
+}
+
+/// The text shown before anything leaves the machine.
+pub fn share_warning(info: &SessionInfo) -> String {
+    format!(
+        "Sharing uploads the whole transcript of {} ({} messages, everything the agent read included) as a secret GitHub gist under your `gh` account. Secret gists are unlisted, not private: anyone with the link can read them.",
+        info.title(),
+        info.messages
+    )
+}
+
+/// Uploads the session's HTML export as a secret gist through the GitHub
+/// CLI, the way pi's `/share` does. The caller has already confirmed the
+/// upload with the user.
+pub fn share_session(store: &Store, info: &SessionInfo) -> Result<ShareOutcome, Box<dyn Error>> {
+    let status = Command::new("gh")
+        .args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(_) => return Err("GitHub CLI is not logged in. Run `gh auth login` first.".into()),
+        Err(_) => {
+            return Err(
+                "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/".into(),
+            );
+        }
+    }
+
+    let content = export_content(store, info, ExportFormat::Html)?;
+    let directory = std::env::temp_dir().join(format!(
+        "goshcoder-share-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    fs::create_dir_all(&directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    }
+    let file = directory.join(default_export_name(info, ExportFormat::Html));
+    let result = (|| -> Result<ShareOutcome, Box<dyn Error>> {
+        sessionlog::write_private(&file, &content)?;
+        let output = Command::new("gh")
+            .args(["gist", "create", "--public=false"])
+            .arg(&file)
+            .stdin(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            return Err(format!(
+                "Failed to create gist: {}",
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    stderr
+                }
+            )
+            .into());
+        }
+        let gist_url = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| line.starts_with("https://"))
+            .map(str::to_owned)
+            .ok_or("Failed to parse the gist URL from gh output")?;
+        let gist_id = gist_url.rsplit('/').next().unwrap_or_default().to_owned();
+        let viewer_url = std::env::var(SHARE_VIEWER_ENV)
+            .ok()
+            .map(|base| base.trim().to_owned())
+            .filter(|base| !base.is_empty() && !gist_id.is_empty())
+            .map(|base| format!("{base}#{gist_id}"));
+        Ok(ShareOutcome {
+            gist_url,
+            viewer_url,
+        })
+    })();
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+/// A viewer that renders a gist given its id after `#`, like pi's
+/// `PI_SHARE_VIEWER_URL`. Unset by default: the exported page is
+/// self-contained, so the gist itself is the artifact.
+pub const SHARE_VIEWER_ENV: &str = "GOSHCODER_SHARE_VIEWER_URL";
+
+fn share(
+    store: &Store,
+    cwd: &Path,
+    args: &[String],
+    output: &mut dyn Write,
+    diagnostics: &mut dyn Write,
+) -> Result<(), Box<dyn Error>> {
+    let mut confirmed = false;
+    let mut reference = None;
+    for argument in args {
+        match argument.as_str() {
+            "--yes" | "-y" | "-yes" => confirmed = true,
+            _ if reference.is_none() => reference = Some(argument.as_str()),
+            _ => return Err("sessions share takes one session and --yes".into()),
+        }
+    }
+    let reference =
+        reference.ok_or_else(|| "sessions share needs a session id, prefix, or path".to_owned())?;
+    let info = store.resolve(cwd, reference)?;
+    if !confirmed {
+        writeln!(diagnostics, "{}", share_warning(&info))?;
+        return Err("re-run with --yes to upload".into());
+    }
+    let outcome = share_session(store, &info)?;
+    writeln!(output, "{}", outcome.render())?;
+    Ok(())
 }
 
 fn render_transcript(tree: &Tree, full: bool, output: &mut dyn Write) -> io::Result<()> {
@@ -447,6 +663,22 @@ fn export_markdown(info: &SessionInfo, header: &sessionlog::Header, tree: &Tree)
         }
     }
     markdown
+}
+
+fn export_html(info: &SessionInfo, header: &sessionlog::Header, tree: &Tree) -> String {
+    export_html::render_document(
+        &export_html::Meta {
+            title: info.title().to_owned(),
+            id: info.id.clone(),
+            cwd: header.cwd.clone(),
+            started: info
+                .created
+                .map(|time| time.format(SECOND_FORMAT).unwrap_or_default())
+                .unwrap_or_else(|| format_time(info.modified, true)),
+            generator: format!("GoshCoder {}", env!("CARGO_PKG_VERSION")),
+        },
+        tree,
+    )
 }
 
 fn age_cutoff(value: &str) -> Result<SystemTime, Box<dyn Error>> {
@@ -617,10 +849,163 @@ mod tests {
     }
 
     #[test]
+    fn html_export_follows_the_flag_or_the_output_extension() {
+        let root = temp_root("html-export");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store
+            .create_with_id(&workspace, None, "html-session")
+            .expect("create");
+        writer
+            .append(assistant("**bold** answer <tag>"))
+            .expect("append");
+        writer.close().expect("close");
+
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let by_flag = root.join("by-flag.txt");
+        run(
+            &store,
+            &workspace,
+            &[
+                "export".to_owned(),
+                "--html".to_owned(),
+                "html-session".to_owned(),
+                by_flag.display().to_string(),
+            ],
+            &mut output,
+            &mut diagnostics,
+        )
+        .expect("export by flag");
+        let html = fs::read_to_string(&by_flag).expect("read export");
+        assert!(html.starts_with("<!DOCTYPE html>"));
+        assert!(html.contains("<strong>bold</strong> answer &lt;tag&gt;"));
+        assert!(!html.contains("<script"));
+        assert!(html.contains("html-session"));
+
+        let by_extension = root.join("by-extension.HTML");
+        run(
+            &store,
+            &workspace,
+            &[
+                "export".to_owned(),
+                "html-session".to_owned(),
+                by_extension.display().to_string(),
+            ],
+            &mut output,
+            &mut diagnostics,
+        )
+        .expect("export by extension");
+        assert!(
+            fs::read_to_string(&by_extension)
+                .expect("read export")
+                .starts_with("<!DOCTYPE html>")
+        );
+
+        // A stream without a flag stays the lossless log.
+        output.clear();
+        run(
+            &store,
+            &workspace,
+            &["export".to_owned(), "html-session".to_owned()],
+            &mut output,
+            &mut diagnostics,
+        )
+        .expect("export to stdout");
+        assert!(String::from_utf8_lossy(&output).starts_with("{\"type\":\"session\""));
+
+        assert_eq!(
+            ExportFormat::for_destination(Path::new("notes.md")),
+            ExportFormat::Markdown
+        );
+        assert_eq!(
+            ExportFormat::for_destination(Path::new("copy.jsonl")),
+            ExportFormat::Jsonl
+        );
+        assert_eq!(
+            ExportFormat::for_destination(Path::new("page")),
+            ExportFormat::Html
+        );
+        let info = store.resolve(&workspace, "html-session").expect("resolve");
+        assert_eq!(
+            default_export_name(&info, ExportFormat::Html),
+            format!("goshcoder-session-{}.html", info.short_id())
+        );
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn share_refuses_to_upload_without_confirmation() {
+        let root = temp_root("share");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store
+            .create_with_id(&workspace, None, "share-session")
+            .expect("create");
+        writer.append(assistant("private")).expect("append");
+        writer.close().expect("close");
+
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let error = run(
+            &store,
+            &workspace,
+            &["share".to_owned(), "share-session".to_owned()],
+            &mut output,
+            &mut diagnostics,
+        )
+        .expect_err("no upload without --yes");
+        assert!(error.to_string().contains("--yes"));
+        let warning = String::from_utf8_lossy(&diagnostics);
+        assert!(warning.contains("secret GitHub gist"));
+        assert!(warning.contains("anyone with the link"));
+        assert!(output.is_empty());
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
     fn age_cutoff_requires_explicit_day_or_week_units() {
         assert!(age_cutoff("30d").is_ok());
         assert!(age_cutoff("6w").is_ok());
         assert!(age_cutoff("30").is_err());
         assert!(age_cutoff("tomorrow").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("export-mode");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store
+            .create_with_id(&workspace, None, "private-export")
+            .expect("create");
+        writer.append(assistant("secret work")).expect("append");
+        writer.close().expect("close");
+
+        let export_path = root.join("session.jsonl");
+        run(
+            &store,
+            &workspace,
+            &[
+                "export".to_owned(),
+                "private-export".to_owned(),
+                export_path.display().to_string(),
+            ],
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect("export");
+        assert_eq!(
+            fs::metadata(&export_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).expect("clean test root");
     }
 }

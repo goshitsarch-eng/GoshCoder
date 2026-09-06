@@ -34,7 +34,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
@@ -458,22 +458,23 @@ impl Store {
 
     pub fn task_path(&self, name: &str, archived: bool) -> Result<PathBuf> {
         let name = checked_name(name)?;
-        Ok(self.checked_store_dir(archived)?.join(format!("{name}.md")))
+        Ok(self.lookup_store_dir(archived)?.join(format!("{name}.md")))
     }
 
     pub fn state_path(&self, name: &str, archived: bool) -> Result<PathBuf> {
         let name = checked_name(name)?;
         Ok(self
-            .checked_store_dir(archived)?
+            .lookup_store_dir(archived)?
             .join(format!("{name}.state.json")))
     }
 
     /// Reads a loop state. `Ok(None)` means the named loop does not exist.
     pub fn load(&self, name: &str, archived: bool) -> Result<Option<LoopState>> {
         let name = checked_name(name)?;
-        let path = self
-            .checked_store_dir(archived)?
-            .join(format!("{name}.state.json"));
+        let Some(directory) = self.existing_store_dir(archived)? else {
+            return Ok(None);
+        };
+        let path = directory.join(format!("{name}.state.json"));
         let bytes = match read_bounded(&path) {
             Ok(bytes) => bytes,
             Err(RalphError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
@@ -482,6 +483,15 @@ impl Store {
             Err(error) => return Err(error),
         };
         let state: LoopState = serde_json::from_slice(&bytes)?;
+        // A record whose embedded name disagrees with its file stem would be
+        // listed under one name and saved back under another, forking the
+        // loop the next time it is touched.
+        if state.name != name {
+            return Err(RalphError::InvalidState(format!(
+                "state file {name:?} records the loop name {:?}",
+                state.name
+            )));
+        }
         self.validate_state_location(&state, archived)?;
         Ok(Some(state))
     }
@@ -491,7 +501,7 @@ impl Store {
         state.normalize();
         self.validate_state_location(state, archived)?;
         let path = self
-            .checked_store_dir(archived)?
+            .ensure_store_dir(archived)?
             .join(format!("{}.state.json", state.name));
         let mut encoded = serde_json::to_vec_pretty(state)?;
         encoded.push(b'\n');
@@ -501,7 +511,9 @@ impl Store {
     /// Lists valid loop records in lexical name order. Corrupt records are
     /// ignored so one damaged state file does not hide all other loops.
     pub fn list(&self, archived: bool) -> Result<Vec<LoopState>> {
-        let directory = self.checked_store_dir(archived)?;
+        let Some(directory) = self.existing_store_dir(archived)? else {
+            return Ok(Vec::new());
+        };
         let mut states = Vec::new();
         for entry in fs::read_dir(directory)? {
             let Ok(entry) = entry else {
@@ -526,7 +538,7 @@ impl Store {
     pub fn read_task(&self, state: &LoopState) -> Result<String> {
         let archived = self.state_is_archived(state)?;
         let path = self
-            .checked_store_dir(archived)?
+            .lookup_store_dir(archived)?
             .join(format!("{}.md", state.name));
         let bytes = read_bounded(&path)?;
         String::from_utf8(bytes)
@@ -537,7 +549,7 @@ impl Store {
     pub fn write_task(&self, state: &LoopState, content: &str) -> Result<()> {
         let archived = self.state_is_archived(state)?;
         let path = self
-            .checked_store_dir(archived)?
+            .ensure_store_dir(archived)?
             .join(format!("{}.md", state.name));
         atomic_write(&path, content.as_bytes())
     }
@@ -739,12 +751,9 @@ impl Store {
         self.write_task(&archived, &task)?;
         self.save(&mut archived, true)?;
 
-        let state_path = self
-            .checked_store_dir(false)?
-            .join(format!("{}.state.json", state.name));
-        let task_path = self
-            .checked_store_dir(false)?
-            .join(format!("{}.md", state.name));
+        let directory = self.lookup_store_dir(false)?;
+        let state_path = directory.join(format!("{}.state.json", state.name));
+        let task_path = directory.join(format!("{}.md", state.name));
         remove_file_if_exists(&state_path)?;
         remove_file_if_exists(&task_path)?;
         self.clear_current_if(&state.name);
@@ -757,10 +766,9 @@ impl Store {
         if self.load(&name, false)?.is_none() {
             return Err(RalphError::NotFound(name));
         }
-        let state_path = self
-            .checked_store_dir(false)?
-            .join(format!("{name}.state.json"));
-        let task_path = self.checked_store_dir(false)?.join(format!("{name}.md"));
+        let directory = self.lookup_store_dir(false)?;
+        let state_path = directory.join(format!("{name}.state.json"));
+        let task_path = directory.join(format!("{name}.md"));
         remove_file_if_exists(&state_path)?;
         remove_file_if_exists(&task_path)?;
         self.clear_current_if(&name);
@@ -917,9 +925,41 @@ impl Store {
         }
     }
 
-    /// Creates and verifies the storage directory a component at a time.
-    /// Existing symlinks are refused before any loop file is opened.
-    fn checked_store_dir(&self, archived: bool) -> Result<PathBuf> {
+    /// Returns the verified storage directory, or `Ok(None)` when it has not
+    /// been created yet. Readers go through here so listing or loading loops
+    /// never leaves an empty `.ralph` behind and never fails in a workspace
+    /// the process cannot write to.
+    fn existing_store_dir(&self, archived: bool) -> Result<Option<PathBuf>> {
+        self.locate_store_dir(archived, false)
+    }
+
+    /// Creates the storage directory for a write.
+    fn ensure_store_dir(&self, archived: bool) -> Result<PathBuf> {
+        self.locate_store_dir(archived, true)?.ok_or_else(|| {
+            RalphError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the Ralph store directory could not be created",
+            ))
+        })
+    }
+
+    /// Resolves where a loop file lives without creating anything: the
+    /// verified directory when it exists, otherwise its lexical location so a
+    /// read or removal fails with a plain not-found error.
+    fn lookup_store_dir(&self, archived: bool) -> Result<PathBuf> {
+        Ok(self.existing_store_dir(archived)?.unwrap_or_else(|| {
+            if archived {
+                self.archive_dir()
+            } else {
+                self.storage_dir()
+            }
+        }))
+    }
+
+    /// Verifies the storage directory a component at a time, refusing
+    /// symlinks before any loop file is opened. A missing component is
+    /// created only when `create` is set; otherwise it is reported as `None`.
+    fn locate_store_dir(&self, archived: bool, create: bool) -> Result<Option<PathBuf>> {
         let root = fs::canonicalize(&self.workspace)?;
         let root_metadata = fs::symlink_metadata(&root)?;
         if !root_metadata.is_dir() {
@@ -938,7 +978,10 @@ impl Store {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    match fs::create_dir(&candidate) {
+                    if !create {
+                        return Ok(None);
+                    }
+                    match create_private_dir(&candidate) {
                         Ok(()) => {}
                         Err(create_error)
                             if create_error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -955,12 +998,20 @@ impl Store {
             if !canonical.starts_with(&root) {
                 return Err(RalphError::UnsafePath(canonical));
             }
-            #[cfg(unix)]
-            fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700))?;
             current = canonical;
         }
-        Ok(current)
+        Ok(Some(current))
     }
+}
+
+/// Creates one store directory. The private mode is applied only here: a
+/// directory that already exists keeps whatever mode its owner chose, which
+/// may deliberately be shared with other users or tools.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path)
 }
 
 /// Compatibility alias for callers that prefer a descriptive store name.
@@ -1729,8 +1780,6 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
             file.sync_all()?;
             drop(file);
             fs::rename(&temporary, path)?;
-            #[cfg(unix)]
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
             sync_directory(parent)?;
             Ok(())
         })();
@@ -1952,6 +2001,9 @@ mod tests {
     fn loads_a_go_workspace_local_ralph_state() {
         let (store, _root, _config, _workspace) = test_store("go-interop");
         let task_path = store.task_path("legacy", false).expect("task path");
+        // The Go build created `.ralph` when it wrote these files; path
+        // lookups deliberately no longer do that on this side.
+        fs::create_dir_all(task_path.parent().expect("store dir")).expect("create .ralph");
         fs::write(&task_path, "# Task\n\nContinue the migration").expect("write task");
         let state_path = store.state_path("legacy", false).expect("state path");
         fs::write(
@@ -2525,5 +2577,90 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(temp_files, 0);
+    }
+
+    #[test]
+    fn read_paths_do_not_create_the_store_directory() {
+        let (store, _root, _config, workspace) = test_store("read-only");
+        assert!(store.list(false).expect("list").is_empty());
+        assert!(store.list(true).expect("list archive").is_empty());
+        assert!(store.load("missing", false).expect("load").is_none());
+        assert!(store.current().expect("current").is_none());
+        assert_eq!(store.status_line().expect("status line"), "");
+        assert!(matches!(
+            store.resume("missing"),
+            Err(RalphError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.delete("missing"),
+            Err(RalphError::NotFound(_))
+        ));
+        assert!(
+            store
+                .task_path("missing", true)
+                .expect("task path")
+                .ends_with("archive/missing.md")
+        );
+        assert!(
+            !workspace.join(STORE_DIR).exists(),
+            "reading loop state must not leave an empty .ralph behind"
+        );
+
+        store
+            .start("loop", "task", LoopOptions::default())
+            .expect("start");
+        assert!(workspace.join(STORE_DIR).is_dir());
+        assert!(store.list(true).expect("list archive").is_empty());
+        assert!(!store.archive_dir().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_directory_modes_are_set_only_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, _root, _config, workspace) = test_store("modes");
+        let shared = workspace.join(STORE_DIR);
+        fs::create_dir(&shared).expect("create .ralph");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).expect("share .ralph");
+        store
+            .start("loop", "task", LoopOptions::default())
+            .expect("start");
+        let mode = |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&shared),
+            0o755,
+            "an existing .ralph keeps the mode its owner chose"
+        );
+        store.archive("loop").expect("archive");
+        assert_eq!(
+            mode(&store.archive_dir()),
+            0o700,
+            "a directory Ralph creates is private"
+        );
+        let state_path = store.state_path("loop", true).expect("state path");
+        assert_eq!(mode(&state_path), 0o600);
+    }
+
+    #[test]
+    fn load_rejects_a_state_file_whose_name_disagrees_with_its_stem() {
+        let (store, _root, _config, _workspace) = test_store("stem");
+        store
+            .start("real", "task", LoopOptions::default())
+            .expect("start");
+        let real_path = store.state_path("real", false).expect("state path");
+        let impostor_path = store.state_path("impostor", false).expect("state path");
+        fs::copy(&real_path, &impostor_path).expect("copy state");
+        assert!(matches!(
+            store.load("impostor", false),
+            Err(RalphError::InvalidState(message)) if message.contains("impostor")
+        ));
+        let listed: Vec<String> = store
+            .list(false)
+            .expect("list")
+            .into_iter()
+            .map(|state| state.name)
+            .collect();
+        assert_eq!(listed, ["real"]);
     }
 }

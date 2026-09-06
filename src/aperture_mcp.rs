@@ -13,7 +13,6 @@
 //! remains the hard upper bound while a read is blocked in the transport.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
     fmt,
@@ -52,8 +51,13 @@ pub const MAX_RESPONSE_BYTES: usize = 16 << 20;
 pub const MAX_REQUEST_BYTES: usize = 8 << 20;
 /// Maximum connector output included directly in an agent tool result.
 pub const MAX_CONNECTOR_OUTPUT_BYTES: usize = 50 << 10;
-/// Maximum accepted connector tool-name size.
-pub const MAX_TOOL_NAME_BYTES: usize = 512;
+/// Maximum accepted connector tool-name size. Together with the
+/// `[A-Za-z0-9_-]` charset this is the grammar every provider accepts; a
+/// longer or stranger name would be rejected on each later model request.
+pub const MAX_TOOL_NAME_BYTES: usize = 64;
+/// Maximum encoded input schema forwarded to a model; anything larger is not
+/// worth the context it would cost and is rejected like a bad name.
+pub const MAX_INPUT_SCHEMA_BYTES: usize = 64 << 10;
 /// Maximum accepted resource URI size.
 pub const MAX_RESOURCE_URI_BYTES: usize = 8 << 10;
 /// Maximum accepted session-id header size.
@@ -277,8 +281,12 @@ impl fmt::Debug for McpClient {
 impl McpClient {
     /// Builds a client for `base_url`, whose MCP endpoint is `/v1/mcp`.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+        // Following a redirect would replay the Mcp-Session-Id header to
+        // whatever host the gateway named, so a redirect is treated as an
+        // error status instead.
         let client = Client::builder()
             .timeout(MCP_CALL_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(McpError::HttpClient)?;
         Self::with_client(base_url, client)
@@ -500,6 +508,11 @@ impl McpSession {
     }
 
     /// Lists connector tools, checking cancellation while the response is read.
+    ///
+    /// Tools whose names fall outside the provider grammar are omitted rather
+    /// than failing the listing: neither a model request nor
+    /// [`McpSession::call_tool`] could ever use them, and one odd upstream
+    /// tool must not take every other connector down with it.
     pub fn list_tools_with<C: Cancellation + ?Sized>(
         &self,
         cancellation: &C,
@@ -507,12 +520,12 @@ impl McpSession {
         let result = self.call_with(cancellation, "tools/list", None)?;
         let decoded: ToolsListResponse = serde_json::from_value(result)
             .map_err(|error| McpError::Protocol(format!("decode MCP tools/list: {error}")))?;
-        let tools = decoded.tools.unwrap_or_default();
-        for tool in &tools {
-            validate_gateway_tool(tool)
-                .map_err(|error| McpError::Protocol(format!("decode MCP tools/list: {error}")))?;
-        }
-        Ok(tools)
+        Ok(decoded
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tool| validate_gateway_tool(tool).is_ok())
+            .collect())
     }
 
     /// Calls a connector tool with a JSON object of arguments.
@@ -689,6 +702,15 @@ impl McpSession {
 /// schema, matching the original connector adapter's safe fallback.
 pub fn gateway_tool_to_agent_tool(session: McpSession, tool: GatewayTool) -> Result<agent::Tool> {
     validate_gateway_tool(&tool)?;
+    let schema_bytes = serde_json::to_vec(&tool.input_schema)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX);
+    if schema_bytes > MAX_INPUT_SCHEMA_BYTES {
+        return Err(McpError::InvalidInput(format!(
+            "MCP tool {} input schema exceeds {MAX_INPUT_SCHEMA_BYTES} bytes",
+            tool.name
+        )));
+    }
     let tool_name = tool.name;
     let description = {
         let description = tool.description.trim();
@@ -857,9 +879,12 @@ fn validate_tool_name(name: &str) -> Result<()> {
             "MCP tool name exceeds {MAX_TOOL_NAME_BYTES} bytes"
         )));
     }
-    if name.chars().any(char::is_control) {
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return Err(McpError::InvalidInput(
-            "MCP tool name must not contain control characters".to_owned(),
+            "MCP tool name must contain only ASCII letters, digits, '_' and '-'".to_owned(),
         ));
     }
     Ok(())
@@ -1040,21 +1065,42 @@ fn clip_utf8(value: &str, limit: usize) -> &str {
 }
 
 fn decode_json_rpc_response(payload: &[u8], expected_id: Option<u64>) -> Result<Value> {
-    let (decoded, diagnostic_payload) = match serde_json::from_slice::<Value>(payload) {
-        Ok(value) => (value, Cow::Borrowed(payload)),
-        Err(_) => {
-            let Some(sse_payload) = extract_sse_data(payload) else {
-                return Err(invalid_json_error(payload));
-            };
-            let decoded = serde_json::from_slice::<Value>(&sse_payload)
-                .map_err(|_| invalid_json_error(&sse_payload))?;
-            (decoded, Cow::Owned(sse_payload))
-        }
-    };
+    if let Ok(decoded) = serde_json::from_slice::<Value>(payload) {
+        return decode_json_rpc_message(&decoded, payload, expected_id);
+    }
 
+    let events = extract_sse_data(payload);
+    if events.is_empty() {
+        return Err(invalid_json_error(payload));
+    }
+    // A Streamable HTTP server may put its own notifications or requests on
+    // the response stream ahead of the reply, so the reply is whichever event
+    // carries this request's id rather than the first one.
+    for event in &events {
+        let decoded =
+            serde_json::from_slice::<Value>(event).map_err(|_| invalid_json_error(event))?;
+        let is_reply = match expected_id {
+            Some(expected_id) => decoded.get("id").and_then(Value::as_u64) == Some(expected_id),
+            None => true,
+        };
+        if is_reply {
+            return decode_json_rpc_message(&decoded, event, expected_id);
+        }
+    }
+    Err(McpError::Protocol(match expected_id {
+        Some(expected_id) => format!("MCP response id did not match request id {expected_id}"),
+        None => "MCP response had no JSON-RPC message".to_owned(),
+    }))
+}
+
+fn decode_json_rpc_message(
+    decoded: &Value,
+    diagnostic_payload: &[u8],
+    expected_id: Option<u64>,
+) -> Result<Value> {
     let object = decoded
         .as_object()
-        .ok_or_else(|| invalid_json_error(diagnostic_payload.as_ref()))?;
+        .ok_or_else(|| invalid_json_error(diagnostic_payload))?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(McpError::Protocol(
             "MCP response did not declare JSON-RPC 2.0".to_owned(),
@@ -1091,18 +1137,28 @@ fn decode_json_rpc_response(payload: &[u8], expected_id: Option<u64>) -> Result<
         .ok_or_else(|| McpError::Protocol("MCP response had neither result nor error".to_owned()))
 }
 
-/// Extracts the data payload of the first SSE event, accepting standard
-/// multi-line `data:` framing as well as the Go client's usual single line.
-fn extract_sse_data(payload: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(payload).ok()?;
-    let mut lines = Vec::new();
+/// Extracts the data payload of every SSE event in stream order, accepting
+/// standard multi-line `data:` framing as well as the Go client's usual
+/// single line. Events without data (comments, bare `event:` lines) are
+/// skipped.
+fn extract_sse_data(payload: &[u8]) -> Vec<Vec<u8>> {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
     let mut saw_data = false;
+    let mut finish_event = |lines: &mut Vec<&str>, saw_data: &mut bool| {
+        if *saw_data {
+            events.push(lines.join("\n").into_bytes());
+        }
+        lines.clear();
+        *saw_data = false;
+    };
     for raw_line in text.split('\n') {
         let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
         if line.is_empty() {
-            if saw_data {
-                break;
-            }
+            finish_event(&mut lines, &mut saw_data);
             continue;
         }
         let Some(data) = line.strip_prefix("data:") else {
@@ -1111,7 +1167,8 @@ fn extract_sse_data(payload: &[u8]) -> Option<Vec<u8>> {
         saw_data = true;
         lines.push(data.strip_prefix(' ').unwrap_or(data));
     }
-    saw_data.then(|| lines.join("\n").into_bytes())
+    finish_event(&mut lines, &mut saw_data);
+    events
 }
 
 #[derive(Serialize)]
@@ -1532,6 +1589,144 @@ mod tests {
                 &json!({"type": "object", "properties": {"x": {"type": "string"}}})
             ),
             json!({"type": "object", "properties": {"x": {"type": "string"}}})
+        );
+    }
+
+    #[test]
+    fn sse_reply_may_follow_server_notifications() {
+        let notification = json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info"}});
+        let reply = json!({"jsonrpc": "2.0", "id": 7, "result": {"ok": true}});
+        let stream = format!(
+            ": keepalive\nevent: message\ndata: {notification}\n\nevent: message\ndata: {reply}\n\n"
+        );
+        assert_eq!(
+            decode_json_rpc_response(stream.as_bytes(), Some(7)).expect("reply after notification"),
+            json!({"ok": true})
+        );
+
+        let only_notification = format!("event: message\ndata: {notification}\n\n");
+        let error = decode_json_rpc_response(only_notification.as_bytes(), Some(7))
+            .expect_err("a stream without the reply must not be mistaken for it");
+        assert!(
+            error.to_string().contains("did not match request id 7"),
+            "unexpected error: {error}"
+        );
+
+        // The same shape end to end: the gateway answers initialize with a
+        // notification event ahead of the actual reply.
+        let init_reply = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": MCP_PROTOCOL_VERSION}
+        });
+        let body = format!(
+            "event: message\ndata: {notification}\n\nevent: message\ndata: {init_reply}\n\n"
+        );
+        let (base_url, requests, worker) = test_server(vec![
+            response(200, &body, &[("Mcp-Session-Id", "session-sse")]),
+            response(202, "", &[]),
+        ]);
+        let session = McpSession::new(&base_url).expect("initialize through a noisy stream");
+        assert_eq!(session.session_id(), "session-sse");
+        for _ in 0..2 {
+            requests.recv().expect("captured request");
+        }
+        worker.join().expect("server worker");
+    }
+
+    #[test]
+    fn redirects_are_reported_not_followed() {
+        let victim = TcpListener::bind("127.0.0.1:0").expect("bind victim listener");
+        victim
+            .set_nonblocking(true)
+            .expect("nonblocking victim listener");
+        let victim_url = format!(
+            "http://{}/v1/mcp",
+            victim.local_addr().expect("victim address")
+        );
+        let (base_url, requests, worker) =
+            test_server(vec![response(307, "", &[("Location", &victim_url)])]);
+
+        let error = McpSession::new(&base_url).expect_err("redirect must not be followed");
+        assert!(
+            matches!(error, McpError::HttpStatus { status: 307, .. }),
+            "unexpected error: {error}"
+        );
+        requests.recv().expect("initialize request");
+        worker.join().expect("server worker");
+        assert!(
+            matches!(victim.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the redirect target must never see the session request"
+        );
+    }
+
+    #[test]
+    fn tool_names_follow_the_provider_grammar_and_schemas_are_bounded() {
+        assert!(validate_tool_name("github_list-repos1").is_ok());
+        assert!(validate_tool_name(&"a".repeat(MAX_TOOL_NAME_BYTES)).is_ok());
+        assert!(matches!(
+            validate_tool_name(&"a".repeat(MAX_TOOL_NAME_BYTES + 1)),
+            Err(McpError::InvalidInput(message)) if message.contains("exceeds")
+        ));
+        for name in ["github.list", "tab\tname", "ünïcode", "a b"] {
+            assert!(
+                matches!(
+                    validate_tool_name(name),
+                    Err(McpError::InvalidInput(message)) if message.contains("ASCII letters")
+                ),
+                "{name:?} must be rejected"
+            );
+        }
+
+        let (base_url, requests, worker) = test_server(vec![
+            rpc_response(
+                1,
+                json!({"protocolVersion": MCP_PROTOCOL_VERSION}),
+                false,
+                Some("session-789"),
+            ),
+            response(202, "", &[]),
+            rpc_response(
+                2,
+                json!({"tools": [
+                    {"name": "github_list_repos", "inputSchema": {"type": "object"}},
+                    {"name": "github.bad", "inputSchema": {"type": "object"}}
+                ]}),
+                false,
+                None,
+            ),
+        ]);
+        let session = McpSession::new(&base_url).expect("initialize session");
+        let tools = session.list_tools().expect("list tools");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["github_list_repos"],
+            "a name no provider accepts is omitted instead of failing the listing"
+        );
+        for _ in 0..3 {
+            requests.recv().expect("captured request");
+        }
+        worker.join().expect("server worker");
+
+        let oversized = json!({
+            "type": "object",
+            "properties": {"blob": {"description": "x".repeat(MAX_INPUT_SCHEMA_BYTES)}}
+        });
+        let error = gateway_tool_to_agent_tool(
+            session,
+            GatewayTool {
+                name: "github_huge".to_owned(),
+                description: String::new(),
+                input_schema: oversized,
+            },
+        )
+        .expect_err("an oversized schema must not reach the model");
+        assert!(
+            matches!(&error, McpError::InvalidInput(message) if message.contains("input schema exceeds")),
+            "unexpected error: {error}"
         );
     }
 }

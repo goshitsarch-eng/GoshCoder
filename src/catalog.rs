@@ -10,17 +10,17 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env,
     error::Error,
     ffi::OsStr,
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -28,14 +28,11 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::{
-    fd::AsRawFd,
-    raw::c_int,
-    unix::fs::{OpenOptionsExt, PermissionsExt},
-};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{aperture, config, llm, oauth, omniroute};
 
@@ -47,6 +44,20 @@ const MAX_AUTH_FILE_BYTES: usize = 10 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// How long a writer waits for another writer to release auth.json before
+/// failing with [`CatalogError::CredentialLockTimeout`]. The lock is only held
+/// across one bounded token refresh or a single write, so waiting this long
+/// means the holder is wedged, not busy.
+const AUTH_LOCK_WAIT: Duration = Duration::from_secs(60);
+const AUTH_LOCK_RETRY: Duration = Duration::from_millis(20);
+/// Budget for a refresh nobody asked for explicitly: provider enumeration and
+/// model resolution must not hang on a slow token endpoint.
+const INCIDENTAL_OAUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+/// A transient refresh failure (network, 5xx, timeout) is remembered briefly
+/// so picker rebuilds do not each spend the refresh budget again; an
+/// unauthorized failure is remembered until the stored credential changes.
+const TRANSIENT_OAUTH_FAILURE_TTL: Duration = Duration::from_secs(30);
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Marker returned for credentials that the wire implementation must discover
 /// itself (AWS profiles, IRSA, Google Application Default Credentials, etc.).
@@ -123,6 +134,11 @@ pub enum CatalogError {
     OAuthClientUnavailable,
     OAuthRefreshFailed {
         provider_id: String,
+        /// The provider rejected the refresh token; only a new login helps.
+        unauthorized: bool,
+    },
+    CredentialLockTimeout {
+        wait: Duration,
     },
 }
 
@@ -190,9 +206,24 @@ impl fmt::Display for CatalogError {
             Self::OAuthClientUnavailable => {
                 formatter.write_str("could not initialize the OAuth client")
             }
-            Self::OAuthRefreshFailed { provider_id } => write!(
+            Self::OAuthRefreshFailed {
+                provider_id,
+                unauthorized: true,
+            } => write!(
                 formatter,
-                "OAuth credential for {provider_id:?} could not be refreshed; run `goshcoder auth login {provider_id}`"
+                "OAuth credential for {provider_id:?} is no longer authorized; run `goshcoder auth login {provider_id}`"
+            ),
+            Self::OAuthRefreshFailed {
+                provider_id,
+                unauthorized: false,
+            } => write!(
+                formatter,
+                "OAuth credential for {provider_id:?} could not be refreshed right now; retry shortly or run `goshcoder auth login {provider_id}`"
+            ),
+            Self::CredentialLockTimeout { wait } => write!(
+                formatter,
+                "timed out after {}s waiting for another process to release auth.json",
+                wait.as_secs()
             ),
         }
     }
@@ -999,8 +1030,11 @@ fn credential_environment(
 fn credential_expiry(object: &Map<String, Value>) -> Result<i64, CatalogError> {
     match object.get("expires") {
         None | Some(Value::Null) => Ok(0),
+        // pi stores `Date.now()` arithmetic, which JSON may carry as a float
+        // such as `1.7e12`; the value is a millisecond timestamp either way.
         Some(Value::Number(value)) => value
             .as_i64()
+            .or_else(|| value.as_f64().map(|millis| millis as i64))
             .ok_or(CatalogError::InvalidCredentialField("expires")),
         Some(_) => Err(CatalogError::InvalidCredentialField("expires")),
     }
@@ -1015,8 +1049,27 @@ impl<'de> Deserialize<'de> for Credential {
         let kind = object
             .get("type")
             .and_then(Value::as_str)
-            .ok_or_else(|| D::Error::custom("credential field \"type\" has an invalid type"))?
-            .to_owned();
+            .map(CredentialKind::from_json_type)
+            .ok_or_else(|| D::Error::custom("credential field \"type\" has an invalid type"))?;
+        if let CredentialKind::Other(_) = kind {
+            // A newer producer's credential type gives the known field names
+            // meanings this build cannot interpret. Keeping everything except
+            // `type` verbatim means a read-modify-write of some other provider
+            // cannot strip this entry's tokens.
+            let extra = object
+                .into_iter()
+                .filter(|(name, _)| name != "type")
+                .collect();
+            return Ok(Self {
+                kind,
+                key: String::new(),
+                environment: BTreeMap::new(),
+                refresh: String::new(),
+                access: String::new(),
+                expires_at_ms: 0,
+                extra,
+            });
+        }
         let key = credential_string(&object, "key").map_err(D::Error::custom)?;
         let environment = credential_environment(&object).map_err(D::Error::custom)?;
         let refresh = credential_string(&object, "refresh").map_err(D::Error::custom)?;
@@ -1028,7 +1081,7 @@ impl<'de> Deserialize<'de> for Credential {
             .collect();
 
         Ok(Self {
-            kind: CredentialKind::from_json_type(&kind),
+            kind,
             key,
             environment,
             refresh,
@@ -1085,32 +1138,57 @@ enum CredentialBacking {
     File(PathBuf),
 }
 
+/// Identity of an auth.json snapshot: a re-read is skipped while the file's
+/// metadata still matches. Atomic replacement gives every write a new inode on
+/// Unix, so even a same-length rewrite inside one timestamp tick is noticed.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct AuthFileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+struct CachedAuthFile {
+    stamp: Option<AuthFileStamp>,
+    credentials: BTreeMap<String, Credential>,
+}
+
 /// In-memory or auth.json-backed credential storage.
 ///
-/// File writes use a sibling advisory lock on Unix, a same-directory private
-/// temporary file, `fsync`, and atomic rename. The final auth.json mode is
-/// forced to `0600` on Unix.
+/// Reads never wait on writers: a token refresh inside [`Self::modify`] can
+/// take seconds, and provider enumeration keeps working meanwhile. Writers are
+/// serialized in-process by `writer` and across processes by an OS lock on the
+/// sibling `auth.json.lock` file, both with one bounded wait. File writes use
+/// a same-directory private temporary file, `fsync`, and atomic rename; the
+/// final auth.json mode is forced to `0600` on Unix.
 pub struct CredentialStore {
     backing: CredentialBacking,
     memory: Mutex<BTreeMap<String, Credential>>,
+    writer: Mutex<()>,
+    cache: Mutex<Option<CachedAuthFile>>,
     environment: EnvironmentLookup,
+    lock_wait: Duration,
 }
 
 impl CredentialStore {
-    pub fn in_memory() -> Self {
+    fn with_backing(backing: CredentialBacking) -> Self {
         Self {
-            backing: CredentialBacking::Memory,
+            backing,
             memory: Mutex::new(BTreeMap::new()),
+            writer: Mutex::new(()),
+            cache: Mutex::new(None),
             environment: process_environment(),
+            lock_wait: AUTH_LOCK_WAIT,
         }
     }
 
+    pub fn in_memory() -> Self {
+        Self::with_backing(CredentialBacking::Memory)
+    }
+
     pub fn file(path: impl Into<PathBuf>) -> Self {
-        Self {
-            backing: CredentialBacking::File(path.into()),
-            memory: Mutex::new(BTreeMap::new()),
-            environment: process_environment(),
-        }
+        Self::with_backing(CredentialBacking::File(path.into()))
     }
 
     /// Uses the durable auth.json location defined by `src/config.rs`.
@@ -1126,6 +1204,13 @@ impl CredentialStore {
         self
     }
 
+    /// Bounds how long a write waits for another writer. Tests shrink it; the
+    /// default suits production because a live holder finishes quickly.
+    pub fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
+    }
+
     pub fn path(&self) -> Option<&Path> {
         match &self.backing {
             CredentialBacking::Memory => None,
@@ -1133,15 +1218,63 @@ impl CredentialStore {
         }
     }
 
+    /// Returns the current credentials; file stores serve them from the
+    /// metadata-validated cache.
+    fn load(&self) -> Result<BTreeMap<String, Credential>, CatalogError> {
+        match &self.backing {
+            CredentialBacking::Memory => Ok(lock_unpoisoned(&self.memory).clone()),
+            CredentialBacking::File(path) => self.load_cached_file(path),
+        }
+    }
+
+    /// Returns the current credentials straight from the backing store.
+    /// Writers use this under their locks: the cache is only as fresh as the
+    /// stat that validated it.
+    fn load_for_update(&self) -> Result<BTreeMap<String, Credential>, CatalogError> {
+        match &self.backing {
+            CredentialBacking::Memory => Ok(lock_unpoisoned(&self.memory).clone()),
+            CredentialBacking::File(path) => read_auth_file(path),
+        }
+    }
+
+    fn load_cached_file(&self, path: &Path) -> Result<BTreeMap<String, Credential>, CatalogError> {
+        let stamp = auth_file_stamp(path)?;
+        // Without a modification time two different contents can share a
+        // stamp, so such a file is simply never cached.
+        let cacheable = stamp.is_none_or(|stamp| stamp.modified.is_some());
+        if cacheable
+            && let Some(cached) = lock_unpoisoned(&self.cache).as_ref()
+            && cached.stamp == stamp
+        {
+            return Ok(cached.credentials.clone());
+        }
+        let credentials = read_auth_file(path)?;
+        if cacheable {
+            // The stamp predates the read, so a write landing between the two
+            // invalidates this entry on the next stat instead of hiding.
+            *lock_unpoisoned(&self.cache) = Some(CachedAuthFile {
+                stamp,
+                credentials: credentials.clone(),
+            });
+        }
+        Ok(credentials)
+    }
+
+    fn store(&self, credentials: BTreeMap<String, Credential>) -> Result<(), CatalogError> {
+        match &self.backing {
+            CredentialBacking::Memory => *lock_unpoisoned(&self.memory) = credentials,
+            CredentialBacking::File(path) => {
+                write_auth_file(path, &credentials)?;
+                *lock_unpoisoned(&self.cache) = None;
+            }
+        }
+        Ok(())
+    }
+
     /// Reads the persisted credential without resolving `$ENV` or `!command`
     /// API-key values.
     pub fn read_raw(&self, provider_id: &str) -> Result<Option<Credential>, CatalogError> {
-        let memory = lock_unpoisoned(&self.memory);
-        let credentials = match &self.backing {
-            CredentialBacking::Memory => memory.clone(),
-            CredentialBacking::File(path) => read_auth_file(path)?,
-        };
-        Ok(credentials.get(provider_id).cloned())
+        Ok(self.load()?.get(provider_id).cloned())
     }
 
     /// Reads a credential and resolves its API key with the store's configured
@@ -1170,12 +1303,8 @@ impl CredentialStore {
     /// Lists persisted credentials in provider-ID order without reading any
     /// secret field.
     pub fn list(&self) -> Result<Vec<CredentialInfo>, CatalogError> {
-        let memory = lock_unpoisoned(&self.memory);
-        let credentials = match &self.backing {
-            CredentialBacking::Memory => memory.clone(),
-            CredentialBacking::File(path) => read_auth_file(path)?,
-        };
-        Ok(credentials
+        Ok(self
+            .load()?
             .into_iter()
             .map(|(provider_id, credential)| CredentialInfo {
                 provider_id,
@@ -1187,6 +1316,9 @@ impl CredentialStore {
     /// Atomically replaces one credential. `None` from `update` preserves the
     /// current entry, matching the prior storage API; use [`Self::delete`] to
     /// remove it deliberately.
+    ///
+    /// `update` runs with both writer locks held, so a token refresh inside it
+    /// cannot race another process refreshing the same entry.
     pub fn modify<F>(
         &self,
         provider_id: &str,
@@ -1195,25 +1327,19 @@ impl CredentialStore {
     where
         F: FnOnce(Option<Credential>) -> Result<Option<Credential>, CatalogError>,
     {
-        let mut memory = lock_unpoisoned(&self.memory);
-        let _file_lock = match &self.backing {
-            CredentialBacking::Memory => None,
-            CredentialBacking::File(path) => Some(acquire_auth_file_lock(path)?),
-        };
-        let mut credentials = match &self.backing {
-            CredentialBacking::Memory => memory.clone(),
-            CredentialBacking::File(path) => read_auth_file(path)?,
-        };
+        let _writers = self.lock_writers()?;
+        let credentials = self.load_for_update()?;
         let current = credentials.get(provider_id).cloned();
         let Some(next) = update(current.clone())? else {
             return Ok(current);
         };
 
+        // `update` may have run a long token exchange. Serialize from a fresh
+        // read so a write that reached the file meanwhile (a foreign writer
+        // does not share this lock) is not rolled back for other providers.
+        let mut credentials = self.load_for_update()?;
         credentials.insert(provider_id.to_owned(), next.clone());
-        match &self.backing {
-            CredentialBacking::Memory => *memory = credentials,
-            CredentialBacking::File(path) => write_auth_file(path, &credentials)?,
-        }
+        self.store(credentials)?;
         Ok(Some(next))
     }
 
@@ -1230,27 +1356,71 @@ impl CredentialStore {
 
     /// Removes one credential and returns whether an entry was present.
     pub fn delete(&self, provider_id: &str) -> Result<bool, CatalogError> {
-        let mut memory = lock_unpoisoned(&self.memory);
-        let _file_lock = match &self.backing {
-            CredentialBacking::Memory => None,
-            CredentialBacking::File(path) => Some(acquire_auth_file_lock(path)?),
-        };
-        let mut credentials = match &self.backing {
-            CredentialBacking::Memory => memory.clone(),
-            CredentialBacking::File(path) => read_auth_file(path)?,
-        };
+        let _writers = self.lock_writers()?;
+        let mut credentials = self.load_for_update()?;
         let removed = credentials.remove(provider_id).is_some();
-        match &self.backing {
-            CredentialBacking::Memory => *memory = credentials,
-            CredentialBacking::File(path) => write_auth_file(path, &credentials)?,
-        }
+        self.store(credentials)?;
         Ok(removed)
     }
+
+    /// Takes the in-process writer lock and then the cross-process file lock
+    /// under one deadline, so a wedged holder fails this call instead of
+    /// blocking it forever. Readers take neither.
+    fn lock_writers(&self) -> Result<WriterGuard<'_>, CatalogError> {
+        let deadline = Instant::now() + self.lock_wait;
+        let writer = loop {
+            match self.writer.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(CatalogError::CredentialLockTimeout {
+                            wait: self.lock_wait,
+                        });
+                    }
+                    thread::sleep(AUTH_LOCK_RETRY);
+                }
+            }
+        };
+        let file = match &self.backing {
+            CredentialBacking::Memory => None,
+            CredentialBacking::File(path) => {
+                Some(acquire_auth_file_lock(path, deadline, self.lock_wait)?)
+            }
+        };
+        Ok(WriterGuard {
+            _file: file,
+            _writer: writer,
+        })
+    }
+}
+
+/// Both writer locks. Fields drop in declaration order, so the file lock is
+/// released before the in-process one.
+struct WriterGuard<'a> {
+    _file: Option<AuthFileLock>,
+    _writer: MutexGuard<'a, ()>,
 }
 
 impl Default for CredentialStore {
     fn default() -> Self {
         Self::in_memory()
+    }
+}
+
+fn auth_file_stamp(path: &Path) -> Result<Option<AuthFileStamp>, CatalogError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(AuthFileStamp {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CatalogError::Io {
+            operation: "read auth.json",
+            source,
+        }),
     }
 }
 
@@ -1277,10 +1447,12 @@ fn read_auth_file(path: &Path) -> Result<BTreeMap<String, Credential>, CatalogEr
     if bytes.len() > MAX_AUTH_FILE_BYTES {
         return Err(CatalogError::CredentialFileTooLarge);
     }
-    if bytes.is_empty() {
+    // Editors on Windows like to prepend a byte-order mark; pi strips it too.
+    let content = bytes.strip_prefix(UTF8_BOM).unwrap_or(&bytes);
+    if content.is_empty() {
         return Ok(BTreeMap::new());
     }
-    serde_json::from_slice(&bytes).map_err(|_| CatalogError::InvalidCredentialFile)
+    serde_json::from_slice(content).map_err(|_| CatalogError::InvalidCredentialFile)
 }
 
 fn auth_parent(path: &Path) -> &Path {
@@ -1401,43 +1573,34 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), CatalogError> {
     write_result
 }
 
-#[cfg(unix)]
-const LOCK_EX: c_int = 2;
-#[cfg(unix)]
-const LOCK_UN: c_int = 8;
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: c_int, operation: c_int) -> c_int;
-}
-
-#[cfg(unix)]
+/// An exclusive OS lock on the sibling `auth.json.lock` file, released on drop
+/// or when the process dies. The lock file itself is never removed: unlinking
+/// a locked file lets a waiter that opened the old inode and a newcomer that
+/// creates a fresh one both believe they hold the lock.
 struct AuthFileLock {
     file: File,
 }
 
-#[cfg(unix)]
 impl Drop for AuthFileLock {
     fn drop(&mut self) {
-        // Closing also releases flock, but unlock explicitly so a held file
+        // Closing also releases the lock, but unlock explicitly so a held file
         // descriptor never keeps a lock after this guard's logical lifetime.
-        unsafe {
-            let _ = flock(self.file.as_raw_fd(), LOCK_UN);
-        }
+        let _ = self.file.unlock();
     }
 }
 
-#[cfg(not(unix))]
-struct AuthFileLock;
-
-fn acquire_auth_file_lock(path: &Path) -> Result<AuthFileLock, CatalogError> {
+fn acquire_auth_file_lock(
+    path: &Path,
+    deadline: Instant,
+    wait: Duration,
+) -> Result<AuthFileLock, CatalogError> {
     let parent = ensure_auth_parent(path)?;
     let file_name = path.file_name().ok_or_else(|| {
         CatalogError::EmbeddedCatalog("auth.json path has no file name".to_owned())
     })?;
     let lock_path = parent.join(format!("{}.lock", file_name.to_string_lossy()));
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     options.mode(0o600);
     let file = options
@@ -1446,28 +1609,30 @@ fn acquire_auth_file_lock(path: &Path) -> Result<AuthFileLock, CatalogError> {
             operation: "open the auth.json lock",
             source,
         })?;
-
     #[cfg(unix)]
-    {
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            CatalogError::Io {
-                operation: "secure the auth.json lock",
-                source,
-            }
-        })?;
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
-            return Err(CatalogError::Io {
-                operation: "lock auth.json",
-                source: io::Error::last_os_error(),
-            });
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        CatalogError::Io {
+            operation: "secure the auth.json lock",
+            source,
         }
-        Ok(AuthFileLock { file })
-    }
+    })?;
 
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        Ok(AuthFileLock)
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AuthFileLock { file }),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(CatalogError::CredentialLockTimeout { wait });
+                }
+                thread::sleep(AUTH_LOCK_RETRY);
+            }
+            Err(TryLockError::Error(source)) => {
+                return Err(CatalogError::Io {
+                    operation: "lock auth.json",
+                    source,
+                });
+            }
+        }
     }
 }
 
@@ -1946,12 +2111,44 @@ pub struct Catalog {
     environment: EnvironmentLookup,
     file_exists: FileExists,
     oauth_client: Arc<oauth::OAuthClient>,
-    oauth_refresh_failures: Arc<Mutex<BTreeSet<String>>>,
+    oauth_refresh_failures: Arc<Mutex<BTreeMap<String, OAuthRefreshFailure>>>,
+    credential_warning: Arc<Mutex<Option<String>>>,
     dynamic_paths: DynamicPaths,
     /// The gateway-integration state layered over the embedded snapshot.
     /// Clones share it, so a sync performed through one handle is visible to
     /// every other handle on the next read.
     dynamic: Arc<Mutex<Option<Arc<DynamicLayer>>>>,
+}
+
+/// A remembered refresh failure. `fingerprint` ties it to the exact stored
+/// credential that failed, so a login completed by another process (or a
+/// rotation under a non-rotating refresh token) is honoured without a restart.
+struct OAuthRefreshFailure {
+    unauthorized: bool,
+    fingerprint: [u8; 32],
+    /// `None` for an unauthorized failure, which only a new credential fixes.
+    expires_at: Option<Instant>,
+}
+
+impl OAuthRefreshFailure {
+    fn applies_to(&self, fingerprint: &[u8; 32]) -> bool {
+        self.fingerprint == *fingerprint
+            && self
+                .expires_at
+                .is_none_or(|expires_at| Instant::now() < expires_at)
+    }
+}
+
+/// Hashes the fields a refresh depends on, so the failure cache can recognise
+/// the credential without holding a copy of its tokens.
+fn credential_fingerprint(credential: &Credential) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in [credential.refresh(), credential.access()] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hasher.update(credential.expires_at_ms().to_le_bytes());
+    hasher.finalize().into()
 }
 
 impl Catalog {
@@ -1995,7 +2192,8 @@ impl Catalog {
             environment,
             file_exists,
             oauth_client: Arc::new(oauth_client),
-            oauth_refresh_failures: Arc::new(Mutex::new(BTreeSet::new())),
+            oauth_refresh_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            credential_warning: Arc::new(Mutex::new(None)),
             dynamic_paths,
             dynamic: Arc::new(Mutex::new(None)),
         })
@@ -2060,8 +2258,22 @@ impl Catalog {
         layer
     }
 
+    /// Replaces the OAuth client used for stored-credential refreshes, so an
+    /// embedder or test can supply its own transport, clock, and endpoints.
+    pub fn with_oauth_client(mut self, oauth_client: Arc<oauth::OAuthClient>) -> Self {
+        self.oauth_client = oauth_client;
+        self
+    }
+
     pub fn credentials(&self) -> Option<&CredentialStore> {
         self.credentials.as_deref()
+    }
+
+    /// Explains a credential-file read that resolution had to skip. Resolution
+    /// degrades to ambient environment credentials in that case; a CLI can show
+    /// this so the user learns their auth.json was ignored rather than empty.
+    pub fn credential_store_warning(&self) -> Option<String> {
+        lock_unpoisoned(&self.credential_warning).clone()
     }
 
     /// Clears a cached OAuth-refresh failure after an interactive login
@@ -2250,9 +2462,9 @@ impl Catalog {
         {
             if definition.supports_oauth
                 && let Some(store) = &self.credentials
-                && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
+                && let Some(stored) = self.read_stored_credential(store, provider_id)
                 && matches!(stored.kind(), CredentialKind::OAuth)
-                && let Ok(Some(auth)) = self.resolve_stored_oauth(provider_id)
+                && let Ok(Some(auth)) = self.resolve_stored_oauth(provider_id, &stored)
             {
                 return Ok(Some(auth));
             }
@@ -2260,7 +2472,7 @@ impl Catalog {
         }
 
         if let Some(store) = &self.credentials
-            && let Some(stored) = store.read_with_environment(provider_id, &self.environment)?
+            && let Some(stored) = self.read_stored_credential(store, provider_id)
         {
             match stored.kind() {
                 CredentialKind::ApiKey => {
@@ -2276,7 +2488,7 @@ impl Catalog {
                 CredentialKind::OAuth => {
                     // An OAuth credential owns its provider. Do not silently
                     // fall back to an ambient API key if refresh fails.
-                    return self.resolve_stored_oauth(provider_id);
+                    return self.resolve_stored_oauth(provider_id, &stored);
                 }
                 CredentialKind::Other(_) => return Ok(None),
             }
@@ -2285,24 +2497,77 @@ impl Catalog {
         if definition.auth_kind == AuthKind::OAuthOnly {
             return Ok(None);
         }
-        Ok(self.build_api_key_auth(definition, None, ""))
+        let auth = self.build_api_key_auth(definition, None, "");
+        // A configured OmniRoute gateway needs no key: the upstream extension
+        // registers the provider with the public placeholder, so the models
+        // stay in the picker and requests carry that bearer value.
+        if auth.is_none() && provider_id == omniroute::OMNI_PROVIDER_ID && layer.omni.is_some() {
+            return Ok(Some(Auth::with_api_key(
+                omniroute::PUBLIC_API_KEY.to_owned(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                "OmniRoute public gateway",
+            )));
+        }
+        Ok(auth)
     }
 
-    fn resolve_stored_oauth(&self, provider_id: &str) -> Result<Option<Auth>, CatalogError> {
+    /// Reads a stored credential, degrading to ambient resolution when the
+    /// file cannot be read: an unreadable auth.json should cost the user its
+    /// stored entries, not every environment-configured provider as well.
+    fn read_stored_credential(
+        &self,
+        store: &CredentialStore,
+        provider_id: &str,
+    ) -> Option<Credential> {
+        match store.read_with_environment(provider_id, &self.environment) {
+            Ok(credential) => {
+                *lock_unpoisoned(&self.credential_warning) = None;
+                credential
+            }
+            Err(error) => {
+                *lock_unpoisoned(&self.credential_warning) = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    fn resolve_stored_oauth(
+        &self,
+        provider_id: &str,
+        stored: &Credential,
+    ) -> Result<Option<Auth>, CatalogError> {
         let Some(provider) = oauth::OAuthProviderId::parse(provider_id) else {
             return Ok(None);
         };
         let Some(store) = self.credentials.as_deref() else {
             return Ok(None);
         };
-        if lock_unpoisoned(&self.oauth_refresh_failures).contains(provider_id) {
-            return Err(CatalogError::OAuthRefreshFailed {
-                provider_id: provider_id.to_owned(),
-            });
+
+        let fingerprint = credential_fingerprint(stored);
+        if self.oauth_client.credential_needs_refresh(stored) {
+            let mut failures = lock_unpoisoned(&self.oauth_refresh_failures);
+            let remembered = failures
+                .get(provider_id)
+                .map(|failure| (failure.applies_to(&fingerprint), failure.unauthorized));
+            match remembered {
+                Some((true, unauthorized)) => {
+                    return Err(CatalogError::OAuthRefreshFailed {
+                        provider_id: provider_id.to_owned(),
+                        unauthorized,
+                    });
+                }
+                Some((false, _)) => {
+                    failures.remove(provider_id);
+                }
+                None => {}
+            }
         }
 
         let environment = oauth::CatalogEnvironment::new(Arc::clone(&self.environment));
-        let cancellation = oauth::CancellationToken::new();
+        // Nobody is waiting on this refresh interactively, so it gets a fixed
+        // budget rather than the transport's full retry allowance.
+        let cancellation = oauth::CancellationToken::with_timeout(INCIDENTAL_OAUTH_REFRESH_TIMEOUT);
         match self
             .oauth_client
             .resolve_stored_oauth(provider, store, &environment, &cancellation)
@@ -2320,10 +2585,20 @@ impl Catalog {
                 self.clear_oauth_refresh_failure(provider_id);
                 Ok(None)
             }
-            Err(_) => {
-                lock_unpoisoned(&self.oauth_refresh_failures).insert(provider_id.to_owned());
+            Err(error) => {
+                let unauthorized = error.is_unauthorized();
+                lock_unpoisoned(&self.oauth_refresh_failures).insert(
+                    provider_id.to_owned(),
+                    OAuthRefreshFailure {
+                        unauthorized,
+                        fingerprint,
+                        expires_at: (!unauthorized)
+                            .then(|| Instant::now() + TRANSIENT_OAUTH_FAILURE_TTL),
+                    },
+                );
                 Err(CatalogError::OAuthRefreshFailed {
                     provider_id: provider_id.to_owned(),
+                    unauthorized,
                 })
             }
         }
@@ -2473,14 +2748,27 @@ impl Catalog {
                 source,
             ));
         }
-        if environment_value(&self.environment, "AWS_ACCESS_KEY_ID").is_some()
-            && environment_value(&self.environment, "AWS_SECRET_ACCESS_KEY").is_some()
+        // pi's "aws-profile" login stores `{type: api_key, env: {AWS_PROFILE}}`
+        // with no key: the credential's env is an AWS source in its own right
+        // and travels with the auth so the wire layer sees the same profile.
+        let scoped = credential
+            .map(|credential| credential.environment().clone())
+            .unwrap_or_default();
+        let found = |name: &'static str| -> Option<&str> {
+            if scoped.get(name).is_some_and(|value| !value.is_empty()) {
+                Some(source)
+            } else {
+                environment_value(&self.environment, name).map(|_| name)
+            }
+        };
+        if let (Some(key_source), Some(_)) =
+            (found("AWS_ACCESS_KEY_ID"), found("AWS_SECRET_ACCESS_KEY"))
         {
             return Some(Auth::with_api_key(
                 AUTHENTICATED_SENTINEL.to_owned(),
+                scoped.clone(),
                 BTreeMap::new(),
-                BTreeMap::new(),
-                "AWS_ACCESS_KEY_ID",
+                key_source,
             ));
         }
         for environment_name in [
@@ -2490,12 +2778,12 @@ impl Catalog {
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
             "AWS_WEB_IDENTITY_TOKEN_FILE",
         ] {
-            if environment_value(&self.environment, environment_name).is_some() {
+            if let Some(found_source) = found(environment_name) {
                 return Some(Auth::with_api_key(
                     AUTHENTICATED_SENTINEL.to_owned(),
+                    scoped.clone(),
                     BTreeMap::new(),
-                    BTreeMap::new(),
-                    environment_name,
+                    found_source,
                 ));
             }
         }
@@ -2648,8 +2936,17 @@ impl Catalog {
             .collect()
     }
 
+    /// Reports whether the provider has a usable credential.
+    ///
+    /// A stored OAuth credential that cannot be refreshed counts as not
+    /// configured here; [`Self::resolve_auth`] still reports that failure for
+    /// the provider itself, so one dead login never hides every other provider.
     pub fn is_configured(&self, provider_id: &str) -> Result<bool, CatalogError> {
-        Ok(self.resolve_auth(provider_id)?.is_some())
+        match self.resolve_auth(provider_id) {
+            Ok(auth) => Ok(auth.is_some()),
+            Err(CatalogError::OAuthRefreshFailed { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns configured providers in lexical ID order.
@@ -2746,6 +3043,9 @@ pub struct DynamicPaths {
     /// keep further state there (the pi-compatible `mcp.json`).
     pub agent_dir: Option<PathBuf>,
     pub omniroute: Option<PathBuf>,
+    /// `OMNIROUTE_URL`: overrides the server in `omniroute.json`, and stands
+    /// in for the file when there is none, as in the upstream extension.
+    pub omniroute_url: Option<String>,
     pub aperture: Option<PathBuf>,
     pub aperture_cache: Option<PathBuf>,
 }
@@ -2761,23 +3061,32 @@ impl DynamicPaths {
         Self {
             agent_dir: Some(agent_dir.to_path_buf()),
             omniroute: Some(config::omni_route_path_in(agent_dir)),
+            omniroute_url: None,
             aperture: Some(config::aperture_path_in(agent_dir)),
             aperture_cache: Some(config::aperture_cache_path_in(agent_dir)),
         }
     }
 
+    /// Sets (or clears) the `OMNIROUTE_URL` override.
+    #[must_use]
+    pub fn with_omniroute_url(mut self, url: Option<String>) -> Self {
+        self.omniroute_url = url.filter(|url| !url.trim().is_empty());
+        self
+    }
+
     fn from_environment(environment: &EnvironmentLookup) -> Self {
+        let omniroute_url = environment_value(environment, omniroute::ENV_SERVER_URL);
         let override_dir = environment_value(environment, config::ENV_AGENT_DIR);
         let home = environment_value(environment, "HOME")
             .or_else(|| environment_value(environment, "USERPROFILE"));
         if override_dir.is_none() && home.is_none() {
-            return Self::disabled();
+            return Self::disabled().with_omniroute_url(omniroute_url);
         }
         let agent_dir = config::agent_dir_from(
             override_dir.as_deref().map(OsStr::new),
             home.as_deref().map(Path::new),
         );
-        Self::for_agent_dir(&agent_dir)
+        Self::for_agent_dir(&agent_dir).with_omniroute_url(omniroute_url)
     }
 
     fn fingerprint(&self) -> DynamicFingerprint {
@@ -2824,19 +3133,20 @@ fn build_dynamic_layer(
 ) -> DynamicLayer {
     // Unconfigured and malformed both leave the catalog untouched; the
     // `/omni` and `/aperture` commands surface malformed files explicitly.
-    let omni = paths
-        .omniroute
-        .as_deref()
-        .and_then(|path| omniroute::Config::load(path).ok())
-        .map(|config| GatewayModels {
-            base_url: config.api_base_url(),
-            models: config
-                .live_catalog()
-                .models
-                .iter()
-                .map(omni_live_model)
-                .collect(),
-        });
+    let omni = match (paths.omniroute.as_deref(), paths.omniroute_url.as_deref()) {
+        (Some(path), url) => omniroute::Config::load_effective(path, url).ok(),
+        (None, Some(url)) => omniroute::Config::new(url).ok(),
+        (None, None) => None,
+    }
+    .map(|config| GatewayModels {
+        base_url: config.api_base_url(),
+        models: config
+            .live_catalog()
+            .models
+            .iter()
+            .map(omni_live_model)
+            .collect(),
+    });
     let aperture = paths
         .aperture
         .as_deref()
@@ -2931,7 +3241,7 @@ mod tests {
     use serde_json::json;
     use std::{
         fs, process,
-        sync::{Arc, Mutex, atomic::AtomicU64},
+        sync::{Arc, Mutex, atomic::AtomicU64, mpsc},
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -3019,13 +3329,20 @@ mod tests {
 
         let omni = catalog.provider("omni").expect("omni provider");
         assert_eq!(omni.base_url, "http://127.0.0.1:20999/v1");
-        assert_eq!(
-            omni.models()
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            ["gpt-x", "chat-only"]
-        );
+        let ids = omni
+            .models()
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        let expected = omniroute::AUTO_MODELS
+            .iter()
+            .copied()
+            .chain(["gpt-x", "chat-only"])
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "routing aliases precede the synced models");
+        let auto = catalog.model("omni", "auto/coding").expect("routing alias");
+        assert!(auto.reasoning);
+        assert_eq!(auto.input, ["text", "image"]);
         let chat_only = catalog.model("omni", "chat-only").expect("dynamic lookup");
         assert_eq!(chat_only.api, omniroute::PROMPT_TOOLS_API);
         assert_eq!(chat_only.provider, "omni");
@@ -3044,6 +3361,90 @@ mod tests {
         // any explicit invalidation.
         write_omni_config(&agent_dir, &["gpt-x", "chat-only", "third-model"]);
         assert!(catalog.model("omni", "third-model").is_some());
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn a_configured_omni_gateway_needs_no_key() {
+        let agent_dir = test_directory("omni-public");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let unconfigured = gateway_catalog(&agent_dir, &[]);
+        assert!(
+            unconfigured
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .is_none(),
+            "without omniroute.json the provider stays unconfigured"
+        );
+
+        write_omni_config(&agent_dir, &["gpt-x"]);
+        let public = gateway_catalog(&agent_dir, &[]);
+        let auth = public
+            .resolve_auth("omni")
+            .expect("resolution succeeds")
+            .expect("a configured gateway resolves");
+        assert_eq!(auth.api_key(), Some(omniroute::PUBLIC_API_KEY));
+        let resolved = public.resolve_model("omni/gpt-x").expect("resolves");
+        assert_eq!(resolved.auth.api_key(), Some(omniroute::PUBLIC_API_KEY));
+
+        // A real key, from the environment or auth.json, still wins.
+        let keyed = gateway_catalog(&agent_dir, &[("OMNIROUTE_API_KEY", "secret")]);
+        assert_eq!(
+            keyed
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .and_then(|auth| auth.api_key().map(str::to_owned)),
+            Some("secret".to_owned())
+        );
+        fs::remove_dir_all(&agent_dir).ok();
+    }
+
+    #[test]
+    fn omniroute_url_overrides_the_file_and_stands_in_for_it() {
+        let agent_dir = test_directory("omni-env");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let environment = [
+            (
+                config::ENV_AGENT_DIR,
+                agent_dir.to_str().expect("utf-8 path"),
+            ),
+            (
+                omniroute::ENV_SERVER_URL,
+                "http://gateway.internal:20128/v1/",
+            ),
+        ];
+        let catalog = test_catalog(&environment);
+        assert_eq!(
+            catalog.dynamic_paths().omniroute_url.as_deref(),
+            Some("http://gateway.internal:20128/v1/")
+        );
+
+        // No file yet: the override alone configures the provider with the
+        // routing aliases, exactly like the extension with OMNIROUTE_URL set.
+        let omni = catalog.provider("omni").expect("omni provider");
+        assert_eq!(omni.base_url, "http://gateway.internal:20128/v1");
+        assert_eq!(omni.models().len(), omniroute::AUTO_MODELS.len());
+        assert!(
+            catalog
+                .resolve_auth("omni")
+                .expect("resolution succeeds")
+                .is_some()
+        );
+
+        // With a file, the models come from it but the server is overridden.
+        write_omni_config(&agent_dir, &["gpt-x"]);
+        let model = catalog.model("omni", "gpt-x").expect("synced model");
+        assert_eq!(model.base_url, "http://gateway.internal:20128/v1");
+
+        let without_home = test_catalog(&[(omniroute::ENV_SERVER_URL, "http://gw:1")]);
+        assert_eq!(
+            without_home
+                .provider("omni")
+                .expect("omni provider")
+                .base_url,
+            "http://gw:1/v1",
+            "the override works even when no agent directory can be derived"
+        );
         fs::remove_dir_all(&agent_dir).ok();
     }
 
@@ -3652,5 +4053,395 @@ mod tests {
             Err(CatalogError::UnknownModel { .. }) => {}
             _ => panic!("unknown qualified model should fail"),
         }
+    }
+
+    /// A token endpoint whose status the test flips between calls. It also
+    /// records the deadline each request arrived with.
+    struct ScriptedTransport {
+        status: Mutex<u16>,
+        calls: AtomicU64,
+        budgets: Mutex<Vec<Option<Duration>>>,
+    }
+
+    impl ScriptedTransport {
+        fn with_status(status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                status: Mutex::new(status),
+                calls: AtomicU64::new(0),
+                budgets: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl oauth::OAuthTransport for ScriptedTransport {
+        fn execute(
+            &self,
+            _: oauth::OAuthRequest,
+            cancellation: &oauth::CancellationToken,
+        ) -> oauth::Result<oauth::OAuthResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            lock_unpoisoned(&self.budgets).push(cancellation.remaining());
+            let status = *lock_unpoisoned(&self.status);
+            let body = if status == 200 {
+                br#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}"#
+                    .to_vec()
+            } else {
+                br#"{"error":"server_error"}"#.to_vec()
+            };
+            Ok(oauth::OAuthResponse { status, body })
+        }
+    }
+
+    fn scripted_catalog(
+        store: Arc<CredentialStore>,
+        transport: Arc<ScriptedTransport>,
+        values: &[(&str, &str)],
+    ) -> Catalog {
+        let client = oauth::OAuthClient::new(
+            transport,
+            Arc::new(oauth::SystemClock),
+            Arc::new(oauth::NoopBrowser),
+            oauth::OAuthEndpoints::default(),
+        );
+        Catalog::with_environment_and_file_exists(
+            Some(store),
+            test_environment(values),
+            Arc::new(|_| false),
+        )
+        .expect("catalog")
+        .with_oauth_client(Arc::new(client))
+    }
+
+    #[test]
+    fn oauth_refresh_failure_leaves_other_providers_configured() {
+        let store = Arc::new(CredentialStore::in_memory());
+        store
+            .put("anthropic", Credential::oauth("stale", "dead-refresh", 0))
+            .expect("store expired credential");
+        let transport = ScriptedTransport::with_status(401);
+        let catalog = scripted_catalog(
+            Arc::clone(&store),
+            Arc::clone(&transport),
+            &[("OPENAI_API_KEY", "openai-key")],
+        );
+
+        assert_eq!(
+            catalog
+                .configured_provider_ids()
+                .expect("one dead login does not fail enumeration"),
+            vec!["openai"]
+        );
+        match catalog.resolve_auth("anthropic") {
+            Err(CatalogError::OAuthRefreshFailed {
+                provider_id,
+                unauthorized: true,
+            }) => assert_eq!(provider_id, "anthropic"),
+            _ => panic!("a rejected refresh token is reported as unauthorized"),
+        }
+        assert_eq!(
+            transport.calls(),
+            1,
+            "an unauthorized failure is not retried"
+        );
+        assert!(
+            lock_unpoisoned(&transport.budgets)[0]
+                .is_some_and(|budget| budget <= INCIDENTAL_OAUTH_REFRESH_TIMEOUT),
+            "an incidental refresh carries a bounded deadline"
+        );
+
+        // A login completed elsewhere replaces the credential; the remembered
+        // failure belongs to the old one and must not mask the new login.
+        store
+            .put(
+                "anthropic",
+                Credential::oauth("relogin-access", "relogin-refresh", i64::MAX),
+            )
+            .expect("store fresh credential");
+        let auth = catalog
+            .resolve_auth("anthropic")
+            .expect("resolve")
+            .expect("fresh credential resolves");
+        assert_eq!(auth.api_key(), Some("relogin-access"));
+        assert_eq!(transport.calls(), 1);
+
+        // A transient failure is remembered only for a while.
+        *lock_unpoisoned(&transport.status) = 503;
+        store
+            .put("anthropic", Credential::oauth("stale", "flaky-refresh", 0))
+            .expect("store expiring credential");
+        match catalog.resolve_auth("anthropic") {
+            Err(CatalogError::OAuthRefreshFailed {
+                unauthorized: false,
+                ..
+            }) => {}
+            _ => panic!("a 5xx is reported as transient"),
+        }
+        assert_eq!(
+            catalog
+                .configured_provider_ids()
+                .expect("enumeration survives a transient failure"),
+            vec!["openai"]
+        );
+        assert_eq!(
+            transport.calls(),
+            2,
+            "a transient failure is not retried inside its TTL"
+        );
+        {
+            let mut failures = lock_unpoisoned(&catalog.oauth_refresh_failures);
+            let failure = failures
+                .get_mut("anthropic")
+                .expect("failure is remembered");
+            assert!(failure.expires_at.is_some(), "transient failures expire");
+            failure.expires_at = Some(Instant::now());
+        }
+        *lock_unpoisoned(&transport.status) = 200;
+        let auth = catalog
+            .resolve_auth("anthropic")
+            .expect("resolve")
+            .expect("refresh is retried once the TTL passes");
+        assert_eq!(auth.api_key(), Some("fresh-access"));
+        assert_eq!(transport.calls(), 3);
+        assert!(lock_unpoisoned(&catalog.oauth_refresh_failures).is_empty());
+    }
+
+    #[test]
+    fn credential_store_bounds_writer_waits_without_blocking_readers() {
+        let directory = test_directory("auth-lock");
+        fs::create_dir_all(&directory).expect("create temp directory");
+        let path = directory.join("auth.json");
+        let wait = Duration::from_millis(300);
+        let store = Arc::new(CredentialStore::file(&path).with_lock_wait(wait));
+        store
+            .put("openai", Credential::api_key("openai-key"))
+            .expect("seed credential");
+
+        let (entered_sender, entered) = mpsc::channel();
+        let (release_sender, release) = mpsc::channel::<()>();
+        let holder = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                store.modify("anthropic", move |_| {
+                    entered_sender.send(()).expect("signal entry");
+                    release.recv().expect("wait for release");
+                    Ok(Some(Credential::oauth("access", "refresh", 1)))
+                })
+            })
+        };
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("update closure runs");
+
+        // A reader is never queued behind a writer's token exchange.
+        let (read_sender, read) = mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                let _ = read_sender.send(store.read_raw("openai"));
+            });
+        }
+        let read = read
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read completes while the writer holds its locks")
+            .expect("read succeeds");
+        assert_eq!(
+            read.map(|credential| credential.key().to_owned())
+                .as_deref(),
+            Some("openai-key")
+        );
+
+        // A second writer in this process fails within its bound ...
+        let started = Instant::now();
+        match store.put("groq", Credential::api_key("groq-key")) {
+            Err(CatalogError::CredentialLockTimeout { .. }) => {}
+            _ => panic!("a held writer lock must time out rather than block"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // ... and so does one in another process, which shares only the lock file.
+        let sibling = CredentialStore::file(&path).with_lock_wait(wait);
+        match sibling.put("groq", Credential::api_key("groq-key")) {
+            Err(CatalogError::CredentialLockTimeout { .. }) => {}
+            _ => panic!("the OS lock must be held across the update closure"),
+        }
+
+        // A foreign writer that does not share the lock lands an entry while
+        // the closure runs; the eventual write must keep it.
+        let mut on_disk: Map<String, Value> =
+            serde_json::from_slice(&fs::read(&path).expect("read auth.json"))
+                .expect("parse auth.json");
+        on_disk.insert(
+            "foreign".to_owned(),
+            json!({"type": "api_key", "key": "foreign-key"}),
+        );
+        fs::write(&path, serde_json::to_vec(&on_disk).expect("serialize")).expect("foreign write");
+
+        release_sender.send(()).expect("release the holder");
+        holder
+            .join()
+            .expect("holder thread")
+            .expect("modify succeeds");
+        let listed: Vec<_> = store
+            .list()
+            .expect("list")
+            .into_iter()
+            .map(|credential| credential.provider_id)
+            .collect();
+        assert_eq!(listed, vec!["anthropic", "foreign", "openai"]);
+        sibling
+            .put("groq", Credential::api_key("groq-key"))
+            .expect("lock is released after modify");
+        fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    #[test]
+    fn stored_bedrock_profile_credential_configures_ambient_auth() {
+        let store = Arc::new(CredentialStore::in_memory());
+        let mut credential = Credential::api_key("");
+        credential.set_environment("AWS_PROFILE", "work");
+        store
+            .put("amazon-bedrock", credential)
+            .expect("store profile credential");
+        let catalog = Catalog::with_environment_and_file_exists(
+            Some(store),
+            test_environment(&[]),
+            Arc::new(|_| false),
+        )
+        .expect("catalog");
+        let auth = catalog
+            .resolve_auth("amazon-bedrock")
+            .expect("resolve")
+            .expect("a stored profile configures Bedrock without a key");
+        assert!(auth.is_ambient());
+        assert_eq!(auth.source(), "stored credential");
+        assert_eq!(
+            auth.environment().get("AWS_PROFILE").map(String::as_str),
+            Some("work")
+        );
+        assert_eq!(
+            catalog.configured_provider_ids().expect("configured"),
+            vec!["amazon-bedrock"]
+        );
+    }
+
+    #[test]
+    fn auth_file_tolerates_bom_and_float_expiry_and_degrades_when_unreadable() {
+        let directory = test_directory("auth-tolerant");
+        fs::create_dir_all(&directory).expect("create temp directory");
+        let path = directory.join("auth.json");
+        let mut content = UTF8_BOM.to_vec();
+        content.extend_from_slice(
+            br#"{"anthropic":{"type":"oauth","refresh":"r","access":"a","expires":1.7e12}}"#,
+        );
+        fs::write(&path, content).expect("write auth.json");
+        let store = CredentialStore::file(&path);
+        let credential = store
+            .read_raw("anthropic")
+            .expect("byte-order mark is stripped")
+            .expect("credential is present");
+        assert_eq!(credential.expires_at_ms(), 1_700_000_000_000);
+
+        fs::write(&path, b"{not json").expect("corrupt auth.json");
+        let catalog = Catalog::with_environment_and_file_exists(
+            Some(Arc::new(CredentialStore::file(&path))),
+            test_environment(&[("OPENAI_API_KEY", "openai-key")]),
+            Arc::new(|_| false),
+        )
+        .expect("catalog");
+        assert_eq!(
+            catalog
+                .configured_provider_ids()
+                .expect("an unreadable auth.json degrades to ambient credentials"),
+            vec!["openai"]
+        );
+        assert!(
+            catalog
+                .credential_store_warning()
+                .is_some_and(|warning| warning.contains("auth.json"))
+        );
+        assert!(
+            store.list().is_err(),
+            "explicit listing still reports the parse failure"
+        );
+        fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    #[test]
+    fn unknown_credential_types_round_trip_verbatim() {
+        let directory = test_directory("auth-unknown");
+        fs::create_dir_all(&directory).expect("create temp directory");
+        let path = directory.join("auth.json");
+        let future = json!({
+            "type": "future-kind",
+            "refresh": "r",
+            "access": "a",
+            "expires": 1.5,
+            "key": 7,
+            "nested": {"x": true}
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"future": future})).expect("serialize"),
+        )
+        .expect("write auth.json");
+        let store = CredentialStore::file(&path);
+        store
+            .put("openai", Credential::api_key("openai-key"))
+            .expect("write another provider");
+        let on_disk: Value = serde_json::from_slice(&fs::read(&path).expect("read auth.json"))
+            .expect("parse auth.json");
+        assert_eq!(on_disk["future"], future);
+        assert_eq!(
+            store
+                .read_raw("future")
+                .expect("read")
+                .expect("present")
+                .kind(),
+            &CredentialKind::Other("future-kind".to_owned())
+        );
+        fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    #[test]
+    fn file_store_cache_observes_external_rewrites() {
+        let directory = test_directory("auth-cache");
+        fs::create_dir_all(&directory).expect("create temp directory");
+        let path = directory.join("auth.json");
+        let store = CredentialStore::file(&path);
+        let key = |store: &CredentialStore| {
+            store
+                .read_raw("openai")
+                .expect("read")
+                .expect("present")
+                .key()
+                .to_owned()
+        };
+        fs::write(&path, br#"{"openai":{"type":"api_key","key":"aaaa"}}"#).expect("write");
+        assert_eq!(key(&store), "aaaa");
+        assert!(
+            lock_unpoisoned(&store.cache).is_some(),
+            "file reads are cached"
+        );
+        thread::sleep(Duration::from_millis(20));
+        // Same length and inode: only the timestamp distinguishes this rewrite.
+        fs::write(&path, br#"{"openai":{"type":"api_key","key":"bbbb"}}"#).expect("rewrite");
+        assert_eq!(key(&store), "bbbb");
+        fs::write(
+            &path,
+            br#"{"openai":{"type":"api_key","key":"longer-key"}}"#,
+        )
+        .expect("rewrite");
+        assert_eq!(key(&store), "longer-key");
+        fs::remove_file(&path).expect("remove auth.json");
+        assert!(
+            store
+                .read_raw("openai")
+                .expect("a missing file reads as empty")
+                .is_none()
+        );
+        fs::remove_dir_all(directory).expect("remove temp directory");
     }
 }

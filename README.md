@@ -118,6 +118,8 @@ goshcoder chat -resume
 goshcoder sessions list
 goshcoder sessions show <id>
 goshcoder sessions export <id> --md notes.md
+goshcoder sessions export <id> transcript.html   # self-contained page, no scripts
+goshcoder sessions share <id> --yes              # secret GitHub gist through gh
 
 # Keep a prompt you refined, and carry your collection between machines
 goshcoder prompts list
@@ -246,26 +248,38 @@ is recorded in [`NOTICE`](NOTICE).
   The package's `fetch_content`, `get_search_content`, `source_check`, browser
   curator, video/PDF handling, and providers not listed above are not ported.
 - [`omniroute-agent-extension`](https://github.com/md-riaz/omniroute-agent-extension)
-  by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation, written against
-  the package when it was named `omniroute-pi-ext-integration`): `/omni
-  setup` validates and stores a local or remote gateway, `/omni sync` imports
-  `/v1/models` into GoshCoder's live `/model`/Ctrl+P picker, `/omni status`
-  checks health, and `/omni dashboard` reports the management URL. Synchronized
-  context, output, reasoning, vision, and native-tool metadata are retained.
-  Web/chat-only models use the package version 2.0.1 buffered `<tool_call>`
-  prompt adapter and are converted back into normal agent tool events. Config
-  is in `omniroute.json`; its API key stays independently in `auth.json` or
-  `OMNIROUTE_API_KEY`.
+  by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation of the current
+  `shared.ts` extension core): `/omni setup` validates a local or remote
+  gateway, stores it, and imports `/v1/models`; `/omni sync` re-imports them
+  into GoshCoder's live `/model`/Ctrl+P picker; `/omni status` probes health
+  (10 s, two attempts, like the extension); `/omni models [search]` browses
+  the gateway's list grouped by vendor; `/omni test <model>` smoke-tests
+  `/v1/chat/completions`; `/omni dashboard` and `/omni config` report the
+  management URL and the effective settings. The routing aliases (`auto`,
+  `auto/coding`, `auto/fast`, `auto/cheap`, `auto/offline`, `auto/smart`,
+  `auto/lkgp`) always precede the synchronized models, whose context, output,
+  reasoning, and vision metadata are retained. Every model uses native
+  tool calling, as upstream does; setting `toolCalling: false` on a model in
+  `omniroute.json` opts it into the buffered `<tool_call>` prompt adapter
+  (package version 2.0.1), whose calls are converted back into normal agent
+  tool events. A configured gateway needs no key: requests then carry the
+  extension's `omniroute-public` placeholder. Config is in `omniroute.json`;
+  `OMNIROUTE_URL` overrides (or stands in for) it and the API key stays
+  independently in `auth.json` or `OMNIROUTE_API_KEY`. Not ported: the
+  `/omni log` connection log, `OMNIROUTE_PROVIDER_NAME` (the provider is
+  always `omni`), and the `omniroute_status`/`omniroute_sync` agent tools.
 - [`@narumitw/pi-btw`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw)
   by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
   context-aware side thread without adding the question or answer to the main
   transcript. The fullscreen side UI supports follow-ups, queued Steering,
-  in-memory resume, independent model/thinking settings in `pi-btw.json`,
+  resume, independent model/thinking settings in `pi-btw.json`,
   Shift+Tab thinking changes, scrolling, cancellation, and Ctrl+R to bring the
   latest Q&A into the editable main composer. GoshCoder requires the main agent
   to be idle before opening BTW rather than rendering both agents concurrently.
   `/btw` lists retained threads;
-  `/btw resume <id> <question>` resumes one. The original's exact character/
+  `/btw resume <id> <question>` resumes one. Unlike the original, threads are
+  saved with the session (as `goshcoder.btw` custom entries, the newest 50)
+  and come back with `-continue` or `/resume`. The original's exact character/
   line range selector and nested bring-preview menus are not ported; native
   line mode offers deterministic `latest`, `all`, and `from:N` export instead.
 - [`@tmustier/pi-ralph-wiggum`](https://github.com/tmustier/pi-extensions) by Thomas
@@ -283,7 +297,12 @@ is recorded in [`NOTICE`](NOTICE).
   themes, planning write gates, persisted phase state, checklist progress,
   `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
   begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
-  local git review needs only `git`.
+  local git review needs only `git`. Unlike the original, which keeps the
+  phase only in the session, the phase and checklist also live in a
+  per-workspace file under `~/.goshcoder/agent/planner/`, so `-no-session`
+  runs keep it and every window on one repository shares one plan mode
+  (another window's change is adopted before the next turn); the session
+  entry remains as the fallback for `-continue`.
 - [`@aliou/pi-ts-aperture`](https://github.com/aliou/pi-ts-aperture) by Aliou
   Diallo — **Aperture (Tailscale)** (native adaptation of version 0.14.1):
   route LLM providers and connector tools through
@@ -447,17 +466,11 @@ rerun the gate before releases.
 
 ## Known gaps
 
-- Planner state belongs to a session rather than to a workspace, so
-  `-no-session` and a `run` without `-continue` do not persist it. Two windows
-  in one repository now have independent plan modes; `-continue` restores the
-  phase along with the transcript.
-- HTML export and `/share` are not implemented, and are not planned. pi's HTML
-  export inlines roughly 165 KB of vendored JavaScript into every output file;
-  `sessions export --md` writes Markdown instead. `/share` would mean sending a
-  file that by construction contains everything the agent read to a third-party
-  host.
-- BTW side threads are still memory-only. Closing a window discards them even
-  though the main conversation is saved.
+The gaps earlier releases listed here are closed: planner state is
+workspace-scoped, BTW threads are saved with the session, and sessions export
+to HTML and share as gists. What remains unported is pi's TypeScript plugin
+host and package manager, custom `models.json` loading, LSP, and MCP
+management; see **Deviations from pi** for the details and the reasoning.
 
 ## Deviations from pi
 
@@ -496,8 +509,17 @@ Documented at the top of each ported file. The notable ones:
   the entry tree, resume, branching, fork/clone, labels, and JSONL/Markdown
   export and import. pi's older v1 and v2 files are read and migrated in memory;
   they are never rewritten in place, so continuing one forks it into a v3 file.
-  Pi's HTML export/share, TypeScript plugin host, packages, custom `models.json`
-  loading, LSP, and MCP management are not implemented. See **Known gaps**.
+  `/export` and `sessions export` write JSONL, Markdown, or HTML by output
+  extension; the HTML page is self-contained and script-free (pi's inlines
+  about 165 KB of vendored JavaScript), renders Markdown, thinking, and
+  collapsible tool cards, and its policy blocks every network load, so a
+  transcript that quotes hostile content stays inert. `/share` (and `sessions
+  share --yes`) uploads that page as a secret gist through the GitHub CLI, as
+  pi does, but only after an explicit confirmation that spells out what
+  leaves the machine; `GOSHCODER_SHARE_VIEWER_URL` names a viewer that renders
+  a gist by id, like pi's `PI_SHARE_VIEWER_URL`. Pi's TypeScript plugin host,
+  packages, custom `models.json` loading, LSP, and MCP management are not
+  implemented.
 
   Two deliberate differences inside the format. GoshCoder takes an exclusive
   claim on a session file, which pi does not: two processes appending to one

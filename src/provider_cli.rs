@@ -12,7 +12,7 @@ use crossterm::{
 };
 
 use crate::{
-    catalog::{Catalog, Credential, CredentialStore, Provider},
+    catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
     config, oauth,
 };
 
@@ -20,8 +20,8 @@ use crate::{
 pub fn providers_command() -> Result<(), Box<dyn Error>> {
     let catalog = Catalog::with_default_credentials()?;
     for provider in catalog.providers() {
-        let (status, detail) = match catalog.resolve_auth(&provider.id)? {
-            Some(authentication) => {
+        let (status, detail) = match catalog.resolve_auth(&provider.id) {
+            Ok(Some(authentication)) => {
                 let ambient = if authentication.is_ambient() {
                     " (ambient)"
                 } else {
@@ -29,12 +29,19 @@ pub fn providers_command() -> Result<(), Box<dyn Error>> {
                 };
                 ("✓", format!("{}{}", authentication.source(), ambient))
             }
-            None => ("-", provider_setup_hint(&provider)),
+            Ok(None) => ("-", provider_setup_hint(&provider)),
+            // One dead OAuth login is that provider's problem, not a reason to
+            // abandon the listing for every other provider.
+            Err(error @ CatalogError::OAuthRefreshFailed { .. }) => ("!", error.to_string()),
+            Err(error) => return Err(error.into()),
         };
         println!(
             "{status} {:<24} {:<22} {detail}",
             provider.id, provider.name
         );
+    }
+    if let Some(warning) = catalog.credential_store_warning() {
+        eprintln!("warning: {warning}; stored credentials were ignored");
     }
     Ok(())
 }

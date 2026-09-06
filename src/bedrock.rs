@@ -10,6 +10,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
+    ffi::OsString,
     fmt, fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -53,6 +54,21 @@ pub const BEDROCK_DATA_RETENTION_DOCS_URL: &str =
     "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html";
 /// The Anthropic beta identifier needed for non-adaptive interleaved thinking.
 pub const ANTHROPIC_INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+/// pi's stand-in text for reasoning a provider returned only in encrypted form.
+pub const REDACTED_THINKING_PLACEHOLDER: &str = "[Reasoning redacted]";
+/// The catalog's marker that ambient credentials exist. It is never a real
+/// bearer token, so it must not take a token's place in the precedence chain.
+const AUTHENTICATED_SENTINEL: &str = "<authenticated>";
+/// pi's human-readable prefixes for Bedrock's modeled exceptions. The wire
+/// header spells them as camelCase union members (`throttlingException`)
+/// while the SDK class names pi matches are PascalCase, so lookups ignore case.
+const BEDROCK_EXCEPTION_PREFIXES: [(&str, &str); 5] = [
+    ("InternalServerException", "Internal server error"),
+    ("ModelStreamErrorException", "Model stream error"),
+    ("ValidationException", "Validation error"),
+    ("ThrottlingException", "Throttling error"),
+    ("ServiceUnavailableException", "Service unavailable"),
+];
 
 /// Compatibility fields supplied by a Bedrock model catalog entry.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -824,6 +840,15 @@ pub fn provider_env_value(environment: &BTreeMap<String, String>, name: &str) ->
 
 /// Selects the AWS profile that should take precedence over ambient keys.
 pub fn resolve_bedrock_profile(options: &BedrockOptions) -> Option<String> {
+    resolve_bedrock_profile_with(options, |name| env::var(name).ok())
+}
+
+/// Profile precedence with the process environment injected, so the ambient
+/// rules can be exercised without mutating this process's environment.
+fn resolve_bedrock_profile_with(
+    options: &BedrockOptions,
+    ambient: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     if let Some(profile) = options
         .profile
         .as_deref()
@@ -838,20 +863,21 @@ pub fn resolve_bedrock_profile(options: &BedrockOptions) -> Option<String> {
     {
         return Some(profile.clone());
     }
-    if options
-        .environment
-        .get("AWS_ACCESS_KEY_ID")
-        .is_some_and(|value| !value.is_empty())
-        && options
+    // pi signs with a static key pair whenever one is present, scoped or
+    // ambient, unless a profile was explicitly configured. An AWS_PROFILE
+    // exported for some unrelated project must therefore not hijack ambient
+    // keys any more than it may hijack scoped ones.
+    let has_value = |name: &str| {
+        options
             .environment
-            .get("AWS_SECRET_ACCESS_KEY")
+            .get(name)
             .is_some_and(|value| !value.is_empty())
-    {
+            || ambient(name).is_some_and(|value| !value.is_empty())
+    };
+    if has_value("AWS_ACCESS_KEY_ID") && has_value("AWS_SECRET_ACCESS_KEY") {
         return None;
     }
-    env::var("AWS_PROFILE")
-        .ok()
-        .filter(|profile| !profile.is_empty())
+    ambient("AWS_PROFILE").filter(|profile| !profile.is_empty())
 }
 
 fn shared_credentials_path(environment: &BTreeMap<String, String>) -> Option<PathBuf> {
@@ -887,7 +913,16 @@ fn shared_config_path(environment: &BTreeMap<String, String>) -> Option<PathBuf>
 }
 
 fn home_directory() -> Option<PathBuf> {
-    env::var_os("HOME").map(PathBuf::from)
+    home_directory_from(env::var_os)
+}
+
+/// The AWS SDKs read `HOME` first and fall back to Windows' `USERPROFILE`, so
+/// the shared credential files still resolve on a machine without `HOME`.
+fn home_directory_from(lookup: impl Fn(&'static str) -> Option<OsString>) -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Reads one AWS INI section. Keys are normalized to ASCII lowercase.
@@ -1226,7 +1261,10 @@ fn hex_encode(data: &[u8]) -> String {
 /// Resolves a Bedrock endpoint and signing region with the same precedence as
 /// the Go protocol: ARN region, explicit/configured region, standard endpoint,
 /// profile, then `us-east-1`.
-pub fn resolve_bedrock_target(model: &llm::Model, options: &BedrockOptions) -> BedrockTarget {
+pub fn resolve_bedrock_target(
+    model: &llm::Model,
+    options: &BedrockOptions,
+) -> Result<BedrockTarget, BedrockError> {
     let profile = resolve_bedrock_profile(options);
     let configured_region = configured_bedrock_region(options);
     let endpoint_region = standard_bedrock_endpoint_region(&model.base_url);
@@ -1249,12 +1287,29 @@ pub fn resolve_bedrock_target(model: &llm::Model, options: &BedrockOptions) -> B
             }
         });
 
+    // The region becomes a host label and the SigV4 credential scope, so a
+    // configured value such as `evil.example.com/#` must be refused before it
+    // can steer the request anywhere else. The AWS SDK behind pi rejects it too.
+    if !is_valid_bedrock_region(&region) {
+        return Err(BedrockError::Message(format!(
+            "invalid AWS region {region:?}: expected lowercase letters, digits, and hyphens"
+        )));
+    }
+
     let endpoint = if use_explicit_endpoint && !model.base_url.is_empty() {
         model.base_url.trim_end_matches('/').to_owned()
     } else {
         format!("https://bedrock-runtime.{region}.amazonaws.com")
     };
-    BedrockTarget { region, endpoint }
+    Ok(BedrockTarget { region, endpoint })
+}
+
+/// Returns whether a region is a plain DNS label as AWS spells them.
+pub fn is_valid_bedrock_region(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn configured_bedrock_region(options: &BedrockOptions) -> String {
@@ -1284,11 +1339,7 @@ pub fn standard_bedrock_endpoint_region(base_url: &str) -> Option<String> {
     let region = prefix
         .strip_suffix(".amazonaws.com")
         .or_else(|| prefix.strip_suffix(".amazonaws.com.cn"))?;
-    (!region.is_empty()
-        && region
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
-    .then_some(region.to_owned())
+    is_valid_bedrock_region(region).then(|| region.to_owned())
 }
 
 fn arn_bedrock_region(model_id: &str) -> Option<String> {
@@ -1309,10 +1360,7 @@ fn arn_bedrock_region(model_id: &str) -> Option<String> {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         || *service != "bedrock"
-        || region.is_empty()
-        || !region
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !is_valid_bedrock_region(region)
     {
         return None;
     }
@@ -1598,6 +1646,22 @@ fn convert_bedrock_messages(
                             }));
                         }
                         llm::ContentBlock::Thinking(thinking) => {
+                            if thinking.redacted {
+                                // Encrypted reasoning is opaque: replay the stored
+                                // payload as `redactedContent` instead of lowering
+                                // the placeholder text to reasoning the model never
+                                // produced. A payload that is not base64 (a hand-
+                                // edited session) drops the block rather than
+                                // failing the whole request, as pi does.
+                                if let Some(payload) =
+                                    normalized_redacted_content(&thinking.thinking_signature)
+                                {
+                                    content.push(json!({
+                                        "reasoningContent": {"redactedContent": payload}
+                                    }));
+                                }
+                                continue;
+                            }
                             let thought = sanitize_surrogates(&thinking.thinking);
                             if thought.trim().is_empty() {
                                 continue;
@@ -1906,6 +1970,22 @@ fn bedrock_image_block(mime_type: &str, data: &str) -> Result<Value, BedrockErro
         .decode(normalized)
         .map_err(|error| BedrockError::Message(format!("invalid base64 image data: {error}")))?;
     Ok(json!({"image": {"format": format, "source": {"bytes": data}}}))
+}
+
+/// Re-encodes a persisted redacted payload as the canonical base64 Bedrock
+/// expects on the wire, or `None` when it is empty or not base64 at all.
+fn normalized_redacted_content(signature: &str) -> Option<String> {
+    // Sessions written by other tools may wrap the payload; Go's decoder
+    // tolerated line breaks for images, so do the same here.
+    let normalized = signature
+        .bytes()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+        .collect::<Vec<_>>();
+    STANDARD
+        .decode(normalized)
+        .ok()
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| STANDARD.encode(bytes))
 }
 
 fn bedrock_tool_result_content(content: &[llm::ContentBlock]) -> Result<Vec<Value>, BedrockError> {
@@ -2262,7 +2342,10 @@ struct BedrockStreamer {
     context: llm::Context,
     options: BedrockOptions,
     event_stream: stream::AssistantMessageEventStream,
-    output: llm::AssistantMessage,
+    /// Shared with every published snapshot. `Arc::make_mut` copies only while
+    /// a consumer still holds the previous snapshot, so a delta no longer
+    /// deep-copies the whole message on every event.
+    output: Arc<llm::AssistantMessage>,
 }
 
 impl BedrockStreamer {
@@ -2285,22 +2368,23 @@ impl BedrockStreamer {
             context,
             options,
             event_stream,
-            output,
+            output: Arc::new(output),
         }
     }
 
     fn run(mut self) {
         if let Err(error) = self.stream_once() {
-            self.output.stop_reason =
-                if self.is_cancelled() || matches!(error, BedrockError::Aborted) {
-                    stream::STOP_ABORTED.to_owned()
-                } else {
-                    stream::STOP_ERROR.to_owned()
-                };
-            self.output.error_message = format_bedrock_stream_error(&error);
+            let stop_reason = if self.is_cancelled() || matches!(error, BedrockError::Aborted) {
+                stream::STOP_ABORTED.to_owned()
+            } else {
+                stream::STOP_ERROR.to_owned()
+            };
+            let output = Arc::make_mut(&mut self.output);
+            output.stop_reason = stop_reason.clone();
+            output.error_message = format_bedrock_stream_error(&error);
             let _ = self.event_stream.push(stream::AssistantMessageEvent::error(
-                self.output.stop_reason.clone(),
-                Arc::new(self.output.clone()),
+                stop_reason,
+                Arc::clone(&self.output),
             ));
             self.event_stream.end();
         }
@@ -2348,7 +2432,7 @@ impl BedrockStreamer {
         self.event_stream
             .push(stream::AssistantMessageEvent::done(
                 self.output.stop_reason.clone(),
-                Arc::new(self.output.clone()),
+                Arc::clone(&self.output),
             ))
             .map_err(|error| BedrockError::Message(error.to_string()))?;
         self.event_stream.end();
@@ -2356,13 +2440,17 @@ impl BedrockStreamer {
     }
 
     fn retry_request(&self, params: &Map<String, Value>) -> Result<Response, BedrockError> {
-        let mut builder = Client::builder();
-        if let Some(timeout) = self.options.timeout.filter(|timeout| !timeout.is_zero()) {
-            builder = builder.timeout(timeout);
-        }
-        let client = builder.build().map_err(|error| {
-            BedrockError::Message(format!("build Bedrock HTTP client: {error}"))
-        })?;
+        // reqwest bounds a whole request at 30 seconds unless told otherwise,
+        // which would cut off any long Converse stream; pi and Go only bound
+        // the request when the caller asks. Redirects are refused because a
+        // signed request or bearer token must never be replayed elsewhere.
+        let client = Client::builder()
+            .timeout(bedrock_http_timeout(&self.options))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                BedrockError::Message(format!("build Bedrock HTTP client: {error}"))
+            })?;
         let mut retries_remaining = self.options.max_retries;
         loop {
             self.check_cancelled()?;
@@ -2472,8 +2560,21 @@ impl BedrockStreamer {
     }
 
     fn consume_stream<R: Read>(&mut self, body: R) -> Result<(), BedrockError> {
-        let mut reader = EventStreamReader::new(body);
         let mut blocks = Vec::<BedrockBlock>::new();
+        let result = self.consume_messages(EventStreamReader::new(body), &mut blocks);
+        // A stream can settle, or fail, without stopping every block, so the
+        // buffered encrypted reasoning is encoded on every exit path like pi.
+        for block in &mut blocks {
+            self.flush_redacted_content(block);
+        }
+        result
+    }
+
+    fn consume_messages<R: Read>(
+        &mut self,
+        mut reader: EventStreamReader<R>,
+        blocks: &mut Vec<BedrockBlock>,
+    ) -> Result<(), BedrockError> {
         while let Some(message) = reader.next_message()? {
             self.check_cancelled()?;
             if let Some(exception_type) = message.exception_type().filter(|value| !value.is_empty())
@@ -2516,7 +2617,7 @@ impl BedrockStreamer {
                         continue;
                     };
                     let content_index = self.output.content.len();
-                    self.output
+                    Arc::make_mut(&mut self.output)
                         .content
                         .push(llm::ContentBlock::ToolCall(llm::ToolCall {
                             id: tool_use.tool_use_id,
@@ -2524,12 +2625,11 @@ impl BedrockStreamer {
                             arguments: BTreeMap::new(),
                             ..llm::ToolCall::default()
                         }));
-                    blocks.push(BedrockBlock {
-                        kind: BedrockBlockKind::ToolCall,
+                    blocks.push(BedrockBlock::new(
+                        BedrockBlockKind::ToolCall,
                         wire_index,
                         content_index,
-                        tool_json: stream::IncrementalToolArguments::new(),
-                    });
+                    ));
                     self.push_progress(stream::AssistantMessageEvent {
                         event_type: stream::EVENT_TOOLCALL_START.to_owned(),
                         content_index: Some(content_index),
@@ -2542,46 +2642,40 @@ impl BedrockStreamer {
                         continue;
                     };
                     if let Some(text) = delta.text {
-                        self.consume_text_delta(&mut blocks, wire_index, &text)?;
+                        self.consume_text_delta(blocks, wire_index, &text)?;
                     } else if let Some(tool_use) = delta.tool_use {
-                        self.consume_tool_delta(&mut blocks, wire_index, &tool_use.input)?;
+                        self.consume_tool_delta(blocks, wire_index, &tool_use.input)?;
                     } else if let Some(reasoning) = delta.reasoning_content {
-                        self.consume_reasoning_delta(
-                            &mut blocks,
-                            wire_index,
-                            &reasoning.text,
-                            &reasoning.signature,
-                        )?;
+                        self.consume_reasoning_delta(blocks, wire_index, &reasoning)?;
                     }
                 }
                 "contentBlockStop" => {
                     if let Some(wire_index) = event.content_block_index {
-                        self.consume_block_stop(&mut blocks, wire_index)?;
+                        self.consume_block_stop(blocks, wire_index)?;
                     }
                 }
                 "messageStop" => {
-                    self.output.raw_stop_reason = event.stop_reason.clone();
                     let (stop_reason, error_message) = map_bedrock_stop_reason(&event.stop_reason);
-                    self.output.stop_reason = stop_reason;
+                    let output = Arc::make_mut(&mut self.output);
+                    output.raw_stop_reason = event.stop_reason;
+                    output.stop_reason = stop_reason;
                     if let Some(error_message) = error_message {
-                        self.output.error_message = error_message;
+                        output.error_message = error_message;
                     }
                 }
                 "metadata" => {
                     if let Some(usage) = event.usage {
-                        self.output.usage.input = usage.input_tokens;
-                        self.output.usage.output = usage.output_tokens;
-                        self.output.usage.cache_read = usage.cache_read_input_tokens;
-                        self.output.usage.cache_write = usage.cache_write_input_tokens;
-                        self.output.usage.total_tokens = usage.total_tokens;
-                        if self.output.usage.total_tokens == 0 {
-                            self.output.usage.total_tokens = self
-                                .output
-                                .usage
-                                .input
-                                .saturating_add(self.output.usage.output);
+                        let output = Arc::make_mut(&mut self.output);
+                        output.usage.input = usage.input_tokens;
+                        output.usage.output = usage.output_tokens;
+                        output.usage.cache_read = usage.cache_read_input_tokens;
+                        output.usage.cache_write = usage.cache_write_input_tokens;
+                        output.usage.total_tokens = usage.total_tokens;
+                        if output.usage.total_tokens == 0 {
+                            output.usage.total_tokens =
+                                output.usage.input.saturating_add(output.usage.output);
                         }
-                        stream::calculate_usage_cost(&self.model, &mut self.output.usage);
+                        stream::calculate_usage_cost(&self.model, &mut output.usage);
                     }
                 }
                 _ => {}
@@ -2600,15 +2694,14 @@ impl BedrockStreamer {
             Some(position) => position,
             None => {
                 let content_index = self.output.content.len();
-                self.output
+                Arc::make_mut(&mut self.output)
                     .content
                     .push(llm::ContentBlock::Text(llm::TextContent::default()));
-                blocks.push(BedrockBlock {
-                    kind: BedrockBlockKind::Text,
+                blocks.push(BedrockBlock::new(
+                    BedrockBlockKind::Text,
                     wire_index,
                     content_index,
-                    tool_json: stream::IncrementalToolArguments::new(),
-                });
+                ));
                 self.push_progress(stream::AssistantMessageEvent {
                     event_type: stream::EVENT_TEXT_START.to_owned(),
                     content_index: Some(content_index),
@@ -2621,7 +2714,10 @@ impl BedrockStreamer {
             return Ok(());
         }
         let content_index = blocks[position].content_index;
-        if let Some(llm::ContentBlock::Text(text)) = self.output.content.get_mut(content_index) {
+        if let Some(llm::ContentBlock::Text(text)) = Arc::make_mut(&mut self.output)
+            .content
+            .get_mut(content_index)
+        {
             text.text.push_str(delta);
         }
         self.push_progress(stream::AssistantMessageEvent {
@@ -2653,8 +2749,9 @@ impl BedrockStreamer {
             )
         };
         if let Some(arguments) = preview
-            && let Some(llm::ContentBlock::ToolCall(tool_call)) =
-                self.output.content.get_mut(content_index)
+            && let Some(llm::ContentBlock::ToolCall(tool_call)) = Arc::make_mut(&mut self.output)
+                .content
+                .get_mut(content_index)
         {
             tool_call.arguments = arguments;
         }
@@ -2670,22 +2767,20 @@ impl BedrockStreamer {
         &mut self,
         blocks: &mut Vec<BedrockBlock>,
         wire_index: usize,
-        text_delta: &str,
-        signature: &str,
+        delta: &BedrockReasoningDelta,
     ) -> Result<(), BedrockError> {
         let position = match find_block(blocks, wire_index) {
             Some(position) => position,
             None => {
                 let content_index = self.output.content.len();
-                self.output
+                Arc::make_mut(&mut self.output)
                     .content
                     .push(llm::ContentBlock::Thinking(llm::ThinkingContent::default()));
-                blocks.push(BedrockBlock {
-                    kind: BedrockBlockKind::Thinking,
+                blocks.push(BedrockBlock::new(
+                    BedrockBlockKind::Thinking,
                     wire_index,
                     content_index,
-                    tool_json: stream::IncrementalToolArguments::new(),
-                });
+                ));
                 self.push_progress(stream::AssistantMessageEvent {
                     event_type: stream::EVENT_THINKING_START.to_owned(),
                     content_index: Some(content_index),
@@ -2698,26 +2793,92 @@ impl BedrockStreamer {
             return Ok(());
         }
         let content_index = blocks[position].content_index;
-        if !text_delta.is_empty() {
-            if let Some(llm::ContentBlock::Thinking(thinking)) =
-                self.output.content.get_mut(content_index)
+        if !delta.text.is_empty() {
+            if let Some(llm::ContentBlock::Thinking(thinking)) = Arc::make_mut(&mut self.output)
+                .content
+                .get_mut(content_index)
             {
-                thinking.thinking.push_str(text_delta);
+                thinking.thinking.push_str(&delta.text);
             }
             self.push_progress(stream::AssistantMessageEvent {
                 event_type: stream::EVENT_THINKING_DELTA.to_owned(),
                 content_index: Some(content_index),
-                delta: text_delta.to_owned(),
+                delta: delta.text.clone(),
                 ..stream::AssistantMessageEvent::default()
             })?;
         }
-        if !signature.is_empty()
-            && let Some(llm::ContentBlock::Thinking(thinking)) =
-                self.output.content.get_mut(content_index)
+        let already_redacted = matches!(
+            self.output.content.get(content_index),
+            Some(llm::ContentBlock::Thinking(thinking)) if thinking.redacted
+        );
+        // `thinking_signature` carries either an Anthropic signature or the
+        // opaque redacted payload, never both: mixing them would corrupt
+        // whichever arrived first.
+        if !delta.signature.is_empty()
+            && !already_redacted
+            && let Some(llm::ContentBlock::Thinking(thinking)) = Arc::make_mut(&mut self.output)
+                .content
+                .get_mut(content_index)
         {
-            thinking.thinking_signature.push_str(signature);
+            thinking.thinking_signature.push_str(&delta.signature);
         }
+        let Some(encoded) = delta
+            .redacted_content
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        // Blobs travel as base64 in the JSON payload. The AWS SDK behind pi
+        // decodes them while deserializing the event, so a corrupt blob fails
+        // the stream there as well.
+        let bytes = STANDARD.decode(encoded).map_err(|error| {
+            BedrockError::Message(format!(
+                "parsing bedrock event: invalid redactedContent: {error}"
+            ))
+        })?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !already_redacted {
+            // Encrypted reasoning (for example OpenAI models on Bedrock) is
+            // opaque, so the block is marked once with pi's placeholder and
+            // the payload kept for replay the way Anthropic redacted thinking
+            // already travels: in `thinking_signature` with `redacted: true`.
+            if let Some(llm::ContentBlock::Thinking(thinking)) = Arc::make_mut(&mut self.output)
+                .content
+                .get_mut(content_index)
+            {
+                thinking.redacted = true;
+                thinking.thinking_signature.clear();
+                thinking.thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
+            }
+            self.push_progress(stream::AssistantMessageEvent {
+                event_type: stream::EVENT_THINKING_DELTA.to_owned(),
+                content_index: Some(content_index),
+                delta: REDACTED_THINKING_PLACEHOLDER.to_owned(),
+                ..stream::AssistantMessageEvent::default()
+            })?;
+        }
+        blocks[position].redacted_bytes.extend_from_slice(&bytes);
         Ok(())
+    }
+
+    /// Encodes buffered encrypted reasoning into `thinking_signature` and
+    /// drops the scratch bytes, which must never outlive the stream. Chunks
+    /// are joined as bytes first because each delta's base64 padding would
+    /// otherwise corrupt the concatenation.
+    fn flush_redacted_content(&mut self, block: &mut BedrockBlock) {
+        if block.redacted_bytes.is_empty() {
+            return;
+        }
+        if let Some(llm::ContentBlock::Thinking(thinking)) = Arc::make_mut(&mut self.output)
+            .content
+            .get_mut(block.content_index)
+        {
+            thinking.thinking_signature = STANDARD.encode(&block.redacted_bytes);
+        }
+        block.redacted_bytes.clear();
     }
 
     fn consume_block_stop(
@@ -2744,6 +2905,7 @@ impl BedrockStreamer {
                 })
             }
             BedrockBlockKind::Thinking => {
+                self.flush_redacted_content(block);
                 let content = match self.output.content.get(content_index) {
                     Some(llm::ContentBlock::Thinking(thinking)) => thinking.thinking.clone(),
                     _ => String::new(),
@@ -2757,7 +2919,10 @@ impl BedrockStreamer {
             }
             BedrockBlockKind::ToolCall => {
                 let arguments = block.tool_json.finish_tool_arguments();
-                let tool_call = match self.output.content.get_mut(content_index) {
+                let tool_call = match Arc::make_mut(&mut self.output)
+                    .content
+                    .get_mut(content_index)
+                {
                     Some(llm::ContentBlock::ToolCall(tool_call)) => {
                         tool_call.arguments = arguments;
                         tool_call.clone()
@@ -2775,7 +2940,7 @@ impl BedrockStreamer {
     }
 
     fn push_progress(&self, mut event: stream::AssistantMessageEvent) -> Result<(), BedrockError> {
-        event.partial = Some(Arc::new(self.output.clone()));
+        event.partial = Some(Arc::clone(&self.output));
         self.event_stream
             .push(event)
             .map_err(|error| BedrockError::Message(error.to_string()))
@@ -2797,6 +2962,12 @@ impl BedrockStreamer {
     }
 }
 
+/// The whole-request bound for the HTTP client: only what the caller
+/// configured, never reqwest's 30-second default.
+fn bedrock_http_timeout(options: &BedrockOptions) -> Option<Duration> {
+    options.timeout.filter(|timeout| !timeout.is_zero())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BedrockBlockKind {
     Text,
@@ -2809,6 +2980,20 @@ struct BedrockBlock {
     wire_index: usize,
     content_index: usize,
     tool_json: stream::IncrementalToolArguments,
+    /// Decoded `redactedContent` chunks awaiting a single base64 encoding.
+    redacted_bytes: Vec<u8>,
+}
+
+impl BedrockBlock {
+    fn new(kind: BedrockBlockKind, wire_index: usize, content_index: usize) -> Self {
+        Self {
+            kind,
+            wire_index,
+            content_index,
+            tool_json: stream::IncrementalToolArguments::new(),
+            redacted_bytes: Vec::new(),
+        }
+    }
 }
 
 fn find_block(blocks: &[BedrockBlock], wire_index: usize) -> Option<usize> {
@@ -2869,6 +3054,9 @@ struct BedrockReasoningDelta {
     text: String,
     #[serde(default)]
     signature: String,
+    /// Encrypted reasoning, base64 in the JSON payload like every AWS blob.
+    #[serde(rename = "redactedContent", default)]
+    redacted_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2893,7 +3081,7 @@ pub fn build_bedrock_http_request(
     now: OffsetDateTime,
 ) -> Result<BedrockHttpRequest, BedrockError> {
     let body = serde_json::to_vec(params)?;
-    let target = resolve_bedrock_target(model, options);
+    let target = resolve_bedrock_target(model, options)?;
     let url = bedrock_request_url(&target.endpoint, &model.id)?;
     let mut request = BedrockHttpRequest {
         method: "POST".to_owned(),
@@ -2914,17 +3102,26 @@ pub fn build_bedrock_http_request(
     }
 
     let skip_auth = provider_env_value(&options.environment, "AWS_BEDROCK_SKIP_AUTH") == "1";
+    // The catalog hands over its sentinel whenever any ambient credential
+    // exists, including when that credential is AWS_BEARER_TOKEN_BEDROCK. pi
+    // resolves the token ahead of static keys, so the sentinel must step aside
+    // for the environment lookup instead of shadowing it and forcing SigV4.
+    let usable_token = |value: &str| !value.is_empty() && value != AUTHENTICATED_SENTINEL;
     let bearer_token = options
         .bearer_token
         .as_deref()
-        .filter(|value| !value.is_empty())
-        .or_else(|| options.api_key.as_deref().filter(|value| !value.is_empty()))
+        .filter(|value| usable_token(value))
+        .or_else(|| {
+            options
+                .api_key
+                .as_deref()
+                .filter(|value| usable_token(value))
+        })
         .map(str::to_owned)
         .or_else(|| {
             let value = provider_env_value(&options.environment, "AWS_BEARER_TOKEN_BEDROCK");
-            (!value.is_empty()).then_some(value)
-        })
-        .filter(|value| value != "<authenticated>");
+            usable_token(&value).then_some(value)
+        });
     if skip_auth {
         sign_aws_request(
             &mut request,
@@ -3039,14 +3236,10 @@ fn bedrock_exception_error(exception_type: &str, payload: &[u8]) -> BedrockError
         message.push_str(BEDROCK_DATA_RETENTION_DOCS_URL);
         message.push_str(" for supported data retention modes.");
     }
-    let prefix = match exception_type {
-        "InternalServerException" => "Internal server error",
-        "ModelStreamErrorException" => "Model stream error",
-        "ValidationException" => "Validation error",
-        "ThrottlingException" => "Throttling error",
-        "ServiceUnavailableException" => "Service unavailable",
-        _ => exception_type,
-    };
+    let prefix = BEDROCK_EXCEPTION_PREFIXES
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(exception_type))
+        .map_or(exception_type, |(_, prefix)| prefix);
     if prefix.is_empty() {
         BedrockError::Message(message)
     } else {
@@ -3087,7 +3280,7 @@ mod tests {
         path::PathBuf,
         sync::{Arc, Mutex},
         thread::{self, JoinHandle},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::{Value, json};
@@ -3170,7 +3363,7 @@ mod tests {
         while let Some(event) = events.try_next() {
             emitted.push(event);
         }
-        (converter.output, emitted)
+        (Arc::unwrap_or_clone(converter.output), emitted)
     }
 
     #[test]
@@ -3394,7 +3587,12 @@ mod tests {
         };
         let mut arn = test_model("");
         arn.id = "arn:aws:bedrock:eu-west-3:123:inference-profile/x".to_owned();
-        assert_eq!(resolve_bedrock_target(&arn, &options).region, "eu-west-3");
+        assert_eq!(
+            resolve_bedrock_target(&arn, &options)
+                .expect("ARN target")
+                .region,
+            "eu-west-3"
+        );
         assert_eq!(
             standard_bedrock_endpoint_region(
                 "https://bedrock-runtime-fips.us-gov-west-1.amazonaws.com"
@@ -3412,7 +3610,8 @@ mod tests {
                 .collect(),
             ..BedrockOptions::default()
         };
-        let target = resolve_bedrock_target(&endpoint_model, &endpoint_options);
+        let target =
+            resolve_bedrock_target(&endpoint_model, &endpoint_options).expect("endpoint target");
         assert_eq!(target.region, "eu-central-1");
         assert_eq!(
             target.endpoint,
@@ -3718,9 +3917,11 @@ mod tests {
         let exception = encode_event_stream_message(
             &BTreeMap::from([
                 (":message-type".to_owned(), "exception".to_owned()),
+                // Bedrock's frames carry the camelCase union member, not the
+                // PascalCase SDK class name pi matches on.
                 (
                     ":exception-type".to_owned(),
-                    "ThrottlingException".to_owned(),
+                    "throttlingException".to_owned(),
                 ),
             ]),
             br#"{"message":"Too many requests"}"#,
@@ -4066,20 +4267,31 @@ mod tests {
             build_bedrock_http_request(&model, &bearer, &params, now).expect("env bearer");
         assert_eq!(request.headers["Authorization"], "Bearer env-token");
 
+        // The catalog hands over its sentinel whenever ambient credentials
+        // exist, including when the only ambient credential is the bearer
+        // token; pi then signs with that token rather than falling back to
+        // static keys.
+        let mut sentinel_with_token = test_options();
+        sentinel_with_token.api_key = Some(AUTHENTICATED_SENTINEL.to_owned());
+        sentinel_with_token.environment.insert(
+            "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
+            "ambient-token".to_owned(),
+        );
+        let request = build_bedrock_http_request(&model, &sentinel_with_token, &params, now)
+            .expect("sentinel bearer");
+        assert_eq!(request.headers["Authorization"], "Bearer ambient-token");
+        assert!(!request.headers.contains_key("X-Amz-Date"));
+
         let mut session = test_options();
         session
             .environment
             .insert("AWS_SESSION_TOKEN".to_owned(), "session-token".to_owned());
-        session.api_key = Some("<authenticated>".to_owned());
-        session.environment.insert(
-            "AWS_BEARER_TOKEN_BEDROCK".to_owned(),
-            "must-not-leak".to_owned(),
-        );
+        session.api_key = Some(AUTHENTICATED_SENTINEL.to_owned());
         let request =
             build_bedrock_http_request(&model, &session, &params, now).expect("SigV4 request");
         assert_eq!(request.headers["X-Amz-Security-Token"], "session-token");
         assert!(request.headers["Authorization"].contains("x-amz-security-token"));
-        assert!(!request.headers["Authorization"].contains("must-not-leak"));
+        assert!(!request.headers["Authorization"].contains(AUTHENTICATED_SENTINEL));
 
         let cancellation = BedrockCancellation::default();
         cancellation.cancel();
@@ -4141,6 +4353,473 @@ mod tests {
         let payload: Value =
             serde_json::from_slice(&captured.lock().expect("captures")[0].body).expect("JSON");
         assert_eq!(payload["hooked"], true);
+    }
+
+    #[test]
+    fn exception_prefixes_match_wire_and_sdk_spellings() {
+        for (spelling, prefix) in [
+            ("throttlingException", "Throttling error"),
+            ("ThrottlingException", "Throttling error"),
+            ("validationException", "Validation error"),
+            ("modelStreamErrorException", "Model stream error"),
+            ("internalServerException", "Internal server error"),
+            ("serviceUnavailableException", "Service unavailable"),
+        ] {
+            assert_eq!(
+                bedrock_exception_error(spelling, br#"{"message":"boom"}"#).to_string(),
+                format!("{prefix}: boom"),
+                "{spelling}"
+            );
+        }
+        assert_eq!(
+            bedrock_exception_error("accessDeniedException", br#"{"message":"no"}"#).to_string(),
+            "accessDeniedException: no"
+        );
+    }
+
+    #[test]
+    fn http_timeout_is_only_the_configured_bound() {
+        let mut options = test_options();
+        assert_eq!(bedrock_http_timeout(&options), None);
+        options.timeout = Some(Duration::ZERO);
+        assert_eq!(bedrock_http_timeout(&options), None);
+        options.timeout = Some(Duration::from_secs(5));
+        assert_eq!(bedrock_http_timeout(&options), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn configured_timeout_bounds_a_stalled_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("connection");
+            let _ = read_captured_request(&mut socket);
+            // Hold the connection open well past the configured bound without
+            // answering, so only the client's own timeout can end the request.
+            thread::sleep(Duration::from_millis(2_500));
+        });
+        let mut options = test_options();
+        options.timeout = Some(Duration::from_millis(200));
+        let started = Instant::now();
+        let events = stream_bedrock(
+            test_model(endpoint),
+            llm::Context {
+                messages: vec![llm::Message::User(llm::UserMessage::text("hi", 1))],
+                ..llm::Context::default()
+            },
+            options,
+        )
+        .iter()
+        .collect::<Vec<_>>();
+        let elapsed = started.elapsed();
+        server.join().expect("server thread");
+        assert_eq!(
+            events.last().expect("terminal event").event_type,
+            stream::EVENT_ERROR
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "gave up after {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn home_directory_falls_back_to_userprofile() {
+        let lookup = |values: BTreeMap<&'static str, &'static str>| {
+            move |name: &'static str| values.get(name).map(OsString::from)
+        };
+        assert_eq!(
+            home_directory_from(lookup(BTreeMap::from([
+                ("HOME", "/home/pi"),
+                ("USERPROFILE", r"C:\Users\pi"),
+            ]))),
+            Some(PathBuf::from("/home/pi"))
+        );
+        assert_eq!(
+            home_directory_from(lookup(BTreeMap::from([
+                ("HOME", ""),
+                ("USERPROFILE", r"C:\Users\pi"),
+            ]))),
+            Some(PathBuf::from(r"C:\Users\pi"))
+        );
+        assert_eq!(
+            home_directory_from(lookup(BTreeMap::from([("USERPROFILE", "")]))),
+            None
+        );
+    }
+
+    #[test]
+    fn ambient_static_keys_outrank_an_ambient_profile() {
+        let ambient = |values: BTreeMap<&'static str, &'static str>| {
+            move |name: &str| values.get(name).map(|value| (*value).to_owned())
+        };
+        let keys_and_profile = BTreeMap::from([
+            ("AWS_ACCESS_KEY_ID", "AKIDAMBIENT"),
+            ("AWS_SECRET_ACCESS_KEY", "secret-ambient"),
+            ("AWS_PROFILE", "unrelated-project"),
+        ]);
+        let unscoped = BedrockOptions::default();
+        assert_eq!(
+            resolve_bedrock_profile_with(&unscoped, ambient(keys_and_profile.clone())),
+            None
+        );
+        assert_eq!(
+            resolve_bedrock_profile_with(
+                &unscoped,
+                ambient(BTreeMap::from([("AWS_PROFILE", "only-profile")]))
+            ),
+            Some("only-profile".to_owned())
+        );
+        // Half a key pair cannot sign anything, so the profile still applies.
+        assert_eq!(
+            resolve_bedrock_profile_with(
+                &unscoped,
+                ambient(BTreeMap::from([
+                    ("AWS_ACCESS_KEY_ID", "AKIDAMBIENT"),
+                    ("AWS_PROFILE", "half"),
+                ]))
+            ),
+            Some("half".to_owned())
+        );
+
+        // A profile configured for this provider is an explicit choice and
+        // keeps winning over ambient keys, as does the profile option.
+        let scoped_profile = BedrockOptions {
+            environment: BTreeMap::from([("AWS_PROFILE".to_owned(), "work".to_owned())]),
+            ..BedrockOptions::default()
+        };
+        assert_eq!(
+            resolve_bedrock_profile_with(&scoped_profile, ambient(keys_and_profile.clone())),
+            Some("work".to_owned())
+        );
+        let explicit = BedrockOptions {
+            profile: Some("explicit".to_owned()),
+            ..scoped_profile
+        };
+        assert_eq!(
+            resolve_bedrock_profile_with(&explicit, ambient(keys_and_profile)),
+            Some("explicit".to_owned())
+        );
+
+        // Scoped keys suppress an ambient profile exactly as before.
+        assert_eq!(
+            resolve_bedrock_profile_with(
+                &test_options(),
+                ambient(BTreeMap::from([("AWS_PROFILE", "unrelated-project")]))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn regions_must_be_host_labels_before_they_reach_the_endpoint() {
+        assert!(is_valid_bedrock_region("us-gov-west-1"));
+        for invalid in [
+            "",
+            "US-EAST-1",
+            "us-east-1.evil.example.com",
+            "us-east-1/#",
+            "us_east_1",
+            "us-east-1 ",
+        ] {
+            assert!(!is_valid_bedrock_region(invalid), "{invalid:?}");
+        }
+
+        let model = test_model("");
+        let now = OffsetDateTime::from_unix_timestamp(1_767_323_045).expect("time");
+        let mut injected = test_options();
+        injected.region = Some("evil.example.com/#".to_owned());
+        let error = resolve_bedrock_target(&model, &injected).expect_err("host injection");
+        assert!(error.to_string().contains("invalid AWS region"));
+        let params =
+            build_bedrock_params(&model, &llm::Context::default(), &injected).expect("params");
+        assert!(build_bedrock_http_request(&model, &injected, &params, now).is_err());
+
+        let mut scoped = test_options();
+        scoped
+            .environment
+            .insert("AWS_REGION".to_owned(), "Evil.Example".to_owned());
+        assert!(resolve_bedrock_target(&model, &scoped).is_err());
+
+        let target = resolve_bedrock_target(&model, &test_options()).expect("valid region");
+        assert_eq!(
+            target.endpoint,
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn redirects_are_never_followed_with_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let location = format!("{endpoint}/elsewhere/model/x/converse-stream");
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("connection");
+            let request = read_captured_request(&mut socket);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).expect("redirect");
+            socket.flush().expect("flush");
+            request
+        });
+        let events = stream_bedrock(
+            test_model(endpoint),
+            llm::Context {
+                messages: vec![llm::Message::User(llm::UserMessage::text("hi", 1))],
+                ..llm::Context::default()
+            },
+            test_options(),
+        )
+        .iter()
+        .collect::<Vec<_>>();
+        // The server answers exactly once, so a followed redirect could never
+        // have surfaced the 302 itself.
+        let only_request = server.join().expect("server thread");
+        let error = events
+            .last()
+            .and_then(|event| event.error.as_ref())
+            .expect("redirect error");
+        assert!(
+            error.error_message.contains("status 302"),
+            "{}",
+            error.error_message
+        );
+        assert!(
+            only_request
+                .headers
+                .get("authorization")
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 "))
+        );
+    }
+
+    fn redacted_delta_frame(index: usize, bytes: &[u8]) -> Vec<u8> {
+        event_frame(
+            "contentBlockDelta",
+            &format!(
+                r#"{{"contentBlockIndex":{index},"delta":{{"reasoningContent":{{"redactedContent":"{}"}}}}}}"#,
+                STANDARD.encode(bytes)
+            ),
+        )
+    }
+
+    #[test]
+    fn redacted_reasoning_is_preserved_and_encoded_once_per_block() {
+        let payload = b"rsn_5ZVrif4J0bXIqmWdledj7QIFeNikRQbE";
+        let (head, tail) = payload.split_at(7);
+        // Splitting at an offset that is not a multiple of three proves the
+        // chunks are joined as bytes rather than as padded base64 strings.
+        assert_ne!(
+            format!("{}{}", STANDARD.encode(head), STANDARD.encode(tail)),
+            STANDARD.encode(payload)
+        );
+        let frames = stream_frames([
+            event_frame("messageStart", r#"{"role":"assistant"}"#),
+            redacted_delta_frame(0, head),
+            redacted_delta_frame(0, tail),
+            // A signature after redaction must not overwrite the opaque payload.
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"late"}}}"#,
+            ),
+            event_frame("contentBlockStop", r#"{"contentBlockIndex":0}"#),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":1,"delta":{"text":"done"}}"#,
+            ),
+            event_frame("contentBlockStop", r#"{"contentBlockIndex":1}"#),
+            event_frame("messageStop", r#"{"stopReason":"end_turn"}"#),
+        ]);
+        let (message, events) = consume_fixture(frames);
+        assert_eq!(message.stop_reason, stream::STOP_STOP);
+        match &message.content[0] {
+            llm::ContentBlock::Thinking(thinking) => {
+                assert!(thinking.redacted);
+                assert_eq!(thinking.thinking, REDACTED_THINKING_PLACEHOLDER);
+                assert_eq!(thinking.thinking_signature, STANDARD.encode(payload));
+            }
+            other => panic!("expected redacted thinking, got {other:?}"),
+        }
+        assert_eq!(message.content[1].plain_text(), Some("done"));
+        let thinking_deltas = events
+            .iter()
+            .filter(|event| event.event_type == stream::EVENT_THINKING_DELTA)
+            .map(|event| event.delta.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(thinking_deltas, vec![REDACTED_THINKING_PLACEHOLDER]);
+        let end = events
+            .iter()
+            .find(|event| event.event_type == stream::EVENT_THINKING_END)
+            .expect("thinking end");
+        assert_eq!(end.content, REDACTED_THINKING_PLACEHOLDER);
+        // The payload is already encoded when the end event is published.
+        match end.partial.as_deref().map(|partial| &partial.content[0]) {
+            Some(llm::ContentBlock::Thinking(thinking)) => {
+                assert_eq!(thinking.thinking_signature, STANDARD.encode(payload));
+            }
+            other => panic!("expected redacted thinking snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redacted_reasoning_is_encoded_when_the_block_never_stops() {
+        let payload = b"opaque-reasoning-bytes";
+        let (message, _) = consume_fixture(stream_frames([
+            event_frame("messageStart", r#"{"role":"assistant"}"#),
+            redacted_delta_frame(0, payload),
+            event_frame("messageStop", r#"{"stopReason":"end_turn"}"#),
+        ]));
+        match &message.content[0] {
+            llm::ContentBlock::Thinking(thinking) => {
+                assert!(thinking.redacted);
+                assert_eq!(thinking.thinking_signature, STANDARD.encode(payload));
+            }
+            other => panic!("expected redacted thinking, got {other:?}"),
+        }
+
+        // A blob that is not base64 fails the stream, as the SDK decoder does
+        // for pi, instead of persisting garbage for replay.
+        let corrupt = stream_frames([
+            event_frame("messageStart", r#"{"role":"assistant"}"#),
+            event_frame(
+                "contentBlockDelta",
+                r#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"redactedContent":"not base64!!"}}}"#,
+            ),
+        ]);
+        let events = stream::AssistantMessageEventStream::new();
+        let mut converter = BedrockStreamer::new(
+            test_model(""),
+            llm::Context::default(),
+            test_options(),
+            events,
+        );
+        let error = converter
+            .consume_stream(Cursor::new(corrupt))
+            .expect_err("corrupt blob");
+        assert!(error.to_string().contains("redactedContent"));
+    }
+
+    #[test]
+    fn redacted_reasoning_replays_as_redacted_content_ahead_of_tool_use() {
+        let payload = STANDARD.encode(b"opaque-reasoning-bytes");
+        let read_call = llm::ContentBlock::ToolCall(llm::ToolCall {
+            id: "tool-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: BTreeMap::from([("path".to_owned(), json!("/tmp/a.txt"))]),
+            ..llm::ToolCall::default()
+        });
+        let context_for = |model: &llm::Model, signature: &str| llm::Context {
+            messages: vec![
+                llm::Message::User(llm::UserMessage::text("read the file", 1)),
+                llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    stop_reason: stream::STOP_TOOL_USE.to_owned(),
+                    timestamp: 2,
+                    content: vec![
+                        llm::ContentBlock::Thinking(llm::ThinkingContent {
+                            thinking: String::new(),
+                            thinking_signature: signature.to_owned(),
+                            redacted: true,
+                        }),
+                        read_call.clone(),
+                    ],
+                    ..llm::AssistantMessage::default()
+                })),
+                llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                    tool_call_id: "tool-1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: vec![llm::ContentBlock::text("file body")],
+                    timestamp: 3,
+                    ..llm::ToolResultMessage::default()
+                })),
+            ],
+            ..llm::Context::default()
+        };
+        let assistant_content = |model: &llm::Model, signature: &str| {
+            let params =
+                build_bedrock_params(model, &context_for(model, signature), &test_options())
+                    .expect("params");
+            params["messages"][1]["content"]
+                .as_array()
+                .expect("assistant content")
+                .clone()
+        };
+
+        let claude = test_model("");
+        let content = assistant_content(&claude, &payload);
+        assert_eq!(
+            content[0],
+            json!({"reasoningContent": {"redactedContent": payload}})
+        );
+        assert_eq!(content[1]["toolUse"]["toolUseId"], "tool-1");
+
+        // Encrypted reasoning comes from non-Anthropic models too, and replays
+        // ahead of the signature rules that only apply to Claude.
+        let gpt = llm::Model {
+            id: "global.openai.gpt-5.6-terra".to_owned(),
+            name: "GPT-5.6 Terra (Global)".to_owned(),
+            ..claude.clone()
+        };
+        let content = assistant_content(&gpt, &payload);
+        assert_eq!(
+            content[0],
+            json!({"reasoningContent": {"redactedContent": payload}})
+        );
+
+        // A wrapped payload is normalized; one that is not base64 drops the
+        // block instead of failing the request.
+        let wrapped = format!("{}\n{}", &payload[..8], &payload[8..]);
+        assert_eq!(
+            assistant_content(&claude, &wrapped)[0],
+            json!({"reasoningContent": {"redactedContent": payload}})
+        );
+        let content = assistant_content(&claude, "not base64!!");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["toolUse"]["toolUseId"], "tool-1");
+    }
+
+    #[test]
+    fn snapshots_share_the_message_and_copy_only_while_a_reader_holds_one() {
+        let events = stream::AssistantMessageEventStream::new();
+        let mut streamer = BedrockStreamer::new(
+            test_model(""),
+            llm::Context::default(),
+            test_options(),
+            events.clone(),
+        );
+        let mut blocks = Vec::new();
+        streamer
+            .consume_text_delta(&mut blocks, 0, "Hel")
+            .expect("first delta");
+        // Draining the queue releases every published snapshot.
+        while events.try_next().is_some() {}
+        assert_eq!(Arc::strong_count(&streamer.output), 1);
+        let allocation = Arc::as_ptr(&streamer.output);
+
+        streamer
+            .consume_text_delta(&mut blocks, 0, "lo")
+            .expect("second delta");
+        // Nobody held the previous snapshot, so the message changed in place
+        // and the new event shares it instead of carrying a deep copy.
+        assert!(std::ptr::eq(allocation, Arc::as_ptr(&streamer.output)));
+        let held = events
+            .try_next()
+            .expect("delta event")
+            .partial
+            .expect("partial snapshot");
+        assert!(Arc::ptr_eq(&held, &streamer.output));
+        assert_eq!(held.content[0].plain_text(), Some("Hello"));
+
+        // A snapshot still in a reader's hands stays frozen while the next
+        // delta lands.
+        streamer
+            .consume_text_delta(&mut blocks, 0, "!")
+            .expect("third delta");
+        assert!(!Arc::ptr_eq(&held, &streamer.output));
+        assert_eq!(held.content[0].plain_text(), Some("Hello"));
+        assert_eq!(streamer.output.content[0].plain_text(), Some("Hello!"));
     }
 
     #[derive(Clone, Debug, Default)]
