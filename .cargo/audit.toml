@@ -1,0 +1,14 @@
+# cargo-audit configuration. CI and `make vuln` fail on any advisory that is
+# not listed here, so every entry needs a reason that survives review.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071, "Marvin attack" timing side channel in the rsa crate,
+    # with no fixed release available. The crate is used for exactly one
+    # thing: signing the RS256 JWT that exchanges a Google service-account key
+    # for a Vertex access token (src/google_auth.rs). The private key is the
+    # user's own, the signature is computed locally a few times an hour, and
+    # nothing measures the operation's timing across a network, which is what
+    # the attack needs. Revisit when the crate ships a constant-time release.
+    "RUSTSEC-2023-0071",
+]

@@ -29,7 +29,7 @@ use tar::{Archive, Builder, EntryType, Header};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Largest accepted resource file, including prompt templates and skills.
 pub const MAX_RESOURCE_BYTES: usize = 2 * 1024 * 1024;
@@ -39,6 +39,10 @@ pub const ARCHIVE_VERSION: u32 = 1;
 pub const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 /// Largest total decompressed archive payload retained or read.
 pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Most skills loaded in one discovery pass across every skill location.
+pub const MAX_SKILLS: usize = 512;
+/// Most skill body bytes held in memory across one discovery pass.
+pub const MAX_SKILL_BYTES: usize = 32 * 1024 * 1024;
 
 const ARCHIVE_MANIFEST_NAME: &str = "manifest.json";
 const ARCHIVE_USER_DIRECTORY: &str = "user";
@@ -595,6 +599,7 @@ fn discover_skills(
     let mut seen_paths = HashSet::new();
     let mut seen_names = HashSet::new();
     let mut skills = Vec::new();
+    let mut budget = SkillBudget::new(MAX_SKILLS, MAX_SKILL_BYTES);
     for (location, root) in locations {
         discover_skills_in_directory(
             &location,
@@ -603,12 +608,51 @@ fn discover_skills(
             &mut seen_names,
             &mut skills,
             warnings,
+            &mut budget,
         );
     }
     skills.sort_by(|left, right| left.name.cmp(&right.name));
     skills
 }
 
+/// Bounds one discovery pass over skill trees, which are walked recursively
+/// and can be workspace-controlled: every loaded body is held in memory and
+/// listed in the system prompt, so an unbounded tree could exhaust both.
+struct SkillBudget {
+    remaining_skills: usize,
+    remaining_bytes: usize,
+    exhausted: bool,
+}
+
+impl SkillBudget {
+    fn new(max_skills: usize, max_bytes: usize) -> Self {
+        Self {
+            remaining_skills: max_skills,
+            remaining_bytes: max_bytes,
+            exhausted: false,
+        }
+    }
+
+    /// Reserves room for one skill body, warning once when the cap is hit.
+    fn admit(&mut self, body_len: usize, path: &Path, warnings: &mut Vec<String>) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        if self.remaining_skills == 0 || body_len > self.remaining_bytes {
+            self.exhausted = true;
+            warnings.push(format!(
+                "skill discovery stopped at {}: more than {MAX_SKILLS} skills or {MAX_SKILL_BYTES} bytes of skill content",
+                display_path(path)
+            ));
+            return false;
+        }
+        self.remaining_skills -= 1;
+        self.remaining_bytes -= body_len;
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn discover_skills_in_directory(
     location: &Path,
     root: &Path,
@@ -616,15 +660,17 @@ fn discover_skills_in_directory(
     seen_names: &mut HashSet<String>,
     skills: &mut Vec<Skill>,
     warnings: &mut Vec<String>,
+    budget: &mut SkillBudget,
 ) {
     if !safe_directory_for_read(location, root, "skill directory", warnings) {
         return;
     }
     walk_skills(
-        location, location, root, seen_paths, seen_names, skills, warnings,
+        location, location, root, seen_paths, seen_names, skills, warnings, budget,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_skills(
     directory: &Path,
     location: &Path,
@@ -633,6 +679,7 @@ fn walk_skills(
     seen_names: &mut HashSet<String>,
     skills: &mut Vec<Skill>,
     warnings: &mut Vec<String>,
+    budget: &mut SkillBudget,
 ) {
     let Some(entries) = sorted_directory_entries(directory, "read skill directory", warnings)
     else {
@@ -640,6 +687,9 @@ fn walk_skills(
     };
 
     for entry in entries {
+        if budget.exhausted {
+            return;
+        }
         let path = entry.path();
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -660,7 +710,7 @@ fn walk_skills(
                 continue;
             }
             walk_skills(
-                &path, location, root, seen_paths, seen_names, skills, warnings,
+                &path, location, root, seen_paths, seen_names, skills, warnings, budget,
             );
             continue;
         }
@@ -729,6 +779,9 @@ fn walk_skills(
                 display_path(&path)
             ));
             continue;
+        }
+        if !budget.admit(content.len(), &path, warnings) {
+            return;
         }
         skills.push(Skill {
             name,
@@ -2008,7 +2061,20 @@ impl<R: Read> Read for BoundedArchiveReader<R> {
 
 fn clean_archive_path(path: &str) -> String {
     let mut components = Vec::new();
-    let normalized = path.replace('\\', "/");
+    // Archive member names end up in warnings shown on a terminal; a control
+    // character there could move the cursor or fake a line of output.
+    let normalized = path
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else if character == '\\' {
+                '/'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
     for component in normalized.split('/') {
         match component {
             "" | "." => {}
@@ -2154,10 +2220,10 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         file.sync_all()
             .map_err(|error| io_error("sync temporary prompt", &temporary, error))?;
         drop(file);
+        // The temporary file was created with mode 0o600, and rename keeps
+        // it; a chmod on the destination afterwards would follow whatever
+        // sits at that path by then, symlink included.
         fs::rename(&temporary, path).map_err(|error| io_error("replace prompt", path, error))?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| io_error("set prompt permissions", path, error))?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -3002,5 +3068,93 @@ mod tests {
             fs::read_to_string(&victim).expect("read victim"),
             "leave this unchanged"
         );
+    }
+
+    #[test]
+    fn archive_member_names_hide_control_characters() {
+        assert_eq!(
+            clean_archive_path("user/\u{1b}[31mevil\r\n.md"),
+            "user/?[31mevil??.md"
+        );
+        assert_eq!(
+            clean_archive_path("./user\\..\\project/a.md"),
+            "project/a.md"
+        );
+        assert_eq!(clean_archive_path(""), ".");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_the_temporary_mode_and_never_chmods_through_a_link() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let scratch = Scratch::new("atomic-write");
+        let plain = scratch.path().join("plain.md");
+        atomic_write(&plain, b"body").expect("atomic write");
+        assert_eq!(
+            fs::metadata(&plain).expect("metadata").permissions().mode() & 0o7777,
+            0o600
+        );
+
+        let victim = scratch.path().join("victim");
+        fs::write(&victim, "keep").expect("write victim");
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("victim mode");
+        let link = scratch.path().join("link.md");
+        symlink(&victim, &link).expect("link");
+        atomic_write(&link, b"replacement").expect("replace link");
+        assert!(
+            !fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&victim).expect("read victim"), "keep");
+        assert_eq!(
+            fs::metadata(&victim)
+                .expect("victim metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn skill_discovery_stops_at_its_budget_with_a_warning() {
+        let scratch = Scratch::new("skill-budget");
+        let location = scratch.path().join("skills");
+        for index in 0..3 {
+            write_file(
+                &location.join(format!("skill-{index}")).join("SKILL.md"),
+                &format!("---\nname: skill-{index}\ndescription: d\n---\nbody-{index}"),
+            );
+        }
+        let discover_with = |budget: &mut SkillBudget| {
+            let mut skills = Vec::new();
+            let mut warnings = Vec::new();
+            discover_skills_in_directory(
+                &location,
+                scratch.path(),
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                &mut skills,
+                &mut warnings,
+                budget,
+            );
+            (skills, warnings)
+        };
+
+        let (skills, warnings) = discover_with(&mut SkillBudget::new(2, usize::MAX));
+        assert_eq!(skills.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("skill discovery stopped"));
+
+        let (skills, warnings) = discover_with(&mut SkillBudget::new(usize::MAX, 1));
+        assert!(skills.is_empty());
+        assert_eq!(warnings.len(), 1);
+
+        let (skills, warnings) = discover_with(&mut SkillBudget::new(3, usize::MAX));
+        assert_eq!(skills.len(), 3);
+        assert!(warnings.is_empty());
     }
 }

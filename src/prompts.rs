@@ -19,8 +19,8 @@ use time::OffsetDateTime;
 use crate::{
     config,
     resources::{
-        self, ArchiveRead, PromptCollection, PromptScope, ResourcePaths, RestoreOptions,
-        RestoreOutcome,
+        self, ArchiveManifest, ArchiveRead, PromptCollection, PromptScope, ResourcePaths,
+        RestoreOptions, RestoreOutcome,
     },
 };
 
@@ -108,11 +108,8 @@ pub fn command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             };
             let (archive, outcomes) = restore_at(&paths, Path::new(archive), &options)?;
             print_warnings(&archive.warnings);
-            if !archive.manifest.tool.is_empty() && archive.manifest.tool != "goshcoder" {
-                eprintln!(
-                    "note: this archive was written by {}",
-                    archive.manifest.tool
-                );
+            if let Some(note) = archive_tool_note(&archive.manifest) {
+                eprintln!("{note}");
             }
             for line in describe_restore(&outcomes) {
                 eprintln!("{line}");
@@ -222,6 +219,32 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
+/// Mentions a foreign producing tool. The name comes straight from the
+/// archive's manifest, so it is scrubbed before it reaches a terminal.
+fn archive_tool_note(manifest: &ArchiveManifest) -> Option<String> {
+    if manifest.tool.is_empty() || manifest.tool == "goshcoder" {
+        return None;
+    }
+    Some(format!(
+        "note: this archive was written by {}",
+        terminal_safe(&manifest.tool)
+    ))
+}
+
+/// Replaces control characters, which an untrusted archive could use to move
+/// the cursor or forge output, with a visible placeholder.
+fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Produces the user-facing summary shared by the CLI and interactive prompt
 /// command.
 pub fn describe_restore(outcomes: &[RestoreOutcome]) -> Vec<String> {
@@ -233,8 +256,8 @@ pub fn describe_restore(outcomes: &[RestoreOutcome]) -> Vec<String> {
             skipped += 1;
             lines.push(format!(
                 "skipped /{}: {}",
-                outcome.name,
-                outcome.reason.as_deref().unwrap_or("unknown reason")
+                terminal_safe(&outcome.name),
+                terminal_safe(outcome.reason.as_deref().unwrap_or("unknown reason"))
             ));
         } else {
             restored += 1;
@@ -372,5 +395,36 @@ mod tests {
             &["--other".to_owned()],
             &["--dry-run", "-dry-run"]
         ));
+    }
+
+    #[test]
+    fn archive_strings_reach_the_terminal_without_control_characters() {
+        let manifest = ArchiveManifest {
+            tool: "evil\u{1b}[2J\r\nrestored 99 prompt(s)".to_owned(),
+            ..ArchiveManifest::default()
+        };
+        assert_eq!(
+            archive_tool_note(&manifest).expect("foreign tool note"),
+            "note: this archive was written by evil?[2J??restored 99 prompt(s)"
+        );
+        assert!(
+            archive_tool_note(&ArchiveManifest {
+                tool: "goshcoder".to_owned(),
+                ..ArchiveManifest::default()
+            })
+            .is_none()
+        );
+
+        let outcomes = vec![RestoreOutcome {
+            name: "bad\u{7}name".to_owned(),
+            scope: PromptScope::User,
+            path: None,
+            skipped: true,
+            reason: Some("because\u{1b}[31m".to_owned()),
+        }];
+        assert_eq!(
+            describe_restore(&outcomes)[0],
+            "skipped /bad?name: because?[31m"
+        );
     }
 }

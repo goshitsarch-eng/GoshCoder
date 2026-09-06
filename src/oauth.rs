@@ -118,6 +118,8 @@ pub type Result<T> = std::result::Result<T, OAuthError>;
 #[derive(Debug)]
 pub enum OAuthError {
     Cancelled,
+    /// A [`CancellationToken`] deadline elapsed before the flow finished.
+    TimedOut,
     Unauthorized {
         provider: &'static str,
         operation: &'static str,
@@ -165,6 +167,7 @@ impl fmt::Display for OAuthError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cancelled => formatter.write_str("OAuth login was cancelled"),
+            Self::TimedOut => formatter.write_str("OAuth request exceeded its time budget"),
             Self::Unauthorized {
                 provider,
                 operation,
@@ -247,9 +250,15 @@ impl From<CatalogError> for OAuthError {
 
 /// Cooperative cancellation for device polling, backoff, prompts, and
 /// loopback waiting.
+///
+/// A token may also carry a deadline. A refresh that nobody asked for
+/// interactively (provider enumeration, model resolution) uses one so a slow
+/// token endpoint bounds the caller's wait instead of the transport's full
+/// retry allowance.
 #[derive(Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
 }
 
 impl CancellationToken {
@@ -257,17 +266,38 @@ impl CancellationToken {
         Self::default()
     }
 
+    /// Creates a token that reports itself cancelled once `timeout` elapses.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            cancelled: Arc::default(),
+            deadline: Instant::now().checked_add(timeout),
+        }
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.cancelled.load(Ordering::Acquire) || self.deadline_passed()
+    }
+
+    /// Time left before the deadline; `None` for a token without one.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     pub fn check(&self) -> Result<()> {
-        if self.is_cancelled() {
+        if self.cancelled.load(Ordering::Acquire) {
             Err(OAuthError::Cancelled)
+        } else if self.deadline_passed() {
+            Err(OAuthError::TimedOut)
         } else {
             Ok(())
         }
@@ -900,12 +930,24 @@ impl BrowserOpener for NoopBrowser {
     }
 }
 
+/// A single callback connection may take this long to deliver its request
+/// line. Browsers redirect in milliseconds; only a stuck or hostile client
+/// needs more.
+const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const CALLBACK_REQUEST_LIMIT: usize = 16 * 1024;
+
 /// A validated loopback callback listener. It accepts only the expected path
 /// and CSRF state, and returns an escaped, no-store browser response.
+///
+/// Anything one connection does wrong (a malformed or oversized request, a
+/// reset socket, a client that never finishes) is answered or dropped and
+/// then forgotten: the login keeps waiting for the browser's real callback or
+/// the manual paste. Only cancellation ends the wait from here.
 pub struct LoopbackCallbackServer {
     listener: TcpListener,
     expected_path: String,
     expected_state: String,
+    request_timeout: Duration,
 }
 
 impl LoopbackCallbackServer {
@@ -941,7 +983,14 @@ impl LoopbackCallbackServer {
             listener,
             expected_path: path.to_owned(),
             expected_state: expected_state.to_owned(),
+            request_timeout: CALLBACK_REQUEST_TIMEOUT,
         })
+    }
+
+    /// Bounds how long one connection may take to send its request line.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -957,12 +1006,9 @@ impl LoopbackCallbackServer {
     ) -> Result<Option<AuthorizationResponse>> {
         let (stream, _) = match self.listener.accept() {
             Ok(pair) => pair,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => {
-                return Err(OAuthError::Callback(format!(
-                    "cannot accept callback connection: {error}"
-                )));
-            }
+            // A peer that vanished between connect and accept, or a passing
+            // resource shortage, is not a reason to abandon the login.
+            Err(_) => return Ok(None),
         };
         self.handle_connection(stream, cancellation)
     }
@@ -972,10 +1018,13 @@ impl LoopbackCallbackServer {
         mut stream: TcpStream,
         cancellation: &CancellationToken,
     ) -> Result<Option<AuthorizationResponse>> {
-        let request = read_callback_request(&mut stream, cancellation)?;
-        let Some(request) = request else {
-            let _ = write_callback_page(&mut stream, 408, "Callback request timed out.");
-            return Ok(None);
+        let request = match read_callback_request(&mut stream, self.request_timeout, cancellation)?
+        {
+            CallbackRead::Request(line) => line,
+            CallbackRead::Reject { status, message } => {
+                let _ = write_callback_page(&mut stream, status, message);
+                return Ok(None);
+            }
         };
         let mut fields = request.split_whitespace();
         let method = fields.next().unwrap_or_default();
@@ -985,9 +1034,10 @@ impl LoopbackCallbackServer {
             return Ok(None);
         }
 
-        let parsed = Url::parse(&format!("http://localhost{target}")).map_err(|_| {
-            OAuthError::Callback("callback request target was not a valid URL".to_owned())
-        })?;
+        let Ok(parsed) = Url::parse(&format!("http://localhost{target}")) else {
+            let _ = write_callback_page(&mut stream, 400, "Callback request target is invalid.");
+            return Ok(None);
+        };
         if parsed.path() != self.expected_path {
             let _ = write_callback_page(&mut stream, 404, "Callback route not found.");
             return Ok(None);
@@ -1028,28 +1078,53 @@ fn is_loopback_host(host: &str) -> bool {
             .unwrap_or(false)
 }
 
+/// Outcome of reading one callback connection's request line. A rejection
+/// carries the response the caller sends, so exactly one response is written
+/// per connection.
+enum CallbackRead {
+    Request(String),
+    Reject { status: u16, message: &'static str },
+}
+
 fn read_callback_request(
     stream: &mut TcpStream,
+    timeout: Duration,
     cancellation: &CancellationToken,
-) -> Result<Option<String>> {
-    stream
+) -> Result<CallbackRead> {
+    if stream
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .map_err(|error| {
-            OAuthError::Callback(format!("cannot configure callback socket: {error}"))
-        })?;
-    let started = Instant::now();
+        .is_err()
+    {
+        return Ok(CallbackRead::Reject {
+            status: 500,
+            message: "Callback socket could not be configured.",
+        });
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 1024];
     loop {
         cancellation.check()?;
+        // Checked on every pass, not only on idle reads: a client trickling a
+        // byte at a time would otherwise keep the login's accept loop busy for
+        // as long as it liked.
+        if Instant::now() >= deadline {
+            return Ok(CallbackRead::Reject {
+                status: 408,
+                message: "Callback request timed out.",
+            });
+        }
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 bytes.extend_from_slice(&buffer[..read]);
-                if bytes.len() > 16 * 1024 {
-                    let _ =
-                        write_callback_page(stream, 431, "Callback request headers are too large.");
-                    return Ok(None);
+                if bytes.len() > CALLBACK_REQUEST_LIMIT {
+                    return Ok(CallbackRead::Reject {
+                        status: 431,
+                        message: "Callback request headers are too large.",
+                    });
                 }
                 if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
                     break;
@@ -1058,23 +1133,35 @@ fn read_callback_request(
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                if started.elapsed() >= Duration::from_secs(10) {
-                    return Ok(None);
-                }
-            }
-            Err(error) => {
-                return Err(OAuthError::Callback(format!(
-                    "cannot read callback request: {error}"
-                )));
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => {
+                return Ok(CallbackRead::Reject {
+                    status: 400,
+                    message: "Callback request could not be read.",
+                });
             }
         }
     }
-    let request = String::from_utf8(bytes)
-        .map_err(|_| OAuthError::Callback("callback request was not UTF-8".to_owned()))?;
-    Ok(request.lines().next().map(str::to_owned))
+    let Ok(request) = String::from_utf8(bytes) else {
+        return Ok(CallbackRead::Reject {
+            status: 400,
+            message: "Callback request was not UTF-8.",
+        });
+    };
+    match request
+        .lines()
+        .next()
+        .filter(|line| !line.trim().is_empty())
+    {
+        Some(line) => Ok(CallbackRead::Request(line.to_owned())),
+        None => Ok(CallbackRead::Reject {
+            status: 400,
+            message: "Callback request was empty.",
+        }),
+    }
 }
 
 fn write_callback_page(stream: &mut TcpStream, status: u16, message: &str) -> io::Result<()> {
@@ -1307,7 +1394,7 @@ impl OAuthTransport for ReqwestOAuthTransport {
             .request(request.method, request.url)
             .headers(headers)
             .body(request.body)
-            .timeout(request.timeout)
+            .timeout(bounded_request_timeout(request.timeout, cancellation))
             .send()
             .map_err(|error| OAuthError::Transport(error.to_string()))?;
         let status = response.status().as_u16();
@@ -1323,6 +1410,14 @@ impl OAuthTransport for ReqwestOAuthTransport {
         cancellation.check()?;
         Ok(OAuthResponse { status, body })
     }
+}
+
+/// A blocking request cannot be interrupted mid-flight, so its own timeout is
+/// the only way a token deadline can cut it short.
+fn bounded_request_timeout(timeout: Duration, cancellation: &CancellationToken) -> Duration {
+    cancellation
+        .remaining()
+        .map_or(timeout, |remaining| remaining.min(timeout))
 }
 
 #[derive(Clone, Debug)]
@@ -1673,6 +1768,12 @@ impl OAuthClient {
 
     pub fn endpoints(&self) -> &OAuthEndpoints {
         &self.endpoints
+    }
+
+    /// Reports whether a stored credential is inside its refresh window
+    /// according to this client's clock.
+    pub fn credential_needs_refresh(&self, credential: &Credential) -> bool {
+        credential_expires_soon(credential, self.clock.as_ref())
     }
 
     /// Starts a provider login but leaves persistence under caller control.
@@ -2396,7 +2497,7 @@ impl OAuthClient {
         interaction.notify(OAuthEvent::device_code(
             device.user_code.clone(),
             self.endpoints.codex_device_verify_url.to_string(),
-            Duration::from_secs(device.interval_seconds),
+            device.interval,
             DEFAULT_DEVICE_TIMEOUT,
         ));
         let (code, verifier) = self.poll_codex_device_token(&device, cancellation)?;
@@ -2416,10 +2517,7 @@ impl OAuthClient {
         poll_device_code(
             self.clock.as_ref(),
             cancellation,
-            DevicePollingPolicy::new(
-                Duration::from_secs(device.interval_seconds),
-                DEFAULT_DEVICE_TIMEOUT,
-            ),
+            DevicePollingPolicy::new(device.interval, DEFAULT_DEVICE_TIMEOUT),
             || {
                 let response = self.post_json(
                     &self.endpoints.codex_device_token_url,
@@ -2450,17 +2548,21 @@ impl OAuthClient {
                     )?;
                     return Ok(DevicePoll::Complete((code, verifier)));
                 }
-                if response.status == 403
-                    || response.status == 404
-                    || codex_device_pending(&response.body)
-                {
+                if response.status == 403 || response.status == 404 {
                     return Ok(DevicePoll::Pending);
                 }
-                Err(operation_failure(
-                    OAuthProviderId::OpenAiCodex.display_name(),
-                    "device token request",
-                    &response,
-                ))
+                match codex_device_error_code(&response.body).as_deref() {
+                    Some("deviceauth_authorization_pending" | "authorization_pending") => {
+                        Ok(DevicePoll::Pending)
+                    }
+                    // RFC 8628 section 3.5: back off instead of giving up.
+                    Some("slow_down") => Ok(DevicePoll::SlowDown(None)),
+                    _ => Err(operation_failure(
+                        OAuthProviderId::OpenAiCodex.display_name(),
+                        "device token request",
+                        &response,
+                    )),
+                }
             },
         )
     }
@@ -2528,7 +2630,7 @@ impl OAuthClient {
 struct CodexDeviceAuthorization {
     device_auth_id: String,
     user_code: String,
-    interval_seconds: u64,
+    interval: Duration,
 }
 
 fn parse_codex_device_authorization(body: &[u8]) -> Result<CodexDeviceAuthorization> {
@@ -2546,16 +2648,20 @@ fn parse_codex_device_authorization(body: &[u8]) -> Result<CodexDeviceAuthorizat
         provider: OAuthProviderId::OpenAiCodex.display_name(),
         operation: "device code request",
     })?;
-    let interval_seconds = value.get("interval").and_then(json_nonnegative_u64).ok_or(
-        OAuthError::InvalidTokenResponse {
+    // The server reports the interval as a number or a numeric string, and a
+    // fractional value is a real interval rather than a malformed one.
+    let interval_seconds = value
+        .get("interval")
+        .and_then(json_seconds)
+        .filter(|seconds| *seconds >= 0.0)
+        .ok_or(OAuthError::InvalidTokenResponse {
             provider: OAuthProviderId::OpenAiCodex.display_name(),
             operation: "device code request",
-        },
-    )?;
+        })?;
     Ok(CodexDeviceAuthorization {
         device_auth_id,
         user_code,
-        interval_seconds,
+        interval: reported_device_interval(interval_seconds, DEFAULT_DEVICE_INTERVAL),
     })
 }
 
@@ -2567,28 +2673,21 @@ fn json_string(value: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn json_nonnegative_u64(value: &Value) -> Option<u64> {
+fn json_seconds(value: &Value) -> Option<f64> {
     value
-        .as_u64()
-        .or_else(|| value.as_str()?.parse::<u64>().ok())
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite())
 }
 
-fn codex_device_pending(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    match value.get("error") {
-        Some(Value::String(error)) => {
-            matches!(
-                error.as_str(),
-                "deviceauth_authorization_pending" | "authorization_pending"
-            )
-        }
-        Some(Value::Object(error)) => matches!(
-            error.get("code").and_then(Value::as_str),
-            Some("deviceauth_authorization_pending" | "authorization_pending")
-        ),
-        _ => false,
+/// Codex reports device-poll errors either as `{"error": "code"}` or as
+/// `{"error": {"code": "code"}}`.
+fn codex_device_error_code(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    match value.get("error")? {
+        Value::String(error) => Some(error.clone()),
+        Value::Object(error) => error.get("code").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
     }
 }
 
@@ -3396,7 +3495,11 @@ struct MetaProblem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, net::TcpStream, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        net::{Shutdown, TcpStream},
+        sync::Mutex,
+    };
 
     struct FakeClock {
         now: Mutex<i64>,
@@ -4241,5 +4344,213 @@ mod tests {
             .expect("credential is retained");
         assert_eq!(preserved.access(), "stale");
         assert_eq!(preserved.refresh(), "still-on-disk");
+    }
+
+    /// Connects to the callback listener, runs `send`, and returns whatever
+    /// the server answered.
+    fn callback_client(
+        port: u16,
+        send: impl FnOnce(&mut TcpStream) + Send + 'static,
+    ) -> thread::JoinHandle<String> {
+        thread::spawn(move || {
+            let mut stream =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect callback listener");
+            send(&mut stream);
+            let mut response = Vec::new();
+            let _ = stream.read_to_end(&mut response);
+            String::from_utf8_lossy(&response).into_owned()
+        })
+    }
+
+    /// Drives the non-blocking listener until the client has its answer.
+    fn serve_until_done(
+        server: &LoopbackCallbackServer,
+        client: thread::JoinHandle<String>,
+    ) -> (Option<AuthorizationResponse>, String) {
+        let cancellation = CancellationToken::new();
+        let started = Instant::now();
+        let mut accepted = None;
+        while !client.is_finished() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "callback client never finished"
+            );
+            if let Some(response) = server
+                .try_accept(&cancellation)
+                .expect("a misbehaving connection is not a login failure")
+            {
+                accepted = Some(response);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        (accepted, client.join().expect("client thread"))
+    }
+
+    #[test]
+    fn loopback_server_survives_bad_connections_and_answers_each_once() {
+        let server = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state")
+            .expect("bind callback listener")
+            .with_request_timeout(Duration::from_millis(200));
+        let port = server.local_addr().expect("address").port();
+
+        let garbage = callback_client(port, |stream| {
+            let _ = stream.write_all(b"\xff\xfe\x00 GARBAGE\r\n\r\n");
+        });
+        let (accepted, response) = serve_until_done(&server, garbage);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert_eq!(response.matches("HTTP/1.1").count(), 1);
+
+        let silent = callback_client(port, |stream| {
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+        let (accepted, response) = serve_until_done(&server, silent);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+
+        // Exactly the read that tips over the limit consumes the last byte
+        // sent, so the reply is not lost to a reset.
+        let oversized = callback_client(port, |stream| {
+            let _ = stream.write_all(&vec![b'a'; 17 * 1024]);
+        });
+        let (accepted, response) = serve_until_done(&server, oversized);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 431"), "{response}");
+        assert_eq!(
+            response.matches("HTTP/1.1").count(),
+            1,
+            "an oversized request gets one response, not a 431 and a 408"
+        );
+
+        // A client trickling one byte per read never idles long enough to hit
+        // the socket timeout; only the per-connection deadline stops it.
+        let slow = thread::spawn(move || {
+            let mut stream =
+                TcpStream::connect(("127.0.0.1", port)).expect("connect callback listener");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(30)))
+                .expect("client read timeout");
+            let mut response = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            for byte in b"GET /callback?code=x&state=state HTTP/1.1"
+                .iter()
+                .cycle()
+                .take(200)
+            {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&buffer[..read]),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+                if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&response).into_owned()
+        });
+        let started = Instant::now();
+        let (accepted, response) = serve_until_done(&server, slow);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let genuine = callback_client(port, |stream| {
+            let _ = stream.write_all(
+                b"GET /callback?code=callback-code&state=state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+        });
+        let (accepted, response) = serve_until_done(&server, genuine);
+        assert_eq!(
+            accepted.map(|callback| callback.code).as_deref(),
+            Some("callback-code"),
+            "the listener still serves the real callback afterwards"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[test]
+    fn codex_device_poll_honors_slow_down_and_fractional_intervals() {
+        let access = codex_jwt("acct-slow");
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(
+                200,
+                br#"{"device_auth_id":"device-auth","user_code":"DEVICE","interval":2.5}"#.to_vec(),
+            ),
+            response(400, br#"{"error":"slow_down"}"#.to_vec()),
+            response(
+                200,
+                br#"{"authorization_code":"authorization-code","code_verifier":"device-verifier"}"#
+                    .to_vec(),
+            ),
+            response(
+                200,
+                serde_json::to_vec(&json!({
+                    "access_token": access,
+                    "refresh_token": "codex-refresh",
+                    "expires_in": 3600,
+                }))
+                .expect("token JSON"),
+            ),
+        ]));
+        let clock = Arc::new(FakeClock::new(0));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = Arc::new(PromptInteraction::answers(["device_code"]));
+        client
+            .login(
+                OAuthProviderId::OpenAiCodex,
+                interaction,
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("Codex device login survives slow_down");
+        // RFC 8628: slow_down adds five seconds to the reported 2.5 s interval.
+        assert_eq!(clock.sleeps(), vec![Duration::from_millis(7_500)]);
+        assert_eq!(transport.requests().len(), 4);
+    }
+
+    #[test]
+    fn cancellation_deadline_reports_timeout_and_bounds_request_timeouts() {
+        let unbounded = CancellationToken::new();
+        assert_eq!(unbounded.remaining(), None);
+        assert_eq!(
+            bounded_request_timeout(Duration::from_secs(30), &unbounded),
+            Duration::from_secs(30)
+        );
+
+        let generous = CancellationToken::with_timeout(Duration::from_secs(3600));
+        assert!(generous.check().is_ok());
+        assert_eq!(
+            bounded_request_timeout(Duration::from_secs(30), &generous),
+            Duration::from_secs(30)
+        );
+        let tight = CancellationToken::with_timeout(Duration::from_secs(5));
+        assert!(bounded_request_timeout(Duration::from_secs(30), &tight) <= Duration::from_secs(5));
+
+        let expired = CancellationToken::with_timeout(Duration::ZERO);
+        assert!(expired.is_cancelled());
+        assert!(matches!(expired.check(), Err(OAuthError::TimedOut)));
+        assert_eq!(expired.remaining(), Some(Duration::ZERO));
+        // An explicit cancellation still wins over an elapsed deadline.
+        expired.cancel();
+        assert!(matches!(expired.check(), Err(OAuthError::Cancelled)));
+
+        // The production clock's sleep observes the deadline mid-wait.
+        let started = Instant::now();
+        assert!(matches!(
+            SystemClock.sleep(
+                Duration::from_secs(5),
+                &CancellationToken::with_timeout(Duration::from_millis(50)),
+            ),
+            Err(OAuthError::TimedOut)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
