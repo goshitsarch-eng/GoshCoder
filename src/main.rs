@@ -188,7 +188,7 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            let _ = render_run_event(event, &mut stdout, &mut stderr, color);
         }
     });
 
@@ -413,7 +413,7 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let (agent_event_sender, agent_event_receiver) = mpsc::channel();
     let (turn_sender, turn_receiver) = mpsc::channel();
     let _agent_event_subscription = agent.subscribe(move |event| {
-        let _ = agent_event_sender.send(event);
+        let _ = agent_event_sender.send(event.clone());
     });
 
     // A panic anywhere on the UI thread must not leave the shell in raw mode
@@ -605,7 +605,7 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut stdout = io::stdout().lock();
             let mut stderr = io::stderr().lock();
-            let _ = render_run_event(&event, &mut stdout, &mut stderr, color);
+            let _ = render_run_event(event, &mut stdout, &mut stderr, color);
         }
     });
 

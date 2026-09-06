@@ -98,10 +98,12 @@ pub fn compact_with_summaries(
     instructions: &str,
     summaries: &[agent::CompactionInfo],
 ) -> Result<Outcome> {
-    let state = agent.state();
-    if state.is_streaming {
+    // Checked before the summary request rather than after: the agent would
+    // refuse the cut anyway, and the request is the expensive part.
+    if !agent.can_compact() {
         return Err(CompactionError::Busy);
     }
+    let state = agent.state();
     let cut = cut_index(&state.messages, state.model.context_window);
     if cut == 0 {
         return Err(CompactionError::InsufficientHistory);
@@ -118,7 +120,10 @@ pub fn compact_with_summaries(
     let tokens_before = estimate_messages_tokens(&state.messages);
     let marker = summary_message(&summary, now_millis());
     let dropped_queued_messages = agent.queued_message_count();
-    agent.compact(
+    // The summary request took a while; a turn that landed meanwhile would
+    // be silently discarded by applying the cut computed from the old state.
+    agent.compact_if_unchanged(
+        state.messages.len(),
         marker,
         retained.clone(),
         agent::CompactionInfo {
@@ -139,6 +144,9 @@ pub fn compact_with_summaries(
 }
 
 /// Runs compaction only once context use approaches the selected model's limit.
+///
+/// Usable before a prompt and, from an [`agent::PrepareNextTurn`] hook,
+/// between the turns of a run.
 pub fn maybe_auto_compact(agent: &agent::Agent) -> Result<Option<Outcome>> {
     let state = agent.state();
     let context_window = state.model.context_window;
@@ -184,14 +192,35 @@ pub fn estimate_messages_tokens(messages: &[llm::Message]) -> u64 {
     })
 }
 
-/// Estimates a single message at four UTF-8 bytes per token.
+/// Characters pi charges for one image block, which the text serialization
+/// used for the byte estimate cannot see.
+pub const ESTIMATED_IMAGE_CHARS: u64 = 4_800;
+
+/// Estimates a single message at four UTF-8 bytes per token, plus a flat
+/// charge per image block.
 pub fn estimate_message_tokens(message: &llm::Message) -> u64 {
     let serialized = serialize_message(message);
-    if serialized.is_empty() {
+    let text_tokens = if serialized.is_empty() {
         0
     } else {
         ((serialized.len() as u64).saturating_add(3) / 4).max(1)
-    }
+    };
+    text_tokens.saturating_add(image_blocks(message).saturating_mul(ESTIMATED_IMAGE_CHARS / 4))
+}
+
+fn image_blocks(message: &llm::Message) -> u64 {
+    let blocks = match message {
+        llm::Message::User(message) => match &message.content {
+            llm::UserContent::Text(_) => return 0,
+            llm::UserContent::Blocks(blocks) => blocks,
+        },
+        llm::Message::Assistant(message) => &message.content,
+        llm::Message::ToolResult(message) => &message.content,
+    };
+    blocks
+        .iter()
+        .filter(|block| matches!(block, llm::ContentBlock::Image(_)))
+        .count() as u64
 }
 
 /// Produces the model-facing summary marker.
@@ -543,7 +572,7 @@ mod tests {
             ..agent::AgentOptions::default()
         });
         let _subscription =
-            agent.subscribe(move |event| event_log.lock().expect("lock").push(event));
+            agent.subscribe(move |event| event_log.lock().expect("lock").push(event.clone()));
         agent.follow_up(user("discarded follow-up"));
 
         let outcome = compact(&agent, "preserve test details").expect("compact");
@@ -586,5 +615,138 @@ mod tests {
             ),
             1.75
         );
+    }
+
+    #[test]
+    fn image_blocks_count_toward_the_token_estimate() {
+        let image = || {
+            llm::ContentBlock::Image(llm::ImageContent {
+                data: "AAAA".to_owned(),
+                mime_type: "image/png".to_owned(),
+            })
+        };
+        let text_only = llm::Message::User(llm::UserMessage {
+            role: "user".to_owned(),
+            content: llm::UserContent::Blocks(vec![llm::ContentBlock::text("look at this")]),
+            timestamp: 1,
+        });
+        let with_image = llm::Message::User(llm::UserMessage {
+            role: "user".to_owned(),
+            content: llm::UserContent::Blocks(vec![
+                llm::ContentBlock::text("look at this"),
+                image(),
+            ]),
+            timestamp: 1,
+        });
+        assert_eq!(
+            estimate_message_tokens(&with_image),
+            estimate_message_tokens(&text_only) + ESTIMATED_IMAGE_CHARS / 4
+        );
+
+        let tool_images = llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+            tool_name: "screenshot".to_owned(),
+            content: vec![image(), image()],
+            ..llm::ToolResultMessage::default()
+        }));
+        assert!(estimate_message_tokens(&tool_images) >= 2 * (ESTIMATED_IMAGE_CHARS / 4));
+    }
+
+    #[test]
+    fn auto_compaction_runs_between_turns_from_the_prepare_next_turn_hook() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let tool = agent::Tool::new(
+            "echo",
+            "Echo",
+            "Returns its value",
+            serde_json::json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+            |_, _, _, _| Ok(agent::ToolResult::text("echoed")),
+        );
+        let responder: agent::AssistantResponder = Arc::new(move |_, context, _| {
+            if context.system_prompt.contains("context compactor") {
+                let llm::Message::Assistant(summary) = assistant("## Goal\nKeep parity") else {
+                    unreachable!("assistant helper builds an assistant message");
+                };
+                return Ok(*summary);
+            }
+            let mut seen = seen.lock().expect("lock");
+            seen.push(
+                context
+                    .messages
+                    .iter()
+                    .map(llm::Message::text_preview)
+                    .collect::<Vec<_>>(),
+            );
+            if seen.len() > 1 {
+                let llm::Message::Assistant(done) = assistant("done") else {
+                    unreachable!("assistant helper builds an assistant message");
+                };
+                return Ok(*done);
+            }
+            // The tool turn reports a context that is nearly full, which is
+            // what the between-turn check must react to.
+            Ok(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::ToolCall(llm::ToolCall {
+                    id: "one".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: std::collections::BTreeMap::new(),
+                    thought_signature: String::new(),
+                    namespace: String::new(),
+                })],
+                api: "test".to_owned(),
+                provider: "test".to_owned(),
+                model: "test".to_owned(),
+                stop_reason: stream::STOP_TOOL_USE.to_owned(),
+                usage: llm::Usage {
+                    total_tokens: 9_000,
+                    ..llm::Usage::default()
+                },
+                timestamp: 2,
+                ..llm::AssistantMessage::default()
+            })
+        });
+        let agent = agent::Agent::new(agent::AgentOptions {
+            initial_state: agent::InitialState {
+                model: llm::Model {
+                    context_window: 10_000,
+                    ..model()
+                },
+                tools: vec![tool],
+                messages: vec![user("old request"), assistant("old reply")],
+                ..agent::InitialState::default()
+            },
+            responder: Some(responder),
+            ..agent::AgentOptions::default()
+        });
+        agent.set_prepare_next_turn(Some(Arc::new(|agent, _| {
+            maybe_auto_compact(agent).expect("auto compaction between turns");
+        })));
+
+        agent.prompt("latest request").expect("prompt");
+
+        let requests = requests.lock().expect("lock");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1][0].contains(SUMMARY_OPEN),
+            "the reply turn already runs on the compacted context: {:?}",
+            requests[1]
+        );
+        assert_eq!(
+            requests[1].len(),
+            4,
+            "summary, latest request, tool call, tool result"
+        );
+        let state = agent.state();
+        assert!(is_summary_message(&state.messages[0]));
+        assert_eq!(state.compactions.len(), 1);
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(llm::Message::text_preview)
+                .as_deref(),
+            Some("done")
+        );
+        assert!(!state.is_streaming);
     }
 }

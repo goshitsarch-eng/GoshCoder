@@ -380,8 +380,8 @@ fn planner_subscription(
         if event.kind != agent::EventKind::TurnEnd {
             return;
         }
-        if let Some(llm::Message::Assistant(message)) = event.message {
-            manager.track_assistant(&message);
+        if let Some(llm::Message::Assistant(message)) = event.message.as_ref() {
+            manager.track_assistant(message);
         }
         let normal_tools = lock(&normal_tools).clone();
         sync_agent(

@@ -1472,11 +1472,11 @@ fn recording_failure(error: &SessionError) -> bool {
     )
 }
 
-fn bridge_agent_event(recorder: &Recorder, event: agent::Event) {
+fn bridge_agent_event(recorder: &Recorder, event: &agent::Event) {
     match event.kind {
         agent::EventKind::MessageEnd => {
-            if let Some(message) = event.message {
-                match Entry::message(&message) {
+            if let Some(message) = event.message.as_ref() {
+                match Entry::message(message) {
                     Ok(entry) => recorder.append_best_effort(entry),
                     Err(error) => recorder.report(format!(
                         "could not encode a completed {} message for the session log: {error}",
@@ -1487,13 +1487,13 @@ fn bridge_agent_event(recorder: &Recorder, event: agent::Event) {
         }
         agent::EventKind::ModelChange => recorder.append_best_effort(Entry {
             kind: sessionlog::TYPE_MODEL_CHANGE.to_owned(),
-            provider: event.provider,
-            model_id: event.model_id,
+            provider: event.provider.clone(),
+            model_id: event.model_id.clone(),
             ..Entry::default()
         }),
         agent::EventKind::ThinkingLevelChange => recorder.append_best_effort(Entry {
             kind: sessionlog::TYPE_THINKING_LEVEL_CHANGE.to_owned(),
-            thinking_level: event.thinking_level,
+            thinking_level: event.thinking_level.clone(),
             ..Entry::default()
         }),
         agent::EventKind::ContextCompacted => {
@@ -1515,7 +1515,7 @@ fn bridge_agent_event(recorder: &Recorder, event: agent::Event) {
             reason: if event.reason.is_empty() {
                 "reset".to_owned()
             } else {
-                event.reason
+                event.reason.clone()
             },
             ..Entry::default()
         }),

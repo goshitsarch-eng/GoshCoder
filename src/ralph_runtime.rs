@@ -161,7 +161,7 @@ fn ralph_subscription(
         if event.kind != agent::EventKind::TurnEnd {
             return;
         }
-        let Some(llm::Message::Assistant(assistant)) = event.message else {
+        let Some(llm::Message::Assistant(assistant)) = event.message.as_ref() else {
             return;
         };
         // A terminal provider failure must leave the active loop at the same
@@ -172,7 +172,7 @@ fn ralph_subscription(
         }
 
         let base_system_prompt = lock(&base_system_prompt).clone();
-        match store.prepare_next_turn(&base_system_prompt, &assistant) {
+        match store.prepare_next_turn(&base_system_prompt, assistant) {
             Ok(preparation) => {
                 system_prompt_sync(preparation.system_prompt);
                 if preparation.completed

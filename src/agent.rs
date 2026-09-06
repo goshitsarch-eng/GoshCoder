@@ -13,7 +13,7 @@ use std::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread,
+    thread::{self, ThreadId},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -30,6 +30,11 @@ pub enum AgentError {
     CannotContinue(String),
     ResetWhileRunning,
     CompactWhileRunning,
+    /// The transcript changed between the caller's snapshot and its compaction.
+    StaleSnapshot {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for AgentError {
@@ -48,6 +53,10 @@ impl fmt::Display for AgentError {
             Self::CompactWhileRunning => {
                 formatter.write_str("agent is already processing; wait for completion before compacting")
             }
+            Self::StaleSnapshot { expected, actual } => write!(
+                formatter,
+                "the transcript changed while compaction was being prepared (expected {expected} messages, found {actual})"
+            ),
         }
     }
 }
@@ -247,6 +256,25 @@ pub type AssistantResponder = Arc<
         + 'static,
 >;
 
+/// The turn a loop has just finished, offered to
+/// [`AgentOptions::prepare_next_turn`] before the following turn starts.
+#[derive(Clone, Copy, Debug)]
+pub struct CompletedTurn<'a> {
+    pub message: &'a llm::AssistantMessage,
+    pub tool_results: &'a [llm::Message],
+    /// Every message the current run has produced so far.
+    pub new_messages: &'a [llm::Message],
+}
+
+/// Runs on the loop thread between turns, mirroring pi's `prepareNextTurn`.
+/// Installed with [`Agent::set_prepare_next_turn`].
+///
+/// The loop reads the agent's state afresh for each request, so the hook
+/// adjusts the next turn by calling back into the agent: it may compact the
+/// transcript, switch the model, or change the thinking level. It is not
+/// invoked after the final turn of a run.
+pub type PrepareNextTurn = Arc<dyn Fn(&Agent, &CompletedTurn<'_>) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 pub struct InitialState {
     pub system_prompt: String,
@@ -340,6 +368,12 @@ pub struct CompactionInfo {
 #[derive(Clone, Debug)]
 pub struct Event {
     pub kind: EventKind,
+    /// The message a lifecycle event concerns.
+    ///
+    /// Streamed assistant notifications (a `MessageStart` raised by a stream
+    /// and every `MessageUpdate`) leave this empty: their current snapshot is
+    /// `assistant_event.partial`, shared with the provider rather than copied
+    /// for every delta.
     pub message: Option<llm::Message>,
     /// The normalized provider event underlying a streamed assistant update.
     /// Present only for streamed message lifecycle notifications.
@@ -383,7 +417,9 @@ impl Event {
     }
 }
 
-pub type Listener = Arc<dyn Fn(Event) + Send + Sync + 'static>;
+/// Observes lifecycle events. One event is built per emission and shared by
+/// every listener, so a listener that needs to keep an event clones it.
+pub type Listener = Arc<dyn Fn(&Event) + Send + Sync + 'static>;
 
 /// Keeps a listener registered for its lifetime.
 pub struct Subscription {
@@ -437,20 +473,38 @@ impl WeakFollowUpQueue {
 
 struct AgentInner {
     state: Mutex<InnerState>,
-    /// Serializes durable lifecycle mutations with beginning a new run.
-    ///
-    /// A recorder must observe a compaction/reset before any subsequently
-    /// recorded prompt, or the persisted branch diverges from the live
-    /// transcript. The actual request runs without this lock.
-    lifecycle: Mutex<()>,
     idle: Condvar,
     listeners: Mutex<BTreeMap<usize, Listener>>,
     next_listener_id: AtomicUsize,
+    /// A broken listener panics on every event; reporting it once keeps a
+    /// terminal frontend readable.
+    listener_panic_reported: AtomicBool,
     responder: AssistantResponder,
+    prepare_next_turn: Mutex<Option<PrepareNextTurn>>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     tool_execution: ToolExecutionMode,
     session_id: String,
+}
+
+/// A message that has started but not yet joined the transcript.
+enum StreamingMessage {
+    /// A complete message between its start and end events.
+    Whole(llm::Message),
+    /// The provider's shared streaming snapshot. It is materialized as a
+    /// message only for a state snapshot, never once per delta.
+    Partial(stream::SharedAssistantMessage),
+}
+
+impl StreamingMessage {
+    fn to_message(&self) -> llm::Message {
+        match self {
+            Self::Whole(message) => message.clone(),
+            Self::Partial(partial) => {
+                llm::Message::Assistant(Box::new(llm::AssistantMessage::clone(partial)))
+            }
+        }
+    }
 }
 
 struct InnerState {
@@ -460,12 +514,62 @@ struct InnerState {
     tools: Vec<Tool>,
     messages: Vec<llm::Message>,
     compactions: Vec<CompactionInfo>,
-    streaming_message: Option<llm::Message>,
+    streaming_message: Option<StreamingMessage>,
     pending_tool_calls: BTreeSet<String>,
     error_message: String,
+    /// Present while the loop is streaming or executing tools; it is cleared
+    /// before `AgentEnd` so that listeners observe an idle stream state.
     cancellation: Option<CancellationToken>,
+    /// Held from the start of a run until its `AgentEnd` listeners settle:
+    /// like pi's `activeRun`, the agent stays busy while they run.
+    run_active: bool,
+    /// The loop thread while `prepare_next_turn` runs. Only that thread may
+    /// compact the transcript in the middle of a run.
+    turn_preparation: Option<ThreadId>,
+    /// A durable transcript rewrite whose event has not reached every listener
+    /// yet. Runs are refused until it clears, so a recorder never sees a
+    /// prompt land before the cut it must follow, and a listener that calls
+    /// back into the agent gets `Busy` instead of a deadlock.
+    lifecycle_transition: bool,
     steering: Vec<llm::Message>,
     follow_ups: Vec<llm::Message>,
+}
+
+impl InnerState {
+    /// Compaction is safe when nothing is in flight: while idle, or between
+    /// turns on the loop thread itself.
+    fn accepts_compaction(&self) -> bool {
+        !self.lifecycle_transition
+            && (!self.run_active || self.turn_preparation == Some(thread::current().id()))
+    }
+}
+
+/// How a run begins: pi's `runAgentLoop` for prompts, `runAgentLoopContinue`
+/// when `messages` is empty.
+struct RunStart {
+    messages: Vec<llm::Message>,
+    /// Set when the prompt itself came from the steering queue, so the loop
+    /// must not immediately poll that queue again: in one-at-a-time mode the
+    /// poll would deliver a second message in the same turn.
+    skip_initial_steering_poll: bool,
+}
+
+/// Releases the run slot even if the loop unwinds twice, which would
+/// otherwise leave the agent permanently busy.
+struct ActiveRun<'a> {
+    agent: &'a Agent,
+}
+
+impl Drop for ActiveRun<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.agent.inner.state);
+        state.streaming_message = None;
+        state.pending_tool_calls.clear();
+        state.cancellation = None;
+        state.turn_preparation = None;
+        state.run_active = false;
+        self.agent.inner.idle.notify_all();
+    }
 }
 
 impl Agent {
@@ -492,14 +596,18 @@ impl Agent {
                     pending_tool_calls: BTreeSet::new(),
                     error_message: String::new(),
                     cancellation: None,
+                    run_active: false,
+                    turn_preparation: None,
+                    lifecycle_transition: false,
                     steering: Vec::new(),
                     follow_ups: Vec::new(),
                 }),
-                lifecycle: Mutex::new(()),
                 idle: Condvar::new(),
                 listeners: Mutex::new(BTreeMap::new()),
                 next_listener_id: AtomicUsize::new(1),
+                listener_panic_reported: AtomicBool::new(false),
                 responder,
+                prepare_next_turn: Mutex::new(None),
                 steering_mode: options.steering_mode,
                 follow_up_mode: options.follow_up_mode,
                 tool_execution: options.tool_execution,
@@ -518,13 +626,16 @@ impl Agent {
             messages: state.messages.clone(),
             compactions: state.compactions.clone(),
             is_streaming: state.cancellation.is_some(),
-            streaming_message: state.streaming_message.clone(),
+            streaming_message: state
+                .streaming_message
+                .as_ref()
+                .map(StreamingMessage::to_message),
             pending_tool_calls: state.pending_tool_calls.iter().cloned().collect(),
             error_message: state.error_message.clone(),
         }
     }
 
-    pub fn subscribe(&self, listener: impl Fn(Event) + Send + Sync + 'static) -> Subscription {
+    pub fn subscribe(&self, listener: impl Fn(&Event) + Send + Sync + 'static) -> Subscription {
         let id = self.inner.next_listener_id.fetch_add(1, Ordering::Relaxed);
         lock(&self.inner.listeners).insert(id, Arc::new(listener));
         Subscription {
@@ -548,7 +659,7 @@ impl Agent {
             let mut event = Event::kind(EventKind::ModelChange);
             event.provider = model.provider;
             event.model_id = model.id;
-            self.emit(event);
+            self.emit(&event);
         }
     }
 
@@ -563,12 +674,19 @@ impl Agent {
         if changed {
             let mut event = Event::kind(EventKind::ThinkingLevelChange);
             event.thinking_level = thinking_level;
-            self.emit(event);
+            self.emit(&event);
         }
     }
 
     pub fn set_tools(&self, tools: Vec<Tool>) {
         lock(&self.inner.state).tools = tools;
+    }
+
+    /// Installs or removes the between-turn hook; see [`PrepareNextTurn`].
+    ///
+    /// A hook installed during a run applies from that run's next turn.
+    pub fn set_prepare_next_turn(&self, hook: Option<PrepareNextTurn>) {
+        *lock(&self.inner.prepare_next_turn) = hook;
     }
 
     /// Replaces both context messages and their retained compaction metadata.
@@ -635,9 +753,11 @@ impl Agent {
         }
     }
 
+    /// Blocks until the current run, including its `AgentEnd` listeners, has
+    /// finished. Returns immediately while idle.
     pub fn wait_for_idle(&self) {
         let mut state = lock(&self.inner.state);
-        while state.cancellation.is_some() {
+        while state.run_active {
             state = self
                 .inner
                 .idle
@@ -646,16 +766,28 @@ impl Agent {
         }
     }
 
+    /// Reports whether [`Agent::compact`] would be accepted right now.
+    ///
+    /// Compaction is allowed while idle and, for a [`PrepareNextTurn`] hook,
+    /// on the loop thread between turns. Checking first spares the caller an
+    /// expensive summary request that the agent would then refuse.
+    #[must_use]
+    pub fn can_compact(&self) -> bool {
+        lock(&self.inner.state).accepts_compaction()
+    }
+
     pub fn reset(&self) -> Result<()> {
         self.reset_with_reason("")
     }
 
     pub fn reset_with_reason(&self, reason: impl Into<String>) -> Result<()> {
-        let _lifecycle = lock(&self.inner.lifecycle);
         {
             let mut state = lock(&self.inner.state);
-            if state.cancellation.is_some() {
+            if state.run_active {
                 return Err(AgentError::ResetWhileRunning);
+            }
+            if state.lifecycle_transition {
+                return Err(AgentError::Busy);
             }
             state.messages.clear();
             state.compactions.clear();
@@ -664,10 +796,12 @@ impl Agent {
             state.streaming_message = None;
             state.pending_tool_calls.clear();
             state.error_message.clear();
+            state.lifecycle_transition = true;
         }
         let mut event = Event::kind(EventKind::TranscriptReset);
         event.reason = reason.into();
-        self.emit(event);
+        self.emit(&event);
+        lock(&self.inner.state).lifecycle_transition = false;
         Ok(())
     }
 
@@ -675,18 +809,56 @@ impl Agent {
     ///
     /// The change is emitted as a single lifecycle event so session recorders
     /// can persist the exact cut rather than replaying the discarded prefix on
-    /// the next resume. Like reset, compaction is refused during a live turn.
+    /// the next resume. Like reset, compaction is refused during a live turn,
+    /// except from a [`PrepareNextTurn`] hook between turns.
+    ///
+    /// Callers that computed `kept` from a state snapshot should prefer
+    /// [`Agent::compact_if_unchanged`], which refuses to apply a cut that no
+    /// longer matches the transcript.
     pub fn compact(
         &self,
         marker: llm::Message,
         kept: Vec<llm::Message>,
         info: CompactionInfo,
     ) -> Result<()> {
-        let _lifecycle = lock(&self.inner.lifecycle);
+        self.apply_compaction(None, marker, kept, info)
+    }
+
+    /// [`Agent::compact`] guarded by the transcript length the cut was
+    /// computed from. A run that completed in between changes the length, and
+    /// applying the stale cut would silently drop its messages.
+    pub fn compact_if_unchanged(
+        &self,
+        expected_messages: usize,
+        marker: llm::Message,
+        kept: Vec<llm::Message>,
+        info: CompactionInfo,
+    ) -> Result<()> {
+        self.apply_compaction(Some(expected_messages), marker, kept, info)
+    }
+
+    fn apply_compaction(
+        &self,
+        expected_messages: Option<usize>,
+        marker: llm::Message,
+        kept: Vec<llm::Message>,
+        info: CompactionInfo,
+    ) -> Result<()> {
         {
             let mut state = lock(&self.inner.state);
-            if state.cancellation.is_some() {
+            if state.lifecycle_transition {
+                return Err(AgentError::Busy);
+            }
+            if !state.accepts_compaction() {
                 return Err(AgentError::CompactWhileRunning);
+            }
+            if let Some(expected) = expected_messages
+                && expected != state.messages.len()
+            {
+                return Err(AgentError::StaleSnapshot {
+                    expected,
+                    actual: state.messages.len(),
+                });
             }
             let mut compacted = Vec::with_capacity(kept.len() + 1);
             compacted.push(marker.clone());
@@ -696,12 +868,14 @@ impl Agent {
             state.streaming_message = None;
             state.pending_tool_calls.clear();
             state.error_message.clear();
+            state.lifecycle_transition = true;
         }
         let mut event = Event::kind(EventKind::ContextCompacted);
         event.message = Some(marker);
         event.kept = kept;
         event.compaction = Some(info);
-        self.emit(event);
+        self.emit(&event);
+        lock(&self.inner.state).lifecycle_transition = false;
         Ok(())
     }
 
@@ -712,135 +886,232 @@ impl Agent {
         ))])
     }
 
+    /// Runs a prompt, then any messages queued while it ran but left behind.
+    ///
+    /// This blocks until the whole sequence, including `AgentEnd` listeners,
+    /// has settled, matching `await agent.prompt(...)` followed by pi's
+    /// post-run `continue()` loop.
     pub fn prompt_messages(&self, messages: Vec<llm::Message>) -> Result<()> {
-        self.run(messages)
+        self.run_with(|_| {
+            Ok(Some(RunStart {
+                messages,
+                skip_initial_steering_poll: false,
+            }))
+        })?;
+        self.run_queued_messages()
     }
 
+    /// Continues from the current transcript, as pi's `Agent.continue()`.
+    ///
+    /// After an assistant message the queued steering messages, then the
+    /// follow-ups, become the prompt; any other tail resumes as it stands.
     pub fn continue_run(&self) -> Result<()> {
-        let continuation = {
-            let mut state = lock(&self.inner.state);
-            if state.cancellation.is_some() {
-                return Err(AgentError::Busy);
-            }
-            let Some(last) = state.messages.last() else {
-                return Err(AgentError::EmptyTranscript);
-            };
-            if last.role() != "assistant" {
-                Vec::new()
-            } else if let Some(messages) = drain(&mut state.steering, self.inner.steering_mode) {
-                messages
-            } else if let Some(messages) = drain(&mut state.follow_ups, self.inner.follow_up_mode) {
-                messages
-            } else {
-                return Err(AgentError::CannotContinue("assistant".to_owned()));
-            }
-        };
-        self.run(continuation)
+        let steering_mode = self.inner.steering_mode;
+        let follow_up_mode = self.inner.follow_up_mode;
+        self.run_with(|state| continuation(state, steering_mode, follow_up_mode).map(Some))?;
+        self.run_queued_messages()
     }
 
-    fn run(&self, initial_messages: Vec<llm::Message>) -> Result<()> {
-        let cancellation = {
-            let _lifecycle = lock(&self.inner.lifecycle);
+    /// pi's session loops on `agent.continue()` once `prompt()` resolves: the
+    /// loop leaves queued messages behind when it stops on an error or abort,
+    /// and `AgentEnd` listeners may queue more, so they would otherwise wait
+    /// for the next prompt.
+    fn run_queued_messages(&self) -> Result<()> {
+        let steering_mode = self.inner.steering_mode;
+        let follow_up_mode = self.inner.follow_up_mode;
+        loop {
+            let started = self.run_with(|state| {
+                if state.steering.is_empty() && state.follow_ups.is_empty() {
+                    return Ok(None);
+                }
+                continuation(state, steering_mode, follow_up_mode).map(Some)
+            })?;
+            if !started {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Claims the run slot and starts a run in one step.
+    ///
+    /// `prepare` decides what to run while the state is still locked, so a
+    /// continuation that drains a queue cannot lose its messages to a busy
+    /// agent. Returns `Ok(false)` when `prepare` found nothing to run.
+    fn run_with(
+        &self,
+        prepare: impl FnOnce(&mut InnerState) -> Result<Option<RunStart>>,
+    ) -> Result<bool> {
+        let (start, cancellation) = {
             let mut state = lock(&self.inner.state);
-            if state.cancellation.is_some() {
+            if state.run_active || state.lifecycle_transition {
                 return Err(AgentError::Busy);
             }
-            state.cancellation = Some(CancellationToken::default());
+            let Some(start) = prepare(&mut state)? else {
+                return Ok(false);
+            };
+            let cancellation = CancellationToken::default();
+            state.run_active = true;
+            state.cancellation = Some(cancellation.clone());
             state.streaming_message = None;
             state.error_message.clear();
-            state
-                .cancellation
-                .clone()
-                .expect("cancellation was just assigned")
+            (start, cancellation)
         };
+        let active = ActiveRun { agent: self };
 
         let messages = match catch_unwind(AssertUnwindSafe(|| {
-            self.run_loop(initial_messages, cancellation.clone())
+            self.run_loop(start, cancellation.clone())
         })) {
             Ok(messages) => messages,
             Err(_) => {
-                let error = self.error_message("the agent runtime panicked");
+                // pi's handleRunFailure: the failure is reported as a complete
+                // final turn so turn-oriented listeners settle their state.
+                let mut error = self.error_message("the agent runtime panicked");
+                if cancellation.is_cancelled() {
+                    error.stop_reason = stream::STOP_ABORTED.to_owned();
+                }
                 let message = llm::Message::Assistant(Box::new(error));
                 self.record_message(message.clone());
+                let mut turn_end = Event::kind(EventKind::TurnEnd);
+                turn_end.message = Some(message.clone());
+                self.emit(&turn_end);
                 vec![message]
             }
         };
+
+        // Listeners observing the end of a run see an idle stream state, while
+        // the run slot stays claimed until they settle (pi's finishRun).
+        {
+            let mut state = lock(&self.inner.state);
+            state.streaming_message = None;
+            state.pending_tool_calls.clear();
+            state.cancellation = None;
+        }
         let mut event = Event::kind(EventKind::AgentEnd);
         event.messages = messages;
-        self.emit(event);
-
-        let mut state = lock(&self.inner.state);
-        state.streaming_message = None;
-        state.pending_tool_calls.clear();
-        state.cancellation = None;
-        self.inner.idle.notify_all();
-        Ok(())
+        self.emit(&event);
+        drop(active);
+        Ok(true)
     }
 
-    fn run_loop(
-        &self,
-        mut pending_messages: Vec<llm::Message>,
-        cancellation: CancellationToken,
-    ) -> Vec<llm::Message> {
+    fn run_loop(&self, start: RunStart, cancellation: CancellationToken) -> Vec<llm::Message> {
         let mut new_messages = Vec::new();
-        self.emit(Event::kind(EventKind::AgentStart));
+        self.emit(&Event::kind(EventKind::AgentStart));
+        self.emit(&Event::kind(EventKind::TurnStart));
+        for message in start.messages {
+            self.record_message(message.clone());
+            new_messages.push(message);
+        }
+        // A message steered while the prompt was being submitted rides along
+        // with it rather than waiting for the first response.
+        let mut pending = if start.skip_initial_steering_poll {
+            Vec::new()
+        } else {
+            self.drain_steering()
+        };
+        let mut last_turn: Option<(llm::Message, Vec<llm::Message>)> = None;
 
+        // Outer loop: resumes when follow-ups arrive after the agent would stop.
         loop {
-            self.emit(Event::kind(EventKind::TurnStart));
-            for message in pending_messages.drain(..) {
-                self.record_message(message.clone());
-                new_messages.push(message);
-            }
+            let mut has_more_tool_calls = true;
 
-            let assistant = if cancellation.is_cancelled() {
-                self.error_message("Request was aborted")
-            } else {
-                self.request_assistant(cancellation.clone())
-            };
-            let is_terminal_error = matches!(assistant.stop_reason.as_str(), "error" | "aborted");
-            self.record_message(llm::Message::Assistant(Box::new(assistant.clone())));
-            new_messages.push(llm::Message::Assistant(Box::new(assistant.clone())));
-
-            let outcomes = if is_terminal_error {
-                Vec::new()
-            } else {
-                self.execute_tool_calls(&assistant, cancellation.clone())
-            };
-            let mut tool_results = Vec::new();
-            for outcome in outcomes {
-                let message = outcome.as_message();
-                self.record_message(message.clone());
-                new_messages.push(message.clone());
-                tool_results.push(message);
-            }
-
-            let mut turn_end = Event::kind(EventKind::TurnEnd);
-            turn_end.message = Some(llm::Message::Assistant(Box::new(assistant)));
-            turn_end.messages = tool_results;
-            self.emit(turn_end);
-            if is_terminal_error || cancellation.is_cancelled() {
-                break;
-            }
-
-            pending_messages = self.drain_steering();
-            if !pending_messages.is_empty() {
-                continue;
-            }
-            if !new_messages
-                .last()
-                .is_some_and(|message| matches!(message, llm::Message::ToolResult(_)))
-            {
-                pending_messages = self.drain_follow_ups();
-                if pending_messages.is_empty() {
-                    break;
+            // Inner loop: tool calls and steering messages.
+            while has_more_tool_calls || !pending.is_empty() {
+                if let Some((message, tool_results)) = last_turn.take() {
+                    if let llm::Message::Assistant(message) = &message {
+                        self.prepare_next_turn(&CompletedTurn {
+                            message,
+                            tool_results: &tool_results,
+                            new_messages: &new_messages,
+                        });
+                    }
+                    // Preparation can be long-running (compaction, say), so
+                    // pick up steering queued meanwhile. Only poll again when
+                    // the earlier poll came back empty: one-at-a-time mode
+                    // would otherwise deliver two messages in this turn.
+                    if pending.is_empty() {
+                        pending = self.drain_steering();
+                    }
+                    self.emit(&Event::kind(EventKind::TurnStart));
                 }
-                continue;
+                for message in pending.drain(..) {
+                    self.record_message(message.clone());
+                    new_messages.push(message);
+                }
+
+                let assistant = if cancellation.is_cancelled() {
+                    let mut aborted = self.error_message("Request was aborted");
+                    aborted.stop_reason = stream::STOP_ABORTED.to_owned();
+                    aborted
+                } else {
+                    self.request_assistant(cancellation.clone())
+                };
+                let is_terminal = matches!(
+                    assistant.stop_reason.as_str(),
+                    stream::STOP_ERROR | stream::STOP_ABORTED
+                );
+                self.record_message(llm::Message::Assistant(Box::new(assistant.clone())));
+                new_messages.push(llm::Message::Assistant(Box::new(assistant.clone())));
+
+                let mut tool_results = Vec::new();
+                has_more_tool_calls = false;
+                if !is_terminal {
+                    let calls = tool_calls(&assistant);
+                    if !calls.is_empty() {
+                        let outcomes = if assistant.stop_reason == stream::STOP_LENGTH {
+                            self.fail_truncated_tool_calls(calls)
+                        } else {
+                            self.execute_tool_calls(calls, cancellation.clone())
+                        };
+                        // A batch ends the run only when every result asked
+                        // for it; an error result is the model's cue to retry.
+                        has_more_tool_calls =
+                            !outcomes.iter().all(|outcome| outcome.result.terminate);
+                        for outcome in outcomes {
+                            let message = outcome.as_message();
+                            self.record_message(message.clone());
+                            new_messages.push(message.clone());
+                            tool_results.push(message);
+                        }
+                    }
+                }
+
+                let mut turn_end = Event::kind(EventKind::TurnEnd);
+                turn_end.message = Some(llm::Message::Assistant(Box::new(assistant)));
+                turn_end.messages = tool_results;
+                self.emit(&turn_end);
+                // Stopping here rather than at the next request spares an
+                // already-cancelled run a wasted round trip and a spurious
+                // empty assistant message.
+                if is_terminal || cancellation.is_cancelled() {
+                    return new_messages;
+                }
+                last_turn = turn_end
+                    .message
+                    .take()
+                    .map(|message| (message, std::mem::take(&mut turn_end.messages)));
+                pending = self.drain_steering();
             }
-            if all_terminate(&new_messages) {
+
+            // The agent would stop here; follow-ups reopen the inner loop.
+            let follow_ups = self.drain_follow_ups();
+            if follow_ups.is_empty() {
                 break;
             }
+            pending = follow_ups;
         }
         new_messages
+    }
+
+    fn prepare_next_turn(&self, turn: &CompletedTurn<'_>) {
+        let Some(hook) = lock(&self.inner.prepare_next_turn).clone() else {
+            return;
+        };
+        lock(&self.inner.state).turn_preparation = Some(thread::current().id());
+        let outcome = catch_unwind(AssertUnwindSafe(|| hook(self, turn)));
+        lock(&self.inner.state).turn_preparation = None;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn request_assistant(&self, cancellation: CancellationToken) -> llm::AssistantMessage {
@@ -884,19 +1155,32 @@ impl Agent {
         }
     }
 
+    /// pi's `failToolCallsFromTruncatedMessage`: streamed arguments are
+    /// finalized by a lenient JSON salvage parser, so a `length` stop can
+    /// yield calls that parse and validate yet are silently incomplete. None
+    /// of them is safe to run; each gets an error result so the model
+    /// re-issues them.
+    fn fail_truncated_tool_calls(&self, calls: Vec<llm::ToolCall>) -> Vec<ToolOutcome> {
+        calls
+            .into_iter()
+            .map(|call| {
+                self.tool_started(&call);
+                let message = format!(
+                    "Tool call \"{}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments.",
+                    call.name
+                );
+                let outcome = ToolOutcome::error(call, message);
+                self.tool_ended(&outcome);
+                outcome
+            })
+            .collect()
+    }
+
     fn execute_tool_calls(
         &self,
-        assistant: &llm::AssistantMessage,
+        calls: Vec<llm::ToolCall>,
         cancellation: CancellationToken,
     ) -> Vec<ToolOutcome> {
-        let calls = assistant
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                llm::ContentBlock::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         if calls.is_empty() {
             return Vec::new();
         }
@@ -980,7 +1264,7 @@ impl Agent {
                 event.tool_name = update_call.name.clone();
                 event.arguments = update_call.arguments.clone();
                 event.result = Some(result);
-                update_agent.emit(event);
+                update_agent.emit(&event);
             }
         });
         let execution = catch_unwind(AssertUnwindSafe(|| {
@@ -1011,7 +1295,7 @@ impl Agent {
         event.tool_call_id = call.id.clone();
         event.tool_name = call.name.clone();
         event.arguments = call.arguments.clone();
-        self.emit(event);
+        self.emit(&event);
     }
 
     fn tool_ended(&self, outcome: &ToolOutcome) {
@@ -1024,58 +1308,58 @@ impl Agent {
         event.arguments = outcome.call.arguments.clone();
         event.result = Some(outcome.result.clone());
         event.is_error = outcome.is_error;
-        self.emit(event);
+        self.emit(&event);
     }
 
     fn record_message(&self, message: llm::Message) {
         let assistant_was_streamed = {
             let mut state = lock(&self.inner.state);
             let assistant_was_streamed = matches!(&message, llm::Message::Assistant(_))
-                && matches!(
-                    state.streaming_message.as_ref(),
-                    Some(llm::Message::Assistant(_))
-                );
-            state.streaming_message = Some(message.clone());
+                && matches!(state.streaming_message, Some(StreamingMessage::Partial(_)));
+            state.streaming_message = Some(StreamingMessage::Whole(message.clone()));
             assistant_was_streamed
         };
+        let mut event = Event::kind(EventKind::MessageStart);
+        event.message = Some(message);
         if !assistant_was_streamed {
-            let mut start = Event::kind(EventKind::MessageStart);
-            start.message = Some(message.clone());
-            self.emit(start);
+            self.emit(&event);
         }
         {
             let mut state = lock(&self.inner.state);
+            let message = event
+                .message
+                .as_ref()
+                .expect("the recorded message was just attached");
             state.messages.push(message.clone());
             state.streaming_message = None;
-            if let llm::Message::Assistant(assistant) = &message
+            if let llm::Message::Assistant(assistant) = message
                 && !assistant.error_message.is_empty()
             {
                 state.error_message = assistant.error_message.clone();
             }
         }
-        let mut end = Event::kind(EventKind::MessageEnd);
-        end.message = Some(message);
-        end.assistant_was_streamed = assistant_was_streamed;
-        self.emit(end);
+        event.kind = EventKind::MessageEnd;
+        event.assistant_was_streamed = assistant_was_streamed;
+        self.emit(&event);
     }
 
     fn forward_assistant_event(&self, assistant_event: stream::AssistantMessageEvent) {
-        let message = assistant_event
+        if let Some(partial) = assistant_event
             .partial
             .clone()
             .or_else(|| assistant_event.terminal_message())
-            .map(|message| llm::Message::Assistant(Box::new((*message).clone())));
-        if let Some(message) = message.as_ref() {
-            lock(&self.inner.state).streaming_message = Some(message.clone());
+        {
+            lock(&self.inner.state).streaming_message = Some(StreamingMessage::Partial(partial));
         }
         let mut event = Event::kind(if assistant_event.event_type == stream::EVENT_START {
             EventKind::MessageStart
         } else {
             EventKind::MessageUpdate
         });
-        event.message = message;
+        // The snapshot stays behind the event's shared `partial`: building a
+        // `Message` here would deep-copy the whole reply on every delta.
         event.assistant_event = Some(assistant_event);
-        self.emit(event);
+        self.emit(&event);
     }
 
     fn drain_steering(&self) -> Vec<llm::Message> {
@@ -1105,15 +1389,68 @@ impl Agent {
         )
     }
 
-    fn emit(&self, event: Event) {
+    fn emit(&self, event: &Event) {
         let listeners = lock(&self.inner.listeners)
             .values()
             .cloned()
             .collect::<Vec<_>>();
         for listener in listeners {
-            let _ = catch_unwind(AssertUnwindSafe(|| listener(event.clone())));
+            if catch_unwind(AssertUnwindSafe(|| listener(event))).is_err()
+                && !self
+                    .inner
+                    .listener_panic_reported
+                    .swap(true, Ordering::Relaxed)
+            {
+                eprintln!(
+                    "goshcoder: an agent event listener panicked while handling {:?}; later listener panics are dropped silently",
+                    event.kind
+                );
+            }
         }
     }
+}
+
+/// pi's `Agent.continue()`: after an assistant message the queued steering
+/// messages, then the follow-ups, become the prompt; any other tail resumes
+/// as it stands.
+fn continuation(
+    state: &mut InnerState,
+    steering_mode: QueueMode,
+    follow_up_mode: QueueMode,
+) -> Result<RunStart> {
+    let Some(last) = state.messages.last() else {
+        return Err(AgentError::EmptyTranscript);
+    };
+    if last.role() != "assistant" {
+        return Ok(RunStart {
+            messages: Vec::new(),
+            skip_initial_steering_poll: false,
+        });
+    }
+    if let Some(messages) = drain(&mut state.steering, steering_mode) {
+        return Ok(RunStart {
+            messages,
+            skip_initial_steering_poll: true,
+        });
+    }
+    if let Some(messages) = drain(&mut state.follow_ups, follow_up_mode) {
+        return Ok(RunStart {
+            messages,
+            skip_initial_steering_poll: false,
+        });
+    }
+    Err(AgentError::CannotContinue("assistant".to_owned()))
+}
+
+fn tool_calls(assistant: &llm::AssistantMessage) -> Vec<llm::ToolCall> {
+    assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            llm::ContentBlock::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 struct PreparedToolCall {
@@ -1273,21 +1610,6 @@ fn drain(messages: &mut Vec<llm::Message>, mode: QueueMode) -> Option<Vec<llm::M
     })
 }
 
-fn all_terminate(messages: &[llm::Message]) -> bool {
-    let results = messages
-        .iter()
-        .rev()
-        .take_while(|message| matches!(message, llm::Message::ToolResult(_)))
-        .collect::<Vec<_>>();
-    !results.is_empty()
-        && results.iter().all(|message| {
-            matches!(
-                message,
-                llm::Message::ToolResult(result) if result.is_error || result.content.is_empty()
-            )
-        })
-}
-
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1303,7 +1625,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
 
     fn model() -> llm::Model {
         llm::Model {
@@ -1326,6 +1651,83 @@ mod tests {
             timestamp: now_millis(),
             ..llm::AssistantMessage::default()
         }
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: Value) -> llm::ContentBlock {
+        let arguments = match arguments {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => BTreeMap::new(),
+        };
+        llm::ContentBlock::ToolCall(llm::ToolCall {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            arguments,
+            thought_signature: String::new(),
+            namespace: String::new(),
+        })
+    }
+
+    fn assistant_calls(calls: Vec<llm::ContentBlock>, stop_reason: &str) -> llm::AssistantMessage {
+        llm::AssistantMessage {
+            content: calls,
+            stop_reason: stop_reason.to_owned(),
+            ..assistant_text("")
+        }
+    }
+
+    fn user(text: &str) -> llm::Message {
+        llm::Message::User(llm::UserMessage::text(text, now_millis()))
+    }
+
+    fn user_texts(context: &llm::Context) -> Vec<String> {
+        context
+            .messages
+            .iter()
+            .filter(|message| message.role() == "user")
+            .map(llm::Message::text_preview)
+            .collect()
+    }
+
+    fn echo_tool(executions: Arc<AtomicUsize>) -> Tool {
+        Tool::new(
+            "echo",
+            "Echo",
+            "Returns its value",
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+            move |_, id, arguments, _| {
+                executions.fetch_add(1, Ordering::Relaxed);
+                Ok(ToolResult::text(format!(
+                    "{id}:{}",
+                    arguments["value"].as_str().unwrap_or_default()
+                )))
+            },
+        )
+    }
+
+    /// Runs `work` on a helper thread and fails, rather than hangs, when it
+    /// does not finish in time.
+    fn bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the run must settle instead of hanging")
+    }
+
+    fn tool_results(messages: &[llm::Message]) -> Vec<&llm::ToolResultMessage> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                llm::Message::ToolResult(result) => Some(result.as_ref()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -1398,7 +1800,7 @@ mod tests {
             })),
             ..AgentOptions::default()
         });
-        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event));
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event.clone()));
 
         agent.prompt("hello").expect("prompt");
 
@@ -1430,6 +1832,17 @@ mod tests {
                 .map(|event| event.delta.as_str()),
             Some("streamed answer")
         );
+        // The streamed snapshot is shared with the provider, not copied into
+        // the event for every delta.
+        assert!(updates[0].message.is_none());
+        assert_eq!(
+            updates[0]
+                .assistant_event
+                .as_ref()
+                .and_then(|event| event.partial.as_ref())
+                .map(|partial| partial.stop_reason.as_str()),
+            Some(stream::STOP_STOP)
+        );
         assert!(events.iter().any(|event| {
             event.kind == EventKind::MessageEnd
                 && event.assistant_was_streamed
@@ -1442,22 +1855,7 @@ mod tests {
     fn tool_calls_continue_the_turn_and_preserve_source_order() {
         let requests = Arc::new(AtomicUsize::new(0));
         let request_count = requests.clone();
-        let tool = Tool::new(
-            "echo",
-            "Echo",
-            "Returns its value",
-            json!({
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"]
-            }),
-            |_, id, arguments, _| {
-                Ok(ToolResult::text(format!(
-                    "{id}:{}",
-                    arguments["value"].as_str().unwrap_or_default()
-                )))
-            },
-        );
+        let tool = echo_tool(Arc::new(AtomicUsize::new(0)));
         let agent = Agent::new(AgentOptions {
             initial_state: InitialState {
                 model: model(),
@@ -1466,37 +1864,13 @@ mod tests {
             },
             responder: Some(Arc::new(move |_, _, _| {
                 if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
-                    Ok(llm::AssistantMessage {
-                        role: "assistant".to_owned(),
-                        content: vec![
-                            llm::ContentBlock::ToolCall(llm::ToolCall {
-                                id: "one".to_owned(),
-                                name: "echo".to_owned(),
-                                arguments: BTreeMap::from([(
-                                    "value".to_owned(),
-                                    Value::String("a".to_owned()),
-                                )]),
-                                thought_signature: String::new(),
-                                namespace: String::new(),
-                            }),
-                            llm::ContentBlock::ToolCall(llm::ToolCall {
-                                id: "two".to_owned(),
-                                name: "echo".to_owned(),
-                                arguments: BTreeMap::from([(
-                                    "value".to_owned(),
-                                    Value::String("b".to_owned()),
-                                )]),
-                                thought_signature: String::new(),
-                                namespace: String::new(),
-                            }),
+                    Ok(assistant_calls(
+                        vec![
+                            tool_call("one", "echo", json!({"value": "a"})),
+                            tool_call("two", "echo", json!({"value": "b"})),
                         ],
-                        api: "test".to_owned(),
-                        provider: "test".to_owned(),
-                        model: "test-model".to_owned(),
-                        stop_reason: "toolUse".to_owned(),
-                        timestamp: now_millis(),
-                        ..llm::AssistantMessage::default()
-                    })
+                        stream::STOP_TOOL_USE,
+                    ))
                 } else {
                     Ok(assistant_text("done"))
                 }
@@ -1507,15 +1881,177 @@ mod tests {
         agent.prompt("run tools").expect("prompt");
         assert_eq!(requests.load(Ordering::Relaxed), 2);
         let state = agent.state();
-        let result_ids = state
-            .messages
+        let result_ids = tool_results(&state.messages)
             .iter()
-            .filter_map(|message| match message {
-                llm::Message::ToolResult(result) => Some(result.tool_call_id.as_str()),
-                _ => None,
-            })
+            .map(|result| result.tool_call_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(result_ids, ["one", "two"]);
+    }
+
+    #[test]
+    fn truncated_tool_calls_are_failed_without_execution() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let event_log = Arc::clone(&events);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![echo_tool(Arc::clone(&executions))],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(assistant_calls(
+                        vec![tool_call("cut", "echo", json!({"value": "a"}))],
+                        stream::STOP_LENGTH,
+                    ))
+                } else {
+                    Ok(assistant_text("re-issued"))
+                }
+            })),
+            ..AgentOptions::default()
+        });
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event.clone()));
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(
+            executions.load(Ordering::Relaxed),
+            0,
+            "truncated call must not run"
+        );
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "the model gets to re-issue the call"
+        );
+        let state = agent.state();
+        let results = tool_results(&state.messages);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        let text = results[0].content[0].plain_text().unwrap_or_default();
+        assert!(
+            text.starts_with("Tool call \"echo\" was not executed"),
+            "{text}"
+        );
+        assert!(text.contains("output token limit"), "{text}");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(llm::Message::text_preview)
+                .as_deref(),
+            Some("re-issued")
+        );
+        assert!(state.pending_tool_calls.is_empty());
+        let events = lock(&events);
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::ToolExecutionStart && event.tool_call_id == "cut"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == EventKind::ToolExecutionEnd
+                && event.tool_call_id == "cut"
+                && event.is_error
+        }));
+    }
+
+    #[test]
+    fn error_tool_results_do_not_end_the_run() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(assistant_calls(
+                        vec![tool_call("bad", "missing", json!({}))],
+                        stream::STOP_TOOL_USE,
+                    ))
+                } else {
+                    Ok(assistant_text("recovered"))
+                }
+            })),
+            ..AgentOptions::default()
+        });
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        let state = agent.state();
+        let results = tool_results(&state.messages);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert_eq!(
+            results[0].content[0].plain_text(),
+            Some("Tool missing not found")
+        );
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .map(llm::Message::text_preview)
+                .as_deref(),
+            Some("recovered")
+        );
+    }
+
+    #[test]
+    fn a_tool_batch_ends_the_run_only_when_every_result_terminates() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let stop = Tool::new(
+            "stop",
+            "Stop",
+            "Optionally ends the run",
+            json!({
+                "type": "object",
+                "properties": {"terminate": {"type": "boolean"}},
+                "required": ["terminate"]
+            }),
+            |_, _, arguments, _| {
+                Ok(ToolResult {
+                    terminate: arguments["terminate"].as_bool().unwrap_or_default(),
+                    ..ToolResult::text("ok")
+                })
+            },
+        );
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![stop],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                let terminate_all = request_count.fetch_add(1, Ordering::Relaxed) > 0;
+                Ok(assistant_calls(
+                    vec![
+                        tool_call("a", "stop", json!({"terminate": true})),
+                        tool_call("b", "stop", json!({"terminate": terminate_all})),
+                    ],
+                    stream::STOP_TOOL_USE,
+                ))
+            })),
+            ..AgentOptions::default()
+        });
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            2,
+            "a mixed batch continues; a unanimous batch stops"
+        );
+        let state = agent.state();
+        assert_eq!(
+            state.messages.last().map(llm::Message::role),
+            Some("toolResult")
+        );
+        assert!(!state.is_streaming);
     }
 
     #[test]
@@ -1552,10 +2088,7 @@ mod tests {
             })),
             ..AgentOptions::default()
         });
-        agent.follow_up(llm::Message::User(llm::UserMessage::text(
-            "next",
-            now_millis(),
-        )));
+        agent.follow_up(user("next"));
         agent.continue_run().expect("continue");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(
@@ -1565,6 +2098,391 @@ mod tests {
                 .iter()
                 .any(|message| message.text_preview() == "next")
         );
+    }
+
+    #[test]
+    fn steering_queued_before_the_prompt_is_delivered_with_it() {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&contexts);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, context, _| {
+                lock(&seen).push(user_texts(context));
+                Ok(assistant_text("reply"))
+            })),
+            ..AgentOptions::default()
+        });
+        agent.steer(user("aside"));
+
+        agent.prompt("main").expect("prompt");
+
+        let contexts = lock(&contexts);
+        assert_eq!(contexts.len(), 1, "the aside joins the first request");
+        assert_eq!(contexts[0], ["main", "aside"]);
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[test]
+    fn continuing_from_steering_skips_the_initial_poll() {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&contexts);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                messages: vec![llm::Message::Assistant(Box::new(assistant_text(
+                    "previous",
+                )))],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, context, _| {
+                lock(&seen).push(user_texts(context));
+                Ok(assistant_text("reply"))
+            })),
+            ..AgentOptions::default()
+        });
+        agent.steer(user("first"));
+        agent.steer(user("second"));
+
+        agent.continue_run().expect("continue");
+
+        let contexts = lock(&contexts);
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0],
+            ["first"],
+            "one-at-a-time steering delivers one message per turn"
+        );
+        assert_eq!(contexts[1], ["first", "second"]);
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[test]
+    fn agent_end_listeners_observe_an_idle_stream_and_late_follow_ups_still_run() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                request_count.fetch_add(1, Ordering::Relaxed);
+                Ok(assistant_text("reply"))
+            })),
+            ..AgentOptions::default()
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = agent.subscribe({
+            let agent = agent.clone();
+            let observed = Arc::clone(&observed);
+            move |event| {
+                if event.kind != EventKind::AgentEnd {
+                    return;
+                }
+                let first_end = lock(&observed).is_empty();
+                lock(&observed).push((
+                    agent.state().is_streaming,
+                    agent.prompt("nested") == Err(AgentError::Busy),
+                ));
+                if first_end {
+                    agent.follow_up(user("late"));
+                }
+            }
+        });
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(
+            lock(&observed).as_slice(),
+            &[(false, true), (false, true)],
+            "not streaming, yet still busy, inside each AgentEnd"
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        let state = agent.state();
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.text_preview() == "late")
+        );
+        assert!(!state.is_streaming);
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[test]
+    fn queued_messages_survive_a_busy_continue_and_run_after_the_turn() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let (entered_sender, entered) = mpsc::channel();
+        let (release_sender, release) = mpsc::channel();
+        let release = Mutex::new(release);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    entered_sender.send(()).expect("test observes the request");
+                    lock(&release).recv().expect("test releases the request");
+                }
+                Ok(assistant_text("reply"))
+            })),
+            ..AgentOptions::default()
+        });
+
+        let run = thread::spawn({
+            let agent = agent.clone();
+            move || agent.prompt("go")
+        });
+        entered.recv().expect("request started");
+        agent.follow_up(user("queued"));
+        assert_eq!(agent.continue_run(), Err(AgentError::Busy));
+        assert_eq!(
+            agent.queued_message_count(),
+            1,
+            "a refused continuation keeps its messages"
+        );
+        release_sender.send(()).expect("release");
+        run.join().expect("prompt thread").expect("prompt");
+
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .any(|message| message.text_preview() == "queued")
+        );
+    }
+
+    #[test]
+    fn between_turn_hook_sees_the_completed_turn_and_may_compact() {
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&contexts);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let hook_calls = Arc::new(Mutex::new(Vec::new()));
+        let hook_log = Arc::clone(&hook_calls);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![echo_tool(Arc::new(AtomicUsize::new(0)))],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, context, _| {
+                lock(&seen).push(
+                    context
+                        .messages
+                        .iter()
+                        .map(llm::Message::text_preview)
+                        .collect::<Vec<_>>(),
+                );
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(assistant_calls(
+                        vec![tool_call("one", "echo", json!({"value": "a"}))],
+                        stream::STOP_TOOL_USE,
+                    ))
+                } else {
+                    Ok(assistant_text("done"))
+                }
+            })),
+            ..AgentOptions::default()
+        });
+        agent.set_prepare_next_turn(Some(Arc::new(move |agent, turn| {
+            lock(&hook_log).push((
+                turn.message.stop_reason.clone(),
+                turn.tool_results.len(),
+                turn.new_messages.len(),
+            ));
+            assert!(
+                agent.can_compact(),
+                "the loop thread may compact between turns"
+            );
+            let elsewhere = thread::spawn({
+                let agent = agent.clone();
+                move || agent.can_compact()
+            });
+            assert!(!elsewhere.join().expect("probe"), "other threads may not");
+            let messages = agent.state().messages;
+            let kept = messages[1..].to_vec();
+            agent
+                .compact_if_unchanged(
+                    messages.len(),
+                    llm::Message::User(llm::UserMessage::text(
+                        "<conversation-summary>\nsummary\n</conversation-summary>",
+                        now_millis(),
+                    )),
+                    kept.clone(),
+                    CompactionInfo {
+                        summary: "summary".to_owned(),
+                        tokens_before: 10,
+                        cost_before: 0.0,
+                        retained_messages: kept.len(),
+                        timestamp: now_millis(),
+                    },
+                )
+                .expect("compact between turns");
+        })));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&events);
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event.kind));
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(
+            lock(&hook_calls).as_slice(),
+            &[(stream::STOP_TOOL_USE.to_owned(), 1, 3)],
+            "invoked once, between the tool turn and the reply turn"
+        );
+        let contexts = lock(&contexts);
+        assert_eq!(contexts.len(), 2);
+        assert!(contexts[1][0].contains("<conversation-summary>"));
+        assert_eq!(contexts[1].len(), 3, "summary, tool call, tool result");
+        let events = lock(&events);
+        let compacted = events
+            .iter()
+            .position(|kind| *kind == EventKind::ContextCompacted)
+            .expect("compaction event");
+        let first_turn_end = events
+            .iter()
+            .position(|kind| *kind == EventKind::TurnEnd)
+            .expect("turn end");
+        let second_turn_start = events
+            .iter()
+            .rposition(|kind| *kind == EventKind::TurnStart)
+            .expect("second turn start");
+        assert!(first_turn_end < compacted && compacted < second_turn_start);
+        assert_eq!(agent.state().messages.len(), 4);
+        assert!(!agent.state().is_streaming);
+    }
+
+    #[test]
+    fn a_panicking_between_turn_hook_ends_the_run_with_a_full_final_turn() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![echo_tool(Arc::new(AtomicUsize::new(0)))],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(assistant_calls(
+                        vec![tool_call("one", "echo", json!({"value": "a"}))],
+                        stream::STOP_TOOL_USE,
+                    ))
+                } else {
+                    Ok(assistant_text("fine"))
+                }
+            })),
+            ..AgentOptions::default()
+        });
+        agent.set_prepare_next_turn(Some(Arc::new(|_, _| panic!("hook failure"))));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&events);
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event.kind));
+
+        bounded({
+            let agent = agent.clone();
+            move || agent.prompt("go")
+        })
+        .expect("a failed run is reported through events");
+
+        let state = agent.state();
+        assert_eq!(state.error_message, "the agent runtime panicked");
+        assert!(!state.is_streaming);
+        assert!(state.pending_tool_calls.is_empty());
+        // The guard must not outlive this block: the listener locks the same
+        // mutex on every event of the next prompt.
+        {
+            let events = lock(&events);
+            assert_eq!(
+                &events[events.len() - 4..],
+                &[
+                    EventKind::MessageStart,
+                    EventKind::MessageEnd,
+                    EventKind::TurnEnd,
+                    EventKind::AgentEnd,
+                ],
+                "the failure is a complete final turn"
+            );
+        }
+        // The agent is not left busy: the next prompt runs normally.
+        bounded({
+            let agent = agent.clone();
+            move || agent.prompt("again")
+        })
+        .expect("prompt after failure");
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_listener_re_entering_the_agent_during_a_lifecycle_event_gets_busy() {
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                messages: vec![
+                    user("old request"),
+                    llm::Message::Assistant(Box::new(assistant_text("old reply"))),
+                    user("latest request"),
+                ],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(|_, _, _| Ok(assistant_text("reply")))),
+            ..AgentOptions::default()
+        });
+        let re_entries = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = agent.subscribe({
+            let agent = agent.clone();
+            let re_entries = Arc::clone(&re_entries);
+            move |event| {
+                if event.kind == EventKind::ContextCompacted {
+                    lock(&re_entries).push(agent.prompt("inside"));
+                    lock(&re_entries).push(agent.reset());
+                }
+            }
+        });
+        let marker = llm::Message::User(llm::UserMessage::text(
+            "<conversation-summary>\nolder work\n</conversation-summary>",
+            4,
+        ));
+        let info = CompactionInfo {
+            summary: "older work".to_owned(),
+            tokens_before: 1_000,
+            cost_before: 1.5,
+            retained_messages: 1,
+            timestamp: 4,
+        };
+
+        assert_eq!(
+            agent.compact_if_unchanged(
+                99,
+                marker.clone(),
+                vec![user("latest request")],
+                info.clone()
+            ),
+            Err(AgentError::StaleSnapshot {
+                expected: 99,
+                actual: 3
+            })
+        );
+        agent
+            .compact_if_unchanged(3, marker, vec![user("latest request")], info)
+            .expect("compact");
+
+        assert_eq!(
+            lock(&re_entries).as_slice(),
+            &[Err(AgentError::Busy), Err(AgentError::Busy)]
+        );
+        agent
+            .prompt("after")
+            .expect("the agent is usable once the event has been delivered");
+        assert_eq!(agent.state().messages.len(), 4);
     }
 
     #[test]
@@ -1598,7 +2516,7 @@ mod tests {
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let event_log = Arc::clone(&events);
-        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event));
+        let _subscription = agent.subscribe(move |event| lock(&event_log).push(event.clone()));
 
         agent
             .compact(marker.clone(), kept.clone(), info.clone())
@@ -1615,6 +2533,32 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_listener_is_reported_once_without_blocking_the_others() {
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(|_, _, _| Ok(assistant_text("reply")))),
+            ..AgentOptions::default()
+        });
+        let _broken = agent.subscribe(|_| panic!("listener failure"));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let event_log = Arc::clone(&events);
+        let _healthy = agent.subscribe(move |event| lock(&event_log).push(event.kind));
+
+        agent.prompt("go").expect("prompt");
+
+        assert_eq!(
+            lock(&events).len(),
+            8,
+            "every event still reaches the healthy listener"
+        );
+        assert!(agent.inner.listener_panic_reported.load(Ordering::Relaxed));
+        assert!(!agent.state().is_streaming);
+    }
+
+    #[test]
     fn weak_follow_up_queue_forwards_without_retaining_the_agent() {
         let queue = {
             let agent = Agent::new(AgentOptions {
@@ -1625,19 +2569,13 @@ mod tests {
                 ..AgentOptions::default()
             });
             let queue = agent.weak_follow_up_queue();
-            queue.follow_up(llm::Message::User(llm::UserMessage::text(
-                "queued",
-                now_millis(),
-            )));
+            queue.follow_up(user("queued"));
             assert!(agent.has_queued_messages());
             queue
         };
 
         assert!(!queue.has_queued_messages());
-        queue.follow_up(llm::Message::User(llm::UserMessage::text(
-            "ignored after drop",
-            now_millis(),
-        )));
+        queue.follow_up(user("ignored after drop"));
         assert!(!queue.has_queued_messages());
     }
 }
