@@ -105,7 +105,17 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if key.is_empty() {
                 return Err(command_error("no key provided"));
             }
-            store.put(provider_id, Credential::api_key(key))?;
+            let mut credential = Credential::api_key(key);
+            // Cloudflare resolves nothing from a key alone; the ids are
+            // stored beside it so the provider is usable right away.
+            for (name, prompt) in cloudflare_credential_fields(provider_id) {
+                let value = read_secret(prompt)?;
+                if value.is_empty() {
+                    return Err(command_error(format!("no {name} provided")));
+                }
+                credential.set_environment(*name, value);
+            }
+            store.put(provider_id, credential)?;
             println!(
                 "Stored an API key for {provider_id} in {}",
                 config::auth_path().display()
@@ -248,7 +258,25 @@ fn print_models(provider: &Provider) {
     }
 }
 
-fn provider_setup_hint(provider: &Provider) -> String {
+/// The values a Cloudflare provider needs beside its API key, with the prompt
+/// `auth set` shows for each.
+fn cloudflare_credential_fields(provider_id: &str) -> &'static [(&'static str, &'static str)] {
+    match provider_id {
+        "cloudflare-workers-ai" => {
+            &[("CLOUDFLARE_ACCOUNT_ID", "Enter the Cloudflare account ID: ")]
+        }
+        "cloudflare-ai-gateway" => &[
+            ("CLOUDFLARE_ACCOUNT_ID", "Enter the Cloudflare account ID: "),
+            (
+                "CLOUDFLARE_GATEWAY_ID",
+                "Enter the Cloudflare AI Gateway ID: ",
+            ),
+        ],
+        _ => &[],
+    }
+}
+
+pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
     let environment = provider.env_keys.join(" or ");
     if provider.supports_oauth {
         if environment.is_empty() {

@@ -449,23 +449,56 @@ pub fn optional_default_chat_model_reference(
     Ok(preferred_model_reference(catalog, &configured))
 }
 
-/// The model a freshly authenticated provider should start on: the curated
-/// defaults first, then the newest model the provider lists.
-pub fn preferred_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
-    let preferred = [
-        ("openai-codex", "gpt-5.6-sol"),
-        ("anthropic", "claude-sonnet-5"),
-        ("kimi-coding", "kimi-for-coding"),
-        ("openai", "gpt-5.6-terra"),
-    ];
-    for (provider, model) in preferred {
-        if configured.iter().any(|configured| configured == provider)
-            && catalog.model(provider, model).is_some()
-        {
-            return Some(format!("{provider}/{model}"));
-        }
-    }
+/// The model a provider starts on right after it is authenticated, for the
+/// providers where the choice is obvious. Order is priority when several are
+/// configured. A provider missing here opens the model picker instead of
+/// guessing, because "the last model in the list" is an audio model for
+/// Mistral and a router for Fireworks. A test checks every entry against the
+/// catalog so a regeneration cannot leave a stale id behind.
+pub const CURATED_MODELS: &[(&str, &str)] = &[
+    ("openai-codex", "gpt-5.6-sol"),
+    ("anthropic", "claude-sonnet-5"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("openai", "gpt-5.6-terra"),
+    ("azure-openai-responses", "gpt-5.6-terra"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("xai", "grok-build-0.1"),
+    ("meta", "muse-spark-1.2"),
+    ("google", "gemini-3.6-flash"),
+    ("google-vertex", "gemini-3.6-flash"),
+    ("zai", "glm-5.2"),
+    ("zai-coding-cn", "glm-5.2"),
+    ("moonshotai", "kimi-k3"),
+    ("moonshotai-cn", "kimi-k3"),
+    ("minimax", "MiniMax-M3"),
+    ("minimax-cn", "MiniMax-M3"),
+    ("mistral", "devstral-medium-latest"),
+    ("xiaomi", "mimo-v2.5-pro"),
+    ("github-copilot", "claude-sonnet-5"),
+    ("opencode", "claude-sonnet-5"),
+    ("opencode-go", "kimi-k3"),
+    ("amazon-bedrock", "anthropic.claude-sonnet-5"),
+    ("cloudflare-ai-gateway", "claude-sonnet-5"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.7-code"),
+];
 
+/// The curated model for the first configured provider that has one.
+pub fn curated_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
+    CURATED_MODELS
+        .iter()
+        .find(|(provider, model)| {
+            configured.iter().any(|configured| configured == provider)
+                && catalog.model(provider, model).is_some()
+        })
+        .map(|(provider, model)| format!("{provider}/{model}"))
+}
+
+/// The model a session starts on when nothing was remembered: the curated
+/// defaults first, then the last model the first configured provider lists.
+pub fn preferred_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
+    if let Some(reference) = curated_model_reference(catalog, configured) {
+        return Some(reference);
+    }
     for provider_id in configured {
         if let Some(provider) = catalog.provider(provider_id)
             && let Some(model) = provider.models().last()
@@ -1441,6 +1474,67 @@ mod tests {
             Some("openai/gpt-5.6-terra".to_owned())
         );
         assert_eq!(preferred_model_reference(&catalog, &[]), None);
+        // An uncurated provider still gets a startup default, but nothing to
+        // auto-select after a login.
+        let groq = ["groq".to_owned()];
+        assert_eq!(curated_model_reference(&catalog, &groq), None);
+        assert!(preferred_model_reference(&catalog, &groq).is_some());
+    }
+
+    /// Guards the onboarding path for every provider: a curated default must
+    /// exist in the catalog and speak a supported protocol, and a key alone
+    /// must configure every provider except the ones that need more.
+    #[test]
+    fn curated_defaults_exist_and_a_key_configures_every_plain_provider() {
+        let store = Arc::new(crate::catalog::CredentialStore::in_memory());
+        let bare = Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
+        for provider_id in bare.provider_ids() {
+            store
+                .put(
+                    &provider_id,
+                    crate::catalog::Credential::api_key("test-key"),
+                )
+                .expect("store key");
+        }
+        let catalog = Catalog::with_environment(Some(store), Arc::new(|_| None)).expect("catalog");
+
+        for (provider_id, model_id) in CURATED_MODELS {
+            let model = catalog.model(provider_id, model_id).unwrap_or_else(|| {
+                panic!("curated {provider_id}/{model_id} is not in the catalog")
+            });
+            assert!(
+                crate::providers::supports_api(&model.api),
+                "curated {provider_id}/{model_id} speaks unsupported protocol {}",
+                model.api
+            );
+        }
+
+        let mut unconfigured = Vec::new();
+        for provider_id in catalog.provider_ids() {
+            if !catalog.is_configured(&provider_id).expect("configured") {
+                unconfigured.push(provider_id);
+                continue;
+            }
+            if let Some(reference) =
+                curated_model_reference(&catalog, std::slice::from_ref(&provider_id))
+            {
+                catalog
+                    .resolve_model(&reference)
+                    .unwrap_or_else(|error| panic!("{reference}: {error}"));
+            }
+        }
+        // Cloudflare needs an account (and gateway) id, which `auth set`
+        // prompts for; Aperture is configured by its gateway; Codex is OAuth
+        // only.
+        assert_eq!(
+            unconfigured,
+            [
+                "aperture",
+                "cloudflare-ai-gateway",
+                "cloudflare-workers-ai",
+                "openai-codex"
+            ]
+        );
     }
 
     #[test]

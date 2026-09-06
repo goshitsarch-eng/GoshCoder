@@ -1042,6 +1042,15 @@ fn event_loop(
                                     append_view_message(&mut view, MessageRole::Error, error);
                                 }
                             }
+                            // A login that could not choose a model on its
+                            // own hands over to the picker, now that there
+                            // is something to pick from.
+                            if !runtime::model_is_selected(&prepared.runtime.agent().state().model)
+                                && interactive_models(catalog)
+                                    .is_ok_and(|models| !models.is_empty())
+                            {
+                                app.set_input("/model ");
+                            }
                             // Whatever was typed at the child process is
                             // not input for this screen.
                             break;
@@ -1770,6 +1779,16 @@ fn dispatch_login_command<'a>(
         );
         return CommandDispatch::Handled;
     }
+    if let Some(setup) = gateway_setup_command(provider_id) {
+        append_view_message(
+            view,
+            MessageRole::Command,
+            format!(
+                "{provider_id} is a gateway, not an API-key provider; run {setup} to configure it."
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
     let provider_id = (*provider_id).to_owned();
     let subcommand = if login_flow_available(&provider_id) {
         "login"
@@ -1783,22 +1802,41 @@ fn dispatch_login_command<'a>(
     }))
 }
 
+/// The in-chat command that configures a gateway provider; `/login` would
+/// only store a key that the gateway never reads.
+fn gateway_setup_command(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "aperture" => Some("/aperture onboarding"),
+        "omni" => Some("/omni setup"),
+        _ => None,
+    }
+}
+
 /// Puts a freshly authenticated provider to use. A session that has no model
-/// yet switches to the provider's preferred model straight away, so the first
-/// login is the whole onboarding; an existing selection is left alone.
+/// yet switches to the provider's curated model straight away, so the first
+/// login is the whole onboarding; a provider without a curated model is left
+/// to the picker, which the event loop opens; an existing selection is left
+/// alone.
 fn after_login_message(
     prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     provider_id: &str,
 ) -> String {
+    if !catalog.is_configured(provider_id).unwrap_or(false) {
+        let hint = catalog
+            .provider(provider_id)
+            .map(|provider| provider_cli::provider_setup_hint(&provider))
+            .unwrap_or_default();
+        return format!(
+            "Stored a credential for {provider_id}, but the provider is still not usable: {hint}"
+        );
+    }
     if runtime::model_is_selected(&prepared.runtime.agent().state().model) {
         return format!("Added {provider_id}. Use /model to switch providers.");
     }
-    let Some(reference) = runtime::preferred_model_reference(catalog, &[provider_id.to_owned()])
+    let Some(reference) = runtime::curated_model_reference(catalog, &[provider_id.to_owned()])
     else {
-        return format!(
-            "Added {provider_id}, but it lists no models; use /model to choose one from another provider."
-        );
+        return format!("Added {provider_id}. Pick one of its models to start.");
     };
     match runtime::set_model(&prepared.runtime, catalog, &reference) {
         Ok(model) => format!(
@@ -1806,7 +1844,7 @@ fn after_login_message(
             model.provider, model.id
         ),
         Err(error) => format!(
-            "Added {provider_id}, but {reference} could not be selected: {error}. Use /model to choose one."
+            "Added {provider_id}, but {reference} could not be selected: {error}. Pick a model to start."
         ),
     }
 }
@@ -3122,7 +3160,9 @@ fn palette_suggestions(
                         .any(|model| providers::supports_api(&model.api))
                 })
                 .map(|provider| state::Suggestion {
-                    description: if login_flow_available(&provider.id) {
+                    description: if let Some(setup) = gateway_setup_command(&provider.id) {
+                        format!("{}  ·  gateway, see {setup}", provider.name)
+                    } else if login_flow_available(&provider.id) {
                         format!("{}  ·  OAuth / subscription", provider.name)
                     } else {
                         format!("{}  ·  API key", provider.name)
