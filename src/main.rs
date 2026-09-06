@@ -3368,7 +3368,8 @@ mod tests {
 
     #[test]
     fn help_and_version_are_non_interactive() {
-        assert!(USAGE.contains("Ratatui"));
+        assert!(USAGE.contains("goshcoder omni <subcommand>"));
+        assert!(USAGE.contains("OMNIROUTE_URL"));
         assert!(env!("CARGO_PKG_VERSION").starts_with("0."));
     }
 

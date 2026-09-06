@@ -5,17 +5,13 @@
 //! and streamed-content rules. Keeping those rules here avoids routing Mistral
 //! models through a superficially similar but wire-incompatible adapter.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, io::Read};
 
-use reqwest::blocking::Response;
 use serde_json::{Map, Value, json};
 
 use crate::{
     agent, llm,
-    providers::{MessageEmitter, ProviderAdapterError, Result},
+    providers::{MessageEmitter, ProviderAdapterError, Result, transform_messages},
     stream,
 };
 
@@ -354,196 +350,9 @@ pub(crate) fn transform_mistral_messages(
     messages: &[llm::Message],
     model: &llm::Model,
 ) -> Vec<llm::Message> {
-    let image_aware = messages
-        .iter()
-        .cloned()
-        .map(|message| downgrade_mistral_message_images(message, model))
-        .collect::<Vec<_>>();
     let mut normalized_tool_ids = MistralToolCallIdNormalizer::default();
-    let mut tool_call_ids = BTreeMap::new();
-    let mut transformed = Vec::with_capacity(image_aware.len());
-
-    for message in image_aware {
-        match message {
-            llm::Message::Assistant(assistant) => {
-                let same_model = assistant.provider == model.provider
-                    && assistant.api == model.api
-                    && assistant.model == model.id;
-                let mut copy = (*assistant).clone();
-                copy.content = copy
-                    .content
-                    .into_iter()
-                    .filter_map(|block| match block {
-                        llm::ContentBlock::Thinking(thinking) => {
-                            if thinking.redacted {
-                                return same_model.then_some(llm::ContentBlock::Thinking(thinking));
-                            }
-                            if same_model && !thinking.thinking_signature.is_empty() {
-                                return Some(llm::ContentBlock::Thinking(thinking));
-                            }
-                            if thinking.thinking.trim().is_empty() {
-                                return None;
-                            }
-                            if same_model {
-                                Some(llm::ContentBlock::Thinking(thinking))
-                            } else {
-                                Some(llm::ContentBlock::text(thinking.thinking))
-                            }
-                        }
-                        llm::ContentBlock::ToolCall(mut tool_call) => {
-                            if !same_model {
-                                tool_call.thought_signature.clear();
-                                let normalized = normalized_tool_ids.normalize(&tool_call.id);
-                                if normalized != tool_call.id {
-                                    tool_call_ids.insert(tool_call.id.clone(), normalized.clone());
-                                    tool_call.id = normalized;
-                                }
-                            }
-                            Some(llm::ContentBlock::ToolCall(tool_call))
-                        }
-                        other => Some(other),
-                    })
-                    .collect();
-                transformed.push(llm::Message::Assistant(Box::new(copy)));
-            }
-            llm::Message::ToolResult(tool_result) => {
-                let mut copy = (*tool_result).clone();
-                if let Some(normalized) = tool_call_ids.get(&copy.tool_call_id) {
-                    copy.tool_call_id = normalized.clone();
-                }
-                transformed.push(llm::Message::ToolResult(Box::new(copy)));
-            }
-            other => transformed.push(other),
-        }
-    }
-
-    let mut result = Vec::with_capacity(transformed.len());
-    let mut pending_tool_calls = Vec::<llm::ToolCall>::new();
-    let mut existing_tool_results = BTreeSet::<String>::new();
-    for message in transformed {
-        match message {
-            llm::Message::Assistant(assistant) => {
-                flush_missing_mistral_tool_results(
-                    &mut result,
-                    &mut pending_tool_calls,
-                    &mut existing_tool_results,
-                );
-                if matches!(
-                    assistant.stop_reason.as_str(),
-                    stream::STOP_ERROR | stream::STOP_ABORTED
-                ) {
-                    continue;
-                }
-                let tool_calls = assistant
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        llm::ContentBlock::ToolCall(tool_call) => Some(tool_call.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if !tool_calls.is_empty() {
-                    pending_tool_calls = tool_calls;
-                    existing_tool_results.clear();
-                }
-                result.push(llm::Message::Assistant(assistant));
-            }
-            llm::Message::ToolResult(tool_result) => {
-                existing_tool_results.insert(tool_result.tool_call_id.clone());
-                result.push(llm::Message::ToolResult(tool_result));
-            }
-            llm::Message::User(user) => {
-                flush_missing_mistral_tool_results(
-                    &mut result,
-                    &mut pending_tool_calls,
-                    &mut existing_tool_results,
-                );
-                result.push(llm::Message::User(user));
-            }
-        }
-    }
-    flush_missing_mistral_tool_results(
-        &mut result,
-        &mut pending_tool_calls,
-        &mut existing_tool_results,
-    );
-    result
-}
-
-fn downgrade_mistral_message_images(message: llm::Message, model: &llm::Model) -> llm::Message {
-    if model.supports_images() {
-        return message;
-    }
-    match message {
-        llm::Message::User(mut user) => {
-            if let llm::UserContent::Blocks(blocks) = user.content {
-                user.content = llm::UserContent::Blocks(replace_images_with_placeholder(
-                    blocks,
-                    "(image omitted: model does not support images)",
-                ));
-            }
-            llm::Message::User(user)
-        }
-        llm::Message::ToolResult(tool_result) => {
-            let mut copy = (*tool_result).clone();
-            copy.content = replace_images_with_placeholder(
-                copy.content,
-                "(tool image omitted: model does not support images)",
-            );
-            llm::Message::ToolResult(Box::new(copy))
-        }
-        other => other,
-    }
-}
-
-fn replace_images_with_placeholder(
-    blocks: Vec<llm::ContentBlock>,
-    placeholder: &str,
-) -> Vec<llm::ContentBlock> {
-    let mut output = Vec::with_capacity(blocks.len());
-    let mut previous_was_placeholder = false;
-    for block in blocks {
-        if matches!(block, llm::ContentBlock::Image(_)) {
-            if !previous_was_placeholder {
-                output.push(llm::ContentBlock::text(placeholder));
-            }
-            previous_was_placeholder = true;
-            continue;
-        }
-        previous_was_placeholder =
-            matches!(&block, llm::ContentBlock::Text(text) if text.text == placeholder);
-        output.push(block);
-    }
-    output
-}
-
-fn flush_missing_mistral_tool_results(
-    result: &mut Vec<llm::Message>,
-    pending_tool_calls: &mut Vec<llm::ToolCall>,
-    existing_tool_results: &mut BTreeSet<String>,
-) {
-    for tool_call in pending_tool_calls.drain(..) {
-        if !existing_tool_results.contains(&tool_call.id) {
-            result.push(llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.name,
-                content: vec![llm::ContentBlock::text("No result provided")],
-                is_error: true,
-                timestamp: mistral_now_millis(),
-                ..llm::ToolResultMessage::default()
-            })));
-        }
-    }
-    existing_tool_results.clear();
-}
-
-fn mistral_now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
+    let mut normalize = |id: &str, _: &llm::AssistantMessage| normalized_tool_ids.normalize(id);
+    transform_messages(messages, model, Some(&mut normalize))
 }
 
 #[derive(Default)]
@@ -637,11 +446,11 @@ struct MistralToolCallState {
 
 /// Consumes Mistral's SSE response and emits common assistant message events.
 pub(crate) fn consume_mistral_conversations(
-    response: Response,
+    body: impl Read,
     cancellation: &agent::CancellationToken,
     emitter: &mut MessageEmitter,
 ) -> Result<()> {
-    let mut reader = stream::SseReader::new(response);
+    let mut reader = stream::SseReader::new(body);
     let mut text_index = None;
     let mut thinking_index = None;
     let mut tool_calls = BTreeMap::<String, MistralToolCallState>::new();
@@ -659,16 +468,16 @@ pub(crate) fn consume_mistral_conversations(
             break;
         }
         let chunk = serde_json::from_str::<Value>(data)?;
-        if emitter.message.response_id.is_empty()
+        if emitter.message().response_id.is_empty()
             && let Some(id) = chunk
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
         {
-            emitter.message.response_id = id.to_owned();
+            emitter.message_mut().response_id = id.to_owned();
         }
         if let Some(usage) = chunk.get("usage") {
-            apply_mistral_usage(&mut emitter.message.usage, usage);
+            apply_mistral_usage(&mut emitter.message_mut().usage, usage);
         }
 
         let Some(choice) = chunk
@@ -684,10 +493,10 @@ pub(crate) fn consume_mistral_conversations(
             .filter(|reason| !reason.is_empty())
         {
             saw_finish_reason = true;
-            emitter.message.raw_stop_reason = reason.to_owned();
+            emitter.message_mut().raw_stop_reason = reason.to_owned();
             let (stop_reason, error_message) = map_mistral_stop_reason(reason);
-            emitter.message.stop_reason = stop_reason;
-            emitter.message.error_message = error_message;
+            emitter.message_mut().stop_reason = stop_reason;
+            emitter.message_mut().error_message = error_message;
         }
 
         let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
@@ -808,9 +617,9 @@ pub(crate) fn consume_mistral_conversations(
         emitter.set_tool_arguments(content_index, arguments)?;
         emitter.end_tool(content_index)?;
     }
-    if emitter.message.stop_reason == stream::STOP_ERROR {
+    if emitter.message().stop_reason == stream::STOP_ERROR {
         return Err(ProviderAdapterError::Protocol(
-            emitter.message.error_message.clone(),
+            emitter.message().error_message.clone(),
         ));
     }
     if !saw_finish_reason {
