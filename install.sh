@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/goshitsarch-eng/goshcoder/main/install.sh | sh
 #
 # By default this downloads the latest published release for your platform and
-# verifies its SHA-256 against the signed checksums file before installing. If
+# verifies its SHA-256 against the published checksums file before installing. If
 # no release is published yet it falls back to building from source with the
 # stable Rust toolchain. Re-running the script upgrades an existing installation.
 #

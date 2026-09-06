@@ -42,14 +42,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: build and publish release archives
+  # Resolves (and when allowed, creates) the tag once, so the build hosts all
+  # check out the same commit.
+  resolve:
+    name: resolve the release tag
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
-      # Inputs reach the shell through the environment rather than through
-      # ${{ }} interpolation: a manual run and a branch name are the paths
-      # where they arrive as free text, and expanding free text into a script
-      # is how a workflow with contents: write gets turned into someone else's.
       - name: resolve the release tag
         id: release
         env:
@@ -160,29 +160,88 @@ jobs:
           git push origin "refs/tags/$TAG"
           echo "created and pushed $TAG at $(git rev-parse --short HEAD)"
 
+  # Linux and Windows archives are cross-compiled from Linux with
+  # cargo-zigbuild. The Apple archives are built natively on macOS: reqwest's
+  # rustls backend verifies certificates through the Security framework,
+  # which only links against the macOS SDK. The Makefile picks the platforms
+  # and the builder from the host it runs on.
+  build:
+    name: build archives (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-pc-windows-gnu
+          - os: macos-latest
+            targets: x86_64-apple-darwin,aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          # `git describe` in the Makefile needs the history behind the tag.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-apple-darwin,aarch64-apple-darwin,x86_64-pc-windows-gnu,aarch64-pc-windows-gnu
+          targets: ${{ matrix.targets }}
       - uses: Swatinem/rust-cache@v2
       - uses: goto-bus-stop/setup-zig@v2
+        if: runner.os == 'Linux'
       - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
         with:
           tool: cargo-audit,cargo-zigbuild
+      - name: install zip
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zip
 
-      # A release must never ship code that does not pass the gate.
+      # A release must never ship code that does not pass the gate. CI has
+      # already run the suite on every host; the release builder repeats it
+      # once, with the advisory check, on the commit it is about to publish.
       - name: verify
+        if: runner.os == 'Linux'
         run: |
           make check
           cargo audit
 
       - name: build archives
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq zip
-          make dist VERSION="$RELEASE_TAG"
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: make dist VERSION="$RELEASE_TAG"
 
+      - name: list artifacts
+        run: ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archives-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish the release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archives-*
+          path: dist
+          merge-multiple: true
+
+      # One checksums file over every archive, from every host, is what both
+      # installers verify against.
+      - name: write checksums
+        run: make checksums
       - name: list artifacts
         run: ls -la dist && cat dist/checksums.txt
 
@@ -191,7 +250,7 @@ jobs:
       # against that branch instead of the tag the archives were built for.
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release.outputs.tag }}
+          tag_name: ${{ needs.resolve.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.zip

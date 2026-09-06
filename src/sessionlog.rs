@@ -816,7 +816,10 @@ impl Store {
 
         let current_size = file.metadata()?.len();
         if current_size > offset {
-            file.set_len(offset)?;
+            // An append-only handle cannot truncate on Windows (it carries no
+            // write-data access), so the cut goes through a plain write
+            // handle; the append handle keeps writing at the new end.
+            OpenOptions::new().write(true).open(path)?.set_len(offset)?;
             report.repaired_tail = true;
         }
         file.seek(SeekFrom::Start(offset))?;
