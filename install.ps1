@@ -59,7 +59,10 @@ function Get-TargetArch {
     if (-not $raw) { $raw = $env:PROCESSOR_ARCHITECTURE }
     switch ($raw) {
         'AMD64' { return 'amd64' }
-        'ARM64' { return 'arm64' }
+        # Releases ship no native arm64 Windows build (stable Rust has no
+        # aarch64-pc-windows-gnu standard library); the amd64 binary runs
+        # under Windows on ARM's x64 emulation.
+        'ARM64' { return 'amd64' }
         'x86'   { Stop-WithError '32-bit Windows is not supported' }
         default { Stop-WithError "unsupported architecture: $raw" }
     }
@@ -171,7 +174,7 @@ function Install-FromSource {
         if ($LASTEXITCODE -ne 0 -or -not $ver) {
             $short = & git rev-parse --short HEAD 2>$null
             if (-not $short) { $short = 'unknown' }
-            $ver = "0.5.0-dev+$short"
+            $ver = "0.6.0-dev+$short"
         }
         $oldTarget = $env:CARGO_TARGET_DIR
         $oldVersion = $env:GOSHCODER_VERSION

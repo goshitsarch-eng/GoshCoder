@@ -76,8 +76,12 @@ make install    # and onto your PATH
 make check      # the Rust gate: rustfmt, cargo check, Clippy, and tests
 ```
 
-`make help` lists every target. `make dist` cross-compiles release archives for
-Linux, macOS, and Windows on amd64 and arm64, with checksums.
+`make help` lists every target. `make dist` builds the release archives for
+the host it runs on: on Linux it cross-compiles Linux amd64/arm64 and Windows
+amd64 with cargo-zigbuild (Windows on ARM runs that build under emulation); on
+macOS it builds both Mac architectures natively, since the Apple targets link
+the Security framework and need the macOS SDK. The release workflow runs both
+hosts and publishes one `checksums.txt` over every archive.
 
 **First run**
 
@@ -550,8 +554,10 @@ provider credentials exported, so a test that reads the developer's real
 environment instead of its own fixtures fails loudly rather than passing on one
 machine and failing on another.
 
-GitHub Actions runs the same gate on Linux, macOS, and Windows, cross-compiles
-every release target, and exercises both installer scripts -- including a
+GitHub Actions runs the same gate on Linux, macOS, and Windows, builds every
+release archive the way the release workflow does (Linux and Windows
+cross-compiled from Linux, the Apple targets natively on macOS), and exercises
+both installer scripts -- including a
 round-trip that serves real release archives over HTTP and drives the
 installer's actual download path, so the Makefile and the installers cannot
 drift apart into a release that 404s. Filesystem tools use Rust workspace

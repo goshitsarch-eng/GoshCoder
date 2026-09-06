@@ -13,7 +13,8 @@ make check
 ```
 
 That is the gate CI runs: `fmt-check vet lint test test-hermetic vuln`, on
-Linux, macOS and Windows, followed by a cross-compile of every release target
+Linux, macOS and Windows, followed by a build of every release target (Linux
+and Windows cross-compiled from Linux, the Apple targets natively on macOS)
 and an installer round-trip. Expected: rustfmt clean, `cargo check` clean,
 Clippy clean under `-D warnings`, every test passing, and `cargo audit` quiet
 when it is installed.
@@ -237,11 +238,16 @@ Anything an audit found that was not fixed is recorded in the README's
 
 ## Cutting a release
 
-`.github/workflows/release.yml` publishes the cross-compiled archives and the
-`checksums.txt` both installers verify against. Three ways in, one code path:
+`.github/workflows/release.yml` publishes the release archives and the
+`checksums.txt` both installers verify against. It resolves the tag once, then
+builds on two hosts -- Linux cross-compiles the Linux and Windows archives with
+cargo-zigbuild, macOS builds both Apple archives natively because reqwest's
+rustls backend links the Security framework, which needs the macOS SDK -- and
+a final job merges the archives, writes one checksums file, and publishes.
+Three ways in, one code path:
 
 - **Push a `v*` tag.** The ordinary route.
-- **Push a `release/v*` branch.** `release/v0.5.0` cuts `v0.5.0` from that
+- **Push a `release/v*` branch.** `release/v0.6.0` cuts `v0.6.0` from that
   branch's head. The branch is only a trigger and is safe to delete once the
   release is published.
 - **Run the workflow manually** (Actions → Release → Run workflow), naming the
@@ -257,10 +263,14 @@ and a push made with it does not trigger another run.
 The tag is validated against `v1.2.3` / `v1.2.3-rc.1` before it reaches a
 shell. The release build stamps the version through `GOSHCODER_VERSION`
 (`make dist VERSION=<tag>`); an ordinary `cargo build` reports the manifest
-version from `Cargo.toml`, and the Makefile, `install.sh` and `install.ps1`
-each carry the same fallback for the case where no tag is reachable. Bump all
-four after a release; skipping it is how two Go-era releases shipped from a
-tree that still claimed the previous version.
+version from `Cargo.toml` (mirrored in `Cargo.lock`), and the Makefile,
+`install.sh` and `install.ps1` each carry the same fallback for the case where
+no tag is reachable. Bump all five after a release; skipping it is how two
+Go-era releases shipped from a tree that still claimed the previous version.
+
+A release branch must also be merged back once the release is published. The
+v0.5.0 fixes lived only on `release/v0.5.0` for a while, during which every
+push to `main` failed CI and `main` could not have cut a release at all.
 
 ## Conventions to keep
 

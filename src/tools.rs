@@ -1451,7 +1451,7 @@ fn read_directory_entries(
 /// `fs::canonicalize` with Windows verbatim prefixes (`\\?\C:\...`) reduced
 /// to ordinary paths, so canonical results compare with lexically built ones
 /// and a new file under `C:\ws` is not reported as outside `\\?\C:\ws`.
-fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn canonicalize(path: &Path) -> io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
     #[cfg(windows)]
     {
