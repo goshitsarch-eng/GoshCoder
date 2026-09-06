@@ -174,7 +174,7 @@ function Install-FromSource {
         if ($LASTEXITCODE -ne 0 -or -not $ver) {
             $short = & git rev-parse --short HEAD 2>$null
             if (-not $short) { $short = 'unknown' }
-            $ver = "0.5.0-dev+$short"
+            $ver = "0.6.0-dev+$short"
         }
         $oldTarget = $env:CARGO_TARGET_DIR
         $oldVersion = $env:GOSHCODER_VERSION

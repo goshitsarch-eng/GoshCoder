@@ -12,7 +12,7 @@ TARGET_DIR ?= $(CURDIR)/target
 # A tagged build reports the tag; an untagged one reports the development
 # revision, so a local binary never claims to be a published release.
 VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
-	|| printf '0.5.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
+	|| printf '0.6.0-dev+%s' "$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 
 # Release archives are named without the tag's leading "v", which is what both
 # installers derive from a release tag.

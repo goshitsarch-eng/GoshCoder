@@ -217,7 +217,7 @@ install_from_source() {
 
 	info "compiling (this takes a minute)"
 	ver=$(cd "$srcdir" && git describe --tags --dirty --match 'v*' 2>/dev/null ||
-		printf '0.5.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
+		printf '0.6.0-dev+%s' "$(cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)")
 	if ! ( cd "$srcdir" && CARGO_TARGET_DIR="$TMPDIR_CREATED/cargo-target" \
 		GOSHCODER_VERSION="$ver" cargo build --release --locked --bin "$BINARY" ); then
 		die "build failed; ensure the stable Rust toolchain selected by rust-toolchain.toml is installed"
