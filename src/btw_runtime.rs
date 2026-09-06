@@ -6,6 +6,11 @@
 //! It deliberately accepts a snapshot of [`agent::State`] and a supplied
 //! [`agent::AssistantResponder`], so dispatching a side question cannot append
 //! to or otherwise mutate the main agent transcript.
+//!
+//! Threads live in memory. An optional [`Options::persist`] hook receives the
+//! complete snapshot after every durable change, and [`Options::restored`]
+//! seeds a new runtime with threads decoded from an earlier [`CUSTOM_TYPE`]
+//! session entry, so a session owner can make them outlive one window.
 
 use std::{
     collections::BTreeMap,
@@ -15,6 +20,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{agent, btw, catalog::Catalog, config, llm};
 
@@ -32,8 +40,26 @@ pub type ModelResolver =
 /// The effective side-thread model, thinking level, and non-fatal warnings.
 pub type Selection = btw::ResolvedSelection;
 
+/// pi-compatible custom entry type used for one session's side threads.
+pub const CUSTOM_TYPE: &str = "goshcoder.btw";
+/// Schema version written under [`CUSTOM_TYPE`].
+pub const PAYLOAD_VERSION: u64 = 1;
+/// Most recently updated threads kept in a persisted payload.
+pub const MAX_PERSISTED_THREADS: usize = 50;
+/// Newest turns kept per persisted thread.
+pub const MAX_PERSISTED_TURNS: usize = 200;
+/// Upper bound for the encoded payload; the oldest threads are dropped first.
+pub const MAX_PAYLOAD_BYTES: usize = 4 << 20;
+
+/// Generous allowance for `{"version":N,"threads":[]}` around the threads.
+const PAYLOAD_ENVELOPE_BYTES: usize = 64;
+
+/// Receives the complete thread snapshot, most recently updated first, after
+/// every durable change.
+pub type PersistHook = Arc<dyn Fn(Vec<btw::Thread>) + Send + Sync + 'static>;
+
 /// Construction settings for a [`Runtime`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct Options {
     /// Location of the independently managed `pi-btw.json` file.
     pub settings_path: PathBuf,
@@ -42,6 +68,13 @@ pub struct Options {
     /// A request for `btw-4` uses `<side_session_id_prefix>:btw-4`. An empty
     /// prefix falls back to `btw`.
     pub side_session_id_prefix: String,
+    /// Called with every thread after a thread is created, a turn completes or
+    /// fails, or a thread-local thinking level changes. `None` keeps threads
+    /// in memory only.
+    pub persist: Option<PersistHook>,
+    /// Threads saved by an earlier runtime, inserted before any new thread is
+    /// created so their IDs are never reused.
+    pub restored: Vec<btw::Thread>,
 }
 
 impl Default for Options {
@@ -49,8 +82,69 @@ impl Default for Options {
         Self {
             settings_path: config::btw_path(),
             side_session_id_prefix: "btw".to_owned(),
+            persist: None,
+            restored: Vec::new(),
         }
     }
+}
+
+impl fmt::Debug for Options {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Options")
+            .field("settings_path", &self.settings_path)
+            .field("side_session_id_prefix", &self.side_session_id_prefix)
+            .field("persist", &self.persist.as_ref().map(|_| "<hook>"))
+            .field("restored", &self.restored)
+            .finish()
+    }
+}
+
+/// Document stored under [`CUSTOM_TYPE`].
+#[derive(Deserialize, Serialize)]
+struct Payload {
+    version: u64,
+    threads: Vec<btw::Thread>,
+}
+
+/// Encodes a snapshot from [`btw::Manager::snapshot_threads`], ordered most
+/// recently updated first, into the [`CUSTOM_TYPE`] payload.
+///
+/// Only the newest [`MAX_PERSISTED_THREADS`] threads and the newest
+/// [`MAX_PERSISTED_TURNS`] turns of each are kept, and the oldest remaining
+/// threads are dropped until the encoded document fits [`MAX_PAYLOAD_BYTES`].
+pub fn encode_threads(
+    mut threads: Vec<btw::Thread>,
+) -> std::result::Result<Value, serde_json::Error> {
+    threads.truncate(MAX_PERSISTED_THREADS);
+    let mut sizes = Vec::with_capacity(threads.len());
+    for thread in &mut threads {
+        let excess = thread.turns.len().saturating_sub(MAX_PERSISTED_TURNS);
+        thread.turns.drain(..excess);
+        sizes.push(serde_json::to_vec(thread)?.len());
+    }
+    // One separating comma per thread on top of the envelope.
+    let mut total = PAYLOAD_ENVELOPE_BYTES + sizes.iter().sum::<usize>() + sizes.len();
+    while total > MAX_PAYLOAD_BYTES && !threads.is_empty() {
+        threads.pop();
+        total -= sizes.pop().unwrap_or(0) + 1;
+    }
+    serde_json::to_value(Payload {
+        version: PAYLOAD_VERSION,
+        threads,
+    })
+}
+
+/// Decodes a [`CUSTOM_TYPE`] payload into threads for [`Options::restored`].
+pub fn decode_threads(payload: &Value) -> std::result::Result<Vec<btw::Thread>, String> {
+    let payload = Payload::deserialize(payload).map_err(|error| error.to_string())?;
+    if payload.version != PAYLOAD_VERSION {
+        return Err(format!(
+            "unsupported BTW payload version {}",
+            payload.version
+        ));
+    }
+    Ok(payload.threads)
 }
 
 /// A new thread and the settings selection used to initialize it.
@@ -183,6 +277,7 @@ struct RuntimeInner {
     resolve_model: ModelResolver,
     settings_path: PathBuf,
     side_session_id_prefix: String,
+    persist: Option<PersistHook>,
     thread_state: Mutex<BTreeMap<String, ThreadRuntimeState>>,
 }
 
@@ -218,13 +313,16 @@ impl Runtime {
         resolve_model: ModelResolver,
         options: Options,
     ) -> Self {
+        let manager = btw::Manager::new();
+        manager.restore_threads(options.restored);
         Self {
             inner: Arc::new(RuntimeInner {
-                manager: btw::Manager::new(),
+                manager,
                 responder,
                 resolve_model,
                 settings_path: options.settings_path,
                 side_session_id_prefix: options.side_session_id_prefix,
+                persist: options.persist,
                 thread_state: Mutex::new(BTreeMap::new()),
             }),
         }
@@ -301,14 +399,15 @@ impl Runtime {
         lock(&self.inner.thread_state)
             .entry(thread.id.clone())
             .or_default();
+        self.persist();
         CreateOutcome { thread, selection }
     }
 
     /// Reopens an existing in-memory side thread for rendering or dispatch.
     ///
-    /// Threads are intentionally session-local. This does not restore a
-    /// thread from disk; it returns a fresh immutable snapshot of one created
-    /// by this runtime.
+    /// This does not read anything from disk; it returns a fresh immutable
+    /// snapshot of a thread created by this runtime or supplied through
+    /// [`Options::restored`].
     pub fn resume_thread(&self, thread: impl AsRef<str>) -> Result<btw::Thread> {
         let id = thread.as_ref().to_owned();
         let snapshot = self.require_thread(&id)?;
@@ -473,6 +572,10 @@ impl Runtime {
         let queued = self.finish_activity(&id);
         let status = status_result?;
         let thread = snapshot_result?;
+        // A cancelled request recorded no turn, so there is nothing new to save.
+        if status != DispatchStatus::Cancelled {
+            self.persist();
+        }
 
         Ok(Some(DispatchOutcome {
             thread,
@@ -508,6 +611,7 @@ impl Runtime {
             .manager
             .set_thinking_level(&id, thinking_level.clone())
             .map_err(runtime_thread_error)?;
+        self.persist();
         selection.thinking_level = thinking_level.clone();
 
         let mut remembered = false;
@@ -682,6 +786,14 @@ impl Runtime {
         let prefix = if prefix.is_empty() { "btw" } else { prefix };
         format!("{prefix}:{thread_id}")
     }
+
+    /// Hands the complete thread snapshot to the persistence hook, if any.
+    /// No runtime lock is held while the hook runs.
+    fn persist(&self) {
+        if let Some(persist) = &self.inner.persist {
+            persist(self.inner.manager.snapshot_threads());
+        }
+    }
 }
 
 fn runtime_thread_error(error: btw::ThreadError) -> RuntimeError {
@@ -788,6 +900,7 @@ mod tests {
         Options {
             settings_path: path,
             side_session_id_prefix: "test-side".to_owned(),
+            ..Options::default()
         }
     }
 
@@ -1269,5 +1382,196 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn persistence_hook_receives_snapshots_after_durable_changes() {
+        let directory = test_directory("persist");
+        let snapshots = Arc::new(Mutex::new(Vec::<Vec<btw::Thread>>::new()));
+        let recorded = Arc::clone(&snapshots);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::clone(&calls);
+        let responder: agent::AssistantResponder =
+            Arc::new(
+                move |_, _, _| match call_count.fetch_add(1, Ordering::Relaxed) {
+                    0 => Ok(assistant("saved answer")),
+                    1 => Err("provider unavailable".to_owned()),
+                    _ => Ok(llm::AssistantMessage {
+                        stop_reason: "aborted".to_owned(),
+                        ..assistant("")
+                    }),
+                },
+            );
+        let runtime = Runtime::new(
+            responder,
+            |_| Err("no configured side model".to_owned()),
+            Options {
+                persist: Some(Arc::new(move |threads| lock(&recorded).push(threads))),
+                ..options(btw::settings_path(&directory))
+            },
+        );
+        let state = main_state(vec![user("main task")]);
+
+        let created = runtime.create_thread(&state);
+        {
+            let snapshots = lock(&snapshots);
+            assert_eq!(snapshots.len(), 1, "creating a thread persists");
+            assert_eq!(snapshots[0].len(), 1);
+            assert_eq!(snapshots[0][0].id, created.thread.id);
+            assert!(snapshots[0][0].turns.is_empty());
+        }
+
+        runtime
+            .enqueue_prompt(&created.thread, "first")
+            .expect("queue prompt");
+        let answered = runtime
+            .run_next(&state, &created.thread)
+            .expect("dispatch")
+            .expect("prompt");
+        assert!(matches!(answered.status, DispatchStatus::Answered { .. }));
+        assert_eq!(lock(&snapshots).len(), 2, "a completed turn persists");
+        assert_eq!(lock(&snapshots)[1][0].turns.len(), 1);
+
+        runtime
+            .set_thread_thinking_level(&state, &created.thread, "low")
+            .expect("change thinking level");
+        assert_eq!(
+            lock(&snapshots).len(),
+            3,
+            "a thinking-level change persists"
+        );
+        assert_eq!(lock(&snapshots)[2][0].thinking_level, llm::THINKING_LOW);
+
+        runtime
+            .enqueue_follow_up(&created.thread, "second")
+            .expect("queue follow-up");
+        let failed = runtime
+            .run_next(&state, &created.thread)
+            .expect("dispatch")
+            .expect("follow-up");
+        assert!(matches!(failed.status, DispatchStatus::Failed { .. }));
+        assert_eq!(lock(&snapshots).len(), 4, "a failed turn persists");
+        assert_eq!(lock(&snapshots)[3][0].turns.len(), 2);
+
+        runtime
+            .enqueue_follow_up(&created.thread, "third")
+            .expect("queue follow-up");
+        let cancelled = runtime
+            .run_next(&state, &created.thread)
+            .expect("dispatch")
+            .expect("follow-up");
+        assert_eq!(cancelled.status, DispatchStatus::Cancelled);
+        assert_eq!(
+            lock(&snapshots).len(),
+            4,
+            "a cancelled request records no turn and persists nothing"
+        );
+
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn persisted_threads_restore_into_a_new_runtime_with_id_continuity() {
+        let directory = test_directory("restore");
+        let latest = Arc::new(Mutex::new(Vec::<btw::Thread>::new()));
+        let recorded = Arc::clone(&latest);
+        let responder: agent::AssistantResponder = Arc::new(|_, _, _| Ok(assistant("answer")));
+        let runtime = Runtime::new(
+            Arc::clone(&responder),
+            |_| Err("no configured side model".to_owned()),
+            Options {
+                persist: Some(Arc::new(move |threads| *lock(&recorded) = threads)),
+                ..options(btw::settings_path(&directory))
+            },
+        );
+        let state = main_state(vec![user("main task")]);
+        let empty = runtime.create_thread(&state);
+        let answered = runtime.create_thread(&state);
+        runtime
+            .enqueue_prompt(&answered.thread, "saved question")
+            .expect("queue prompt");
+        runtime
+            .run_next(&state, &answered.thread)
+            .expect("dispatch")
+            .expect("prompt");
+        let original = runtime.thread(&answered.thread).expect("thread");
+
+        let payload = encode_threads(lock(&latest).clone()).expect("encode");
+        assert_eq!(payload["version"], PAYLOAD_VERSION);
+        assert_eq!(payload["threads"].as_array().map(Vec::len), Some(2));
+        let restored = decode_threads(&payload).expect("decode");
+        assert!(decode_threads(&serde_json::json!({"version": 99, "threads": []})).is_err());
+        assert!(decode_threads(&serde_json::json!("not a payload")).is_err());
+
+        let reopened = Runtime::new(
+            responder,
+            |_| Err("no configured side model".to_owned()),
+            Options {
+                restored,
+                ..options(btw::settings_path(&directory))
+            },
+        );
+        let summaries = reopened.list_threads();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, answered.thread.id);
+        assert_eq!(summaries[0].questions, 1);
+        assert!(reopened.thread(&empty.thread).is_ok());
+        let resumed = reopened
+            .resume_thread(&answered.thread)
+            .expect("resume restored thread");
+        assert_eq!(resumed.turns, original.turns);
+        assert_eq!(resumed.conversation_context, original.conversation_context);
+        assert_eq!(resumed.thinking_level, original.thinking_level);
+        assert_eq!(reopened.create_thread(&state).thread.id, "btw-3");
+
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn encoding_caps_threads_and_turns_and_drops_the_oldest_past_the_size_limit() {
+        let manager = btw::Manager::new();
+        for index in 0..MAX_PERSISTED_THREADS + 10 {
+            let thread = manager.new_thread("context", llm::THINKING_OFF);
+            manager
+                .record_answered(&thread, format!("question {index}"), assistant("answer"))
+                .expect("record");
+        }
+        let threads = decode_threads(&encode_threads(manager.snapshot_threads()).expect("encode"))
+            .expect("decode");
+        assert_eq!(threads.len(), MAX_PERSISTED_THREADS);
+        assert_eq!(threads[0].id, format!("btw-{}", MAX_PERSISTED_THREADS + 10));
+        assert_eq!(threads[MAX_PERSISTED_THREADS - 1].id, "btw-11");
+
+        let manager = btw::Manager::new();
+        let thread = manager.new_thread("context", llm::THINKING_OFF);
+        for index in 0..MAX_PERSISTED_TURNS + 25 {
+            manager
+                .record_answered(&thread, format!("turn {index}"), assistant("answer"))
+                .expect("record");
+        }
+        let threads = decode_threads(&encode_threads(manager.snapshot_threads()).expect("encode"))
+            .expect("decode");
+        assert_eq!(threads[0].turns.len(), MAX_PERSISTED_TURNS);
+        assert_eq!(threads[0].turns[0].question, "turn 25");
+        assert_eq!(
+            threads[0].turns[MAX_PERSISTED_TURNS - 1].question,
+            format!("turn {}", MAX_PERSISTED_TURNS + 24)
+        );
+
+        let manager = btw::Manager::new();
+        for _ in 0..6 {
+            let thread = manager.new_thread("x".repeat(1 << 20), llm::THINKING_OFF);
+            manager
+                .record_answered(&thread, "large", assistant("answer"))
+                .expect("record");
+        }
+        let payload = encode_threads(manager.snapshot_threads()).expect("encode");
+        assert!(serde_json::to_vec(&payload).expect("bytes").len() <= MAX_PAYLOAD_BYTES);
+        let ids = decode_threads(&payload)
+            .expect("decode")
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["btw-6", "btw-5", "btw-4"]);
     }
 }

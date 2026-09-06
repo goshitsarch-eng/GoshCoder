@@ -571,7 +571,7 @@ pub fn prepare_session(
     let btw = btw_runtime::Runtime::with_catalog(
         runtime.agent().responder(),
         catalog.clone(),
-        btw_runtime::Options::default(),
+        btw_options(&runtime),
     );
     let ralph_store = config
         .enable_ralph
@@ -913,6 +913,54 @@ fn desktop_mcp_tool(
     }
     let session = computeruse::McpSession::new(binary);
     Some((computeruse::agent_tool(session.clone()), session))
+}
+
+/// Joins the side-thread runtime to the session log. Threads are restored from
+/// the latest `goshcoder.btw` entry on the current path, and every durable
+/// change is recorded back while the session is writable; a no-session or
+/// read-only session keeps them in memory only.
+fn btw_options(runtime: &SessionRuntime) -> btw_runtime::Options {
+    let notices = runtime.notice_sender();
+    let restored = runtime
+        .restored()
+        .custom
+        .get(btw_runtime::CUSTOM_TYPE)
+        .map_or_else(Vec::new, |payload| {
+            btw_runtime::decode_threads(payload).unwrap_or_else(|error| {
+                notices.push(
+                    "BTW",
+                    format!("ignoring unreadable saved side threads: {error}"),
+                );
+                Vec::new()
+            })
+        });
+    let recorder = runtime.custom_recorder();
+    let persist: btw_runtime::PersistHook = Arc::new(move |threads| {
+        if !recorder.recording() {
+            return;
+        }
+        let payload = match btw_runtime::encode_threads(threads) {
+            Ok(payload) => payload,
+            Err(error) => {
+                notices.push(
+                    "BTW",
+                    format!("could not encode side threads for the session: {error}"),
+                );
+                return;
+            }
+        };
+        if let Err(error) = recorder.record(btw_runtime::CUSTOM_TYPE, payload) {
+            notices.push(
+                "BTW",
+                format!("could not save side threads to the session: {error}"),
+            );
+        }
+    });
+    btw_runtime::Options {
+        persist: Some(persist),
+        restored,
+        ..btw_runtime::Options::default()
+    }
 }
 
 /// Builds the native cited web-search tool with fresh OpenAI/Codex credential
@@ -1425,6 +1473,149 @@ mod tests {
         prepared.runtime.close().expect("close session");
         drop(prepared);
         let _ = std::fs::remove_dir_all(storage);
+        std::fs::remove_dir_all(directory).expect("remove workspace");
+    }
+
+    #[test]
+    fn btw_threads_persist_in_the_session_and_survive_continue() {
+        let catalog = Catalog::with_environment(
+            None,
+            Arc::new(|name| (name == "OPENAI_API_KEY").then(|| "test-key".to_owned())),
+        )
+        .expect("catalog");
+        let model_id = catalog
+            .provider("openai")
+            .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+            .expect("OpenAI model");
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-btw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("workspace");
+        let responder: agent::AssistantResponder = Arc::new(|_, _, _| {
+            Ok(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::text("side answer")],
+                api: "test".to_owned(),
+                provider: "test".to_owned(),
+                model: "test-model".to_owned(),
+                stop_reason: "stop".to_owned(),
+                timestamp: 1,
+                ..llm::AssistantMessage::default()
+            })
+        });
+        let config = SessionConfig {
+            model_ref: format!("openai/{model_id}"),
+            workdir: directory.clone(),
+            sessions_dir: Some(directory.join("sessions")),
+            ..SessionConfig::default()
+        };
+
+        let mut prepared = prepare_session(
+            &catalog,
+            config.clone(),
+            Some(Arc::clone(&responder)),
+            Vec::new(),
+        )
+        .expect("prepare recording session");
+        assert!(prepared.runtime.recording());
+        // A session without an assistant message is discarded on close, so the
+        // main conversation needs one turn before side threads can outlive it.
+        prepared
+            .runtime
+            .agent()
+            .prompt("main question")
+            .expect("main turn");
+        let state = prepared.runtime.agent().state();
+        let created = prepared.btw.create_thread(&state);
+        prepared
+            .btw
+            .enqueue_prompt(&created.thread, "what was decided?")
+            .expect("queue prompt");
+        let outcome = prepared
+            .btw
+            .run_next(&state, &created.thread)
+            .expect("dispatch")
+            .expect("prompt");
+        assert!(matches!(
+            outcome.status,
+            btw_runtime::DispatchStatus::Answered { .. }
+        ));
+        assert!(
+            prepared
+                .runtime
+                .restored()
+                .custom
+                .contains_key(btw_runtime::CUSTOM_TYPE)
+        );
+        assert!(
+            drain_session_notices(&prepared.runtime)
+                .iter()
+                .all(|notice| !notice.starts_with("BTW:"))
+        );
+        prepared.runtime.close().expect("close session");
+        drop(prepared);
+
+        let mut continued = prepare_session(
+            &catalog,
+            SessionConfig {
+                continue_session: true,
+                ..config.clone()
+            },
+            Some(Arc::clone(&responder)),
+            Vec::new(),
+        )
+        .expect("continue session");
+        assert!(continued.runtime.resumed());
+        let summaries = continued.btw.list_threads();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, created.thread.id);
+        let restored = continued
+            .btw
+            .resume_thread(&created.thread)
+            .expect("resume persisted thread");
+        assert_eq!(restored.turns.len(), 1);
+        assert_eq!(restored.turns[0].answer, "side answer");
+        assert_eq!(
+            restored.conversation_context,
+            created.thread.conversation_context
+        );
+        let next = continued
+            .btw
+            .create_thread(&continued.runtime.agent().state());
+        assert_eq!(next.thread.id, "btw-2");
+        continued
+            .runtime
+            .custom_recorder()
+            .record(
+                btw_runtime::CUSTOM_TYPE,
+                serde_json::json!({"version": 99, "threads": []}),
+            )
+            .expect("record an unreadable payload");
+        continued.runtime.close().expect("close session");
+        drop(continued);
+
+        let mut reopened = prepare_session(
+            &catalog,
+            SessionConfig {
+                continue_session: true,
+                ..config
+            },
+            Some(responder),
+            Vec::new(),
+        )
+        .expect("reopen session with an unreadable payload");
+        assert!(reopened.btw.list_threads().is_empty());
+        assert!(
+            drain_session_notices(&reopened.runtime)
+                .iter()
+                .any(|notice| notice.starts_with("BTW: ignoring unreadable saved side threads"))
+        );
+        reopened.runtime.close().expect("close session");
+        drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove workspace");
     }
 }
