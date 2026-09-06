@@ -12,7 +12,7 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -40,6 +40,9 @@ pub const CONTEXT_COST_WARNING_THRESHOLD: usize = 10;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Bound on symlink hops followed before an atomic write; longer chains are
+/// written to wherever the walk stopped rather than looping forever.
+const MAX_SYMLINK_HOPS: usize = 8;
 
 /// A gateway API usable by a pi-compatible model client.
 pub type RoutableApi = String;
@@ -522,7 +525,34 @@ fn read_limited(reader: &mut impl Read, limit: usize, too_large: ApertureError) 
     Ok(bytes)
 }
 
+/// Follows an existing symlink chain so the atomic rename replaces the file a
+/// user linked the configuration to (a dotfiles checkout, say) instead of
+/// swapping the link itself for a private copy.
+fn resolve_write_target(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    // A dangling link still says where the file should land.
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) if !target.is_absolute() => parent.join(target),
+            _ => target,
+        };
+    }
+    match (current.parent(), current.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(current),
+        _ => current,
+    }
+}
+
 fn atomic_private_write(path: &Path, bytes: &[u8], operation: &'static str) -> Result<()> {
+    let path = &resolve_write_target(path);
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -621,7 +651,14 @@ pub fn normalize_input_url(raw: &str) -> String {
     if value.is_empty() {
         return value;
     }
-    if !value.starts_with("http://") && !value.starts_with("https://") {
+    // Schemes are case-insensitive; a literal prefix check would wrap
+    // "HTTPS://host" in a second scheme and mangle the origin.
+    let has_scheme = ["http://", "https://"].iter().any(|scheme| {
+        value
+            .get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    });
+    if !has_scheme {
         value = format!("http://{value}");
     }
     match Url::parse(&value) {
@@ -1028,8 +1065,11 @@ impl GatewayClient {
     /// Builds a bounded-timeout gateway client. The input may include trailing
     /// slashes, which are removed before endpoint paths are joined.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+        // A gateway redirect to another host would carry the request there
+        // unchanged, so redirects surface as HTTP errors instead.
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(ApertureError::HttpClient)?;
         Ok(Self {
@@ -2421,6 +2461,95 @@ mod tests {
             Err(ApertureError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound
         ));
         let _ = fs::remove_dir_all(malformed.parent().expect("parent"));
+    }
+
+    #[test]
+    fn input_url_scheme_is_matched_case_insensitively() {
+        assert_eq!(
+            normalize_input_url("HTTPS://Gateway.Example/v1/"),
+            "https://Gateway.Example"
+        );
+        assert_eq!(
+            normalize_input_url("Http://gateway.example:8443/v1/models"),
+            "http://gateway.example:8443"
+        );
+    }
+
+    #[test]
+    fn gateway_client_reports_redirects_instead_of_following_them() {
+        let victim = TcpListener::bind("127.0.0.1:0").expect("bind victim listener");
+        victim
+            .set_nonblocking(true)
+            .expect("nonblocking victim listener");
+        let victim_url = format!(
+            "http://{}/v1/providers",
+            victim.local_addr().expect("victim address")
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {victim_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write redirect");
+            stream.flush().expect("flush redirect");
+        });
+
+        let client = GatewayClient::new(format!("http://{address}")).expect("gateway client");
+        let error = client
+            .providers()
+            .expect_err("a redirect must surface as an HTTP error");
+        assert!(
+            matches!(&error, ApertureError::Http(HttpError { status: 302, .. })),
+            "unexpected error: {error}"
+        );
+        worker.join().expect("gateway worker");
+        assert!(
+            matches!(victim.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the redirect target must never receive the gateway request"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_updates_the_linked_file() {
+        let root = temporary_path("symlink");
+        let real = root.join("dotfiles").join("aperture.json");
+        fs::create_dir_all(real.parent().expect("parent")).expect("create dotfiles directory");
+        fs::write(
+            &real,
+            r#"{"baseUrl":"http://gw.example","onboardingDone":true}"#,
+        )
+        .expect("seed linked config");
+        let link = root.join("aperture.json");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let config = load_config(&link).expect("load through link");
+        save_config(&link, &config).expect("save through link");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the atomic replace must keep the user's link in place"
+        );
+        let stored = fs::read_to_string(&real).expect("read linked file");
+        assert!(
+            stored.contains("\"version\""),
+            "the linked file must hold the normalized save: {stored}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

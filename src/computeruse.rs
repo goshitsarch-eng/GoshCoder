@@ -50,12 +50,19 @@ pub const MAX_REQUEST_BYTES: usize = 8 << 20;
 pub const MAX_RESPONSE_LINE_BYTES: usize = 64 << 20;
 /// Maximum text copied into a model tool result.
 pub const MAX_TEXT_OUTPUT_BYTES: usize = 50 << 10;
+/// Maximum base64 image payload accepted from one content item. The server
+/// caps screenshots at 2 MiB before encoding; this leaves room for that and
+/// refuses anything that could only be a runaway or hostile response.
+pub const MAX_IMAGE_DATA_BYTES: usize = 8 << 20;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const MAX_SKIPPED_MESSAGES: usize = 1_024;
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Bound on symlink hops followed before an atomic write; longer chains are
+/// written to wherever the walk stopped rather than looping forever.
+const MAX_SYMLINK_HOPS: usize = 8;
 
 /// Errors from configuration, process control, or the MCP protocol.
 #[derive(Debug)]
@@ -328,7 +335,34 @@ fn write_mcp_config(path: &Path, config: &Map<String, Value>) -> Result<()> {
     atomic_write(path, &contents)
 }
 
+/// Follows an existing symlink chain so the atomic rename replaces the file a
+/// user linked `mcp.json` to (a dotfiles checkout, say) instead of swapping
+/// the link itself for a private copy.
+fn resolve_write_target(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    // A dangling link still says where the file should land.
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) if !target.is_absolute() => parent.join(target),
+            _ => target,
+        };
+    }
+    match (current.parent(), current.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(current),
+        _ => current,
+    }
+}
+
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let path = &resolve_write_target(path);
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -876,7 +910,7 @@ struct ReadOutcome {
 
 fn read_matching_response<R: BufRead>(reader: &mut R, expected_id: u64) -> Result<Value> {
     let expected_id = Value::from(expected_id);
-    let mut skipped = 0;
+    let mut malformed = 0;
     loop {
         let Some(line) = read_bounded_line(reader, MAX_RESPONSE_LINE_BYTES)? else {
             return Err(ComputerUseError::Protocol(
@@ -886,44 +920,22 @@ fn read_matching_response<R: BufRead>(reader: &mut R, expected_id: u64) -> Resul
         if line.is_empty() {
             continue;
         }
-        let response: Value = match serde_json::from_slice(&line) {
-            Ok(response) => response,
-            Err(_) => {
-                skipped += 1;
-                if skipped > MAX_SKIPPED_MESSAGES {
+        // Only undecodable output counts toward the limit. Well-formed
+        // notifications and replies to other ids are legitimate traffic a
+        // busy server emits in any quantity; the call deadline bounds those.
+        let object = match serde_json::from_slice::<Value>(&line) {
+            Ok(Value::Object(object)) => object,
+            _ => {
+                malformed += 1;
+                if malformed > MAX_SKIPPED_MESSAGES {
                     return Err(ComputerUseError::Protocol(
-                        "too many malformed or unrelated stdout messages".to_owned(),
+                        "too many malformed stdout messages".to_owned(),
                     ));
                 }
                 continue;
             }
         };
-        let Value::Object(object) = response else {
-            skipped += 1;
-            if skipped > MAX_SKIPPED_MESSAGES {
-                return Err(ComputerUseError::Protocol(
-                    "too many malformed or unrelated stdout messages".to_owned(),
-                ));
-            }
-            continue;
-        };
-
-        let Some(response_id) = object.get("id") else {
-            skipped += 1;
-            if skipped > MAX_SKIPPED_MESSAGES {
-                return Err(ComputerUseError::Protocol(
-                    "too many malformed or unrelated stdout messages".to_owned(),
-                ));
-            }
-            continue;
-        };
-        if response_id != &expected_id {
-            skipped += 1;
-            if skipped > MAX_SKIPPED_MESSAGES {
-                return Err(ComputerUseError::Protocol(
-                    "too many malformed or unrelated stdout messages".to_owned(),
-                ));
-            }
+        if object.get("id") != Some(&expected_id) {
             continue;
         }
         if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
@@ -1332,6 +1344,22 @@ fn call_result_to_proxy_result(raw_name: &str, result: McpCallResult) -> Result<
                     "tools/call {raw_name:?} returned empty image data or mimeType"
                 )));
             }
+            // The payload is forwarded to a model as an image block, so it
+            // must actually be one and must not be arbitrarily large.
+            if !mime_type
+                .get(.."image/".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+            {
+                return Err(ComputerUseError::Protocol(format!(
+                    "tools/call {raw_name:?} returned image content with mimeType {:?}",
+                    mime_type.chars().take(64).collect::<String>()
+                )));
+            }
+            if data.len() > MAX_IMAGE_DATA_BYTES {
+                return Err(ComputerUseError::Protocol(format!(
+                    "tools/call {raw_name:?} returned image data exceeding {MAX_IMAGE_DATA_BYTES} bytes"
+                )));
+            }
             images.push(ImageResult { data, mime_type });
         } else if let Some(text) = item.text.filter(|text| !text.is_empty()) {
             text_parts.push(text);
@@ -1629,6 +1657,103 @@ mod tests {
             read_bounded_line(&mut unterminated, 10),
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof
         ));
+    }
+
+    #[test]
+    fn only_undecodable_stdout_lines_count_toward_the_skip_limit() {
+        let mut noisy = Vec::new();
+        for index in 0..(MAX_SKIPPED_MESSAGES + 8) {
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progress": index}
+            });
+            noisy.extend_from_slice(notification.to_string().as_bytes());
+            noisy.push(b'\n');
+        }
+        let unrelated = json!({"jsonrpc": "2.0", "id": 41, "result": {"other": true}});
+        noisy.extend_from_slice(unrelated.to_string().as_bytes());
+        noisy.push(b'\n');
+        let reply = json!({"jsonrpc": "2.0", "id": 42, "result": {"ok": true}});
+        noisy.extend_from_slice(reply.to_string().as_bytes());
+        noisy.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(noisy));
+        assert_eq!(
+            read_matching_response(&mut reader, 42).expect("reply after many notifications"),
+            json!({"ok": true})
+        );
+
+        let mut garbage = Vec::new();
+        for _ in 0..=MAX_SKIPPED_MESSAGES {
+            garbage.extend_from_slice(b"not json\n");
+        }
+        garbage.extend_from_slice(reply.to_string().as_bytes());
+        garbage.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(garbage));
+        assert!(matches!(
+            read_matching_response(&mut reader, 42),
+            Err(ComputerUseError::Protocol(message)) if message.contains("malformed")
+        ));
+    }
+
+    #[test]
+    fn image_content_requires_an_image_mime_type_and_bounded_data() {
+        let result_with = |data: String, mime_type: &str| McpCallResult {
+            content: vec![McpContentItem {
+                kind: "image".to_owned(),
+                text: None,
+                data: Some(data),
+                mime_type: Some(mime_type.to_owned()),
+            }],
+            ..McpCallResult::default()
+        };
+
+        let accepted =
+            call_result_to_proxy_result("screenshot", result_with("cG5n".to_owned(), "IMAGE/png"))
+                .expect("an image payload of any mime case is accepted");
+        assert_eq!(accepted.images.len(), 1);
+
+        let error =
+            call_result_to_proxy_result("screenshot", result_with("cG5n".to_owned(), "text/html"))
+                .expect_err("non-image content must not become an image block");
+        assert!(
+            matches!(&error, ComputerUseError::Protocol(message) if message.contains("mimeType \"text/html\"")),
+            "unexpected error: {error}"
+        );
+
+        let oversized = "A".repeat(MAX_IMAGE_DATA_BYTES + 1);
+        let error = call_result_to_proxy_result("screenshot", result_with(oversized, "image/png"))
+            .expect_err("an unbounded payload must be refused");
+        assert!(
+            matches!(&error, ComputerUseError::Protocol(message) if message.contains("exceeding")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writing_through_a_symlink_updates_the_linked_file() {
+        let root = test_dir("symlink");
+        let real = root.join("dotfiles").join("mcp.json");
+        fs::create_dir_all(real.parent().expect("parent")).expect("create dotfiles directory");
+        fs::write(&real, "{}\n").expect("seed linked config");
+        let link = root.join("mcp.json");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        atomic_write(&link, b"{\"mcpServers\":{}}\n").expect("write through link");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the atomic replace must keep the user's link in place"
+        );
+        assert_eq!(
+            fs::read_to_string(&real).expect("read linked file"),
+            "{\"mcpServers\":{}}\n"
+        );
+        fs::remove_dir_all(root).expect("clean test directory");
     }
 
     fn helper_session() -> McpSession {

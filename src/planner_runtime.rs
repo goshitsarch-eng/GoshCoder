@@ -11,7 +11,7 @@ use std::{
     io::Read,
     path::Path,
     process::{Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -88,15 +88,39 @@ pub struct PlannerReviewHandle {
     cancellation: Arc<Mutex<Option<agent::CancellationToken>>>,
 }
 
+/// Upper bound on a slash-command review. A tool-driven review ends with the
+/// agent turn that owns it; `/planner-review` and `/planner-annotate` have no
+/// such owner, so an abandoned browser tab would otherwise hold the session
+/// open indefinitely.
+const SLASH_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 impl PlannerReviewHandle {
     /// Opens the configured review surface and waits for a decision.
     pub fn review(
         &self,
         request: &plannotator::ReviewRequest,
     ) -> std::result::Result<plannotator::Decision, plannotator::ReviewError> {
+        self.review_within(request, SLASH_REVIEW_TIMEOUT)
+    }
+
+    fn review_within(
+        &self,
+        request: &plannotator::ReviewRequest,
+        timeout: Duration,
+    ) -> std::result::Result<plannotator::Decision, plannotator::ReviewError> {
         let cancellation = agent::CancellationToken::default();
         *lock(&self.cancellation) = Some(cancellation.clone());
+        let (finished, watchdog) = mpsc::channel::<()>();
+        let expiring = cancellation.clone();
+        thread::spawn(move || {
+            // Dropping `finished` wakes the watchdog early; only a real
+            // timeout cancels the review.
+            if watchdog.recv_timeout(timeout) == Err(mpsc::RecvTimeoutError::Timeout) {
+                expiring.cancel();
+            }
+        });
         let result = self.reviewer.review(&cancellation, request);
+        drop(finished);
         *lock(&self.cancellation) = None;
         result
     }
@@ -519,7 +543,12 @@ pub fn load_diff_review(
 const REVIEW_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn run_bounded_command(command: &mut Command) -> std::result::Result<String, String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // `git` and `gh` prompt on an inherited terminal (credentials, a pager)
+    // and would then wait on the user behind the UI's back.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("start review diff command: {error}"))?;
@@ -728,5 +757,62 @@ mod tests {
     fn planner_review_requires_an_omitted_or_github_url_target() {
         let error = load_diff_review(".", "not-a-url").expect_err("reject target");
         assert_eq!(error, "usage: /planner-review [GitHub PR URL]");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_diff_commands_do_not_inherit_stdin() {
+        let output = run_bounded_command(
+            Command::new("sh")
+                .arg("-c")
+                .arg("if read -r line; then echo got; else echo eof; fi"),
+        )
+        .expect("run helper");
+        assert_eq!(output.trim(), "eof");
+    }
+
+    /// Waits for cancellation the way an unattended browser review does.
+    struct BlockingReviewer;
+
+    impl plannotator::Reviewer for BlockingReviewer {
+        fn review(
+            &self,
+            cancellation: &agent::CancellationToken,
+            _: &plannotator::ReviewRequest,
+        ) -> std::result::Result<plannotator::Decision, plannotator::ReviewError> {
+            let give_up = Instant::now() + Duration::from_secs(10);
+            while !cancellation.is_cancelled() {
+                if Instant::now() > give_up {
+                    return Err(plannotator::ReviewError::Failed(
+                        "never cancelled".to_owned(),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(plannotator::ReviewError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn slash_reviews_are_cancelled_at_their_deadline() {
+        let root = temporary_path("deadline");
+        fs::create_dir_all(&root).expect("create root");
+        let mut runtime = runtime(&root);
+        let handle = PlannerReviewHandle {
+            reviewer: Arc::new(BlockingReviewer),
+            notices: runtime.notice_sender(),
+            cancellation: Arc::new(Mutex::new(None)),
+        };
+        let request = plannotator::ReviewRequest::new("Review", "# Plan");
+        assert_eq!(
+            handle.review_within(&request, Duration::from_millis(50)),
+            Err(plannotator::ReviewError::Cancelled)
+        );
+        assert!(
+            !handle.cancel(),
+            "a finished review must not stay cancellable"
+        );
+        runtime.close().expect("close");
+        fs::remove_dir_all(root).expect("remove root");
     }
 }

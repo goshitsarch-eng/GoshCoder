@@ -125,8 +125,13 @@ struct ReqwestTransport {
 
 impl ReqwestTransport {
     fn new(timeout: Duration) -> Result<Self, Box<dyn Error>> {
+        // Requests carry the bearer key; a redirect must not replay it to
+        // another host, so redirects are returned as ordinary statuses.
         Ok(Self {
-            client: Client::builder().timeout(timeout).build()?,
+            client: Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
         })
     }
 }
@@ -183,6 +188,63 @@ mod tests {
         let error = omniroute::HttpTransport::execute(&transport, request)
             .expect_err("connection should fail");
         assert_eq!(error.message(), "request failed");
+    }
+
+    #[test]
+    fn transport_returns_redirects_instead_of_following_them() {
+        use std::{
+            io::{BufRead, BufReader},
+            net::TcpListener,
+            thread,
+        };
+
+        let victim = TcpListener::bind("127.0.0.1:0").expect("bind victim listener");
+        victim
+            .set_nonblocking(true)
+            .expect("nonblocking victim listener");
+        let victim_url = format!(
+            "http://{}/v1/models",
+            victim.local_addr().expect("victim address")
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting gateway");
+        let address = listener.local_addr().expect("gateway address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("read request");
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {victim_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write redirect");
+            stream.flush().expect("flush redirect");
+        });
+
+        let transport = ReqwestTransport::new(Duration::from_secs(5)).expect("transport");
+        let response = omniroute::HttpTransport::execute(
+            &transport,
+            omniroute::HttpRequest {
+                method: omniroute::HttpMethod::Get,
+                url: format!("http://{address}/v1/models"),
+                headers: [("Authorization".to_owned(), "Bearer private".to_owned())]
+                    .into_iter()
+                    .collect(),
+                body: None,
+            },
+        )
+        .expect("the redirect itself is a complete response");
+        assert_eq!(response.status, 302);
+        worker.join().expect("gateway worker");
+        assert!(
+            matches!(victim.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the redirect target must never receive the bearer key"
+        );
     }
 
     #[test]

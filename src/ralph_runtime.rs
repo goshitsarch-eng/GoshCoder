@@ -87,7 +87,16 @@ impl RalphRuntime {
             system_prompt_sync,
             _subscription: subscription,
         };
-        integration.sync_agent()?;
+        // An unreadable store (a `.ralph` that is a file, a vanished
+        // workspace) is a Ralph problem, not a reason to refuse the session:
+        // the base prompt is installed and the user is told why no loop is
+        // active.
+        if let Err(error) = integration.sync_agent() {
+            notices.push(
+                "Ralph",
+                format!("could not read the loop store, so no loop is active: {error}"),
+            );
+        }
         Ok(integration)
     }
 
@@ -108,12 +117,15 @@ impl RalphRuntime {
     /// lifecycle update between agent turns.
     pub fn sync_agent(&self) -> Result<()> {
         let base_system_prompt = lock(&self.base_system_prompt).clone();
-        let system_prompt = match self.store.current()? {
-            Some(state) => ralph::inject_system_prompt(&base_system_prompt, &state),
-            None => base_system_prompt,
+        let current = self.store.current();
+        let system_prompt = match &current {
+            Ok(Some(state)) => ralph::inject_system_prompt(&base_system_prompt, state),
+            // Without a readable loop the agent still needs its base prompt,
+            // and Planner still needs to layer its own state on top of it.
+            Ok(None) | Err(_) => base_system_prompt,
         };
         (self.system_prompt_sync)(system_prompt);
-        Ok(())
+        current.map(|_| ()).map_err(Into::into)
     }
 
     /// Replaces the prompt beneath the current Ralph and Planner layers.
@@ -322,6 +334,45 @@ mod tests {
         );
         assert!(runtime.drain_notices().iter().any(|notice| {
             notice.kind == "Ralph" && notice.text.contains("completed at iteration 1")
+        }));
+
+        drop(integration);
+        runtime.close().expect("close runtime");
+        fs::remove_dir_all(directory).expect("remove temporary directory");
+    }
+
+    #[test]
+    fn attach_reports_an_unreadable_store_instead_of_failing() {
+        let directory = temporary_directory();
+        // A regular file where the store directory belongs is the portable
+        // stand-in for a `.ralph` this process cannot read.
+        fs::write(directory.join(ralph::STORE_DIR), "not a directory").expect("block store");
+        let mut runtime = SessionRuntime::open(SessionOptions {
+            cwd: directory.clone(),
+            sessions_dir: Some(directory.join("sessions")),
+            selection: SessionSelection::NoSession,
+            system_prompt: "base prompt".to_owned(),
+            model: model(),
+            ..SessionOptions::default()
+        })
+        .expect("open runtime");
+        let agent = runtime.agent().clone();
+        let prompt_sync: SystemPromptSync = {
+            let agent = agent.clone();
+            Arc::new(move |prompt| agent.set_system_prompt(prompt))
+        };
+        let integration = RalphRuntime::attach(
+            &runtime,
+            ralph::Store::new(&directory, "test-session"),
+            "base prompt".to_owned(),
+            prompt_sync,
+        )
+        .expect("an unreadable store must not refuse the session");
+
+        assert_eq!(agent.state().system_prompt, "base prompt");
+        assert!(integration.current().is_err());
+        assert!(runtime.drain_notices().iter().any(|notice| {
+            notice.kind == "Ralph" && notice.text.contains("could not read the loop store")
         }));
 
         drop(integration);

@@ -220,7 +220,7 @@ impl Config {
     /// Atomically saves this config. The temporary and final files are 0600 on
     /// Unix; a newly created parent directory is 0700 there as well.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path.as_ref();
+        let path = &resolve_write_target(path.as_ref());
         let normalized = Self {
             server_url: normalize_server_url(&self.server_url)?,
             dashboard_url: self.dashboard_url.clone(),
@@ -274,6 +274,51 @@ impl Config {
     pub fn live_catalog(&self) -> LiveCatalog {
         LiveCatalog::from_config(self)
     }
+}
+
+/// Bound on symlink hops followed before an atomic write; longer chains are
+/// written to wherever the walk stopped rather than looping forever.
+const MAX_SYMLINK_HOPS: usize = 8;
+
+/// Follows an existing symlink chain so the atomic rename replaces the file a
+/// user linked the configuration to (a dotfiles checkout, say) instead of
+/// swapping the link itself for a private copy.
+fn resolve_write_target(path: &Path) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    // A dangling link still says where the file should land.
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) if !target.is_absolute() => parent.join(target),
+            _ => target,
+        };
+    }
+    match (current.parent(), current.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or(current),
+        _ => current,
+    }
+}
+
+/// Replaces control characters in gateway-supplied text with spaces so it can
+/// be shown on a terminal without carrying escape sequences or line breaks.
+fn sanitize_gateway_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 pub fn default_config() -> Config {
@@ -1063,7 +1108,10 @@ impl<'a, T: HttpTransport + ?Sized> Client<'a, T> {
             });
         }
         if !(200..300).contains(&response.status) {
-            let body = String::from_utf8_lossy(&response.body);
+            // The body is gateway-controlled text that ends up on a terminal
+            // line, so escape sequences and line breaks are neutralized here
+            // rather than trusted by every renderer downstream.
+            let body = sanitize_gateway_text(&String::from_utf8_lossy(&response.body));
             return Err(OmniRouteError::HttpStatus {
                 status: response.status,
                 body: truncate(body.trim(), 500),
@@ -1439,6 +1487,72 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    struct StatusTransport(u16, &'static [u8]);
+
+    impl HttpTransport for StatusTransport {
+        fn execute(
+            &self,
+            _request: HttpRequest,
+        ) -> std::result::Result<HttpResponse, HttpTransportError> {
+            Ok(HttpResponse {
+                status: self.0,
+                body: self.1.to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn gateway_error_bodies_lose_control_characters_before_display() {
+        let transport = StatusTransport(503, b"upstream \x1b[31mdown\r\n\x07retry later");
+        let config = Config {
+            server_url: "http://gw.example".to_owned(),
+            ..Config::default()
+        };
+        let error = Client::new(config, "key", &transport)
+            .health()
+            .expect_err("a 503 must be reported");
+        let rendered = error.to_string();
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "control characters must not reach the terminal: {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with("OmniRoute returned 503: upstream  [31mdown"),
+            "unexpected rendering: {rendered:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_updates_the_linked_file() {
+        let root = test_directory("symlink");
+        let real = root.join("dotfiles").join("omniroute.json");
+        fs::create_dir_all(real.parent().expect("parent")).expect("create dotfiles directory");
+        fs::write(&real, "{}").expect("seed linked config");
+        let link = root.join("omniroute.json");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink");
+
+        let config = Config {
+            server_url: "http://gw.example".to_owned(),
+            ..Config::default()
+        };
+        config.save(&link).expect("save through link");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "the atomic replace must keep the user's link in place"
+        );
+        let stored = fs::read_to_string(&real).expect("read linked file");
+        assert!(
+            stored.contains("gw.example"),
+            "the linked file must hold the saved config: {stored}"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

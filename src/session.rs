@@ -530,50 +530,35 @@ impl SessionRuntime {
     }
 
     /// A point-in-time snapshot of the complete tree, including abandoned
-    /// branches and metadata entries.
+    /// branches and metadata entries. Prefer [`Self::with_tree`] for a
+    /// lookup that does not need to outlive the call.
     pub fn tree(&self) -> Option<Tree> {
         self.recorder.snapshot()
+    }
+
+    /// Runs `inspect` against the live tree without copying it. Status lines
+    /// ask for the name and title on every frame, where cloning a long
+    /// session's tree was the dominant cost.
+    pub fn with_tree<T>(&self, inspect: impl FnOnce(&Tree) -> T) -> Option<T> {
+        self.recorder.with_tree(inspect)
     }
 
     /// Reprojects the current tree. It reflects resets, branches, labels, and
     /// direct compaction recording that happened after startup.
     pub fn restored(&self) -> RestoredSession {
-        self.tree()
-            .map(|tree| restore_from_tree(&tree, tree.leaf()))
+        self.with_tree(|tree| restore_from_tree(tree, tree.leaf()))
             .unwrap_or_default()
     }
 
     pub fn name(&self) -> Option<String> {
-        self.tree()
-            .map(|tree| tree.name().to_owned())
+        self.with_tree(|tree| tree.name().to_owned())
             .filter(|name| !name.is_empty())
     }
 
     /// Uses the same name → first user message → ID fallback as session lists.
     pub fn title(&self) -> Option<String> {
         let handle = self.handle()?;
-        let tree = self.tree()?;
-        if !tree.name().is_empty() {
-            return Some(tree.name().to_owned());
-        }
-        for entry in tree.path(tree.leaf()) {
-            if entry.kind != sessionlog::TYPE_MESSAGE {
-                continue;
-            }
-            let Some(message) = entry.message.as_ref() else {
-                continue;
-            };
-            let Ok(llm::Message::User(message)) =
-                serde_json::from_value::<llm::Message>(message.clone())
-            else {
-                continue;
-            };
-            let text = message_text(&message);
-            if !text.is_empty() {
-                return Some(first_line(&text, 120));
-            }
-        }
-        Some(handle.id)
+        self.with_tree(|tree| tree_title(tree).unwrap_or(handle.id))
     }
 
     /// Takes startup, load, and fail-soft recording notices accumulated so far.
@@ -584,7 +569,16 @@ impl SessionRuntime {
     /// Writes a `session_info` entry and flushes it so names survive an
     /// immediate process exit.
     pub fn set_name(&self, name: impl Into<String>) -> Result<()> {
-        let name = name.into().trim().to_owned();
+        // A name is a single display line; pi collapses line breaks the same
+        // way so a multi-line paste cannot break the picker layout.
+        let name = name
+            .into()
+            .split(['\r', '\n'])
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_owned();
         self.recorder.append(Entry {
             kind: sessionlog::TYPE_SESSION_INFO.to_owned(),
             name,
@@ -625,10 +619,8 @@ impl SessionRuntime {
     /// Lists only user-message branch boundaries, because continuing from the
     /// middle of an assistant/tool turn can create invalid provider context.
     pub fn branch_points(&self) -> Vec<BranchPoint> {
-        let Some(tree) = self.tree() else {
-            return Vec::new();
-        };
-        branch_points(&tree, tree.leaf())
+        self.with_tree(|tree| branch_points(tree, tree.leaf()))
+            .unwrap_or_default()
     }
 
     /// Rewinds the write head to a user-message branch point while preserving
@@ -636,10 +628,7 @@ impl SessionRuntime {
     pub fn fork_to(&self, index: usize) -> Result<BranchPoint> {
         self.require_recording()?;
         self.require_idle("wait for the current response to finish before rewinding")?;
-        let Some(tree) = self.tree() else {
-            return Err(SessionRuntimeError::NotRecording);
-        };
-        let points = branch_points(&tree, tree.leaf());
+        let points = self.branch_points();
         let target = points
             .get(index.checked_sub(1).ok_or_else(|| {
                 SessionRuntimeError::InvalidOptions(
@@ -653,16 +642,26 @@ impl SessionRuntime {
                     points.len()
                 ))
             })?;
-        let old_path_len = tree.path(tree.leaf()).len();
-        let target_path_len = tree.path(Some(&target.id)).len();
-        let abandoned = old_path_len.saturating_sub(target_path_len);
+        let (abandoned, previous_leaf) = self
+            .with_tree(|tree| {
+                let old_path_len = tree.path(tree.leaf()).len();
+                let target_path_len = tree.path(Some(&target.id)).len();
+                (
+                    old_path_len.saturating_sub(target_path_len),
+                    tree.leaf().map(str::to_owned),
+                )
+            })
+            .ok_or(SessionRuntimeError::NotRecording)?;
 
         self.recorder.mutate(|writer| {
             writer.set_leaf(target.id.clone())?;
             if abandoned > 0 {
                 writer.append(Entry {
                     kind: sessionlog::TYPE_BRANCH_SUMMARY.to_owned(),
-                    from_id: target.id.clone(),
+                    // pi's `fromId` names the tip that was left behind, which
+                    // is what lets a tree view find the abandoned branch; the
+                    // entry's parent already says where the rewind landed.
+                    from_id: previous_leaf.unwrap_or_else(|| "root".to_owned()),
                     summary: format!(
                         "branched from {:?}, leaving {abandoned} entries on the previous path",
                         target.text
@@ -769,9 +768,10 @@ impl SessionRuntime {
         }
     }
 
-    /// Writes an export to a caller-selected destination.
+    /// Writes an export to a caller-selected destination, readable only by
+    /// its owner like the session log it came from.
     pub fn export_to(&self, format: ExportFormat, destination: impl AsRef<Path>) -> Result<()> {
-        fs::write(destination, self.export(format)?)?;
+        sessionlog::write_private(destination, &self.export(format)?)?;
         Ok(())
     }
 
@@ -934,11 +934,47 @@ pub fn restore_from_tree(tree: &Tree, leaf: Option<&str>) -> RestoredSession {
                 restored.messages.push(compaction_context_message(&summary));
                 restored.compactions.push(summary);
             }
+            // pi hands both of these to the model as user turns
+            // (`convertToLlm`), so a session shared between clients must
+            // read the same to the model here.
+            sessionlog::TYPE_CUSTOM_MESSAGE => {
+                let Some(value) = entry.content.clone() else {
+                    continue;
+                };
+                match serde_json::from_value::<llm::UserContent>(value) {
+                    Ok(content) => restored.messages.push(llm::Message::User(llm::UserMessage {
+                        role: "user".to_owned(),
+                        content,
+                        timestamp: timestamp_millis(&entry.timestamp),
+                    })),
+                    Err(error) => restored.warnings.push(format!(
+                        "entry {} carries custom content that could not be read and was skipped: {error}",
+                        entry.id
+                    )),
+                }
+            }
+            sessionlog::TYPE_BRANCH_SUMMARY if !entry.summary.is_empty() => {
+                restored
+                    .messages
+                    .push(llm::Message::User(llm::UserMessage::text(
+                        format!(
+                            "{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}",
+                            entry.summary
+                        ),
+                        timestamp_millis(&entry.timestamp),
+                    )));
+            }
             _ => {}
         }
     }
     restored
 }
+
+/// pi's wording from `messages.ts`, so the model sees identical text for a
+/// branch summary whichever client wrote it.
+const BRANCH_SUMMARY_PREFIX: &str =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
 #[derive(Clone)]
 struct ModelSelection {
@@ -1257,6 +1293,13 @@ impl Recorder {
         lock(&self.state).writer.as_ref().map(Writer::snapshot)
     }
 
+    fn with_tree<T>(&self, inspect: impl FnOnce(&Tree) -> T) -> Option<T> {
+        lock(&self.state)
+            .writer
+            .as_ref()
+            .map(|writer| inspect(writer.tree()))
+    }
+
     fn leaf(&self) -> Option<String> {
         lock(&self.state)
             .writer
@@ -1288,16 +1331,24 @@ impl Recorder {
         retained: &[llm::Message],
     ) -> Result<()> {
         self.mutate(|writer| {
-            // The marker refers to an entry that already exists, so retained
-            // messages are appended immediately before it. `context_path`
-            // then reconstructs exactly summary + retained messages.
-            let mut first_kept_entry_id = String::new();
-            for (index, message) in retained.iter().enumerate() {
-                let id = writer.append(Entry::message(message)?)?;
-                if index == 0 {
-                    first_kept_entry_id = id;
+            // The marker refers to an entry that already exists. The retained
+            // messages are normally the newest entries on the path, recorded
+            // as they completed, so the marker points back at them rather
+            // than writing the same messages a second time. Only a tail that
+            // does not match the log (a caller-edited cut) is written out.
+            let first_kept_entry_id = match retained_tail_id(writer.tree(), retained) {
+                Some(id) => id,
+                None => {
+                    let mut first_kept_entry_id = String::new();
+                    for (index, message) in retained.iter().enumerate() {
+                        let id = writer.append(Entry::message(message)?)?;
+                        if index == 0 {
+                            first_kept_entry_id = id;
+                        }
+                    }
+                    first_kept_entry_id
                 }
-            }
+            };
             let details = compaction_details_value(&summary)?;
             writer.append(Entry {
                 kind: sessionlog::TYPE_COMPACTION.to_owned(),
@@ -1480,7 +1531,33 @@ fn bridge_agent_event(recorder: &Recorder, event: agent::Event) {
     }
 }
 
+/// The id of the entry holding `retained[0]` when the retained messages are
+/// exactly the newest message entries on the current path.
+fn retained_tail_id(tree: &Tree, retained: &[llm::Message]) -> Option<String> {
+    if retained.is_empty() {
+        return None;
+    }
+    let path = tree.path(tree.leaf());
+    let mut tail = path
+        .iter()
+        .rev()
+        .filter(|entry| entry.kind == sessionlog::TYPE_MESSAGE)
+        .take(retained.len())
+        .collect::<Vec<_>>();
+    if tail.len() != retained.len() {
+        return None;
+    }
+    tail.reverse();
+    for (entry, message) in tail.iter().zip(retained) {
+        if entry.message.as_ref() != Some(&serde_json::to_value(message).ok()?) {
+            return None;
+        }
+    }
+    Some(tail[0].id.clone())
+}
+
 fn branch_points(tree: &Tree, leaf: Option<&str>) -> Vec<BranchPoint> {
+    let children = tree.child_counts();
     let mut points = tree
         .path(leaf)
         .into_iter()
@@ -1496,7 +1573,7 @@ fn branch_points(tree: &Tree, leaf: Option<&str>) -> Vec<BranchPoint> {
                 id: entry.id.clone(),
                 text: first_line(&message_text(&message), 120),
                 label: tree.label(&entry.id).map(str::to_owned),
-                children: tree.children(Some(&entry.id)).len(),
+                children: children.get(entry.id.as_str()).copied().unwrap_or(0),
                 current: false,
             })
         })
@@ -1590,27 +1667,28 @@ fn timestamp_millis(value: &str) -> i64 {
         .unwrap_or_default()
 }
 
-fn export_markdown(tree: &Tree, header: &Header) -> String {
-    let title = if !tree.name().is_empty() {
-        tree.name().to_owned()
-    } else {
-        tree.path(tree.leaf())
-            .iter()
-            .find_map(|entry| {
-                (entry.kind == sessionlog::TYPE_MESSAGE)
-                    .then_some(entry.message.as_ref())
-                    .flatten()
-                    .and_then(|value| serde_json::from_value::<llm::Message>(value.clone()).ok())
-                    .and_then(|message| match message {
-                        llm::Message::User(message) => {
-                            let text = message_text(&message);
-                            (!text.is_empty()).then_some(first_line(&text, 120))
-                        }
-                        _ => None,
-                    })
+/// The session name, or else the first user message on the current path.
+fn tree_title(tree: &Tree) -> Option<String> {
+    if !tree.name().is_empty() {
+        return Some(tree.name().to_owned());
+    }
+    tree.path(tree.leaf()).iter().find_map(|entry| {
+        (entry.kind == sessionlog::TYPE_MESSAGE)
+            .then_some(entry.message.as_ref())
+            .flatten()
+            .and_then(|value| serde_json::from_value::<llm::Message>(value.clone()).ok())
+            .and_then(|message| match message {
+                llm::Message::User(message) => {
+                    let text = message_text(&message);
+                    (!text.is_empty()).then_some(first_line(&text, 120))
+                }
+                _ => None,
             })
-            .unwrap_or_else(|| header.id.clone())
-    };
+    })
+}
+
+fn export_markdown(tree: &Tree, header: &Header) -> String {
+    let title = tree_title(tree).unwrap_or_else(|| header.id.clone());
     let mut markdown = format!(
         "# {title}\n\n- Session: `{}`\n- Workspace: `{}`\n- Started: {}\n\n",
         header.id, header.cwd, header.timestamp
@@ -1948,12 +2026,14 @@ mod tests {
         let mut fork = SessionRuntime::open(fork_options).expect("fork source");
         assert!(fork.resumed());
         assert_ne!(fork.id().as_deref(), Some(source_id.as_str()));
-        assert_eq!(
-            fork.header()
-                .expect("fork header")
-                .parent_session
-                .as_deref(),
-            Some(source_id.as_str())
+        let parent = fork
+            .header()
+            .expect("fork header")
+            .parent_session
+            .expect("parent session");
+        assert!(
+            parent.ends_with(&format!("_{source_id}.jsonl")),
+            "pi records the source path, got {parent:?}"
         );
         assert_eq!(fork.agent().state().messages.len(), 2);
         close(&mut fork);
@@ -1989,7 +2069,7 @@ mod tests {
                 .expect("fork header")
                 .parent_session
                 .as_deref(),
-            Some("legacy-source")
+            Some(legacy.to_string_lossy().as_ref())
         );
         assert_eq!(runtime.agent().state().messages.len(), 2);
         close(&mut runtime);
@@ -2137,10 +2217,14 @@ mod tests {
 
         let original = runtime.handle().expect("original");
         runtime.fork_to(2).expect("rewind");
-        assert_eq!(runtime.agent().state().messages.len(), 3);
-        assert_eq!(
-            runtime.agent().state().messages[2].text_preview(),
-            "second question"
+        // The rewound context ends with pi's branch summary of what was left.
+        let messages = runtime.agent().state().messages;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].text_preview(), "second question");
+        assert!(
+            messages[3]
+                .text_preview()
+                .contains("summary of a branch that this conversation came back from")
         );
         runtime
             .agent()
@@ -2185,7 +2269,7 @@ mod tests {
                 .expect("imported header")
                 .parent_session
                 .as_deref(),
-            Some(clone.id.as_str())
+            Some(source.to_string_lossy().as_ref())
         );
 
         close(&mut imported);
@@ -2233,6 +2317,193 @@ mod tests {
         );
         assert_eq!(notices.load(Ordering::Relaxed), 1);
         close(&mut second);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn with_tree_inspects_the_live_tree_without_a_snapshot() {
+        let root = temp_root("with-tree");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("borrowed").expect("prompt");
+
+        assert_eq!(
+            runtime.with_tree(Tree::len),
+            runtime.tree().map(|tree| tree.len())
+        );
+        assert_eq!(runtime.title().as_deref(), Some("borrowed"));
+        assert_eq!(runtime.name(), None);
+        close(&mut runtime);
+
+        let mut options = options(&root, &cwd);
+        options.selection = SessionSelection::NoSession;
+        let mut detached = SessionRuntime::open(options).expect("open no-session");
+        assert_eq!(detached.with_tree(Tree::len), None);
+        close(&mut detached);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_messages_and_branch_summaries_join_the_restored_context_like_pi() {
+        let root = temp_root("pi-context");
+        let cwd = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store
+            .create_with_id(&cwd, None, "pi-context")
+            .expect("create");
+        writer
+            .append(
+                Entry::message(&llm::Message::User(llm::UserMessage::text("question", 1)))
+                    .expect("encode user"),
+            )
+            .expect("append user");
+        writer
+            .append(
+                Entry::message(&llm::Message::Assistant(Box::new(assistant(
+                    "answer",
+                    "fallback",
+                    "fallback-model",
+                ))))
+                .expect("encode assistant"),
+            )
+            .expect("append assistant");
+        writer
+            .append(Entry {
+                kind: sessionlog::TYPE_CUSTOM_MESSAGE.to_owned(),
+                custom_type: "memory".to_owned(),
+                content: Some(serde_json::json!([{"type": "text", "text": "remember the plan"}])),
+                display: Some(false),
+                ..Entry::default()
+            })
+            .expect("append custom message");
+        writer
+            .append(Entry {
+                kind: sessionlog::TYPE_BRANCH_SUMMARY.to_owned(),
+                from_id: "abandoned".to_owned(),
+                summary: "tried a rewrite that failed".to_owned(),
+                ..Entry::default()
+            })
+            .expect("append branch summary");
+        writer.close().expect("close");
+
+        let mut session_options = options(&root, &cwd);
+        session_options.selection = SessionSelection::Session("pi-context".to_owned());
+        let mut runtime = SessionRuntime::open(session_options).expect("open");
+        let messages = runtime.agent().state().messages;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[2].role(), "user");
+        assert_eq!(messages[2].text_preview(), "remember the plan");
+        assert_eq!(
+            messages[3].text_preview(),
+            format!("{BRANCH_SUMMARY_PREFIX}tried a rewrite that failed{BRANCH_SUMMARY_SUFFIX}")
+        );
+        close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rewinding_records_the_abandoned_tip_as_the_branch_summary_origin() {
+        let root = temp_root("from-id");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("first").expect("first");
+        runtime.agent().prompt("second").expect("second");
+        let abandoned_tip = runtime
+            .with_tree(|tree| tree.leaf().map(str::to_owned))
+            .flatten()
+            .expect("leaf");
+
+        let target = runtime.fork_to(1).expect("rewind");
+        let summary = runtime
+            .with_tree(|tree| {
+                tree.path(tree.leaf())
+                    .into_iter()
+                    .find(|entry| entry.kind == sessionlog::TYPE_BRANCH_SUMMARY)
+                    .cloned()
+            })
+            .flatten()
+            .expect("branch summary");
+        assert_eq!(summary.from_id, abandoned_tip);
+        assert_eq!(summary.parent_id.as_deref(), Some(target.id.as_str()));
+        // The rewound point now has the abandoned reply and the summary
+        // beneath it, which a branch listing counts without a per-point scan.
+        assert_eq!(runtime.branch_points()[0].children, 2);
+        close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_names_collapse_line_breaks() {
+        let root = temp_root("name-lines");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime
+            .set_name("  first line\r\nsecond\n\nthird  ")
+            .expect("name");
+        assert_eq!(runtime.name().as_deref(), Some("first line second third"));
+        close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compaction_reuses_recorded_messages_instead_of_writing_them_twice() {
+        let root = temp_root("compaction-reuse");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("old question").expect("old prompt");
+        runtime
+            .agent()
+            .prompt("latest question")
+            .expect("latest prompt");
+        let retained = runtime.agent().state().messages[2..].to_vec();
+        let count_messages = |tree: &Tree| {
+            tree.all()
+                .iter()
+                .filter(|entry| entry.kind == sessionlog::TYPE_MESSAGE)
+                .count()
+        };
+        let before = runtime.with_tree(count_messages).expect("count");
+
+        runtime
+            .agent()
+            .compact(
+                llm::Message::User(llm::UserMessage::text("<conversation-summary/>", 3)),
+                retained.clone(),
+                agent::CompactionInfo {
+                    summary: "Old work".to_owned(),
+                    tokens_before: 42,
+                    cost_before: 0.5,
+                    retained_messages: retained.len(),
+                    timestamp: 3,
+                },
+            )
+            .expect("compact");
+
+        let (after, first_kept) = runtime
+            .with_tree(|tree| {
+                let compaction = tree
+                    .all()
+                    .into_iter()
+                    .find(|entry| entry.kind == sessionlog::TYPE_COMPACTION)
+                    .expect("compaction entry");
+                let first_kept = tree
+                    .entry(&compaction.first_kept_entry_id)
+                    .and_then(|entry| entry.message.clone());
+                (count_messages(tree), first_kept)
+            })
+            .expect("tree");
+        assert_eq!(
+            after, before,
+            "retained messages are referenced, not rewritten"
+        );
+        assert_eq!(
+            first_kept,
+            Some(serde_json::to_value(&retained[0]).expect("encode retained"))
+        );
+        let restored = runtime.restored();
+        assert_eq!(restored.messages.len(), retained.len() + 1);
+        assert_eq!(&restored.messages[1..], retained.as_slice());
+        close(&mut runtime);
         let _ = fs::remove_dir_all(root);
     }
 }

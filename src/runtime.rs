@@ -1083,11 +1083,10 @@ fn thinking_level_names() -> [&'static str; 7] {
 
 /// Resolves the configured working directory exactly as session construction
 /// does, without canonicalizing it away from the persisted session shard.
+/// Sharing the session store's normalisation is what keeps `-workdir ./x/`
+/// and `-workdir x` on one shard.
 pub fn absolute_workdir(workdir: &Path) -> Result<PathBuf> {
-    if workdir.is_absolute() {
-        return Ok(workdir.to_path_buf());
-    }
-    Ok(env::current_dir()?.join(workdir))
+    Ok(crate::sessionlog::try_absolute_path(workdir)?)
 }
 
 fn short_id(id: &str) -> &str {
@@ -1242,6 +1241,25 @@ mod tests {
     fn short_ids_do_not_split_utf8() {
         assert_eq!(short_id("你好世界"), "你好");
         assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn absolute_workdir_normalizes_exactly_like_the_session_store() {
+        let temp = std::env::temp_dir();
+        let spelled = temp.join("work").join("..").join("project").join(".");
+        let cleaned = absolute_workdir(&spelled).expect("absolute");
+        assert_eq!(
+            cleaned,
+            crate::sessionlog::clean_path(&temp.join("project"))
+        );
+        assert_eq!(
+            crate::sessionlog::Store::dir_name(&spelled),
+            crate::sessionlog::Store::dir_name(&cleaned)
+        );
+
+        let relative = absolute_workdir(Path::new("./src/..")).expect("relative");
+        assert!(relative.is_absolute());
+        assert_eq!(relative, crate::sessionlog::absolute_path(Path::new(".")));
     }
 
     #[test]

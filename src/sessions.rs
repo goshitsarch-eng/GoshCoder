@@ -243,7 +243,9 @@ fn export(
     match destination {
         None | Some("-") => output.write_all(&content)?,
         Some(destination) => {
-            fs::write(destination, &content)?;
+            // The export carries the whole transcript, so it gets the same
+            // owner-only mode as the session log.
+            sessionlog::write_private(destination, &content)?;
             writeln!(diagnostics, "exported {} to {destination}", info.short_id())?;
         }
     }
@@ -622,5 +624,43 @@ mod tests {
         assert!(age_cutoff("6w").is_ok());
         assert!(age_cutoff("30").is_err());
         assert!(age_cutoff("tomorrow").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("export-mode");
+        let workspace = root.join("workspace");
+        let store = Store::new(root.join("sessions"));
+        let mut writer = store
+            .create_with_id(&workspace, None, "private-export")
+            .expect("create");
+        writer.append(assistant("secret work")).expect("append");
+        writer.close().expect("close");
+
+        let export_path = root.join("session.jsonl");
+        run(
+            &store,
+            &workspace,
+            &[
+                "export".to_owned(),
+                "private-export".to_owned(),
+                export_path.display().to_string(),
+            ],
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect("export");
+        assert_eq!(
+            fs::metadata(&export_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(root).expect("clean test root");
     }
 }
