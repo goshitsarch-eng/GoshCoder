@@ -19,11 +19,14 @@ VERSION ?= $(shell git describe --tags --dirty --match 'v*' 2>/dev/null \
 DIST_VERSION := $(VERSION:v%=%)
 
 # Platforms produced by `make dist`. cargo-zigbuild supplies the native C
-# toolchains required to link Rust targets from the release builder.
+# toolchains required to link Rust targets from the release builder. Windows
+# on ARM runs the amd64 build under emulation: stable Rust ships no
+# aarch64-pc-windows-gnu standard library and the MSVC target cannot be
+# linked from the Linux release builder.
 PLATFORMS := \
 	linux/amd64 linux/arm64 \
 	darwin/amd64 darwin/arm64 \
-	windows/amd64 windows/arm64
+	windows/amd64
 
 INSTALL_DIR ?= $(if $(CARGO_INSTALL_ROOT),$(CARGO_INSTALL_ROOT)/bin,$(HOME)/.cargo/bin)
 
@@ -128,7 +131,6 @@ dist: clean-dist
 			darwin/amd64) target=x86_64-apple-darwin ;; \
 			darwin/arm64) target=aarch64-apple-darwin ;; \
 			windows/amd64) target=x86_64-pc-windows-gnu ;; \
-			windows/arm64) target=aarch64-pc-windows-gnu ;; \
 			*) echo "unsupported release platform $$platform" >&2; exit 1 ;; \
 		esac; \
 		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \

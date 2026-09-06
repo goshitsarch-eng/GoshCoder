@@ -1018,6 +1018,10 @@ impl LoopbackCallbackServer {
         mut stream: TcpStream,
         cancellation: &CancellationToken,
     ) -> Result<Option<AuthorizationResponse>> {
+        // macOS and Windows hand out the accepted socket in the listener's
+        // non-blocking mode, which would turn the timed reads below into a
+        // busy loop and could drop the confirmation page on a full buffer.
+        let _ = stream.set_nonblocking(false);
         let request = match read_callback_request(&mut stream, self.request_timeout, cancellation)?
         {
             CallbackRead::Request(line) => line,

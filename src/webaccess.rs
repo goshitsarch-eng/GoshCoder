@@ -2051,6 +2051,12 @@ mod tests {
                 while !worker_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // macOS and Windows hand out accepted sockets in
+                            // the listener's non-blocking mode; Linux does
+                            // not. The request loop below wants blocking I/O.
+                            if stream.set_nonblocking(false).is_err() {
+                                continue;
+                            }
                             let Some(request) = read_request(&mut stream) else {
                                 continue;
                             };
@@ -2096,7 +2102,12 @@ mod tests {
                 let _ = stream.shutdown(Shutdown::Both);
             }
             if let Some(worker) = self.worker.take() {
-                worker.join().expect("join test server");
+                let joined = worker.join();
+                // A second panic while a test is already unwinding aborts the
+                // whole test binary and hides the assertion that failed.
+                if !thread::panicking() {
+                    joined.expect("join test server");
+                }
             }
         }
     }
@@ -2159,13 +2170,14 @@ mod tests {
             response.content_type,
             response.body.len()
         );
-        stream
-            .write_all(head.as_bytes())
-            .expect("write test headers");
-        stream
-            .write_all(response.body.as_bytes())
-            .expect("write test body");
-        stream.flush().expect("flush test response");
+        // A client that stops reading early (a bounded body, a refused
+        // redirect) closes its end first; that is the behaviour under test,
+        // not a server failure.
+        if stream.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let _ = stream.write_all(response.body.as_bytes());
+        let _ = stream.flush();
     }
 
     fn test_service(resolve_openai: Option<ResolveOpenAIAuth>) -> Service {

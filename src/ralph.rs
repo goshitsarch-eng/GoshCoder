@@ -960,7 +960,9 @@ impl Store {
     /// symlinks before any loop file is opened. A missing component is
     /// created only when `create` is set; otherwise it is reported as `None`.
     fn locate_store_dir(&self, archived: bool, create: bool) -> Result<Option<PathBuf>> {
-        let root = fs::canonicalize(&self.workspace)?;
+        // Verbatim-free on Windows, so store paths compare with the plain
+        // workspace path callers hold.
+        let root = crate::tools::canonicalize(&self.workspace)?;
         let root_metadata = fs::symlink_metadata(&root)?;
         if !root_metadata.is_dir() {
             return Err(RalphError::UnsafePath(root));
@@ -994,7 +996,7 @@ impl Store {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err(RalphError::UnsafePath(candidate));
             }
-            let canonical = fs::canonicalize(&candidate)?;
+            let canonical = crate::tools::canonicalize(&candidate)?;
             if !canonical.starts_with(&root) {
                 return Err(RalphError::UnsafePath(canonical));
             }
