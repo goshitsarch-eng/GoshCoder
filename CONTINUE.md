@@ -152,9 +152,12 @@ is installed; the server is spawned lazily and closed with the session.
 
 Sessions are pi's **v3** JSONL: header, entries with `parentId` links,
 `YYYY-MM-DDTHH:MM:SS.mmmZ` timestamps, `<stamp>_<id>.jsonl` names in a
-per-workspace shard. Resume, branching, fork/clone, labels and JSONL/Markdown
-export/import are implemented; v1 and v2 pi files are migrated in memory and
-never rewritten, so continuing one forks it into a v3 file.
+per-workspace shard. Resume, branching, fork/clone, labels and
+JSONL/Markdown/HTML export and import are implemented; v1 and v2 pi files are
+migrated in memory and never rewritten, so continuing one forks it into a v3
+file. The HTML export (`src/export_html.rs`) is deliberately script-free and
+self-contained, with its own small Markdown renderer; `/share` and `sessions
+share --yes` upload it as a secret gist through `gh` after a confirmation.
 
 Two deliberate differences: GoshCoder takes an exclusive claim on a session
 file (a lock file with a heartbeat; a claim that is taken over stops the
