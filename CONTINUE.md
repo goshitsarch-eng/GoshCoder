@@ -166,6 +166,18 @@ writer rather than letting two processes interleave), and `/clear` appends a
 entry but replays the cleared prefix, which is the one documented interop
 divergence.
 
+## Planner and BTW state
+
+Planner phase and checklist are written to
+`<agent_dir>/planner/<sha256[..16] of the canonical root>-<basename>.json`
+(0600, atomic rename) on every change and to the session as a
+`goshcoder.planner` custom entry when one is recording. The file is
+authoritative at attach and is re-read (by mtime and size) before each turn
+and on `/planner`, so two windows on one repository share a phase;
+`plannotator::Manager::adopt_state` applies another window's change without
+re-publishing it. BTW threads are `goshcoder.btw` custom entries (newest 50
+threads, 200 turns each, under 4 MiB) restored on `-continue` and `/resume`.
+
 ## Audit
 
 Every module was reviewed against pi and the Go original for correctness,

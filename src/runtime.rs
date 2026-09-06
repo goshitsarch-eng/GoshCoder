@@ -1470,8 +1470,17 @@ mod tests {
             );
         }
 
+        // The toggle above wrote this workspace's planner state under the
+        // real agent directory; do not leave a file for a temporary root.
+        let planner_state = prepared
+            .planner
+            .as_ref()
+            .map(|planner| planner.workspace_state_path().to_path_buf());
         prepared.runtime.close().expect("close session");
         drop(prepared);
+        if let Some(path) = planner_state {
+            let _ = std::fs::remove_file(path);
+        }
         let _ = std::fs::remove_dir_all(storage);
         std::fs::remove_dir_all(directory).expect("remove workspace");
     }

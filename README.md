@@ -297,7 +297,12 @@ is recorded in [`NOTICE`](NOTICE).
   themes, planning write gates, persisted phase state, checklist progress,
   `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
   begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
-  local git review needs only `git`.
+  local git review needs only `git`. Unlike the original, which keeps the
+  phase only in the session, the phase and checklist also live in a
+  per-workspace file under `~/.goshcoder/agent/planner/`, so `-no-session`
+  runs keep it and every window on one repository shares one plan mode
+  (another window's change is adopted before the next turn); the session
+  entry remains as the fallback for `-continue`.
 - [`@aliou/pi-ts-aperture`](https://github.com/aliou/pi-ts-aperture) by Aliou
   Diallo — **Aperture (Tailscale)** (native adaptation of version 0.14.1):
   route LLM providers and connector tools through
@@ -461,10 +466,11 @@ rerun the gate before releases.
 
 ## Known gaps
 
-- Planner state belongs to a session rather than to a workspace, so
-  `-no-session` and a `run` without `-continue` do not persist it. Two windows
-  in one repository now have independent plan modes; `-continue` restores the
-  phase along with the transcript.
+The gaps earlier releases listed here are closed: planner state is
+workspace-scoped, BTW threads are saved with the session, and sessions export
+to HTML and share as gists. What remains unported is pi's TypeScript plugin
+host and package manager, custom `models.json` loading, LSP, and MCP
+management; see **Deviations from pi** for the details and the reasoning.
 
 ## Deviations from pi
 

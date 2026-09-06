@@ -127,9 +127,15 @@ pub struct ChecklistItem {
     pub completed: bool,
 }
 
-/// Durable planner state.  Store it in a session's `custom` slot, not in a
-/// workspace-global file, so multiple sessions in one repository stay
-/// independent.
+/// Durable planner state.
+///
+/// The state belongs to a workspace rather than to one session.  The runtime
+/// keeps the authoritative copy in a per-workspace file under the agent
+/// directory ([`crate::planner_runtime::WorkspaceStateStore`]), so every
+/// window open on one repository shares one plan mode and a `-no-session`
+/// run keeps it.  The same state is also recorded in the session's `custom`
+/// slot in the pi-compatible shape; that entry is the fallback when the
+/// workspace file does not exist.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct State {
     #[serde(default)]
@@ -382,11 +388,7 @@ impl Manager {
             });
         }
 
-        let mut state = options.initial.unwrap_or_default();
-        let invalid_phase = (!state.phase.is_known()).then(|| state.phase.as_str().to_owned());
-        if invalid_phase.is_some() {
-            state = State::default();
-        }
+        let (state, invalid_phase) = known_or_idle(options.initial.unwrap_or_default());
         let manager = Self {
             inner: Arc::new(Mutex::new(ManagerInner {
                 root: canonical,
@@ -738,6 +740,27 @@ impl Manager {
                 format!("Planner: executing {completed}/{}", state.items.len())
             }
             Phase::Idle | Phase::Unknown(_) => "Planner: idle".to_owned(),
+        }
+    }
+
+    /// Replaces the current state with one saved by another process on the
+    /// same workspace.
+    ///
+    /// An executing plan's checklist is re-read from the plan file exactly as
+    /// on construction.  The change callback is deliberately not invoked: the
+    /// state already exists in the shared store, and writing it back would
+    /// make two windows overwrite each other's file in turn.
+    pub fn adopt_state(&self, state: State) {
+        let (state, invalid_phase) = known_or_idle(state);
+        let needs_rehydrate = state.phase == Phase::Executing && !state.plan_path.is_empty();
+        lock(&self.inner).state = state;
+        if let Some(phase) = invalid_phase {
+            self.warn(format!(
+                "ignoring an unrecognized shared Planner phase {phase:?}; now idle"
+            ));
+        }
+        if needs_rehydrate {
+            self.rehydrate_checklist();
         }
     }
 
@@ -1094,6 +1117,16 @@ fn portable_input_path(path: &str) -> String {
 fn publish(callback: Option<StateCallback>, state: State) {
     if let Some(callback) = callback {
         callback(state);
+    }
+}
+
+/// Replaces a phase this build does not understand with idle, returning the
+/// rejected spelling so the caller can warn about it.
+fn known_or_idle(state: State) -> (State, Option<String>) {
+    if state.phase.is_known() {
+        (state, None)
+    } else {
+        (State::default(), Some(state.phase.as_str().to_owned()))
     }
 }
 
@@ -3181,6 +3214,53 @@ mod tests {
             .expect("model-facing rejection");
         assert!(result.text.contains("cannot be read"));
         assert!(result.text.contains("not a regular file"));
+    }
+
+    #[test]
+    fn adopted_state_rehydrates_its_checklist_without_publishing_a_change() {
+        let root = Scratch::new();
+        root.write("PLAN.md", "- [ ] one\n- [ ] two\n");
+        let changes = Arc::new(Mutex::new(Vec::new()));
+        let capture = changes.clone();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let warned = warnings.clone();
+        let planner = Manager::new(
+            &root.0,
+            None,
+            Options {
+                initial: None,
+                on_change: Some(Arc::new(move |state| lock(&capture).push(state))),
+                warn: Some(Arc::new(move |message| lock(&warned).push(message))),
+            },
+        )
+        .expect("manager");
+        let content = fs::read(root.0.join("PLAN.md")).expect("read plan");
+
+        planner.adopt_state(State {
+            phase: Phase::Executing,
+            plan_path: "PLAN.md".to_owned(),
+            items: vec![ChecklistItem {
+                step: 1,
+                text: "one".to_owned(),
+                completed: true,
+            }],
+            plan_hash: hash_plan(&content),
+        });
+        let state = planner.state();
+        assert_eq!(state.phase, Phase::Executing);
+        assert_eq!(state.items.len(), 2);
+        assert!(state.items[0].completed);
+        assert!(!state.items[1].completed);
+        assert!(lock(&changes).is_empty());
+        assert!(lock(&warnings).is_empty());
+
+        planner.adopt_state(State {
+            phase: Phase::Unknown("future".to_owned()),
+            ..State::default()
+        });
+        assert_eq!(planner.state(), State::default());
+        assert!(lock(&changes).is_empty());
+        assert!(lock(&warnings)[0].contains("future"));
     }
 
     #[test]

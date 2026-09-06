@@ -15,12 +15,17 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use sha2::{Digest, Sha256};
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 pub const DIR_NAME: &str = ".goshcoder";
 pub const ENV_AGENT_DIR: &str = "GOSHCODER_AGENT_DIR";
+/// Directory under the agent root holding per-workspace planner state.
+pub const PLANNER_DIR_NAME: &str = "planner";
 const MAX_DEFAULT_MODEL_BYTES: usize = 4096;
+const MAX_PLANNER_LABEL_CHARS: usize = 40;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Expands only a leading `~`, `~/`, or `~\`. User-name expansion is
@@ -88,6 +93,59 @@ pub fn prompts_dir() -> PathBuf {
 
 pub fn default_model_path() -> PathBuf {
     agent_dir().join("default-model")
+}
+
+/// Returns the per-user planner state file shared by every window open on
+/// `workspace_root`. See [`planner_state_path_in`] for the key format.
+pub fn planner_state_path(workspace_root: &Path) -> PathBuf {
+    planner_state_path_in(&agent_dir(), workspace_root)
+}
+
+/// Returns `<agent_dir>/planner/<key>.json` for a workspace.
+///
+/// `workspace_root` must already be canonical: the key hashes the path text
+/// as given, so two spellings of one directory would otherwise map to two
+/// files. The key is the first 16 bytes of the SHA-256 of that text in
+/// lower-case hex, followed by a sanitized basename so a directory listing
+/// stays readable. Only the hash distinguishes workspaces.
+pub fn planner_state_path_in(agent_dir: &Path, workspace_root: &Path) -> PathBuf {
+    let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+    let mut key = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let label = planner_label(workspace_root);
+    if !label.is_empty() {
+        key.push('-');
+        key.push_str(&label);
+    }
+    key.push_str(".json");
+    agent_dir.join(PLANNER_DIR_NAME).join(key)
+}
+
+/// Reduces a workspace basename to at most 40 ASCII letters, digits, `-`,
+/// and `_`. Runs of other characters collapse to one underscore.
+fn planner_label(workspace_root: &Path) -> String {
+    let basename = workspace_root
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let mut label = String::new();
+    for character in basename.chars() {
+        let character = if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+            character
+        } else {
+            '_'
+        };
+        if character == '_' && label.ends_with('_') {
+            continue;
+        }
+        if label.len() == MAX_PLANNER_LABEL_CHARS {
+            break;
+        }
+        label.push(character);
+    }
+    label.trim_matches('_').to_owned()
 }
 
 /// Reads the remembered model, treating unavailable, malformed, or oversized
@@ -243,6 +301,32 @@ mod tests {
             agent_dir_from(Some(OsStr::new("~/custom")), Some(home)),
             PathBuf::from("/home/example/custom")
         );
+    }
+
+    #[test]
+    fn planner_state_path_is_stable_and_sanitized() {
+        let agent = Path::new("/home/example/.goshcoder/agent");
+        let root = Path::new("/srv/repos/My Project!");
+        let path = planner_state_path_in(agent, root);
+        assert_eq!(
+            path,
+            agent
+                .join("planner")
+                .join("c4f1efc5c4ff38c46cc7820baba3c2da-My_Project.json")
+        );
+        assert_ne!(
+            path,
+            planner_state_path_in(agent, Path::new("/srv/repos/My Project"))
+        );
+
+        let long = planner_state_path_in(agent, &Path::new("/srv").join("a".repeat(100)));
+        let name = long.file_name().and_then(OsStr::to_str).expect("name");
+        assert_eq!(name.len(), 32 + 1 + MAX_PLANNER_LABEL_CHARS + ".json".len());
+
+        let bare = planner_state_path_in(agent, Path::new("/"));
+        let name = bare.file_name().and_then(OsStr::to_str).expect("name");
+        assert_eq!(name.len(), 32 + ".json".len());
+        assert!(!name.contains('-'));
     }
 
     #[test]
