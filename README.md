@@ -127,9 +127,12 @@ goshcoder chat -resume
 # Manage what has been saved
 goshcoder sessions list
 goshcoder sessions show <id>
+goshcoder sessions rm <id>
 goshcoder sessions export <id> --md notes.md
 goshcoder sessions export <id> transcript.html   # self-contained page, no scripts
 goshcoder sessions share <id> --yes              # secret GitHub gist through gh
+goshcoder sessions gc --older-than 30d           # lists what it would remove
+goshcoder sessions gc --older-than 30d --yes     # and --keep-named spares named ones
 
 # Keep a prompt you refined, and carry your collection between machines
 goshcoder prompts list

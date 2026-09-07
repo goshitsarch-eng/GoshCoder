@@ -49,7 +49,6 @@ const RESERVED_COMMAND_NAMES: &[&str] = &[
     "model",
     "thinking",
     "login",
-    "logout",
     "btw",
     "omni",
     "ralph",

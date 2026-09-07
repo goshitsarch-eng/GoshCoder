@@ -78,7 +78,7 @@ Usage:
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
   goshcoder ralph <subcommand>       Manage Ralph loops
-  goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
+  goshcoder sessions [subcommand]    List, inspect, export, import, remove, or prune sessions
   goshcoder prompts <subcommand>     Manage prompt templates
   goshcoder version                  Print the version
 
@@ -2732,7 +2732,6 @@ fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
         "?",
         "model",
         "login",
-        "logout",
         "omni",
         "aperture",
         "aperture:onboarding",
