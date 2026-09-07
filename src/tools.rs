@@ -708,6 +708,8 @@ impl Workspace {
 
         let mut output = BoundedText::new(MAX_LIST_OUTPUT_BYTES);
         let mut matches = 0usize;
+        // One set of buffers serves every line of every candidate file.
+        let mut scratch = SearchScratch::default();
         let candidate_notice = candidate_truncation_notice(candidates.truncated);
         for candidate in candidates.files {
             check_cancelled(cancellation)?;
@@ -741,7 +743,7 @@ impl Workspace {
                 if index % 256 == 0 {
                     check_cancelled(cancellation)?;
                 }
-                if !expression.is_match(line, cancellation)? {
+                if !expression.is_match(line, &mut scratch, cancellation)? {
                     continue;
                 }
                 matches += 1;
@@ -2302,6 +2304,41 @@ struct SearchRegex {
     ignore_case: bool,
 }
 
+/// Working buffers for [`SearchRegex::is_match`], owned by the caller so one
+/// grep reuses them for every line it tests.
+///
+/// A match over a single line allocated a `Vec<char>` for the line, a mark
+/// array for the states, and a worklist for every character position. A
+/// repository-wide search runs that for millions of lines, and the buffers
+/// are the same size every time, so they are cleared and reused instead.
+#[derive(Debug, Default)]
+struct SearchScratch {
+    characters: Vec<char>,
+    marks: Vec<usize>,
+    generation: usize,
+    current: Vec<usize>,
+    next: Vec<usize>,
+    pending: Vec<usize>,
+}
+
+impl SearchScratch {
+    /// Loads `text` and makes the mark array fit `states`. Marks are only
+    /// ever compared against the generation counter, so reused entries from
+    /// an earlier line read as unmarked without being cleared.
+    fn load(&mut self, states: usize, text: &str) {
+        self.characters.clear();
+        self.characters.extend(text.chars());
+        if self.marks.len() != states {
+            self.marks.clear();
+            self.marks.resize(states, 0);
+            self.generation = 0;
+        }
+        self.current.clear();
+        self.next.clear();
+        self.pending.clear();
+    }
+}
+
 #[derive(Clone, Debug)]
 enum RegexState {
     Consume { matcher: CharMatcher, next: usize },
@@ -2471,24 +2508,37 @@ impl SearchRegex {
         })
     }
 
-    fn is_match(&self, text: &str, cancellation: &CancellationToken) -> Result<bool> {
-        let characters = text.chars().collect::<Vec<_>>();
-        let mut marks = vec![0usize; self.states.len()];
-        let mut generation = next_generation(&mut marks, 0);
-        let mut current = Vec::new();
+    fn is_match(
+        &self,
+        text: &str,
+        scratch: &mut SearchScratch,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        scratch.load(self.states.len(), text);
+        let SearchScratch {
+            characters,
+            marks,
+            generation,
+            current,
+            next,
+            pending,
+        } = scratch;
+        *generation = next_generation(marks, *generation);
         let mut work = 0usize;
 
         for position in 0..=characters.len() {
             if position % 256 == 0 {
                 check_cancelled(cancellation)?;
             }
-            self.add_closure(
+            Self::add_closure(
+                &self.states,
                 self.start,
                 position,
-                &characters,
-                generation,
-                &mut marks,
-                &mut current,
+                characters,
+                *generation,
+                marks,
+                current,
+                pending,
                 &mut work,
                 cancellation,
             )?;
@@ -2502,9 +2552,9 @@ impl SearchRegex {
                 break;
             }
 
-            let mut next = Vec::new();
-            generation = next_generation(&mut marks, generation);
-            for state in &current {
+            next.clear();
+            *generation = next_generation(marks, *generation);
+            for state in current.iter() {
                 work = work.saturating_add(1);
                 if work > MAX_REGEX_STEPS {
                     return Err(ToolError::new(format!(
@@ -2520,36 +2570,40 @@ impl SearchRegex {
                 } = &self.states[*state]
                     && matcher.matches(characters[position], self.ignore_case)
                 {
-                    self.add_closure(
+                    Self::add_closure(
+                        &self.states,
                         *target,
                         position + 1,
-                        &characters,
-                        generation,
-                        &mut marks,
-                        &mut next,
+                        characters,
+                        *generation,
+                        marks,
+                        next,
+                        pending,
                         &mut work,
                         cancellation,
                     )?;
                 }
             }
-            current = next;
+            std::mem::swap(current, next);
         }
         Ok(false)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn add_closure(
-        &self,
+        states: &[RegexState],
         start: usize,
         position: usize,
         characters: &[char],
         generation: usize,
         marks: &mut [usize],
         destination: &mut Vec<usize>,
+        pending: &mut Vec<usize>,
         work: &mut usize,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let mut pending = vec![start];
+        pending.clear();
+        pending.push(start);
         while let Some(state) = pending.pop() {
             *work = work.saturating_add(1);
             if *work > MAX_REGEX_STEPS {
@@ -2564,7 +2618,7 @@ impl SearchRegex {
                 continue;
             }
             marks[state] = generation;
-            match self.states[state] {
+            match states[state] {
                 RegexState::Split { left, right } => {
                     pending.push(left);
                     pending.push(right);
@@ -3815,13 +3869,67 @@ mod tests {
         assert_eq!(detect_line_ending("a\r\nb\n"), LineEnding::CrLf);
     }
 
+    /// A grep reuses one scratch for every line it tests. The mark array is
+    /// carried over rather than cleared, so a stale mark from an earlier line
+    /// must read as unmarked -- otherwise a later line silently loses states
+    /// and stops matching.
+    #[test]
+    fn a_reused_regex_scratch_matches_a_fresh_one_line_for_line() {
+        let token = CancellationToken::default();
+        let lines = [
+            "let candidate = workspace.resolve(requested)?;",
+            "",
+            "no match on this line at all",
+            "let x=1;",
+            "trailing let y = 2",
+            "a much longer line that pushes the state set wider: let alpha = beta_gamma_delta;",
+            "let z = 3;",
+        ];
+
+        for pattern in [
+            r"let\s+\w+\s*=",
+            r"\bworkspace\b",
+            r"(candidate|alpha)\w*",
+            r"^let",
+            r"\d+;$",
+        ] {
+            let expression = SearchRegex::compile(pattern, false).expect(pattern);
+            let mut shared = SearchScratch::default();
+            for line in lines {
+                let reused = expression
+                    .is_match(line, &mut shared, &token)
+                    .expect("reused scratch");
+                let fresh = expression
+                    .is_match(line, &mut SearchScratch::default(), &token)
+                    .expect("fresh scratch");
+                assert_eq!(reused, fresh, "pattern {pattern:?} on line {line:?}");
+            }
+        }
+
+        // One scratch handed to a different expression must resize rather
+        // than index a mark array built for the previous state count.
+        let mut shared = SearchScratch::default();
+        let short = SearchRegex::compile("a", false).expect("short");
+        let long = SearchRegex::compile(r"(alpha|beta|gamma)+\d{2,4}", false).expect("long");
+        assert!(short.is_match("a", &mut shared, &token).expect("short"));
+        assert!(
+            long.is_match("alphabeta123", &mut shared, &token)
+                .expect("long")
+        );
+        assert!(
+            short
+                .is_match("a", &mut shared, &token)
+                .expect("short again")
+        );
+    }
+
     #[test]
     fn regex_word_boundaries_lazy_quantifiers_and_unknown_escapes() {
         let token = CancellationToken::default();
         let matches = |pattern: &str, text: &str| {
             SearchRegex::compile(pattern, false)
                 .unwrap_or_else(|error| panic!("{pattern}: {error}"))
-                .is_match(text, &token)
+                .is_match(text, &mut SearchScratch::default(), &token)
                 .expect("match")
         };
         assert!(matches(r"\bfoo\b", "a foo b"));
