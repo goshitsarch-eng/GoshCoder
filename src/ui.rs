@@ -136,22 +136,22 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
 fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Every line is pre-wrapped to the area, so one line is one row and the
     // scroll arithmetic below cannot push the newest content out of view.
-    let lines = transcript_lines(
+    let mut cache = app.transcript.borrow_mut();
+    let total = cache.refresh(
         &app.messages,
         area.width.saturating_sub(2),
         app.tools_expanded,
         app.hide_thinking,
     );
     let height = area.height as usize;
-    let max_scroll = lines.len().saturating_sub(height);
+    let max_scroll = total.saturating_sub(height);
     app.last_max_scroll
         .set(max_scroll.min(usize::from(u16::MAX)) as u16);
     let scroll = usize::from(app.scroll).min(max_scroll);
     let start = max_scroll.saturating_sub(scroll);
-    let end = (start + height).min(lines.len());
-    let visible = lines[start..end].to_vec();
-    let transcript =
-        Paragraph::new(Text::from(visible)).style(Style::default().fg(TEXT).bg(BACKGROUND));
+    let end = (start + height).min(total);
+    let transcript = Paragraph::new(Text::from(cache.rows(start, end)))
+        .style(Style::default().fg(TEXT).bg(BACKGROUND));
     frame.render_widget(transcript, area);
 }
 
@@ -384,14 +384,32 @@ fn sidebar_line(line: &SidebarLine) -> Line<'static> {
     }
 }
 
+/// Rendered rows for a whole transcript, with no reuse. The renderer goes
+/// through [`TranscriptCache`] instead; this is the reference the cache is
+/// checked against, so a cached frame and a from-scratch one cannot drift.
+#[cfg(test)]
 fn transcript_lines(
     messages: &[Message],
     width: u16,
     tools_expanded: bool,
     hide_thinking: bool,
 ) -> Vec<Line<'static>> {
+    messages
+        .iter()
+        .flat_map(|message| message_rows(message, width, tools_expanded, hide_thinking))
+        .collect()
+}
+
+/// Rendered rows for one transcript entry, including the blank row that
+/// separates it from the next.
+fn message_rows(
+    message: &Message,
+    width: u16,
+    tools_expanded: bool,
+    hide_thinking: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for message in messages {
+    {
         match message.role {
             MessageRole::User => {
                 lines.extend(message_lines(
@@ -519,6 +537,86 @@ fn transcript_lines(
         lines.push(Line::from(""));
     }
     lines
+}
+
+/// Transcript rows kept between frames.
+///
+/// A streaming reply changes only its own entry, but the view is rebuilt from
+/// the agent's state on every animation frame. Re-rendering every earlier
+/// message each time costs work linear in the whole conversation to refresh a
+/// viewport that never grows, so each entry's rows are retained and reused
+/// until that entry, the width, or a display toggle actually changes.
+#[derive(Debug, Default)]
+pub struct TranscriptCache {
+    width: u16,
+    tools_expanded: bool,
+    hide_thinking: bool,
+    entries: Vec<CachedMessage>,
+    /// Entries re-rendered since this cache was created. Only the tests read
+    /// it, but it is the one direct evidence that reuse is happening.
+    rendered: usize,
+}
+
+#[derive(Debug)]
+struct CachedMessage {
+    message: Message,
+    lines: Vec<Line<'static>>,
+}
+
+impl TranscriptCache {
+    /// Brings the cache in line with `messages`, re-rendering only what
+    /// changed, and returns the total number of rows.
+    fn refresh(
+        &mut self,
+        messages: &[Message],
+        width: u16,
+        tools_expanded: bool,
+        hide_thinking: bool,
+    ) -> usize {
+        // Anything that changes how every entry is laid out invalidates all
+        // of them; nothing else does.
+        if self.width != width
+            || self.tools_expanded != tools_expanded
+            || self.hide_thinking != hide_thinking
+        {
+            self.width = width;
+            self.tools_expanded = tools_expanded;
+            self.hide_thinking = hide_thinking;
+            self.entries.clear();
+        }
+        self.entries.truncate(messages.len());
+        for (index, message) in messages.iter().enumerate() {
+            if self
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.message == *message)
+            {
+                continue;
+            }
+            let entry = CachedMessage {
+                message: message.clone(),
+                lines: message_rows(message, width, tools_expanded, hide_thinking),
+            };
+            self.rendered += 1;
+            match self.entries.get_mut(index) {
+                Some(slot) => *slot = entry,
+                None => self.entries.push(entry),
+            }
+        }
+        self.entries.iter().map(|entry| entry.lines.len()).sum()
+    }
+
+    /// Clones only the rows in `[start, end)`. Walking past the earlier rows
+    /// costs a pointer step each; nothing above the viewport is copied.
+    fn rows(&self, start: usize, end: usize) -> Vec<Line<'static>> {
+        self.entries
+            .iter()
+            .flat_map(|entry| entry.lines.iter())
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Wraps plain text to `width` cells: words first, then a hard break inside
@@ -782,6 +880,72 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn transcript_message(text: &str) -> Message {
+        Message {
+            role: MessageRole::Assistant,
+            text: text.to_owned(),
+            ..Message::default()
+        }
+    }
+
+    /// The cache exists to keep a streaming reply from re-rendering the whole
+    /// conversation on every frame. It has to reuse earlier entries, and it
+    /// has to produce exactly what rendering from scratch would.
+    #[test]
+    fn the_transcript_cache_reuses_unchanged_entries_without_changing_the_rows() {
+        let mut messages: Vec<Message> = (0..20)
+            .map(|index| transcript_message(&format!("## Entry {index}\n\nBody text here.")))
+            .collect();
+        let mut cache = TranscriptCache::default();
+
+        let total = cache.refresh(&messages, 60, false, false);
+        assert_eq!(cache.rendered, 20, "the first pass renders every entry");
+        assert_eq!(total, transcript_lines(&messages, 60, false, false).len());
+
+        // A frame with nothing changed must render nothing again.
+        cache.refresh(&messages, 60, false, false);
+        assert_eq!(cache.rendered, 20, "an unchanged frame re-renders nothing");
+
+        // A streaming reply grows its own entry; only that one is redone.
+        messages
+            .last_mut()
+            .expect("last entry")
+            .text
+            .push_str(" More.");
+        cache.refresh(&messages, 60, false, false);
+        assert_eq!(cache.rendered, 21, "only the changed entry is re-rendered");
+
+        // Appending a reply renders just the new entry.
+        messages.push(transcript_message("A fresh reply."));
+        let total = cache.refresh(&messages, 60, false, false);
+        assert_eq!(cache.rendered, 22, "only the new entry is rendered");
+        assert_eq!(total, transcript_lines(&messages, 60, false, false).len());
+
+        // Width and the display toggles change every entry's layout, so they
+        // must invalidate all of them rather than serve stale rows.
+        let narrow = cache.refresh(&messages, 30, false, false);
+        assert_eq!(cache.rendered, 22 + messages.len());
+        assert_eq!(narrow, transcript_lines(&messages, 30, false, false).len());
+        cache.refresh(&messages, 30, true, false);
+        cache.refresh(&messages, 30, true, true);
+
+        // Whatever the route through the cache, the rows match the direct
+        // render exactly -- an optimization that changed output is a bug.
+        let total = cache.refresh(&messages, 30, true, true);
+        assert_eq!(
+            plain(&cache.rows(0, total)),
+            plain(&transcript_lines(&messages, 30, true, true))
+        );
+
+        // A shorter transcript (a /clear, a fork) drops the extra entries.
+        messages.truncate(3);
+        let total = cache.refresh(&messages, 30, true, true);
+        assert_eq!(
+            plain(&cache.rows(0, total)),
+            plain(&transcript_lines(&messages, 30, true, true))
+        );
     }
 
     #[test]

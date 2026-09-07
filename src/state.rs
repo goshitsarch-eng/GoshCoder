@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     time::{Duration, Instant},
 };
 
@@ -87,6 +87,9 @@ pub struct App {
     /// writes it so key handling can clamp instead of letting the offset
     /// run past the top of the transcript.
     pub last_max_scroll: Cell<u16>,
+    /// Rendered transcript rows, reused across frames. The renderer owns it,
+    /// but it lives here because it is per-session state, not per-draw.
+    pub transcript: RefCell<crate::ui::TranscriptCache>,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -164,6 +167,7 @@ impl App {
             history: Vec::new(),
             dynamic_suggestions: Vec::new(),
             last_max_scroll: Cell::new(0),
+            transcript: RefCell::default(),
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
