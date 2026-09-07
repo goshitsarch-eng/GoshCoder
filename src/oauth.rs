@@ -941,8 +941,9 @@ impl BrowserOpener for NoopBrowser {
 const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_REQUEST_LIMIT: usize = 16 * 1024;
 
-/// A validated loopback callback listener. It accepts only the expected path
-/// and CSRF state, and returns an escaped, no-store browser response.
+/// A validated loopback callback listener. It accepts only a request that
+/// names this listener in its `Host` header and carries the expected path and
+/// CSRF state, and returns an escaped, no-store browser response.
 ///
 /// Anything one connection does wrong (a malformed or oversized request, a
 /// reset socket, a client that never finishes) is answered or dropped and
@@ -950,6 +951,9 @@ const CALLBACK_REQUEST_LIMIT: usize = 16 * 1024;
 /// the manual paste. Only cancellation ends the wait from here.
 pub struct LoopbackCallbackServer {
     listener: TcpListener,
+    /// The address actually bound, so a request's `Host` can be checked
+    /// against it rather than trusted.
+    address: SocketAddr,
     expected_path: String,
     expected_state: String,
     request_timeout: Duration,
@@ -981,11 +985,15 @@ impl LoopbackCallbackServer {
                 "callback listener did not bind to loopback".to_owned(),
             ));
         }
+        let address = listener.local_addr().map_err(|error| {
+            OAuthError::Callback(format!("cannot inspect callback address: {error}"))
+        })?;
         listener.set_nonblocking(true).map_err(|error| {
             OAuthError::Callback(format!("cannot configure callback listener: {error}"))
         })?;
         Ok(Self {
             listener,
+            address,
             expected_path: path.to_owned(),
             expected_state: expected_state.to_owned(),
             request_timeout: CALLBACK_REQUEST_TIMEOUT,
@@ -1027,14 +1035,23 @@ impl LoopbackCallbackServer {
         // non-blocking mode, which would turn the timed reads below into a
         // busy loop and could drop the confirmation page on a full buffer.
         let _ = stream.set_nonblocking(false);
-        let request = match read_callback_request(&mut stream, self.request_timeout, cancellation)?
-        {
-            CallbackRead::Request(line) => line,
+        let head = match read_callback_request(&mut stream, self.request_timeout, cancellation)? {
+            CallbackRead::Request(head) => head,
             CallbackRead::Reject { status, message } => {
                 let _ = write_callback_page(&mut stream, status, message);
                 return Ok(None);
             }
         };
+        let mut head_lines = head.lines();
+        let request = head_lines.next().unwrap_or_default();
+        // A browser reaching the real loopback listener always names it. A
+        // request that arrives under some other name reached this port
+        // through a DNS rebind rather than through the redirect, so it is
+        // refused before its query string is looked at at all.
+        if !allowed_callback_host(header_value(head_lines, "host"), self.address) {
+            let _ = write_callback_page(&mut stream, 421, "Unexpected Host header.");
+            return Ok(None);
+        }
         let mut fields = request.split_whitespace();
         let method = fields.next().unwrap_or_default();
         let target = fields.next().unwrap_or_default();
@@ -1160,17 +1177,56 @@ fn read_callback_request(
             message: "Callback request was not UTF-8.",
         });
     };
-    match request
+    if request
         .lines()
         .next()
-        .filter(|line| !line.trim().is_empty())
+        .is_none_or(|line| line.trim().is_empty())
     {
-        Some(line) => Ok(CallbackRead::Request(line.to_owned())),
-        None => Ok(CallbackRead::Reject {
+        return Ok(CallbackRead::Reject {
             status: 400,
             message: "Callback request was empty.",
-        }),
+        });
     }
+    Ok(CallbackRead::Request(request))
+}
+
+/// The first value of `name` among already-split header lines.
+fn header_value<'a>(lines: impl Iterator<Item = &'a str>, name: &str) -> Option<&'a str> {
+    lines
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(header, value)| {
+            header
+                .trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim())
+        })
+}
+
+/// Whether `host` names the loopback listener actually bound. Both the
+/// `localhost` and literal-IP spellings are accepted because the registered
+/// redirect URIs use both, but the port must be the one being listened on.
+fn allowed_callback_host(host: Option<&str>, expected: SocketAddr) -> bool {
+    let Some(host) = host.map(str::trim).filter(|host| !host.is_empty()) else {
+        return false;
+    };
+    if host == expected.to_string() {
+        return true;
+    }
+    let Some((name, port)) = split_callback_host_port(host) else {
+        return false;
+    };
+    port == expected.port() && is_loopback_host(name)
+}
+
+fn split_callback_host_port(value: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (name, port) = rest.split_once("]:")?;
+        return port.parse().ok().map(|port| (name, port));
+    }
+    let (name, port) = value.rsplit_once(':')?;
+    (!name.contains(':'))
+        .then(|| port.parse().ok().map(|port| (name, port)))
+        .flatten()
 }
 
 fn write_callback_page(stream: &mut TcpStream, status: u16, message: &str) -> io::Result<()> {
@@ -3802,7 +3858,7 @@ mod tests {
                         TcpStream::connect(("127.0.0.1", port)).expect("connect callback listener");
                     write!(
                         stream,
-                        "GET /callback?code=callback-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                        "GET /callback?code=callback-code&state={state} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
                     )
                     .expect("write callback");
                     let mut body = String::new();
@@ -4500,9 +4556,12 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 408"), "{response}");
         assert!(started.elapsed() < Duration::from_secs(3));
 
-        let genuine = callback_client(port, |stream| {
+        let genuine = callback_client(port, move |stream| {
             let _ = stream.write_all(
-                b"GET /callback?code=callback-code&state=state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                format!(
+                    "GET /callback?code=callback-code&state=state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+                )
+                .as_bytes(),
             );
         });
         let (accepted, response) = serve_until_done(&server, genuine);
@@ -4512,6 +4571,57 @@ mod tests {
             "the listener still serves the real callback afterwards"
         );
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// A page the user visits cannot reach the callback listener under its
+    /// own name unless DNS rebinding points that name at loopback. The
+    /// listener therefore refuses any request that does not name it, before
+    /// looking at the query string at all.
+    #[test]
+    fn a_callback_naming_another_host_is_refused() {
+        let server = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state")
+            .expect("bind callback listener");
+        let port = server.local_addr().expect("callback address").port();
+
+        for host in ["evil.example", "evil.example:80", "localhost", ""] {
+            let rebound = callback_client(port, move |stream| {
+                let _ = stream.write_all(
+                    format!(
+                        "GET /callback?code=stolen&state=state HTTP/1.1\r\nHost: {host}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            });
+            let (accepted, response) = serve_until_done(&server, rebound);
+            assert!(
+                accepted.is_none(),
+                "a callback claiming Host {host:?} must not be accepted"
+            );
+            assert!(
+                response.starts_with("HTTP/1.1 421"),
+                "Host {host:?} should be refused as misdirected: {response}"
+            );
+        }
+
+        // Both spellings of the listener's own address stay acceptable.
+        for host in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let sent = host.clone();
+            let genuine = callback_client(port, move |stream| {
+                let _ = stream.write_all(
+                    format!(
+                        "GET /callback?code=callback-code&state=state HTTP/1.1\r\nHost: {sent}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            });
+            let (accepted, response) = serve_until_done(&server, genuine);
+            assert_eq!(
+                accepted.map(|callback| callback.code).as_deref(),
+                Some("callback-code"),
+                "Host {host} names this listener and must be served"
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
     }
 
     #[test]
