@@ -7,19 +7,13 @@
 
 use std::collections::BTreeMap;
 
+use crate::theme::{ACCENT, BLUE, CYAN, FAINT, MUTED, TEXT};
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-const ACCENT: Color = Color::Rgb(255, 172, 92);
-const CYAN: Color = Color::Rgb(86, 182, 194);
-const BLUE: Color = Color::Rgb(112, 174, 221);
-const TEXT: Color = Color::Rgb(220, 230, 232);
-const MUTED: Color = Color::Rgb(119, 143, 150);
-const FAINT: Color = Color::Rgb(62, 87, 96);
 
 /// The transcript role whose base style is applied to ordinary prose.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

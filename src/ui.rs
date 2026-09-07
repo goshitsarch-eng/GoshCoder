@@ -12,21 +12,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     markdown::{MarkdownRenderer, MarkdownRole},
     state::{App, FileStatus, Message, MessageRole, SidebarKind, SidebarLine},
+    theme::{
+        ACCENT, AMBER, BACKGROUND, CYAN, FAINT, GREEN, MUTED, PANEL_BACKGROUND, RED, TEXT,
+        TOOL_BACKGROUND, USER_BACKGROUND, VIOLET,
+    },
 };
-
-const BACKGROUND: Color = Color::Rgb(10, 10, 10);
-const PANEL_BACKGROUND: Color = Color::Rgb(20, 20, 20);
-const USER_BACKGROUND: Color = Color::Rgb(30, 30, 30);
-const TOOL_BACKGROUND: Color = Color::Rgb(24, 24, 24);
-const ACCENT: Color = Color::Rgb(255, 172, 92);
-const VIOLET: Color = Color::Rgb(73, 166, 191);
-const CYAN: Color = Color::Rgb(86, 182, 194);
-const GREEN: Color = Color::Rgb(127, 216, 143);
-const AMBER: Color = Color::Rgb(242, 201, 108);
-const RED: Color = Color::Rgb(246, 116, 116);
-const TEXT: Color = Color::Rgb(220, 230, 232);
-const MUTED: Color = Color::Rgb(119, 143, 150);
-const FAINT: Color = Color::Rgb(62, 87, 96);
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();

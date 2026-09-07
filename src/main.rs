@@ -35,6 +35,7 @@ pub mod sessionlog;
 pub mod sessions;
 mod state;
 pub mod stream;
+mod theme;
 pub mod tools;
 pub mod turns;
 mod ui;
