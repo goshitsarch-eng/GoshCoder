@@ -242,12 +242,17 @@ fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         #[cfg(unix)]
         options.mode(mode);
         let mut file = options.open(&temporary)?;
+        // Force the mode on the descriptor rather than on the destination
+        // path once the rename has happened. `open` applies the umask, so the
+        // bits still have to be set explicitly, but a path-based chmod
+        // afterwards would follow whatever sits at that path by then --
+        // a symlink included.
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         Ok(())
     })();
 
@@ -269,6 +274,46 @@ mod tests {
             .expect("clock after epoch")
             .as_nanos();
         env::temp_dir().join(format!("goshcoder-rust-{label}-{}-{nonce}", process::id()))
+    }
+
+    /// `atomic_write` forces the mode on the descriptor before the rename.
+    /// The race it avoids -- a symlink swapped in between the rename and a
+    /// path-based chmod -- cannot be reproduced deterministically, so this
+    /// pins the observable half: the file really does end up owner-only, and
+    /// not merely because the ambient umask happened to say so.
+    #[cfg(unix)]
+    #[test]
+    fn an_atomically_written_file_is_owner_only() {
+        let directory = test_dir("atomic-mode");
+        fs::create_dir_all(&directory).expect("create temp directory");
+        let path = directory.join("default-model");
+
+        atomic_write(&path, b"anthropic/claude-sonnet-5\n", 0o600).expect("write");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat written file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // Replacing an existing file keeps the guarantee.
+        atomic_write(&path, b"openai/gpt-5.6-terra\n", 0o600).expect("rewrite");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat rewritten file")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "openai/gpt-5.6-terra\n"
+        );
+
+        fs::remove_dir_all(&directory).expect("remove temp directory");
     }
 
     #[test]

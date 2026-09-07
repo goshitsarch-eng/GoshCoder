@@ -1544,6 +1544,16 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), CatalogError> {
         source: io::Error::other("temporary file was not retained"),
     })?;
     let write_result = (|| {
+        // The mode is forced on the descriptor, not on the destination path
+        // after the rename: `open` applies the umask so it must be set
+        // explicitly, but a path-based chmod would follow whatever sits at
+        // that path by then, a symlink included.
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| CatalogError::Io {
+                operation: "secure auth.json",
+                source,
+            })?;
         file.write_all(bytes).map_err(|source| CatalogError::Io {
             operation: "write auth.json",
             source,
@@ -1556,13 +1566,6 @@ fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), CatalogError> {
         fs::rename(&temporary, path).map_err(|source| CatalogError::Io {
             operation: "atomically replace auth.json",
             source,
-        })?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            CatalogError::Io {
-                operation: "secure auth.json",
-                source,
-            }
         })?;
         // Directory fsync makes the rename durable where the filesystem
         // supports it. The data file was already synced; unsupported directory
@@ -1615,13 +1618,15 @@ fn acquire_auth_file_lock(
             operation: "open the auth.json lock",
             source,
         })?;
+    // Set on the descriptor for the same reason as auth.json itself: the
+    // lock path is one an attacker could swap for a link between the open
+    // and the chmod.
     #[cfg(unix)]
-    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-        CatalogError::Io {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| CatalogError::Io {
             operation: "secure the auth.json lock",
             source,
-        }
-    })?;
+        })?;
 
     loop {
         match file.try_lock() {
