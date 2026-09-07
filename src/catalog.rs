@@ -22,6 +22,7 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -43,6 +44,11 @@ const CATALOG_OVERRIDES_JSON: &str = include_str!("../data/catalog_overrides.jso
 const MAX_AUTH_FILE_BYTES: usize = 10 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the output reader may still be running once the helper itself is
+/// gone. A helper that exits while a process it started keeps the stdout pipe
+/// open never delivers EOF, so the reader is given a bounded grace and then
+/// left detached rather than joined.
+const COMMAND_DRAIN_GRACE: Duration = Duration::from_secs(2);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// How long a writer waits for another writer to release auth.json before
 /// failing with [`CatalogError::CredentialLockTimeout`]. The lock is only held
@@ -1944,7 +1950,15 @@ fn execute_command(command_config: &str) -> Option<String> {
         .stderr(Stdio::null());
     let mut child = process.spawn().ok()?;
     let stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || drain_command_output(stdout));
+    // The reader publishes into shared state rather than returning a value,
+    // so what it captured stays readable even when it has to be abandoned.
+    let captured = Arc::new(Mutex::new(CommandOutput::default()));
+    let reader_output = Arc::clone(&captured);
+    let (drained, drain_finished) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        drain_command_output(stdout, &reader_output);
+        let _ = drained.send(());
+    });
     let deadline = Instant::now() + COMMAND_TIMEOUT;
 
     let status = loop {
@@ -1954,37 +1968,54 @@ fn execute_command(command_config: &str) -> Option<String> {
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
                 return None;
             }
         }
     };
-    let (output, truncated) = reader.join().ok()?.ok()?;
-    if !status.success() || truncated {
+    // Wait for a clean end of stream, but never indefinitely: a helper that
+    // backgrounds anything inheriting stdout keeps the pipe open for as long
+    // as that process lives, and joining here would hang this resolution --
+    // and every caller queued behind the credential store -- with it. Past
+    // the grace the reader owns only a pipe nobody is waiting on.
+    let _ = drain_finished.recv_timeout(COMMAND_DRAIN_GRACE);
+    let output = lock_unpoisoned(&captured);
+    if !status.success() || output.truncated || output.failed {
         return None;
     }
-    let output = String::from_utf8(output).ok()?;
-    let output = output.trim().to_owned();
-    (!output.is_empty()).then_some(output)
+    let text = String::from_utf8(output.bytes.clone()).ok()?;
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
-fn drain_command_output(mut stdout: impl Read) -> io::Result<(Vec<u8>, bool)> {
-    let mut output = Vec::new();
-    let mut truncated = false;
+/// What a helper wrote, readable while the reader is still running.
+#[derive(Default)]
+struct CommandOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    failed: bool,
+}
+
+fn drain_command_output(mut stdout: impl Read, captured: &Mutex<CommandOutput>) {
     let mut buffer = [0_u8; 8192];
     loop {
-        let read = stdout.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(output.len());
-        let kept = remaining.min(read);
-        output.extend_from_slice(&buffer[..kept]);
-        if kept < read {
-            truncated = true;
+        match stdout.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => {
+                let mut output = lock_unpoisoned(captured);
+                let remaining = COMMAND_OUTPUT_LIMIT.saturating_sub(output.bytes.len());
+                let kept = remaining.min(read);
+                output.bytes.extend_from_slice(&buffer[..kept]);
+                if kept < read {
+                    output.truncated = true;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                lock_unpoisoned(captured).failed = true;
+                return;
+            }
         }
     }
-    Ok((output, truncated))
 }
 
 /// Header overrides supplied by provider authentication. `None` explicitly
@@ -3763,6 +3794,27 @@ mod tests {
             &BTreeMap::new(),
             &lookup
         ));
+    }
+
+    /// A helper that prints its key and exits while something it started
+    /// still holds stdout never delivers EOF. Joining the reader used to
+    /// block credential resolution for as long as that process lived.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_value_resolves_even_when_the_helper_leaks_its_stdout() {
+        let _test_lock = lock_unpoisoned(&COMMAND_TEST_LOCK);
+        clear_config_value_cache();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            // `sleep` inherits stdout and outlives the shell, so the pipe
+            // stays open far longer than the drain grace allows.
+            let _ = sender.send(execute_command("!printf 'token-value'; sleep 30 &"));
+        });
+
+        let resolved = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("resolution must not wait for the leaked pipe to close");
+        assert_eq!(resolved.as_deref(), Some("token-value"));
     }
 
     #[cfg(unix)]
