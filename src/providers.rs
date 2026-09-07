@@ -439,8 +439,17 @@ impl ProviderResponderFactory {
         // headers and then re-arms for every body read, which makes it an
         // idle deadline. A per-request timeout would instead become a total
         // deadline that cuts long streams off mid-response, so none is set.
+        // Provider auth travels in headers reqwest does not strip when a
+        // redirect crosses to another origin: it removes only `Authorization`
+        // (and `Cookie`), while `x-api-key`, `x-goog-api-key` and `api-key`
+        // are replayed verbatim. Following a redirect would therefore hand
+        // the user's Anthropic, Google or Azure key to whichever host the
+        // endpoint named, so a redirect is surfaced as an ordinary status
+        // instead -- the same rule the Bedrock, Aperture, OmniRoute and
+        // web-search clients already follow.
         let mut builder = Client::builder()
             .user_agent(oauth::OAUTH_USER_AGENT)
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(config.read_timeout);
         if let Some(timeout) = config.connect_timeout {
             builder = builder.connect_timeout(timeout);
@@ -9699,5 +9708,53 @@ mod tests {
         assert_eq!(response.usage.input, 6);
         assert_eq!(response.usage.output, 2);
         assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    /// reqwest strips only `Authorization` when a redirect crosses origins,
+    /// so a followed redirect would replay `x-api-key` (and the Google and
+    /// Azure equivalents) to whatever host the provider named. The client
+    /// must therefore report a redirect rather than chase it.
+    #[test]
+    fn redirects_are_reported_instead_of_replaying_provider_keys() {
+        // Stands in for the host a hostile or hijacked endpoint redirects to.
+        // It is never written to, so any connection at all means the key left.
+        let harvester = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        let harvester_address = harvester.local_addr().expect("redirect target address");
+        harvester
+            .set_nonblocking(true)
+            .expect("poll the redirect target without blocking");
+
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://{harvester_address}/harvested\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (base_url, requests, server) = test_server(vec![redirect]);
+
+        let response = factory(0)
+            .respond(
+                &model(API_ANTHROPIC_MESSAGES, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("a provider failure is normalized into an assistant message");
+        let request = requests.recv().expect("captured provider request");
+        server.join().expect("test server finishes");
+
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(
+            response.error_message.contains("status 302"),
+            "the redirect should surface as an ordinary status: {}",
+            response.error_message
+        );
+        // The key really was on the request that got redirected, so the
+        // assertion below is about where it went, not whether it was sent.
+        assert_eq!(
+            request.headers.get("x-api-key").map(String::as_str),
+            Some("test-key")
+        );
+        assert!(
+            harvester.accept().is_err(),
+            "the redirect target must never receive the provider request"
+        );
     }
 }
