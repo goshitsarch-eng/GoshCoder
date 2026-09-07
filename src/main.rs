@@ -397,8 +397,11 @@ fn clip_characters(text: &str, limit: usize) -> String {
     }
 }
 
+/// Whether the line-oriented renderers may use colour. The fullscreen
+/// interface asks `theme::theme()` the same question; both defer to
+/// `theme::monochrome_requested` so they cannot disagree about NO_COLOR.
 fn color_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()
+    !theme::monochrome_requested() && io::stderr().is_terminal()
 }
 
 fn dim(text: &str, color: bool) -> String {

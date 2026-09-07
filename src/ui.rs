@@ -12,21 +12,22 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     markdown::{MarkdownRenderer, MarkdownRole},
     state::{App, FileStatus, Message, MessageRole, SidebarKind, SidebarLine},
-    theme::{
-        ACCENT, AMBER, BACKGROUND, CYAN, FAINT, GREEN, MUTED, PANEL_BACKGROUND, RED, TEXT,
-        TOOL_BACKGROUND, USER_BACKGROUND, VIOLET,
-    },
+    theme::theme,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(
-        Block::default().style(Style::default().bg(BACKGROUND)),
+        Block::default().style(Style::default().bg(theme().background)),
         area,
     );
     if area.width < 20 || area.height < 8 {
         let too_small = Paragraph::new("GoshCoder\nTerminal is too small")
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(theme().accent)
+                    .add_modifier(Modifier::BOLD),
+            )
             .alignment(Alignment::Center);
         frame.render_widget(too_small, area);
         return;
@@ -84,23 +85,30 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
     let title = Line::from(vec![
         Span::styled(
             "  GOSH",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "CODER",
-            Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().violet)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
                 "  {}",
                 truncate(&app.title, area.width.saturating_sub(17) as usize)
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme().muted),
         ),
     ]);
     let header = Paragraph::new(vec![
         title,
-        Line::from(Span::styled("  · · · · · ·", Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            "  · · · · · ·",
+            Style::default().fg(theme().accent),
+        )),
     ]);
     frame.render_widget(header, chunks[0]);
 
@@ -141,7 +149,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let start = max_scroll.saturating_sub(scroll);
     let end = (start + height).min(total);
     let transcript = Paragraph::new(Text::from(cache.rows(start, end)))
-        .style(Style::default().fg(TEXT).bg(BACKGROUND));
+        .style(Style::default().fg(theme().text).bg(theme().background));
     frame.render_widget(transcript, area);
 }
 
@@ -185,8 +193,8 @@ fn render_suggestions(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(VIOLET))
-                .title(Line::from(title).style(Style::default().fg(MUTED))),
+                .border_style(Style::default().fg(theme().violet))
+                .title(Line::from(title).style(Style::default().fg(theme().muted))),
         )
         .highlight_style(
             Style::default()
@@ -203,25 +211,30 @@ fn render_suggestions(
 fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(CYAN));
+        .border_style(Style::default().fg(theme().cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let placeholder = "Tell GoshCoder what to build…  / for commands";
     let lines: Vec<Line<'_>> = if app.input.is_empty() {
         vec![Line::from(Span::styled(
             truncate(placeholder, inner.width as usize),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme().muted),
         ))]
     } else {
         editor
             .lines
             .iter()
-            .map(|line| Line::from(Span::styled(line.as_str(), Style::default().fg(TEXT))))
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.as_str(),
+                    Style::default().fg(theme().text),
+                ))
+            })
             .collect()
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(BACKGROUND))
+            .style(Style::default().bg(theme().background))
             .wrap(Wrap { trim: false }),
         inner,
     );
@@ -240,13 +253,13 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let left = if app.streaming {
         Line::from(vec![
-            Span::styled("  ● ", Style::default().fg(ACCENT)),
-            Span::styled(sanitize(&app.status), Style::default().fg(TEXT)),
+            Span::styled("  ● ", Style::default().fg(theme().accent)),
+            Span::styled(sanitize(&app.status), Style::default().fg(theme().text)),
         ])
     } else {
         Line::from(vec![
-            Span::styled("  ● ", Style::default().fg(CYAN)),
-            Span::styled(sanitize(&app.status), Style::default().fg(MUTED)),
+            Span::styled("  ● ", Style::default().fg(theme().cyan)),
+            Span::styled(sanitize(&app.status), Style::default().fg(theme().muted)),
         ])
     };
     let hint = if app.streaming {
@@ -260,7 +273,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let hint_width = hint.width();
     if available > left_width + hint_width + 2 {
         spans.push(Span::raw(" ".repeat(available - left_width - hint_width)));
-        spans.push(Span::styled(hint, Style::default().fg(FAINT)));
+        spans.push(Span::styled(hint, Style::default().fg(theme().faint)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -271,7 +284,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, lines: &[SidebarLine]) {
         .map(|line| sidebar_line(line))
         .collect::<Vec<_>>();
     let sidebar = Paragraph::new(rendered)
-        .style(Style::default().bg(PANEL_BACKGROUND))
+        .style(Style::default().bg(theme().panel_background))
         .wrap(Wrap { trim: true });
     frame.render_widget(sidebar, area);
 }
@@ -312,62 +325,78 @@ static SIDEBAR_ELLIPSIS: SidebarLine = SidebarLine {
 fn sidebar_line(line: &SidebarLine) -> Line<'static> {
     let value = sanitize(&line.value);
     if matches!(line.kind, SidebarKind::Meta) && value.is_empty() {
-        return Line::from(Span::styled("  …", Style::default().fg(MUTED)));
+        return Line::from(Span::styled("  …", Style::default().fg(theme().muted)));
     }
     match line.kind {
         SidebarKind::Title | SidebarKind::Section => Line::from(Span::styled(
             format!("  {}", value),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().text)
+                .add_modifier(Modifier::BOLD),
         )),
         SidebarKind::Accent => Line::from(Span::styled(
             format!("  {}", value),
-            Style::default().fg(ACCENT),
+            Style::default().fg(theme().accent),
         )),
         SidebarKind::Active => Line::from(vec![
-            Span::styled("  ● ", Style::default().fg(GREEN)),
-            Span::styled(value, Style::default().fg(TEXT)),
+            Span::styled("  ● ", Style::default().fg(theme().green)),
+            Span::styled(value, Style::default().fg(theme().text)),
         ]),
         SidebarKind::Meta => Line::from(Span::styled(
             format!("  {}", value),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme().muted),
         )),
         SidebarKind::Path => Line::from(Span::styled(
             format!("  {}", truncate_left(&value, 36)),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme().muted),
         )),
         SidebarKind::Brand => Line::from(Span::styled(
             format!("  {}", value),
-            Style::default().fg(GREEN),
+            Style::default().fg(theme().green),
         )),
         SidebarKind::Progress(percent) => {
             let cells = 24usize;
             let filled = min(cells, cells * percent as usize / 100);
             Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled("━".repeat(filled), Style::default().fg(ACCENT)),
-                Span::styled("━".repeat(cells - filled), Style::default().fg(FAINT)),
+                Span::styled("━".repeat(filled), Style::default().fg(theme().accent)),
+                Span::styled(
+                    "━".repeat(cells - filled),
+                    Style::default().fg(theme().faint),
+                ),
             ])
         }
         SidebarKind::Todo { complete } => {
             let marker = if complete { "☑" } else { "☐" };
-            let color = if complete { GREEN } else { MUTED };
+            let color = if complete {
+                theme().green
+            } else {
+                theme().muted
+            };
             Line::from(vec![
                 Span::styled(format!("  {marker} "), Style::default().fg(color)),
                 Span::styled(
                     value,
-                    Style::default().fg(if complete { MUTED } else { TEXT }),
+                    Style::default().fg(if complete {
+                        theme().muted
+                    } else {
+                        theme().text
+                    }),
                 ),
             ])
         }
         SidebarKind::File { status } => {
             let (prefix, color) = match status {
-                FileStatus::Added | FileStatus::Untracked => ("A ", GREEN),
-                FileStatus::Modified => ("M ", AMBER),
-                FileStatus::Deleted => ("D ", RED),
+                FileStatus::Added | FileStatus::Untracked => ("A ", theme().green),
+                FileStatus::Modified => ("M ", theme().amber),
+                FileStatus::Deleted => ("D ", theme().red),
             };
             Line::from(vec![
                 Span::styled(format!("  {prefix}"), Style::default().fg(color)),
-                Span::styled(truncate_left(&value, 32), Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate_left(&value, 32),
+                    Style::default().fg(theme().muted),
+                ),
             ])
         }
         SidebarKind::Blank => Line::from(""),
@@ -404,7 +433,9 @@ fn message_rows(
             MessageRole::User => {
                 lines.extend(message_lines(
                     &message.text,
-                    Style::default().fg(TEXT).bg(USER_BACKGROUND),
+                    Style::default()
+                        .fg(theme().text)
+                        .bg(theme().user_background),
                     "  ",
                     width,
                 ));
@@ -419,7 +450,9 @@ fn message_rows(
             MessageRole::Thinking if hide_thinking => {
                 lines.push(styled_line(
                     "  Thinking…".to_owned(),
-                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(theme().muted)
+                        .add_modifier(Modifier::DIM),
                 ));
             }
             MessageRole::Thinking => {
@@ -427,9 +460,9 @@ fn message_rows(
             }
             MessageRole::Tool => {
                 let (icon, color) = if message.is_error {
-                    ("×", RED)
+                    ("×", theme().red)
                 } else {
-                    ("✓", CYAN)
+                    ("✓", theme().cyan)
                 };
                 let title = if message.title.is_empty() {
                     "tool".to_owned()
@@ -437,19 +470,19 @@ fn message_rows(
                     sanitize(&message.title).replace('\n', " ")
                 };
                 let title_style = Style::default()
-                    .fg(TEXT)
-                    .bg(TOOL_BACKGROUND)
+                    .fg(theme().text)
+                    .bg(theme().tool_background)
                     .add_modifier(Modifier::BOLD);
                 let mut title_rows = wrap_plain(&title, usize::from(width).saturating_sub(4));
                 let first_title = title_rows.first().cloned().unwrap_or_default();
                 lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().bg(TOOL_BACKGROUND)),
-                    Span::styled(icon, Style::default().fg(color).bg(TOOL_BACKGROUND)),
+                    Span::styled("  ", Style::default().bg(theme().tool_background)),
+                    Span::styled(icon, Style::default().fg(color).bg(theme().tool_background)),
                     Span::styled(format!(" {first_title}"), title_style),
                 ]));
                 for row in title_rows.drain(1..) {
                     lines.push(Line::from(vec![
-                        Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
+                        Span::styled("    ", Style::default().bg(theme().tool_background)),
                         Span::styled(row, title_style),
                     ]));
                 }
@@ -480,8 +513,13 @@ fn message_rows(
                 for line in &shown_lines[..visible] {
                     for row in wrap_plain(line, usize::from(width).saturating_sub(4)) {
                         lines.push(Line::from(vec![
-                            Span::styled("    ", Style::default().bg(TOOL_BACKGROUND)),
-                            Span::styled(row, Style::default().fg(MUTED).bg(TOOL_BACKGROUND)),
+                            Span::styled("    ", Style::default().bg(theme().tool_background)),
+                            Span::styled(
+                                row,
+                                Style::default()
+                                    .fg(theme().muted)
+                                    .bg(theme().tool_background),
+                            ),
                         ]));
                     }
                 }
@@ -491,34 +529,38 @@ fn message_rows(
                             "    … {} more lines (ctrl+o to expand)",
                             total_lines - visible
                         ),
-                        Style::default().fg(MUTED).bg(TOOL_BACKGROUND),
+                        Style::default()
+                            .fg(theme().muted)
+                            .bg(theme().tool_background),
                     ));
                 }
             }
             MessageRole::Error => {
                 lines.push(styled_line(
                     "  Error".to_owned(),
-                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme().red)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 lines.extend(message_lines(
                     &message.text,
-                    Style::default().fg(RED),
+                    Style::default().fg(theme().red),
                     "  ",
                     width,
                 ));
             }
             MessageRole::Notice | MessageRole::Command => {
                 let (symbol, color, label) = match message.role {
-                    MessageRole::Command => ("◇", VIOLET, "Command"),
-                    _ => ("i", CYAN, "Notice"),
+                    MessageRole::Command => ("◇", theme().violet, "Command"),
+                    _ => ("i", theme().cyan, "Notice"),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {symbol} "), Style::default().fg(color)),
-                    Span::styled(label, Style::default().fg(MUTED)),
+                    Span::styled(label, Style::default().fg(theme().muted)),
                 ]));
                 lines.extend(message_lines(
                     &message.text,
-                    Style::default().fg(MUTED),
+                    Style::default().fg(theme().muted),
                     "  ",
                     width,
                 ));

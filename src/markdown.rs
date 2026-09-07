@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::theme::{ACCENT, BLUE, CYAN, FAINT, MUTED, TEXT};
+use crate::theme::theme;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span, Text},
@@ -115,7 +115,7 @@ impl MarkdownRenderer {
             if is_horizontal_rule(trimmed) {
                 rendered.push(line_from_fragments(vec![Fragment::new(
                     "─".repeat(self.width.max(3)),
-                    Style::default().fg(FAINT),
+                    Style::default().fg(theme().faint),
                 )]));
                 reset_lists(&mut ordered_at, &mut hang_at);
                 in_quote = false;
@@ -128,7 +128,9 @@ impl MarkdownRenderer {
                     &mut rendered,
                     inline_fragments(
                         heading,
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme().accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     self.width,
                     Vec::new(),
@@ -172,7 +174,7 @@ impl MarkdownRenderer {
                 if let Some((_, quote)) = parse_quote(content.trim()) {
                     append_wrapped(
                         &mut rendered,
-                        inline_fragments(quote, Style::default().fg(MUTED)),
+                        inline_fragments(quote, Style::default().fg(theme().muted)),
                         self.width.saturating_sub(hang + 2).max(1),
                         append_fragments_to(prefix, quote_prefix(1)),
                         append_fragments_to(spaces(hang), quote_prefix(1)),
@@ -198,7 +200,7 @@ impl MarkdownRenderer {
                 if let Some((_, quote)) = parse_quote(content) {
                     append_wrapped(
                         &mut rendered,
-                        inline_fragments(quote, Style::default().fg(MUTED)),
+                        inline_fragments(quote, Style::default().fg(theme().muted)),
                         self.width.saturating_sub(hang + 2).max(1),
                         append_fragments_to(spaces(hang), quote_prefix(1)),
                         append_fragments_to(spaces(hang), quote_prefix(1)),
@@ -224,7 +226,9 @@ impl MarkdownRenderer {
                         &mut rendered,
                         inline_fragments(
                             heading,
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme().accent)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         self.width,
                         Vec::new(),
@@ -270,13 +274,15 @@ impl MarkdownRenderer {
 
     fn body_style(self) -> Style {
         match self.role {
-            MarkdownRole::Assistant => Style::default().fg(TEXT),
-            MarkdownRole::Thinking => Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            MarkdownRole::Assistant => Style::default().fg(theme().text),
+            MarkdownRole::Thinking => Style::default()
+                .fg(theme().muted)
+                .add_modifier(Modifier::DIM),
         }
     }
 
     fn push_code_line(self, raw: &str, rendered: &mut Vec<Line<'static>>) {
-        let content = vec![Fragment::new(raw, Style::default().fg(BLUE))];
+        let content = vec![Fragment::new(raw, Style::default().fg(theme().blue))];
         for row in hard_wrap(&content, self.width.saturating_sub(2).max(1)) {
             append_line(rendered, quote_prefix(1), row);
         }
@@ -286,7 +292,7 @@ impl MarkdownRenderer {
         let prefix = quote_prefix(depth);
         append_wrapped(
             rendered,
-            inline_fragments(quote, Style::default().fg(MUTED)),
+            inline_fragments(quote, Style::default().fg(theme().muted)),
             self.width.saturating_sub(fragments_width(&prefix)).max(1),
             prefix.clone(),
             prefix,
@@ -310,7 +316,7 @@ impl MarkdownRenderer {
                     .map(|column| {
                         inline_fragments(
                             row.get(column).map_or("", String::as_str),
-                            Style::default().fg(TEXT),
+                            Style::default().fg(theme().text),
                         )
                     })
                     .collect()
@@ -328,9 +334,9 @@ impl MarkdownRenderer {
             let height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1);
 
             for line_index in 0..height {
-                let mut fragments = vec![Fragment::new("│", Style::default().fg(FAINT))];
+                let mut fragments = vec![Fragment::new("│", Style::default().fg(theme().faint))];
                 for (column, width) in widths.iter().enumerate() {
-                    fragments.push(Fragment::new(" ", Style::default().fg(TEXT)));
+                    fragments.push(Fragment::new(" ", Style::default().fg(theme().text)));
                     let cell = wrapped_cells[column]
                         .get(line_index)
                         .cloned()
@@ -340,11 +346,11 @@ impl MarkdownRenderer {
                     if cell_width < *width {
                         fragments.push(Fragment::new(
                             " ".repeat(*width - cell_width),
-                            Style::default().fg(TEXT),
+                            Style::default().fg(theme().text),
                         ));
                     }
-                    fragments.push(Fragment::new(" ", Style::default().fg(TEXT)));
-                    fragments.push(Fragment::new("│", Style::default().fg(FAINT)));
+                    fragments.push(Fragment::new(" ", Style::default().fg(theme().text)));
+                    fragments.push(Fragment::new("│", Style::default().fg(theme().faint)));
                 }
                 rendered.push(line_from_fragments(fragments));
             }
@@ -661,7 +667,7 @@ fn list_prefix(nest: usize, display: &str, checked: Option<bool>) -> Vec<Fragmen
         Some(false) => format!("{display} [ ]"),
         None => display.to_owned(),
     };
-    prefix.push(Fragment::new(marker, Style::default().fg(CYAN)));
+    prefix.push(Fragment::new(marker, Style::default().fg(theme().cyan)));
     prefix.push(Fragment::new(" ", Style::default()));
     prefix
 }
@@ -669,7 +675,7 @@ fn list_prefix(nest: usize, display: &str, checked: Option<bool>) -> Vec<Fragmen
 fn quote_prefix(depth: usize) -> Vec<Fragment> {
     vec![Fragment::new(
         "│ ".repeat(depth.max(1)),
-        Style::default().fg(FAINT),
+        Style::default().fg(theme().faint),
     )]
 }
 
@@ -707,7 +713,11 @@ fn inline_fragments_at_depth(text: &str, style: Style, depth: usize) -> Vec<Frag
             && end > cursor + 1
         {
             push_fragment(&mut fragments, &text[plain_start..cursor], style);
-            push_fragment(&mut fragments, &text[cursor + 1..end], style.fg(BLUE));
+            push_fragment(
+                &mut fragments,
+                &text[cursor + 1..end],
+                style.fg(theme().blue),
+            );
             cursor = end + 1;
             plain_start = cursor;
             continue;
@@ -723,15 +733,19 @@ fn inline_fragments_at_depth(text: &str, style: Style, depth: usize) -> Vec<Frag
             push_fragment(&mut fragments, &text[plain_start..cursor], style);
             append_fragments(
                 &mut fragments,
-                inline_fragments_at_depth(&text[cursor + 1..label_end], style.fg(CYAN), depth + 1),
+                inline_fragments_at_depth(
+                    &text[cursor + 1..label_end],
+                    style.fg(theme().cyan),
+                    depth + 1,
+                ),
             );
-            push_fragment(&mut fragments, " (", style.fg(FAINT));
+            push_fragment(&mut fragments, " (", style.fg(theme().faint));
             push_fragment(
                 &mut fragments,
                 &text[label_end + 2..url_end],
-                style.fg(FAINT),
+                style.fg(theme().faint),
             );
-            push_fragment(&mut fragments, ")", style.fg(FAINT));
+            push_fragment(&mut fragments, ")", style.fg(theme().faint));
             cursor = url_end + 1;
             plain_start = cursor;
             continue;
@@ -916,7 +930,10 @@ fn table_rule(widths: &[usize], left: &str, middle: &str, right: &str) -> Line<'
         }
     }
     rule.push_str(right);
-    line_from_fragments(vec![Fragment::new(rule, Style::default().fg(FAINT))])
+    line_from_fragments(vec![Fragment::new(
+        rule,
+        Style::default().fg(theme().faint),
+    )])
 }
 
 fn append_wrapped(
