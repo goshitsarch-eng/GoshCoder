@@ -133,28 +133,11 @@ impl App {
     pub fn new() -> Self {
         Self {
             title: "interactive session".to_owned(),
-            messages: vec![Message {
-                role: MessageRole::Notice,
-                text: "Rust/Ratatui migration is initializing. The terminal UI is active while runtime features are ported."
-                    .to_owned(),
-                ..Message::default()
-            }],
-            sidebar: vec![
-                SidebarLine::title("New Session"),
-                SidebarLine::accent("goshcoder"),
-                SidebarLine::meta("off thinking · normal"),
-                SidebarLine::blank(),
-                SidebarLine::section("Context"),
-                SidebarLine::progress(0),
-                SidebarLine::meta("0 / 0 tokens"),
-                SidebarLine::meta("0% used · $0.0000 spent"),
-                SidebarLine::blank(),
-                SidebarLine::section("Workspace"),
-                SidebarLine::meta("Rust migration"),
-                SidebarLine::path("."),
-                SidebarLine::blank(),
-                SidebarLine::brand("● GoshCoder"),
-            ],
+            // The transcript and the sidebar are both rebuilt from the live
+            // session before every draw, so there is nothing useful to seed
+            // them with here.
+            messages: Vec::new(),
+            sidebar: Vec::new(),
             input: String::new(),
             cursor: 0,
             status: "Ready".to_owned(),

@@ -850,6 +850,19 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::new();
         app.set_input("/mo");
+        // The runtime fills both of these in before every draw; the renderer
+        // is what is under test, so it is given them explicitly.
+        app.sidebar = vec![
+            SidebarLine::title("New Session"),
+            SidebarLine::blank(),
+            SidebarLine::section("Context"),
+            SidebarLine::progress(40),
+        ];
+        app.replace_messages(vec![Message {
+            role: MessageRole::Assistant,
+            text: "A reply in the transcript.".to_owned(),
+            ..Message::default()
+        }]);
 
         terminal.draw(|frame| draw(frame, &app)).expect("draw");
 
@@ -858,6 +871,7 @@ mod tests {
         assert!(text.contains("GOSHCODER"));
         assert!(text.contains("COMMANDS"));
         assert!(text.contains("New Session"));
+        assert!(text.contains("A reply in the transcript."));
     }
 
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
