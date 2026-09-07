@@ -78,6 +78,15 @@ impl CancellationToken {
     }
 }
 
+/// Most tool calls run at once when a batch executes in parallel.
+///
+/// The size of a batch comes from the model's message, not from anything
+/// this process decides, and every call in flight holds an OS thread. The
+/// built-in tools are I/O bound -- files, a shell, HTTP -- so a wider
+/// fan-out buys little, and a bound keeps one message from deciding how many
+/// threads exist.
+const MAX_PARALLEL_TOOL_CALLS: usize = 16;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ToolExecutionMode {
     Sequential,
@@ -1222,33 +1231,46 @@ impl Agent {
                 outcomes.push((index, outcome));
             }
         } else {
-            let mut handles = Vec::new();
-            for (index, prepared_call) in prepared {
-                let agent = self.clone();
-                let cancellation = cancellation.clone();
-                handles.push((
-                    index,
-                    thread::spawn(move || {
-                        let outcome = agent.execute_prepared_tool(prepared_call, cancellation);
-                        agent.tool_ended(&outcome);
-                        outcome
-                    }),
-                ));
-            }
-            for (index, handle) in handles {
-                let outcome = handle.join().unwrap_or_else(|_| {
-                    ToolOutcome::error(
-                        llm::ToolCall {
-                            id: "unknown".to_owned(),
-                            name: "unknown".to_owned(),
-                            arguments: BTreeMap::new(),
-                            thought_signature: String::new(),
-                            namespace: String::new(),
-                        },
-                        "tool worker panicked",
-                    )
-                });
-                outcomes.push((index, outcome));
+            // Run in bounded groups rather than spawning the whole batch:
+            // results are reordered by index afterwards, so grouping changes
+            // only how many calls are in flight at once.
+            let mut queued = prepared.into_iter();
+            loop {
+                let group = queued
+                    .by_ref()
+                    .take(MAX_PARALLEL_TOOL_CALLS)
+                    .collect::<Vec<_>>();
+                if group.is_empty() {
+                    break;
+                }
+                let mut handles = Vec::with_capacity(group.len());
+                for (index, prepared_call) in group {
+                    let agent = self.clone();
+                    let cancellation = cancellation.clone();
+                    handles.push((
+                        index,
+                        thread::spawn(move || {
+                            let outcome = agent.execute_prepared_tool(prepared_call, cancellation);
+                            agent.tool_ended(&outcome);
+                            outcome
+                        }),
+                    ));
+                }
+                for (index, handle) in handles {
+                    let outcome = handle.join().unwrap_or_else(|_| {
+                        ToolOutcome::error(
+                            llm::ToolCall {
+                                id: "unknown".to_owned(),
+                                name: "unknown".to_owned(),
+                                arguments: BTreeMap::new(),
+                                thought_signature: String::new(),
+                                namespace: String::new(),
+                            },
+                            "tool worker panicked",
+                        )
+                    });
+                    outcomes.push((index, outcome));
+                }
             }
         }
         outcomes.sort_by_key(|(index, _)| *index);
@@ -1859,6 +1881,91 @@ mod tests {
                 && matches!(event.message.as_ref(), Some(llm::Message::Assistant(_)))
         }));
         assert!(agent.state().streaming_message.is_none());
+    }
+
+    /// The number of tool calls in a message is the model's choice, and each
+    /// one in flight holds a thread. A large batch must still run, still
+    /// return in source order, and still never exceed the bound.
+    #[test]
+    fn a_large_tool_batch_runs_bounded_and_still_returns_in_order() {
+        const CALLS: usize = MAX_PARALLEL_TOOL_CALLS * 3 + 5;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let running = Arc::clone(&live);
+        let highest = Arc::clone(&peak);
+        let counting = Tool::new(
+            "counting",
+            "Counting",
+            "records how many calls overlap",
+            json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+            move |_, _, parameters, _| {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                highest.fetch_max(now, Ordering::SeqCst);
+                // Hold the slot long enough that a group really does overlap.
+                thread::sleep(std::time::Duration::from_millis(20));
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolResult::text(
+                    parameters
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                ))
+            },
+        );
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let agent = Agent::new(AgentOptions {
+            initial_state: InitialState {
+                model: model(),
+                tools: vec![counting],
+                ..InitialState::default()
+            },
+            responder: Some(Arc::new(move |_, _, _| {
+                if request_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(assistant_calls(
+                        (0..CALLS)
+                            .map(|index| {
+                                tool_call(
+                                    &format!("call-{index}"),
+                                    "counting",
+                                    json!({"value": index.to_string()}),
+                                )
+                            })
+                            .collect(),
+                        stream::STOP_TOOL_USE,
+                    ))
+                } else {
+                    Ok(assistant_text("done"))
+                }
+            })),
+            ..AgentOptions::default()
+        });
+
+        agent.prompt("run many tools").expect("prompt");
+
+        let state = agent.state();
+        let results = tool_results(&state.messages);
+        assert_eq!(results.len(), CALLS, "every call still runs");
+        let ids = results
+            .iter()
+            .map(|result| result.tool_call_id.as_str())
+            .collect::<Vec<_>>();
+        let expected = (0..CALLS)
+            .map(|index| format!("call-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, expected, "results stay in the model's order");
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= MAX_PARALLEL_TOOL_CALLS,
+            "{peak} calls overlapped, above the {MAX_PARALLEL_TOOL_CALLS} bound"
+        );
+        assert!(
+            peak > 1,
+            "the batch should still run in parallel, saw {peak}"
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0, "no call is left running");
     }
 
     #[test]
