@@ -299,6 +299,20 @@ impl LoginFlow {
     }
 }
 
+/// What of an OAuth event belongs on the clipboard: the device code to type,
+/// or the address to open when the browser did not. The fullscreen interface
+/// wraps a long address over several rows, which a terminal cannot select as
+/// one piece or recognise as one link.
+pub fn clipboard_text(event: &oauth::OAuthEvent) -> Option<&str> {
+    match event.kind {
+        oauth::OAuthEventKind::DeviceCode => {
+            Some(event.user_code.as_str()).filter(|code| !code.is_empty())
+        }
+        oauth::OAuthEventKind::AuthorizationUrl => event.authorization_url.as_deref(),
+        _ => None,
+    }
+}
+
 /// The transcript notice for an OAuth event. Indented lines are what the
 /// interface renders as an address (blue) or a code (bold accent).
 pub fn event_notice(provider: &str, event: &oauth::OAuthEvent) -> Option<String> {
@@ -454,6 +468,28 @@ mod tests {
             ..event
         };
         assert!(event_notice("xai", &progress).is_none());
+        assert_eq!(clipboard_text(&progress), None);
+    }
+
+    #[test]
+    fn the_code_or_the_address_goes_on_the_clipboard() {
+        let mut event = oauth::OAuthEvent {
+            kind: oauth::OAuthEventKind::DeviceCode,
+            message: String::new(),
+            authorization_url: None,
+            instructions: String::new(),
+            user_code: "QWRT-8KDP".to_owned(),
+            verification_uri: "https://auth.example/device".to_owned(),
+            interval_seconds: 5,
+            expires_in_seconds: 900,
+        };
+        assert_eq!(clipboard_text(&event), Some("QWRT-8KDP"));
+        event.kind = oauth::OAuthEventKind::AuthorizationUrl;
+        event.authorization_url = Some("https://auth.example/authorize?x=1".to_owned());
+        assert_eq!(
+            clipboard_text(&event),
+            Some("https://auth.example/authorize?x=1")
+        );
     }
 
     #[test]

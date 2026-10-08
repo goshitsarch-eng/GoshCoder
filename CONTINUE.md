@@ -271,6 +271,31 @@ regression tests. The ones worth knowing about when reading the code:
   before aborting, as pi's interactive mode does, so nothing queued runs
   after an interrupted turn.
 
+- A hands-on QA pass drove the real interface in tmux against a mock
+  OpenAI-compatible gateway (`OMNIROUTE_URL` pointed at a local server) and
+  fixed what it found. The ones with a rule to keep:
+  - Tool results pair with their calls by order (`llm::ToolPairing`), not by
+    a history-wide id map: OpenAI-compatible servers that number calls
+    `call_0` every turn made every card show the last result.
+  - SIGTERM and SIGHUP end chat the way `/exit` does (`termination` in
+    `main.rs`). After a hangup crossterm spins forever inside `event::poll`
+    reading the dead terminal, out of reach of the interface loop, so a
+    watchdog aborts the turn (which records itself) and exits 128 + signal
+    after a short grace. Quitting waits briefly for an aborted first reply
+    to be recorded; closing earlier discarded the session with the prompt.
+  - `Agent::abort` also bumps a counter, and the retry backoff sleeps through
+    `Agent::pause`, so Esc stops a turn that is between attempts.
+  - `-continue` skips sessions with nothing in them (no messages, never
+    cleared, no name): a process killed before anyone spoke leaves one.
+  - Short session ids are 13 characters, the whole millisecond timestamp of
+    the UUIDv7; eight stopped at about a minute's resolution. One function,
+    `sessionlog::short_id`, makes them.
+  - Notices treat a line as a callout only when it is four spaces and a
+    single token (a URL, a device code); everything else wraps with a
+    hanging indent under its column.
+  - Both editors move and delete by grapheme cluster; Ctrl-K/Ctrl-U are
+    line-scoped as in pi.
+
 Anything an audit found that was not fixed is recorded in the README's
 **Known gaps**.
 

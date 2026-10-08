@@ -25,6 +25,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// What one prompt read produced.
@@ -241,18 +242,20 @@ impl LineBuffer {
     }
 }
 
+// Boundaries are grapheme clusters, as in the fullscreen editor: a step of
+// one code point could stop inside "👍🏽" and let typing split it.
 fn previous_boundary(text: &str, cursor: usize) -> usize {
     text[..cursor]
-        .char_indices()
+        .grapheme_indices(true)
         .next_back()
         .map_or(0, |(index, _)| index)
 }
 
 fn next_boundary(text: &str, cursor: usize) -> usize {
     text[cursor..]
-        .chars()
+        .graphemes(true)
         .next()
-        .map_or(cursor, |character| cursor + character.len_utf8())
+        .map_or(cursor, |grapheme| cursor + grapheme.len())
 }
 
 /// Reads one prompt line from the terminal in raw mode.
@@ -262,7 +265,8 @@ pub fn read_line(prompt: &str, history: &[String]) -> io::Result<LineInput> {
     let result = edit(prompt, history);
     let _ = execute!(io::stderr(), DisableBracketedPaste);
     let _ = disable_raw_mode();
-    eprintln!();
+    // Not `eprintln!`, which panics when the terminal has hung up.
+    let _ = writeln!(io::stderr());
     result
 }
 
@@ -270,6 +274,14 @@ fn edit(prompt: &str, history: &[String]) -> io::Result<LineInput> {
     let mut buffer = LineBuffer::default();
     redraw(prompt, &buffer)?;
     loop {
+        // Polled rather than blocking, so SIGTERM or a hangup ends the
+        // prompt (and leaves raw mode) instead of waiting for a key.
+        if crate::termination::requested().is_some() {
+            return Ok(LineInput::Exit);
+        }
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 match buffer.handle_key(key, history) {
@@ -354,6 +366,18 @@ mod tests {
 
     fn ctrl(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_grapheme() {
+        let mut buffer = LineBuffer::default();
+        buffer.insert("ok 👍🏽");
+        buffer.handle_key(key(KeyCode::Backspace), &[]);
+        assert_eq!(buffer.text, "ok ");
+        buffer.insert("e\u{301}");
+        buffer.handle_key(key(KeyCode::Left), &[]);
+        buffer.handle_key(key(KeyCode::Char('X')), &[]);
+        assert_eq!(buffer.text, "ok Xe\u{301}");
     }
 
     fn type_text(buffer: &mut LineBuffer, text: &str) {

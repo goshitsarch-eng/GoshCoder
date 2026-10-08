@@ -64,7 +64,11 @@ pub const TYPE_TRANSCRIPT_RESET: &str = "transcript_reset";
 const LOCK_HEARTBEAT: Duration = Duration::from_secs(2);
 const LOCK_STALE: Duration = Duration::from_secs(20);
 const MAX_SEARCH_TEXT_BYTES: usize = 64 << 10;
-const SHORT_ID_LENGTH: usize = 8;
+/// Session ids are UUIDv7, whose first 48 bits are the creation time in
+/// milliseconds: "01a11c3d-1524". Eight characters stop at about a minute's
+/// resolution, so every session opened in the same minute shared one short
+/// id; thirteen keep the whole timestamp.
+const SHORT_ID_LENGTH: usize = 13;
 
 /// Best-effort information about the process currently holding a session.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -160,7 +164,10 @@ impl fmt::Display for SessionError {
                     "sessionlog: session id prefix {reference:?} matches more than one session"
                 )
             }
-            Self::ReadOnly => write!(formatter, "sessionlog: session is open read-only"),
+            Self::ReadOnly => write!(
+                formatter,
+                "sessionlog: this session is open read-only (another window is recording it, or -read-only was given), so changes to it are not saved"
+            ),
             Self::Degraded(reason) => write!(formatter, "sessionlog: recording stopped: {reason}"),
             Self::Closed => write!(formatter, "sessionlog: writer is closed"),
         }
@@ -926,10 +933,16 @@ impl Store {
         }
         candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         // Only the winner is parsed in full. A newest file whose body is
-        // unreadable falls through to the next one, as `list` would skip it.
-        Ok(candidates
-            .into_iter()
-            .find_map(|(_, _, path)| self.describe(&path, false).ok()))
+        // unreadable falls through to the next one, as `list` would skip it,
+        // and so does one with nothing in it: a session is created when chat
+        // opens and discarded on a clean exit if nobody spoke, but a closed
+        // terminal or a crash leaves it behind, and continuing that would
+        // hide the conversation the user meant.
+        Ok(candidates.into_iter().find_map(|(_, _, path)| {
+            self.describe(&path, false)
+                .ok()
+                .filter(|info| info.messages > 0 || info.cleared > 0 || !info.name.is_empty())
+        }))
     }
 
     /// Resolves an explicit path, exact ID, or unambiguous ID prefix.
@@ -938,9 +951,16 @@ impl Store {
             return Err(SessionError::NotFound(reference.to_owned()));
         }
         if reference.ends_with(".jsonl") || reference.contains(['/', '\\']) {
-            return self
-                .describe(&absolute_path(Path::new(reference)), false)
-                .map_err(|_| SessionError::NotFound(reference.to_owned()));
+            let path = absolute_path(Path::new(reference));
+            // A file that is there but is not a session says why, instead
+            // of claiming nothing matched.
+            return self.describe(&path, false).map_err(|error| {
+                if path.is_file() {
+                    error
+                } else {
+                    SessionError::NotFound(reference.to_owned())
+                }
+            });
         }
 
         let cwd = absolute_path(cwd.as_ref());
@@ -1163,8 +1183,13 @@ impl SessionInfo {
     }
 
     pub fn short_id(&self) -> &str {
-        truncate_utf8(&self.id, SHORT_ID_LENGTH)
+        short_id(&self.id)
     }
+}
+
+/// The readable prefix a session id is shown and typed by.
+pub fn short_id(id: &str) -> &str {
+    truncate_utf8(id, SHORT_ID_LENGTH)
 }
 
 /// Returns unique, readable ID prefixes for a list of sessions. Ids written
@@ -1960,11 +1985,25 @@ fn create_private_dir(directory: &Path) -> io::Result<()> {
 /// Writes a file that only its owner can read. Transcripts carry the same
 /// content as the 0600 session log, so an export must not widen that.
 pub fn write_private(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
+    let path = path.as_ref();
+    // The path is part of the message: "No such file or directory" alone
+    // does not say which of the export's directories is missing.
+    let in_context =
+        |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     options.mode(0o600);
-    options.open(path)?.write_all(contents)
+    let mut file = options.open(path).map_err(in_context)?;
+    // The mode above only applies to a new file; one being overwritten
+    // keeps whatever it had, which may be world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(in_context)?;
+    }
+    file.write_all(contents).map_err(in_context)
 }
 
 /// The `.jsonl` files directly inside one shard directory.
@@ -2251,7 +2290,7 @@ mod tests {
         let store = Store::new(root.join("sessions"));
 
         let mut first = store
-            .create_with_id(&workspace, None, "a1234567-first")
+            .create_with_id(&workspace, None, "a1234567-0001-first")
             .expect("create first");
         first
             .append(assistant("first answer"))
@@ -2259,7 +2298,7 @@ mod tests {
         first.close().expect("close first");
 
         let mut second = store
-            .create_with_id(&workspace, None, "a1234567-second")
+            .create_with_id(&workspace, None, "a1234567-0001-second")
             .expect("create second");
         second
             .append(assistant("second answer"))
@@ -2283,15 +2322,15 @@ mod tests {
         );
         let ids = short_ids(&sessions);
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&"a1234567-fir".to_owned()));
-        assert!(ids.contains(&"a1234567-sec".to_owned()));
+        assert!(ids.contains(&"a1234567-0001-fir".to_owned()));
+        assert!(ids.contains(&"a1234567-0001-sec".to_owned()));
         assert!(matches!(
             store.resolve(&workspace, "a1234567"),
             Err(SessionError::Ambiguous(_))
         ));
 
         let resolved = store
-            .resolve(&workspace, "a1234567-first")
+            .resolve(&workspace, "a1234567-0001-first")
             .expect("resolve exact");
         let (mut reader, _) = store.open(&resolved.path).expect("open read only");
         assert!(reader.read_only());
@@ -2463,6 +2502,97 @@ mod tests {
     }
 
     #[test]
+    fn continue_skips_an_empty_session_left_by_a_killed_process() {
+        let root = temp_root("continue-empty");
+        let store = Store::new(root.join("sessions"));
+        let workspace = root.join("workspace");
+        let shard = store.directory(&workspace);
+        fs::create_dir_all(&shard).expect("make shard");
+        let header = |id: &str| {
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"cwd\":{}}}\n",
+                serde_json::json!(workspace.to_string_lossy())
+            )
+        };
+        let message = "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"message\":{\"role\":\"user\",\"content\":\"hello\",\"timestamp\":1}}\n";
+        let write = |name: &str, body: String| {
+            let path = shard.join(name);
+            fs::write(&path, body).expect("write fixture");
+            // mtimes decide the order; keep them strictly increasing.
+            thread::sleep(Duration::from_millis(20));
+            path
+        };
+        write("a.jsonl", header("talked") + message);
+        // Newer, but the process that opened it died before anyone spoke.
+        write(
+            "b.jsonl",
+            header("empty")
+                + "{\"type\":\"thinking_level_change\",\"id\":\"t1\",\"parentId\":null,\"thinkingLevel\":\"off\"}\n",
+        );
+        let recent = || {
+            store
+                .most_recent(&workspace)
+                .expect("most recent")
+                .map(|info| info.id)
+        };
+        assert_eq!(recent().as_deref(), Some("talked"));
+
+        // A named session is the user's own, even before its first message.
+        write(
+            "c.jsonl",
+            header("named")
+                + "{\"type\":\"session_info\",\"id\":\"n1\",\"parentId\":null,\"name\":\"plan\"}\n",
+        );
+        assert_eq!(recent().as_deref(), Some("named"));
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn resolving_a_file_that_is_not_a_session_says_why() {
+        let root = temp_root("resolve-not-session");
+        fs::create_dir_all(&root).expect("make root");
+        let store = Store::new(root.join("sessions"));
+        let page = root.join("page.html");
+        fs::write(&page, "<html></html>").expect("write page");
+        let error = store
+            .resolve(&root, page.to_str().expect("utf-8 path"))
+            .expect_err("not a session");
+        assert!(
+            !matches!(error, SessionError::NotFound(_)),
+            "an existing file is not 'no matching session': {error}"
+        );
+        assert!(matches!(
+            store.resolve(&root, root.join("missing.jsonl").to_str().expect("utf-8")),
+            Err(SessionError::NotFound(_))
+        ));
+        fs::remove_dir_all(root).expect("clean test root");
+    }
+
+    #[test]
+    fn short_ids_tell_sessions_from_the_same_minute_apart() {
+        let info = |id: &str| SessionInfo {
+            id: id.to_owned(),
+            path: PathBuf::new(),
+            cwd: String::new(),
+            name: String::new(),
+            first_message: String::new(),
+            created: None,
+            modified: SystemTime::UNIX_EPOCH,
+            messages: 0,
+            cleared: 0,
+            size: 0,
+            search_text: String::new(),
+            locked: false,
+            owner: LockOwner::default(),
+        };
+        // Two UUIDv7 ids created 40 seconds apart.
+        let first = info("01a11c3d-1524-7fe2-9d29-7df2138c9194");
+        let second = info("01a11c3d-ba44-7130-bf9b-c264f37f52ea");
+        assert_ne!(first.short_id(), second.short_id());
+        assert_eq!(first.short_id(), "01a11c3d-1524");
+    }
+
+    #[test]
     fn headers_without_cwd_or_timestamp_are_still_discoverable() {
         let root = temp_root("bare-header");
         let store = Store::new(root.join("sessions"));
@@ -2624,7 +2754,7 @@ mod tests {
             owner: LockOwner::default(),
         };
         let sessions = [info("会話セッション一"), info("会話セッション二")];
-        assert_eq!(sessions[0].short_id(), "会話");
+        assert_eq!(sessions[0].short_id(), "会話セッ");
         assert_eq!(
             short_ids(&sessions),
             ["会話セッション一", "会話セッション二"]
@@ -2682,6 +2812,28 @@ mod tests {
         );
         write_private(&path, b"replaced").expect("overwrite");
         assert_eq!(fs::read(&path).expect("read"), b"replaced");
+
+        // Overwriting a file the user made world-readable still leaves the
+        // transcript owner-only.
+        let shared = root.join("notes.md");
+        fs::write(&shared, b"old").expect("write shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_private(&shared, b"transcript").expect("overwrite shared");
+        assert_eq!(
+            fs::metadata(&shared)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let missing = root.join("no-such-dir").join("x.md");
+        let error = write_private(&missing, b"x").expect_err("missing directory");
+        assert!(
+            error.to_string().contains("no-such-dir"),
+            "the error names the path: {error}"
+        );
         fs::remove_dir_all(root).expect("clean test root");
     }
 

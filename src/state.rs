@@ -4,9 +4,13 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Width, tools expanded, thinking hidden: what the transcript rows depend on.
 pub type TranscriptLayout = (u16, bool, bool);
+
+/// How long the second Ctrl-C of an unsaved session has to arrive.
+const QUIT_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
 /// A paste longer than this is summarized in the transcript.
 pub const LARGE_PASTE_LINES: usize = 20;
@@ -433,7 +437,7 @@ impl App {
                     self.status = "Aborting".to_owned();
                     Action::Abort
                 } else if !self.input.is_empty() {
-                    self.clear_input();
+                    self.discard_draft();
                     Action::None
                 } else {
                     Action::None
@@ -558,14 +562,29 @@ impl App {
                 self.delete_at_cursor();
                 Action::None
             }
+            // pi's editor: the kill keys work on the cursor's line, and at
+            // the line's edge they remove the line break instead, so a
+            // multi-line draft never loses the lines it is not on.
             (KeyCode::Char('k'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.truncate(self.cursor);
+                let end = line_end(&self.input, self.cursor);
+                let end = if end == self.cursor && end < self.input.len() {
+                    end + 1
+                } else {
+                    end
+                };
+                self.input.drain(self.cursor..end);
                 self.selected_suggestion = 0;
                 Action::None
             }
             (KeyCode::Char('u'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.drain(..self.cursor);
-                self.cursor = 0;
+                let start = line_start(&self.input, self.cursor);
+                let start = if start == self.cursor && start > 0 {
+                    start - 1
+                } else {
+                    start
+                };
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
                 self.selected_suggestion = 0;
                 Action::None
             }
@@ -618,7 +637,7 @@ impl App {
 
     fn handle_ctrl_c(&mut self) -> Action {
         if !self.input.is_empty() {
-            self.clear_input();
+            self.discard_draft();
             return Action::None;
         }
         if self.streaming {
@@ -630,7 +649,7 @@ impl App {
         }
         if self
             .quit_armed_at
-            .is_some_and(|armed_at| armed_at.elapsed() < Duration::from_secs(3))
+            .is_some_and(|armed_at| armed_at.elapsed() < QUIT_CONFIRM_WINDOW)
         {
             return Action::Quit;
         }
@@ -704,6 +723,36 @@ impl App {
         self.selected_suggestion = 0;
     }
 
+    /// Clears a draft the user threw away with Esc or Ctrl-C, keeping it in
+    /// the history so Up brings back a long message cleared by reflex. A
+    /// composer question never comes here: its answer may be a secret.
+    fn discard_draft(&mut self) {
+        let draft = self.input.trim();
+        if self.history_index.is_none()
+            && !draft.is_empty()
+            && self.history.last().map(String::as_str) != Some(draft)
+        {
+            self.history.push(draft.to_owned());
+        }
+        self.history_index = None;
+        self.draft.clear();
+        self.clear_input();
+    }
+
+    /// Ends a lapsed "press Ctrl+C again" window, so its prompt does not
+    /// stay on screen promising an exit the next press would not perform.
+    /// Returns whether one ended.
+    pub fn expire_quit_arm(&mut self) -> bool {
+        if self
+            .quit_armed_at
+            .is_some_and(|armed_at| armed_at.elapsed() >= QUIT_CONFIRM_WINDOW)
+        {
+            self.clear_quit_arm();
+            return true;
+        }
+        false
+    }
+
     fn clear_quit_arm(&mut self) {
         self.quit_armed_at = None;
         if self.status.starts_with("Press Ctrl+C again") {
@@ -717,21 +766,15 @@ impl App {
         self.selected_suggestion = 0;
     }
 
+    // The cursor moves and deletes by grapheme cluster, as pi's editor does:
+    // a character-sized step could stop inside "👍🏽" or "é" (e + U+0301),
+    // where typing splits the cluster and Backspace strands half of it.
     fn move_left(&mut self) {
-        if let Some((index, _)) = self.input[..self.cursor].char_indices().next_back() {
-            self.cursor = index;
-        }
+        self.cursor = previous_grapheme(&self.input, self.cursor);
     }
 
     fn move_right(&mut self) {
-        if self.cursor < self.input.len() {
-            let width = self.input[self.cursor..]
-                .chars()
-                .next()
-                .expect("cursor always stays at a character boundary")
-                .len_utf8();
-            self.cursor += width;
-        }
+        self.cursor = next_grapheme(&self.input, self.cursor);
     }
 
     fn move_word(&mut self, direction: i8) {
@@ -777,7 +820,7 @@ impl App {
             return false;
         }
         let start = line_start(&self.input, self.cursor);
-        let column = self.input[start..self.cursor].chars().count();
+        let column = self.input[start..self.cursor].graphemes(true).count();
         if direction < 0 {
             if start == 0 {
                 return false;
@@ -827,11 +870,7 @@ impl App {
         if self.cursor == 0 {
             return;
         }
-        let previous = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .expect("cursor always stays at a character boundary");
+        let previous = previous_grapheme(&self.input, self.cursor);
         self.input.drain(previous..self.cursor);
         self.cursor = previous;
         self.selected_suggestion = 0;
@@ -841,12 +880,7 @@ impl App {
         if self.cursor >= self.input.len() {
             return;
         }
-        let next = self.cursor
-            + self.input[self.cursor..]
-                .chars()
-                .next()
-                .expect("cursor always stays at a character boundary")
-                .len_utf8();
+        let next = next_grapheme(&self.input, self.cursor);
         self.input.drain(self.cursor..next);
         self.selected_suggestion = 0;
     }
@@ -929,15 +963,31 @@ fn line_end(input: &str, cursor: usize) -> usize {
 
 fn byte_at_character(input: &str, start: usize, character_offset: usize) -> usize {
     input[start..]
-        .char_indices()
+        .grapheme_indices(true)
         .nth(character_offset)
         .map_or(input.len(), |(index, _)| start + index)
+}
+
+/// The start of the grapheme cluster before `cursor`.
+fn previous_grapheme(input: &str, cursor: usize) -> usize {
+    input[..cursor]
+        .grapheme_indices(true)
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+/// The end of the grapheme cluster at `cursor`.
+fn next_grapheme(input: &str, cursor: usize) -> usize {
+    input[cursor..]
+        .graphemes(true)
+        .next()
+        .map_or(input.len(), |grapheme| cursor + grapheme.len())
 }
 
 /// The commands whose argument the runtime completes, and the argument typed
 /// so far. `None` for everything else, including the bare command.
 pub fn dynamic_palette_argument(input: &str) -> Option<&str> {
-    ["/model ", "/thinking ", "/login "]
+    ["/model ", "/thinking ", "/login ", "/resume "]
         .into_iter()
         .find_map(|prefix| input.strip_prefix(prefix))
         .map(str::trim)
@@ -1137,6 +1187,94 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn a_cleared_draft_comes_back_with_up() {
+        let mut app = App::new();
+        app.record_submission("sent earlier");
+        app.set_input("a long draft\nover two lines");
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.input.is_empty());
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "a long draft\nover two lines");
+
+        // Clearing a recalled entry neither duplicates it nor leaves the
+        // history cursor behind, so Up starts from the newest entry again.
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.history,
+            ["sent earlier", "a long draft\nover two lines"]
+        );
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "a long draft\nover two lines");
+
+        // A composer question's answer is never remembered.
+        let mut app = App::new();
+        app.prompt = Some(ComposerPrompt::text("API key", true));
+        app.set_input("sk-secret");
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::CancelPrompt);
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn a_lapsed_quit_confirmation_leaves_the_status_bar() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.status.starts_with("Press Ctrl+C again"));
+        assert!(!app.expire_quit_arm(), "still inside the window");
+        app.quit_armed_at = Some(Instant::now() - QUIT_CONFIRM_WINDOW);
+        assert!(app.expire_quit_arm());
+        assert_eq!(app.status, "Ready");
+        assert!(app.quit_armed_at.is_none());
+    }
+
+    #[test]
+    fn the_cursor_never_stops_inside_a_grapheme() {
+        let mut app = App::new();
+        app.set_input("a👍🏽b e\u{301}");
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "a👍🏽b ", "the accent goes with its letter");
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(app.input, "aX👍🏽b ", "typing never splits the emoji");
+        app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.input, "aXb ", "the whole emoji is deleted");
+
+        // Up and Down keep the column in clusters, not code points.
+        app.set_input("👍🏽x\nabc");
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Char('Y')));
+        assert_eq!(app.input, "👍🏽xY\nabc");
+    }
+
+    #[test]
+    fn kill_keys_stay_on_the_cursor_line() {
+        let ctrl = |character| KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        let mut app = App::new();
+        app.set_input("first\nsecond line\nthird");
+        app.cursor = "first\nsecond".len();
+        app.handle_key(ctrl('k'));
+        assert_eq!(app.input, "first\nsecond\nthird");
+        // At the end of a line Ctrl-K joins the next one, as in pi.
+        app.handle_key(ctrl('k'));
+        assert_eq!(app.input, "first\nsecondthird");
+        assert_eq!(app.cursor, "first\nsecond".len());
+
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.input, "first\nthird");
+        assert_eq!(app.cursor, "first\n".len());
+        // At the start of a line Ctrl-U joins the previous one.
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.input, "firstthird");
+        assert_eq!(app.cursor, "first".len());
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.input, "third");
+        assert_eq!(app.cursor, 0);
+        app.handle_key(ctrl('u'));
+        assert_eq!(app.input, "third");
     }
 
     #[test]

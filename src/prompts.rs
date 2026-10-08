@@ -179,7 +179,8 @@ pub fn restore_at(
     archive_path: &Path,
     options: &RestoreOptions,
 ) -> Result<(ArchiveRead, Vec<RestoreOutcome>), Box<dyn Error>> {
-    let mut file = File::open(archive_path)?;
+    let mut file = File::open(archive_path)
+        .map_err(|error| command_error(format!("{}: {error}", archive_path.display())))?;
     let archive = resources::read_archive(&mut file)?;
     if archive.prompts.is_empty() {
         return Err(command_error("this archive holds no prompts"));

@@ -452,17 +452,29 @@ impl ShareOutcome {
 
 /// The text shown before anything leaves the machine.
 pub fn share_warning(info: &SessionInfo) -> String {
+    let title = if info.title() == info.id {
+        info.short_id()
+    } else {
+        info.title()
+    };
     format!(
-        "Sharing uploads the whole transcript of {} ({} messages, everything the agent read included) as a secret GitHub gist under your `gh` account. Secret gists are unlisted, not private: anyone with the link can read them.",
-        info.title(),
+        "Sharing uploads the whole transcript of {title} ({} messages, everything the agent read included) as a secret GitHub gist under your `gh` account. Secret gists are unlisted, not private: anyone with the link can read them.",
         info.messages
     )
+}
+
+/// Why a session cannot be shared before `gh` is even asked, if it cannot.
+pub fn share_refusal(info: &SessionInfo) -> Option<&'static str> {
+    (info.messages == 0).then_some("Nothing to share yet: this conversation has no messages.")
 }
 
 /// Uploads the session's HTML export as a secret gist through the GitHub
 /// CLI, the way pi's `/share` does. The caller has already confirmed the
 /// upload with the user.
 pub fn share_session(store: &Store, info: &SessionInfo) -> Result<ShareOutcome, Box<dyn Error>> {
+    if let Some(refusal) = share_refusal(info) {
+        return Err(refusal.into());
+    }
     let status = Command::new("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())
@@ -714,11 +726,7 @@ fn format_time(value: SystemTime, seconds: bool) -> String {
 }
 
 fn short_id(id: &str) -> &str {
-    let mut end = id.len().min(8);
-    while end > 0 && !id.is_char_boundary(end) {
-        end -= 1;
-    }
-    &id[..end]
+    sessionlog::short_id(id)
 }
 
 fn one_line(value: &str, limit: usize) -> String {
@@ -761,6 +769,35 @@ fn human_bytes(size: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_session_is_not_offered_for_sharing() {
+        let mut info = SessionInfo {
+            id: "01a11c54-4a5d-7490-99dc-ac9661669796".to_owned(),
+            path: PathBuf::new(),
+            cwd: String::new(),
+            name: String::new(),
+            first_message: String::new(),
+            created: None,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            messages: 0,
+            cleared: 0,
+            size: 0,
+            search_text: String::new(),
+            locked: false,
+            owner: Default::default(),
+        };
+        assert!(share_refusal(&info).is_some());
+        let store = Store::new(std::env::temp_dir().join("goshcoder-share-refusal"));
+        assert!(
+            share_session(&store, &info).is_err(),
+            "refused before gh runs"
+        );
+        info.messages = 2;
+        assert!(share_refusal(&info).is_none());
+        // An untitled session is named by its short id, not the whole UUID.
+        assert!(share_warning(&info).contains("of 01a11c54-4a5d ("));
+    }
     use crate::sessionlog::{Entry, TYPE_MESSAGE};
     use std::path::PathBuf;
 

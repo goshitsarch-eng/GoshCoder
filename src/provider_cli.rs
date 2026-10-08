@@ -509,6 +509,9 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
             "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE_NAME)"
                 .to_owned()
         }
+        // Gateways are set up, not merely given a key.
+        "aperture" => "run: goshcoder aperture onboarding".to_owned(),
+        "omni" => "run: goshcoder omni setup, or set OMNIROUTE_URL".to_owned(),
         _ => format!("run: goshcoder auth set {}", provider.id),
     }
 }

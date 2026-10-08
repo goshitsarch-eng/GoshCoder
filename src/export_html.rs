@@ -10,8 +10,6 @@
 //! `https`, and `mailto` links become clickable, so a transcript that quotes
 //! hostile content stays inert when opened in a browser.
 
-use std::collections::HashMap;
-
 use serde_json::Value;
 
 use crate::{
@@ -34,14 +32,21 @@ pub struct Meta {
 pub fn render_document(meta: &Meta, tree: &Tree) -> String {
     let entries = tree.context_path(None);
     let messages = decode_messages(&entries);
-    let results = collect_tool_results(&messages);
+    let pairing = llm::ToolPairing::new(messages.iter().map(|item| match item {
+        Item::Message(message) => Some(message),
+        Item::Compaction { .. } => None,
+    }));
+    let result_at = |index: usize| match &messages[index] {
+        Item::Message(llm::Message::ToolResult(result)) => Some(result.as_ref()),
+        _ => None,
+    };
     let mut body = String::new();
     let mut usage_input = 0u64;
     let mut usage_output = 0u64;
     let mut cost = 0.0f64;
     let mut message_count = 0usize;
 
-    for item in &messages {
+    for (index, item) in messages.iter().enumerate() {
         match item {
             Item::Compaction {
                 tokens_before,
@@ -80,7 +85,7 @@ pub fn render_document(meta: &Meta, tree: &Tree) -> String {
                 }
                 body.push_str(&timestamp_html(message.timestamp));
                 body.push_str("</div><div class=\"body\">");
-                for block in &message.content {
+                for (block_index, block) in message.content.iter().enumerate() {
                     match block {
                         ContentBlock::Text(text) => body.push_str(&markdown_to_html(&text.text)),
                         ContentBlock::Thinking(thinking) => {
@@ -94,7 +99,10 @@ pub fn render_document(meta: &Meta, tree: &Tree) -> String {
                         }
                         ContentBlock::Image(image) => body.push_str(&image_html(image)),
                         ContentBlock::ToolCall(call) => {
-                            body.push_str(&tool_call_html(call, results.get(&call.id).copied()));
+                            body.push_str(&tool_call_html(
+                                call,
+                                pairing.result_for(index, block_index).and_then(result_at),
+                            ));
                         }
                     }
                 }
@@ -109,9 +117,7 @@ pub fn render_document(meta: &Meta, tree: &Tree) -> String {
                 body.push_str("</div></section>\n");
             }
             Item::Message(llm::Message::ToolResult(result)) => {
-                if !results.contains_key(&result.tool_call_id)
-                    || results_orphaned(&messages, result)
-                {
+                if !pairing.is_answer(index) {
                     body.push_str(&tool_result_html(result, None));
                 }
             }
@@ -189,30 +195,6 @@ fn decode_messages(entries: &[&sessionlog::Entry]) -> Vec<Item> {
         }
     }
     items
-}
-
-/// Tool results keyed by call id, so each result renders inside its call.
-fn collect_tool_results(items: &[Item]) -> HashMap<String, &llm::ToolResultMessage> {
-    let mut results = HashMap::new();
-    for item in items {
-        if let Item::Message(llm::Message::ToolResult(result)) = item {
-            results
-                .entry(result.tool_call_id.clone())
-                .or_insert(result.as_ref());
-        }
-    }
-    results
-}
-
-/// A result whose call is absent from the path (a truncated or hand-edited
-/// file) still deserves a place in the transcript.
-fn results_orphaned(items: &[Item], result: &llm::ToolResultMessage) -> bool {
-    !items.iter().any(|item| {
-        matches!(item, Item::Message(llm::Message::Assistant(message))
-        if message.content.iter().any(|block| {
-            matches!(block, ContentBlock::ToolCall(call) if call.id == result.tool_call_id)
-        }))
-    })
 }
 
 fn model_label(message: &llm::AssistantMessage) -> String {
@@ -1274,5 +1256,43 @@ mod tests {
         );
         assert!(html.contains("[attachment omitted: text/html]"));
         assert!(!html.contains("onload"));
+    }
+
+    #[test]
+    fn reused_call_ids_keep_each_result_with_its_own_call() {
+        let call = |command: &str| {
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                content: vec![ContentBlock::ToolCall(llm::ToolCall {
+                    id: "call_0".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: [("command".to_owned(), json!(command))]
+                        .into_iter()
+                        .collect(),
+                    ..llm::ToolCall::default()
+                })],
+                ..llm::AssistantMessage::default()
+            }))
+        };
+        let result = |text: &str| {
+            llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: "call_0".to_owned(),
+                tool_name: "bash".to_owned(),
+                content: vec![ContentBlock::text(text)],
+                ..llm::ToolResultMessage::default()
+            }))
+        };
+        let tree = tree_with(&[
+            call("echo first"),
+            result("first output"),
+            call("echo second"),
+            result("second output"),
+        ]);
+        let html = render_document(&Meta::default(), &tree);
+        let first = html.find("command=echo first").expect("first call");
+        let second = html.find("command=echo second").expect("second call");
+        let first_output = html.find("first output").expect("first output");
+        let second_output = html.find("second output").expect("second output");
+        assert!(first < first_output && first_output < second && second < second_output);
+        assert_eq!(html.matches("<details class=\"tool").count(), 2);
     }
 }
