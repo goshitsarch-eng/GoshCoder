@@ -145,14 +145,18 @@ goshcoder grok-cli usage      # its weekly usage; `grok-cli accounts` for more l
 goshcoder auth login xai      # Grok subscription against api.x.ai
 goshcoder auth login meta     # Meta account; mints a Model API key
 goshcoder auth login meta-muse  # Muse Code subscription; then meta-muse/muse-spark-1.3
+goshcoder auth login openrouter # mints an OpenRouter key: hundreds of models, one login
 
 # The same providers by API key, for a developer account
 goshcoder auth set xai        # then select xai/grok-4.6 or grok-build-0.1
 goshcoder auth set meta       # then select meta/muse-spark-1.2
+goshcoder auth set anthropic  # an Anthropic API key instead of Claude Pro/Max
 ```
 
-Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
-providers are added to `auth.json` independently, so signing in to one does not
+Inside chat, `/login` opens a provider picker. A provider that has both a
+subscription login and an API key gets a row for each; `/login <provider> key`
+asks for the key directly. OAuth subscriptions and API-key providers are added
+to `auth.json` independently, so signing in to one does not
 remove existing logins. A session that has no model yet switches to the new
 provider's default model as soon as the login finishes; otherwise use `/model`
 to search models across every authenticated provider.
@@ -622,10 +626,18 @@ Documented at the top of each ported file. The notable ones:
 - **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
-  Code, xAI, Grok CLI, Meta, and Meta Muse Code. Every one of them except the
+  Code, xAI, Grok CLI, Meta, Meta Muse Code, and OpenRouter. Every one of them except the
   pure subscriptions (OpenAI Codex, Grok CLI and Meta Muse Code, whose API-key
   counterparts are `openai`, `xai` and `meta`) also accepts an API key, so a
   developer account never has to go through a subscription login.
+  - **Browser sign-in** answers the browser only after the code exchange, as
+    pi's callback server does, so the page reports a rejected code instead of
+    claiming success; a provider redirect carrying `error=` ends the login
+    with its reason. Anthropic falls back to a free loopback port when 53692
+    is taken, and offers pi's copy-code login for a machine whose browser
+    cannot reach this one.
+  - **OpenRouter** uses pi's PKCE flow, which mints a permanent API key
+    through a state-less callback on an ephemeral port with a random path.
   - **xAI (Grok)** uses xAI's own OIDC server at `auth.x.ai`: PKCE S256 over a
     loopback callback, or RFC 8628 device code for a headless session, against
     the public desktop client. Discovered endpoints are pinned to the issuer's
