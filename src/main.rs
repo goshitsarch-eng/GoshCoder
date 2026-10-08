@@ -326,17 +326,13 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
     )?;
-    let prepared = runtime::prepare_session(
-        catalog.as_ref(),
-        invocation.config,
-        Some(responder),
-        Vec::new(),
-    )?;
+    let mut config = invocation.config;
+    config.live_notices = !quiet;
+    let prepared = runtime::prepare_session(catalog.as_ref(), config, Some(responder), Vec::new())?;
 
+    // Notices were printed as they arrived (`live_notices`); only clear them.
+    let _ = runtime::drain_session_notices(&prepared.runtime);
     if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
-        }
         if let Some(banner) = runtime::session_banner(&prepared.runtime) {
             eprintln!("{}", dim(&banner, color_enabled()));
         }
@@ -365,11 +361,8 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some(&prepared.runtime.notice_sender()),
     )?;
     prepared.runtime.sync()?;
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color));
-        }
-    }
+    // Notices were printed as they arrived (`live_notices`); only clear them.
+    let _ = runtime::drain_session_notices(&prepared.runtime);
     // pi's print mode exits 1 when the final turn failed or was aborted, so
     // scripts can tell a provider error from an answer.
     let failed = agent

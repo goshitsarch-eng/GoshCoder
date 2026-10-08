@@ -5724,6 +5724,11 @@ fn consume_openai_completions(
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
+            // pi ends the open block whenever another kind of delta starts,
+            // so reasoning that precedes the answer is closed before it.
+            if let Some(index) = thinking_index.take() {
+                emitter.end_thinking(index)?;
+            }
             let index = match text_index {
                 Some(index) => index,
                 None => {
@@ -5744,6 +5749,9 @@ fn consume_openai_completions(
                     .map(|value| (*field, value))
             });
         if let Some((source, delta)) = reasoning {
+            if let Some(index) = text_index.take() {
+                emitter.end_text(index)?;
+            }
             let index = match thinking_index {
                 Some(index) => index,
                 None => {
@@ -5776,6 +5784,12 @@ fn consume_openai_completions(
                 .unwrap_or_default();
             let id = value_string(call, "id").unwrap_or_default();
             if let Entry::Vacant(entry) = tool_calls.entry(key) {
+                if let Some(index) = text_index.take() {
+                    emitter.end_text(index)?;
+                }
+                if let Some(index) = thinking_index.take() {
+                    emitter.end_thinking(index)?;
+                }
                 let content_index = emitter.start_tool(id, name)?;
                 entry.insert(OpenAiToolState {
                     content_index,

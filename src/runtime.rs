@@ -67,6 +67,9 @@ pub struct SessionConfig {
     /// provider is authenticated yet, so the user can log in and pick a model
     /// from inside the interface instead of being refused at startup.
     pub allow_unselected_model: bool,
+    /// Prints session notices to stderr as they happen. `run` has no screen
+    /// to queue them on, and a retry's backoff otherwise passes in silence.
+    pub live_notices: bool,
 }
 
 impl Default for SessionConfig {
@@ -93,6 +96,7 @@ impl Default for SessionConfig {
             sessions_dir: None,
             model_from_flag: false,
             allow_unselected_model: false,
+            live_notices: false,
         }
     }
 }
@@ -599,7 +603,11 @@ pub fn session_options(
         steering_mode: agent::QueueMode::OneAtATime,
         follow_up_mode: agent::QueueMode::OneAtATime,
         tool_execution: agent::ToolExecutionMode::Parallel,
-        on_notice: None,
+        on_notice: config.live_notices.then(|| {
+            Arc::new(|notice: crate::session::SessionNotice| {
+                eprintln!("{}: {}", notice.kind, notice.text);
+            }) as crate::session::SessionNoticeCallback
+        }),
     })
 }
 
