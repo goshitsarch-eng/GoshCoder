@@ -10,6 +10,18 @@ Its interactive interface is built with
 practice. [`NOTICE`](NOTICE) credits every project adapted here, and
 [`LICENSE`](LICENSE) covers GoshCoder itself.
 
+## Handbook
+
+The full user manual, architecture guide and audit report is
+[`docs/handbook/index.html`](docs/handbook/index.html). It is one
+self-contained page: open the file in any browser (double-click it, or
+`xdg-open docs/handbook/index.html`, `open …` on macOS, `start …` on Windows).
+It needs no server, network connection or build step. It has search, filters,
+light and dark themes, and screenshots of the running program. It also lists
+the defects found when version 0.6.0 (revision `3870a05`) was audited on
+2026-10-08, with evidence and what was and was not verified. This README is
+the short version.
+
 ## Relationship to pi
 
 GoshCoder is a **fork in substance**. It is not a git fork — the two share no
@@ -57,12 +69,21 @@ curl -fsSL https://raw.githubusercontent.com/goshitsarch-eng/goshcoder/main/inst
 irm https://raw.githubusercontent.com/goshitsarch-eng/goshcoder/main/install.ps1 | iex
 ```
 
-Both installers download the release for your platform, verify its SHA-256
-against the published checksums file, and refuse to install anything that does
-not match. When no release is published they fall back to building from source.
-Re-running upgrades in place. Useful flags: `--dir <path>` to choose the install
-location, `--version <tag>` to pin a release, `--from-source` to always compile,
-`--no-modify-path` to leave your shell profile alone.
+Both installers download the release archive for your platform and its
+`checksums.txt`, check the SHA-256, and refuse an archive that does not match.
+Re-running upgrades in place.
+
+- `install.sh` flags: `--dir <path>`, `--version <tag>`, `--from-source`,
+  `--no-modify-path` (pass them after `sh -s --` when piping). The same can be
+  set with `GOSHCODER_INSTALL_DIR`, `GOSHCODER_VERSION` and
+  `GOSHCODER_FROM_SOURCE=1`. It installs without checking when neither
+  `sha256sum` nor `shasum` exists, and prints a warning.
+- `install.ps1` parameters: `-InstallDir`, `-Version`, `-FromSource`,
+  `-NoModifyPath`. They cannot be passed through `irm | iex`; set
+  `GOSHCODER_INSTALL_DIR` or `GOSHCODER_VERSION` first, or download the script.
+- If **any** download step fails, both installers build the current default
+  branch from source instead, even when a version was pinned. Watch for the
+  warning.
 
 **From a checkout**
 
@@ -71,17 +92,19 @@ for Cargo and rustup, while the installers build source releases with the same
 toolchain.
 
 ```sh
-make build      # stamped binary in bin/
-make install    # and onto your PATH
-make check      # the Rust gate: rustfmt, cargo check, Clippy, and tests
+make build      # release binary in bin/, stamped with `git describe`
+make install    # copied to $CARGO_INSTALL_ROOT/bin or ~/.cargo/bin
+make check      # rustfmt, cargo check, Clippy, tests, and cargo audit when installed
 ```
 
-`make help` lists every target. `make dist` builds the release archives for
+`make help` lists the targets. `make dist` builds the release archives for
 the host it runs on: on Linux it cross-compiles Linux amd64/arm64 and Windows
 amd64 with cargo-zigbuild (Windows on ARM runs that build under emulation); on
 macOS it builds both Mac architectures natively, since the Apple targets link
 the Security framework and need the macOS SDK. The release workflow runs both
-hosts and publishes one `checksums.txt` over every archive.
+hosts and publishes one `checksums.txt` over every archive. Besides
+cargo-zigbuild (`make tools`), a Linux `make dist` needs `zig`, `zip`,
+`python3` and the targets added with `rustup target add`.
 
 **First run**
 
@@ -106,11 +129,11 @@ goshcoder providers
 # List models for configured providers
 goshcoder models [provider]
 
-# One-shot prompt
-goshcoder run -m anthropic/claude-sonnet-5 "explain this repo"
+# One-shot prompt; `run` has no tools unless you pass -tools
+goshcoder run -m anthropic/claude-sonnet-5 -tools "explain this repo"
 
-# Fullscreen interactive session; the last selected model is remembered
-goshcoder -m openai/gpt-5.6-terra -tools
+# Fullscreen interactive session (tools are on by default in chat)
+goshcoder -m openai/gpt-5.6-terra
 
 # After the first launch, simply run
 goshcoder
@@ -121,7 +144,7 @@ goshcoder auth set anthropic
 # Come back to the last conversation in this workspace
 goshcoder chat -continue
 
-# Or pick one from a searchable list
+# Or pick one from a numbered list
 goshcoder chat -resume
 
 # Manage what has been saved
@@ -161,17 +184,17 @@ remove existing logins. A session that has no model yet switches to the new
 provider's default model as soon as the login finishes; otherwise use `/model`
 to search models across every authenticated provider.
 
-Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
+Session flags (`-fullscreen` affects interactive chat only). One or two leading
+dashes both work, and values can be given as `-flag=value`:
 
 | Flag | Meaning |
 | --- | --- |
 | `-m`, `-model` | Model as `provider/model`, or a bare id when unambiguous |
 | `-s`, `-system` | System prompt |
 | `-thinking` | `off`, `minimal`, `low`, `medium` (default, as in pi), `high`, `xhigh`, `max`; clamped to what the model supports |
-| `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
+| `-tools` | Enable built-in file, shell and web tools (default true in chat, false in `run`). `-tools=false` removes them, but it is not a guarantee of a read-only session: while the Planner is planning or executing for this repository it adds file tools, and in its executing phase `bash` (see the handbook's finding F-02) |
 | `-ralph` | Enable long-running Ralph loops (default in chat; use `-ralph=false` to disable) |
-| `-planner` | Start in native Planner review mode (`-plan` remains an alias) |
-| `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
+| `-planner` | Start in Planner planning mode, unless the repository's stored phase is already planning or executing (`-plan` remains an alias) |
 | `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
 | `-C` | Workspace directory for tools |
 | `-continue` | Reopen the most recent session for this workspace (one with a conversation in it) |
@@ -181,44 +204,54 @@ Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 | `-no-session` | Do not record this session |
 | `-read-only` | Open a session without claiming it |
 | `-sessions-dir` | Session storage root (default `~/.goshcoder/agent/sessions`) |
+| `-quiet` | Suppress session notices |
+
+`-claude-tui` is still accepted for compatibility but has no effect.
 
 `chat` records by default. `run` records only with `-continue`, `-session` or
 `-name`: it is the scripting entry point, and recording by default would turn
 every cron invocation into a permanent file.
 
 Credentials and config live in `~/.goshcoder/agent` (override with
-`GOSHCODER_AGENT_DIR`). The `auth.json` format matches pi's, so a directory can
-be pointed at either tool. Sessions live under `sessions/`, sharded by working
-directory with pi's exact encoding and written in pi's v3 JSONL format, so
-`-sessions-dir ~/.pi/agent/sessions` reads and writes the same files pi does.
+`GOSHCODER_AGENT_DIR`; the model you last chose with `/model` is kept in
+`default-model` there, and `GOSHCODER_MODEL` overrides it). The `auth.json`
+format matches pi's, so a directory can be pointed at either tool, though the
+two tools' credential lock files are not compatible, so do not run both against
+one directory at the same time. Sessions live under `sessions/`, sharded by
+working directory with pi's exact encoding and written in pi's v3 JSONL format,
+so `-sessions-dir ~/.pi/agent/sessions` reads and writes the same files pi does.
 
 ## Layout
 
-| Package | Contents |
+| Module | Contents |
 | --- | --- |
-| `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
-| `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation, usage |
-| `src/grok_imagine.rs` | Grok Imagine image generation, `/grok-cli-imagine`, and the `image_gen` tool |
-| `src/grok_accounts.rs` | Several Grok CLI accounts, per-session account choice, and exhaustion rotation |
-| `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
-| `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
-| `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
+| `src/main.rs` | CLI dispatch, fullscreen event loop, slash commands, line-mode chat, signal handling |
+| `src/{state,ui,markdown}.rs` | Editor and palette state, Ratatui rendering, Markdown and terminal sanitising |
+| `src/{tui_login,line_editor,session_picker}.rs` | `/login` inside the interface, line-mode editor, `-resume` picker |
+| `src/{runtime,config}.rs` | Flag parsing, model selection, session assembly; agent-directory paths |
+| `src/{agent,turns,compaction}.rs` | Agent loop and tool execution, retries and overflow handling, summaries |
+| `src/{llm,stream}.rs` | pi-compatible messages, streaming and SSE parsing, retry classification, thinking levels |
+| `src/{providers,bedrock,mistral,google_auth,omni_prompt_tools}.rs` | Wire protocols and request adapters (Bedrock SigV4, Vertex tokens, OmniRoute prompt-emulated tools) |
+| `src/{catalog,oauth,provider_cli}.rs` | Provider catalog, credential store and resolution, OAuth logins; `providers`, `models`, `auth` |
+| `src/tools.rs` | Built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) and workspace confinement |
 | `src/webaccess.rs` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
-| `src/meta_muse.rs` | Meta Muse Code subscription login, key mint, and live Muse Spark model list |
-| `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
-| `src/{aperture,aperture_mcp}.rs` | Tailscale Aperture core, routing, cache, and connector MCP client |
 | `src/computeruse.rs` | computer-use-linux discovery, mcp.json upkeep, stdio MCP client, and `mcp` tool |
-| `src/btw.rs` | Ephemeral context-aware side threads and settings |
-| `src/{ralph,ralph_runtime,ralph_cli}.rs` | Durable iterative development loops |
-| `src/{plannotator,planner_runtime}.rs` | Native Planner mode, browser approval, annotations, and checklist progress |
-| `src/{session,sessionlog,sessions}.rs` | pi-compatible v3 sessions, lifecycle, tree, and command adapter |
+| `src/{session,sessionlog,sessions,export_html}.rs` | pi-compatible v3 sessions, locks, tree, `sessions` command, HTML export |
 | `src/{resources,prompts}.rs` | Local context, skills, templates, and portable prompt archives |
-| `src/{state,ui,markdown}.rs` | Ratatui state, responsive rendering, composer, sidebar, and Markdown |
-| `src/main.rs` | CLI dispatch and interactive Ratatui runtime |
+| `src/{plannotator,planner_runtime}.rs` | Planner mode, browser review, tool gating, and checklist progress |
+| `src/{ralph,ralph_runtime,ralph_cli}.rs` | Durable iterative development loops |
+| `src/{btw,btw_runtime}.rs` | Ephemeral context-aware side threads and settings |
+| `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
+| `src/{aperture,aperture_cli,aperture_mcp,aperture_tools}.rs` | Tailscale Aperture routing, cache, wizard, connector MCP client and tools |
+| `src/{grok_cli,grok_accounts,grok_imagine}.rs` | Grok CLI provider, several accounts and rotation, Grok Imagine |
+| `src/meta_muse.rs` | Meta Muse Code subscription login, key mint, and live Muse Spark model list |
+| `data/*.json` | Generated model catalog, extra models, and overrides (compiled in) |
+| `docs/handbook/` | The HTML handbook and its screenshots |
 
 ## Provider coverage
 
-The built-in catalog covers all bundled models across nine wire protocols:
+The built-in catalog has 45 providers and 1,256 bundled models across nine
+wire protocols:
 `openai-completions`, `anthropic-messages`, `openai-responses`,
 `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`,
 `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`.
@@ -235,8 +268,17 @@ a price, or the reasoning-effort levels a model accepts. Tests fail once the
 regenerated data catches up with either, so neither file quietly outlives the
 gap it was written for.
 
-Bedrock is reached without the AWS SDK: SigV4 signing and the binary
-event-stream framing are implemented against stdlib crypto.
+Bedrock is reached without the AWS SDK: SigV4 signing (with the `hmac` and
+`sha2` crates) and the binary event-stream framing are implemented here. Only
+static credentials (environment, or a profile with keys in the shared files)
+and `AWS_BEARER_TOKEN_BEDROCK` are used; SSO, container and web-identity
+credentials make Bedrock *look* configured but requests fail.
+
+**Known broken:** the Cloudflare AI Gateway and Workers AI models (56) are
+listed, but their base URLs keep the literal `{CLOUDFLARE_ACCOUNT_ID}` /
+`{CLOUDFLARE_GATEWAY_ID}` placeholders, so every request fails. Several
+OpenAI-completions compat settings from pi's catalog are also not applied,
+among them Anthropic-style prompt caching for Claude models on OpenRouter.
 
 OpenAI Codex uses its supported uncompressed SSE transport. WebSocket session
 reuse and optional zstd request compression are intentionally omitted.
@@ -273,58 +315,70 @@ is recorded in [`NOTICE`](NOTICE).
   by Oscar Andrea / md-riaz — **OmniRoute** (native adaptation of the current
   `shared.ts` extension core): `/omni setup` validates a local or remote
   gateway, stores it, and imports `/v1/models`; `/omni sync` re-imports them
-  into GoshCoder's live `/model`/Ctrl+P picker; `/omni status` probes health
-  (10 s, two attempts, like the extension); `/omni models [search]` browses
-  the gateway's list grouped by vendor; `/omni test <model>` smoke-tests
+  into GoshCoder's live `/model`/Ctrl+P picker; `/omni status` probes health (10
+  s, two attempts, like the extension); `/omni models [search]` browses the
+  gateway's list grouped by vendor; `/omni test <model>` smoke-tests
   `/v1/chat/completions`; `/omni dashboard` and `/omni config` report the
   management URL and the effective settings. The routing aliases (`auto`,
   `auto/coding`, `auto/fast`, `auto/cheap`, `auto/offline`, `auto/smart`,
   `auto/lkgp`) always precede the synchronized models, whose context, output,
-  reasoning, and vision metadata are retained. Every model uses native
-  tool calling, as upstream does; setting `toolCalling: false` on a model in
+  reasoning, and vision metadata are retained. Every model uses native tool
+  calling, as upstream does; setting `toolCalling: false` on a model in
   `omniroute.json` opts it into the buffered `<tool_call>` prompt adapter
-  (package version 2.0.1), whose calls are converted back into normal agent
-  tool events. A configured gateway needs no key: requests then carry the
-  extension's `omniroute-public` placeholder. Config is in `omniroute.json`;
-  `OMNIROUTE_URL` overrides (or stands in for) it and the API key stays
-  independently in `auth.json` or `OMNIROUTE_API_KEY`. Not ported: the
-  `/omni log` connection log, `OMNIROUTE_PROVIDER_NAME` (the provider is
-  always `omni`), and the `omniroute_status`/`omniroute_sync` agent tools.
+  (package version 2.0.1), whose calls are converted back into normal agent tool
+  events. `/omni sync` and `/omni setup` rewrite the model list and drop that
+  setting, so re-apply it after each sync. `/omni setup` always prompts for the
+  URL; an argument is ignored. A configured gateway needs no key: requests then
+  carry the extension's `omniroute-public` placeholder. Config is in
+  `omniroute.json`; `OMNIROUTE_URL` overrides (or stands in for) it and the API
+  key stays independently in `auth.json` or `OMNIROUTE_API_KEY`. Not ported: the
+  `/omni log` connection log, `OMNIROUTE_PROVIDER_NAME` (the provider is always
+  `omni`), and the `omniroute_status`/`omniroute_sync` agent tools.
 - [`@narumitw/pi-btw`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw)
-  by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
-  context-aware side thread without adding the question or answer to the main
-  transcript. Answers appear as cards in the interface; `/btw` lists retained
-  threads, `/btw resume <id> <question>` continues one, `/btw settings` shows
-  or changes the independent model/thinking settings in `pi-btw.json`, and
-  `/btw bring <id> [latest|all|from:N]` puts a thread's exchange into the main
-  composer to edit and send. Esc cancels a side question in flight. GoshCoder
-  requires the main agent to be idle before opening BTW rather than running
-  both agents concurrently. Unlike the original, threads are saved with the
-  session (as `goshcoder.btw` custom entries, the newest 50) and come back with
-  `-continue` or `/resume`. The original's side panel, its exact character/line
-  range selector and nested bring-preview menus are not ported; the `latest`,
-  `all`, and `from:N` selections replace them.
+  by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw
+  <question>` opens a context-aware side thread without adding the question or
+  answer to the main transcript. Answers appear as cards in the interface;
+  `/btw` lists retained threads, `/btw resume <id> <question>` continues one,
+  `/btw settings` shows or changes the independent model/thinking settings in
+  `pi-btw.json`, and `/btw bring <id> [latest|all|from:N]` puts a thread's
+  exchange into the main composer to edit and send (in fullscreen; line mode
+  drops the text). Esc cancels a side question in flight. GoshCoder requires the
+  main agent to be idle before opening BTW rather than running both agents
+  concurrently. Unlike the original, threads are saved with the session (as
+  `goshcoder.btw` custom entries, the newest 50) and come back when the session
+  is reopened with `-continue`, `-resume` or `-session`. They are not reloaded
+  by an in-chat `/resume`, which keeps the current process's threads instead.
+  The original's side panel, its exact character/line range selector and nested
+  bring-preview menus are not ported; the `latest`, `all`, and `from:N`
+  selections replace them.
 - [`@tmustier/pi-ralph-wiggum`](https://github.com/tmustier/pi-extensions) by Thomas
   Mustier — **Ralph** (native adaptation): persistent iterative loops and
   completion tools.
   Ralph is enabled by default in chat; use `/ralph start <name> <task>` or ask
   the model to start a loop. Loop state is kept in the workspace-local
   `.ralph/` directory so loops written by pi-ralph-wiggum, and by earlier
-  GoshCoder builds, remain discoverable. `/ralph` opens loop controls in the command palette.
+  GoshCoder builds, remain discoverable. Typing `/ralph ` offers the
+  subcommands in the palette; bare `/ralph` shows this session's loop. `/ralph
+  stop` ends a loop by marking it completed, so it cannot be resumed afterwards.
+  Loops belong to the process that started them: after restarting chat, an
+  active loop is listed by `/ralph list` but is no longer this session's loop,
+  and `goshcoder ralph status` never shows one.
 - **Planner** (native adaptation of
   [`@plannotator/pi-extension`](https://github.com/backnotprop/plannotator) by
-  the Plannotator contributors): `/planner`,
-  browser plan approval/denial with line annotations, overall notes, direct
-  Markdown edits, resubmission change views, responsive navigation, light/dark
-  themes, planning write gates, persisted phase state, checklist progress,
-  `/planner-review`, `/planner-annotate`, and `/planner-last`. Use `-planner` to
-  begin in planning mode. PR URL review uses the optional GitHub CLI (`gh`);
-  local git review needs only `git`. Unlike the original, which keeps the
-  phase only in the session, the phase and checklist also live in a
-  per-workspace file under `~/.goshcoder/agent/planner/`, so `-no-session`
-  runs keep it and every window on one repository shares one plan mode
-  (another window's change is adopted before the next turn); the session
-  entry remains as the fallback for `-continue`.
+  the Plannotator contributors): `/planner`, browser plan approval/denial with
+  line annotations, overall notes, direct Markdown edits, resubmission change
+  views, responsive navigation, light/dark themes, planning write gates,
+  persisted phase state, checklist progress, `/planner-review`,
+  `/planner-annotate`, and `/planner-last`. Use `-planner` to begin in planning
+  mode. The planning gate removes `bash` and limits `write` and `edit` to
+  Markdown files; other tools (desktop control, Aperture connectors,
+  `image_gen`, Ralph) stay available. PR URL review uses the optional GitHub CLI
+  (`gh`); local git review needs only `git`. Unlike the original, which keeps
+  the phase only in the session, the phase and checklist also live in a
+  per-workspace file under `~/.goshcoder/agent/planner/`, so `-no-session` runs
+  keep it and every window on one repository shares one plan mode (another
+  window's change is adopted before the next turn); the session entry remains as
+  the fallback for `-continue`.
 - [`@aliou/pi-ts-aperture`](https://github.com/aliou/pi-ts-aperture) by Aliou
   Diallo — **Aperture (Tailscale)** (native adaptation of version 0.14.1):
   route LLM providers and connector tools through
@@ -397,26 +451,26 @@ is recorded in [`NOTICE`](NOTICE).
   `computer-use-linux doctor`.
 - [`pi-meta-muse-auth`](https://github.com/sadiksaifi/pi-meta-muse-auth) by
   Sadik Saifi — **Meta Muse Code** (native adaptation of version 0.1.2): a
-  `meta-muse` provider for a Muse Code subscription, beside the existing
-  `meta` provider rather than replacing it, so pi's `auth.json` entries for
-  both keep working. `goshcoder auth login meta-muse` (or `/login`, "sign in
-  with your Muse Code subscription") runs the auth.meta.com device flow,
-  accepting a verification page only on `https://auth.meta.com`, and then
-  mints a Model API key at `api.meta.ai/muse-code/key`. A key Meta does not
-  confirm as subscription-backed is refused rather than stored, so a login
-  can never fall back to pay-as-you-go billing; for the same reason the
-  provider takes no API key (`meta` is the API-key route). The key is
-  re-minted from the stored identity token every twelve hours, and the base
-  URL Meta returns with it is honoured only on `https://api.meta.ai`. Requests
-  use OpenAI Responses with the Muse client identity and a `system`-role
-  prompt. Five Muse Spark models (1.1 to 1.3, plus the Contributor variants)
-  are bundled; the live list from `/v1/models`, with Meta's names, limits and
-  reasoning levels, replaces them after login and is revalidated in the
-  background at session start, cached in `extensions/meta-muse-models.json`
-  so it loads offline. Not ported: pi's own models store (the sibling cache
-  file stands in for it) and the extension's npm packaging; a reported poll
-  interval under a second is treated as five seconds by the shared device
-  poller.
+  `meta-muse` provider for a Muse Code subscription, beside the existing `meta`
+  provider rather than replacing it, so pi's `auth.json` entries for both keep
+  working. `goshcoder auth login meta-muse` (or `/login`, "sign in with your
+  Muse Code subscription") runs the auth.meta.com device flow, accepting a
+  verification page only on `https://auth.meta.com`, and then mints a Model API
+  key at `api.meta.ai/muse-code/key`. A key Meta does not confirm as
+  subscription-backed is refused rather than stored, so a login can never fall
+  back to pay-as-you-go billing; for the same reason the provider takes no API
+  key (`meta` is the API-key route). The key is re-minted from the stored
+  identity token every twelve hours, and the base URL Meta returns with it is
+  honoured only on `https://api.meta.ai`. Requests use OpenAI Responses with the
+  Muse client identity and a `system`-role prompt. Five Muse Spark models (1.1
+  to 1.3, plus the Contributor variants) are bundled; the live list from
+  `/v1/models`, with Meta's names, limits and reasoning levels, replaces them
+  after `goshcoder auth login meta-muse` (an in-chat `/login meta-muse` takes
+  effect at the next session start) and is revalidated in the background at
+  session start, cached in `extensions/meta-muse-models.json` so it loads
+  offline. Not ported: pi's own models store (the sibling cache file stands in
+  for it) and the extension's npm packaging; a reported poll interval under a
+  second is treated as five seconds by the shared device poller.
 - [`pi-grok-cli`](https://github.com/kenryu42/pi-grok-cli) by J Liew
   (kenryu42) — **Grok CLI** (native adaptation of version 0.9.3): a separate
   `grok-cli` provider that puts an X Premium or SuperGrok subscription to
@@ -470,23 +524,22 @@ is recorded in [`NOTICE`](NOTICE).
     (0600, upstream's format; an entry older than 30 minutes counts as
     stale), and a failed refresh falls back to the cached figures.
   - **Accounts.** Several subscriptions can be kept side by side.
-    `/grok-cli-accounts` lists them with their cached quota;
-    `/grok-cli-accounts add [label]` and `login <n>` sign one in (the OAuth
-    flow takes over the terminal, as `/login` does), `use <n>` switches this
-    session and makes the account the default for new ones, and `rename`,
-    `logout` and `remove` do what they say. `goshcoder grok-cli accounts`
-    offers the same outside chat. Account 1 is the ordinary `grok-cli` login
-    in `auth.json`; the others, their labels and the default live in
-    `grok-cli/accounts.json` (0600, written under a lock file). A session's
-    choice is recorded as a `grok-cli-active-account-v1` entry, so resuming
-    or rewinding a session brings back the account it used, and requests are
-    sent with that account's token, refreshed when it is about to expire.
-    When the proxy answers that an account's Grok Build balance is
-    exhausted (HTTP 402), the session moves to the next logged-in account —
-    the one with the most weekly credit left by fresh cached figures, else
-    the next in the list — and the turn continues with upstream's
-    continuation message; a chain never returns to an account it used up,
-    and an exhausted account is skipped for five minutes.
+    `/grok-cli-accounts` lists them with their cached quota; `/grok-cli-accounts
+    add [label]` and `login <n>` sign one in (these two leave the fullscreen
+    interface while the OAuth flow runs), `use <n>` switches this session and
+    makes the account the default for new ones, and `rename`, `logout` and
+    `remove` do what they say. `goshcoder grok-cli accounts` offers the same
+    outside chat. Account 1 is the ordinary `grok-cli` login in `auth.json`; the
+    others, their labels and the default live in `grok-cli/accounts.json` (0600,
+    written under a lock file). A session's choice is recorded as a
+    `grok-cli-active-account-v1` entry, so resuming or rewinding a session
+    brings back the account it used, and requests are sent with that account's
+    token, refreshed when it is about to expire. When the proxy answers that an
+    account's Grok Build balance is exhausted (HTTP 402), the session moves to
+    the next logged-in account — the one with the most weekly credit left by
+    fresh cached figures, else the next in the list — and the turn continues
+    with upstream's continuation message; a chain never returns to an account it
+    used up, and an exhausted account is skipped for five minutes.
   - **Grok Imagine.** With a Grok CLI login, `/grok-cli-imagine <prompt>
     [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]` generates
     an image, or edits a PNG, JPEG or WebP of up to 400 KiB (typed by its
@@ -499,7 +552,9 @@ is recorded in [`NOTICE`](NOTICE).
     session, and recorded as `grok-cli-imagine` session entries. The
     `image_gen` tool gives the model the same ability; it is offered only
     while coding tools are on, a Grok CLI credential exists and the switch in
-    `grok-cli/config.json` (`/grok-cli-imagine:tool [on|off|status]`) is on.
+    `grok-cli/config.json` (`/grok-cli-imagine:tool [on|off|status]`, on by
+    default) is on. After an in-chat `/login grok-cli` the tool appears only
+    once chat is restarted or the switch is toggled.
     Its source image is read through the workspace confinement the other
     file tools use, where upstream accepts any path. The interface shows the
     saved path rather than drawing the image.
@@ -519,14 +574,15 @@ is recorded in [`NOTICE`](NOTICE).
   from the environment on every request, where upstream pins the one a login
   recorded; the recorded `baseUrl` is kept in the credential for reference.
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
-  — startup card, half-open rounded chat prompt, and an
-  OpenCode-inspired right sidebar with model, context usage, cost, messages,
-  tools, changed files, branch, and active mode. The panel refreshes
-  automatically after turns and state changes; `/status` can also print it on
-  demand. It is enabled by default in chat. In line mode, use
-  `/use-default-tui` or `-claude-tui=false` for the plain interface and
-  `/use-claude-code-tui` to switch back. The fullscreen layout is fixed for the
-  lifetime of the process.
+  — the right-hand sidebar of the fullscreen interface follows its
+  OpenCode-inspired design: session title, model, thinking level and mode,
+  whether the session is recorded, a context bar with tokens and cost, an
+  activity block (turns, tools, changed files, last tool), the Planner
+  checklist, and the workspace path. It refreshes after turns and state
+  changes and is shown at 96 columns and wider; `/status` prints a similar
+  summary. The extension's startup card and line-mode appearance switch are
+  not implemented: `-claude-tui` is accepted but does nothing, and
+  `/use-default-tui` / `/use-claude-code-tui` do not exist.
 
 The visual extensions are implemented by GoshCoder's Ratatui terminal UI rather
 than pi's TypeScript runtime. Type `/` to open the command
@@ -539,53 +595,68 @@ eight visible lines (`Shift+Enter`/`Ctrl+J` inserts a newline) and edits by
 grapheme, so an emoji or accented letter is never split. Tool calls render as
 compact cards; `Ctrl+O` expands their output and `Ctrl+T` toggles thinking.
 `/compact [focus]` creates a Pi-style structured summary while retaining recent
-turns; the same compaction runs automatically near the active model's context
-limit. Transient 429/5xx provider failures are retried automatically, with the
-countdown in the status bar; Esc cancels the wait. During a browser or device
+turns; the same compaction runs automatically before a prompt (and after a
+run) once usage comes within `clamp(window/5, 2048, 16384)` tokens of the
+active model's context window. Compaction cannot be interrupted. Transient
+provider failures (429, 5xx, overloads, timeouts, dropped streams) are retried
+three times after 2, 4 and 8 seconds, with the countdown in the status bar;
+Esc cancels the wait. During a browser or device
 login the sign-in address (or the device code) is also put on the clipboard
 through the terminal (OSC 52), because a long address wraps over several rows
 of the fullscreen interface and cannot be selected as one piece.
 
-**Keyboard** (`/hotkeys` shows the same list inside chat):
+**Keyboard** (`/hotkeys` shows a shorter list inside chat):
 
 | Key | Action |
 | --- | --- |
 | Enter | Send, or accept the palette selection; while a reply streams, steer it |
 | Alt+Enter | Queue a follow-up for after the current reply |
-| Ctrl+J, Shift+Enter | Insert a newline (Shift+Enter needs the kitty keyboard protocol) |
+| Ctrl+J, Shift+Enter, Ctrl+Enter | Insert a newline (Shift+Enter and Ctrl+Enter need the kitty keyboard protocol) |
 | Up / Down | Move in the palette, between editor lines, or through history |
-| Alt+← / Alt+→, Home / End, Ctrl+A / Ctrl+E | Move by word; to the line's start or end |
+| ← / →, Ctrl+B / Ctrl+F | Move one character |
+| Alt+← / Alt+→, Ctrl+← / Ctrl+→ | Move by word |
+| Home / End, Ctrl+A / Ctrl+E | Move to the line's start or end |
 | Ctrl+U / Ctrl+K / Ctrl+W | Delete to the line's start, to its end, or the previous word |
 | Tab / Shift+Tab | Complete the palette selection / cycle thinking levels |
-| Ctrl+L, Ctrl+P | Open the model picker; cycle models (Ctrl+Shift+P backwards) |
+| Ctrl+L, Ctrl+P | Open the model picker; cycle models (Ctrl+Shift+P backwards, kitty protocol only) |
 | Ctrl+O, Ctrl+T | Expand tool output; collapse thinking |
-| PgUp / PgDn, Ctrl+Home / Ctrl+End, mouse wheel | Scroll the transcript; jump to top or bottom |
-| Esc | Close the palette, clear the draft (Up brings it back), or abort a reply |
+| PgUp / PgDn, Ctrl+Home / Ctrl+End, mouse wheel | Scroll the transcript; jump to top or bottom (End on an empty editor also jumps to the bottom) |
+| Esc | Close the palette; otherwise abort a running reply; otherwise clear the draft (Up brings it back) |
 | Ctrl+C | Clear the draft, abort a reply, or quit (twice when the session is not saved) |
-| Ctrl+D | Quit when the editor is empty |
+| Ctrl+D | Quit when the editor is empty (no confirmation, even for an unsaved session); abort a running reply |
 
-Chat ends cleanly on SIGTERM or a closed terminal as it does on `/exit`: the
-terminal is restored, an interrupted reply is saved, and the exit status is
-128 plus the signal number.
+The interface captures the mouse for wheel scrolling, so hold Shift (or your
+terminal's bypass modifier) to select text. Fullscreen uses its own dark
+colours and ignores `NO_COLOR`; line mode (`-fullscreen=false`) honours it and
+is the better choice with a screen reader.
+
+On Linux and macOS chat ends cleanly on SIGTERM or a closed terminal as it does
+on `/exit`: the terminal is restored, an interrupted reply is saved, and the
+exit status is 128 plus the signal number. Windows has no such handling.
 
 ## Local resources
 
 GoshCoder discovers Pi-compatible inert resources at startup and with `/reload`:
 
-- ancestor `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md` instructions;
-- `SYSTEM.md` and `APPEND_SYSTEM.md` under the agent directory, `.pi`, or
-  `.goshcoder`;
-- Markdown prompt templates under `prompts/`, including frontmatter and
-  positional arguments;
+- `AGENTS.md` in the agent directory, then one of `AGENTS.override.md`,
+  `AGENTS.md` or `CLAUDE.md` (in that order of preference) from each directory
+  between the repository root and the workspace. Without a repository the walk
+  continues to the filesystem root;
+- `SYSTEM.md` (first found) and `APPEND_SYSTEM.md` (all found) in the agent
+  directory, then the workspace's `.pi/` and `.goshcoder/` directories;
+- Markdown prompt templates in the agent directory's `prompts/` and the
+  workspace's `.pi/prompts/` and `.goshcoder/prompts/` (the first name wins),
+  including frontmatter and positional arguments. Templates and `SYSTEM.md` are
+  looked up in the directory chat was started in, not the repository root;
 - Agent Skills (`SKILL.md`) under agent, project, and `.agents/skills`
   locations, available as `/skill:<name>`. Ancestor discovery stops at the
   repository root, so a sibling checkout's skills are not offered as this
   project's.
 
 Use `/resources` to inspect what was loaded; it also lists any warning raised
-during discovery, including a workspace `SYSTEM.md` that replaced the prompt
-and any context file skipped for being a symbolic link. GoshCoder generates Pi's coding
-system prompt when no explicit or local `SYSTEM.md` override exists.
+during discovery, including a workspace `SYSTEM.md` that replaced the prompt and
+any context file skipped for being a symbolic link. GoshCoder generates Pi's
+coding system prompt when no explicit or local `SYSTEM.md` override exists.
 
 ## Security notes
 
@@ -598,44 +669,63 @@ boundary matters:
   repository could otherwise point `AGENTS.md` at your SSH key and have it sent
   to the model provider.
 - **`.pi/SYSTEM.md` / `.goshcoder/SYSTEM.md`** in a workspace *replace* the whole
-  system prompt. Your own `SYSTEM.md` in the agent directory takes precedence,
-  and a workspace one is reported in `/resources` rather than applied silently.
-  Treat it like any other executable content in a repository you did not write.
+  system prompt. Your own `SYSTEM.md` in the agent directory takes precedence.
+  A workspace one is applied **without a startup notice**; it shows up only as
+  a warning in `/resources`. Run `/resources` in a repository you did not write.
+- **Workspace prompt templates** (`.pi/prompts/`, `.goshcoder/prompts/`) become
+  slash commands and are currently expanded *before* built-in commands, so a
+  repository can ship a `clear.md` that changes what `/clear` does, including
+  expanding to `/share confirm`. Check `/resources` before typing commands in
+  an untrusted repository (handbook finding F-01).
 - **Filesystem tools** are confined to the workspace by Rust path and symlink
-  validation, so symlink and rename races cannot escape it. The `bash` tool
-  runs with your privileges;
-  planning mode removes it and independently blocks shell execution.
+  validation. The checks run before each operation, so they are not proof
+  against another process swapping a directory for a symlink at the same
+  moment, and hard links are not detected: do not run the agent in a workspace
+  an untrusted process can write to. The `bash` tool runs `sh -c` with your
+  privileges and environment (API keys included); planning mode removes it and
+  independently blocks shell execution. `-tools=false` is not a sandbox while
+  the Planner is planning or executing (see the flags table).
 - **Credentials** live in `auth.json` (mode 0600) and are never echoed to the
-  terminal. Concurrent sessions coordinate through a heartbeat lock file so a
-  refreshed token cannot be lost to a racing writer. The 0600 here and below is
-  a Unix guarantee: Windows has no permission bits, so those files are
-  protected by whatever ACLs they inherit from your user profile instead.
-- **Local servers** (OAuth callback, Planner review) bind loopback only, validate
-  state/CSRF tokens and the `Host` header, and set no-store and CSP headers.
+  terminal. Writers take an exclusive OS lock on `auth.json.lock` (waiting up to
+  60 seconds) and re-read the file under it, so a refreshed token cannot be lost
+  to a racing writer. Anthropic's browser login puts the PKCE verifier in the
+  sign-in address it prints and copies to the clipboard, as pi does. The 0600
+  here and below is a Unix guarantee: Windows has no permission bits, so those
+  files are protected by whatever ACLs they inherit from your user profile
+  instead.
+- **Local servers** (OAuth callback, Planner review) bind loopback only, check
+  the `Host` header when one is sent, validate the state or CSRF token
+  (OpenRouter's callback relies on a random path instead), and set no-store and
+  CSP headers. Loopback does not keep out other users of the same machine.
 - **Session transcripts** contain every file the agent read and every command's
   output. `read` returns up to 50 KiB and `bash` output up to 30 KiB, and there
   is no content filter, so `cat .env` lands in the session file verbatim. Files
-  are mode 0600 under `~/.goshcoder/agent/sessions`, never inside the workspace,
-  and are never sent anywhere. **No redaction is performed**: the only redaction
-  primitive in this tree replaces a *known* secret string, which cannot find a
-  key the agent read out of a file, and a partial filter would buy false
-  confidence. Use `-no-session` for work that should not be written down, and
-  `goshcoder sessions rm` to delete what already was.
+  are mode 0600 under `~/.goshcoder/agent/sessions` (or `-sessions-dir`) and are
+  sent nowhere unless you `/share` them. A bare `/export`, however, writes
+  `goshcoder-session-<id>.html` into the workspace, where it can be committed by
+  accident; give it a path outside the repository. **No redaction is
+  performed**: the only redaction primitive in this tree replaces a *known*
+  secret string, which cannot find a key the agent read out of a file, and a
+  partial filter would buy false confidence. Use `-no-session` for work that
+  should not be written down, and `goshcoder sessions rm` to delete what already
+  was.
 - **Prompt archives** written by `prompts backup` are read back as untrusted
   input: member names are re-derived and re-validated rather than trusted, any
   member that is not a regular file is refused, and both the entry count and the
   decompressed size are bounded. Symlinked prompts are skipped on backup rather
   than followed, so an archive you share cannot carry a file you did not choose.
 
-**Durability.** A completed turn survives a machine crash: entries are appended
-as they happen and flushed at each turn boundary. A turn still in flight
-survives a process crash -- a kill, a panic, a closed terminal -- but not a power
-loss, because the containing directory is not fsynced. That matches every other
-durable write in this repository. A session torn mid-append loses only the
-partial entry; the rest of the file loads normally.
+**Durability.** Each finished message is appended to the session file as soon
+as it completes, and the file is synced to disk at the end of every prompt's
+run (and after `/name`, `/label`, `/fork`, compaction and on close). Completed
+messages survive a process crash -- a kill, a panic, a closed terminal; a reply
+that was still streaming does not, and a power loss can take the entries since
+the last sync, because the containing directory is not fsynced. A session torn
+mid-append loses only the partial entry; the rest of the file loads normally.
 
 CI and release builds run `cargo audit`; keep the Rust toolchain patched and
-rerun the gate before releases.
+rerun the gate before releases. At revision `3870a05` it reports
+RUSTSEC-2026-0285 for rustls 0.23.43 (fixed in 0.23.45).
 
 ## Known gaps
 
@@ -645,19 +735,30 @@ to HTML and share as gists. What remains unported is pi's TypeScript plugin
 host and package manager, custom `models.json` loading, LSP, and MCP
 management; see **Deviations from pi** for the details and the reasoning.
 
+Known defects found by the 2026-10-08 audit are listed, with evidence and
+reproduction steps, under **Audit findings** in the
+[handbook](docs/handbook/index.html#findings). The ones most likely to matter:
+workspace prompt templates can override built-in commands; `-tools=false` is
+not a sandbox while the Planner is active; Cloudflare models do not work;
+`cargo audit` reports RUSTSEC-2026-0285; `goshcoder sessions rm` deletes
+without asking; and Ralph loops cannot be resumed after `stop` or a restart.
+
 ## Deviations from pi
 
 Documented at the top of each ported file. The notable ones:
 
-- **Compat plumbing.** pi keys `model.compat` by API; here per-API compat
-  structs travel on the options struct.
+- **Compat plumbing.** Per-API compat settings are detected from the provider
+  and base URL and then overridden by the model's `compat` entry, as in pi.
+  Not every pi compat key is applied: `cacheControlFormat`,
+  `sendSessionAffinityHeaders`, `sessionAffinityFormat`, `zaiToolStream`,
+  `supportsStrictTools` and `supportsExplicitPromptCacheMode` are ignored.
 - **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
-  Code, xAI, Grok CLI, Meta, Meta Muse Code, and OpenRouter. Every one of them except the
-  pure subscriptions (OpenAI Codex, Grok CLI and Meta Muse Code, whose API-key
-  counterparts are `openai`, `xai` and `meta`) also accepts an API key, so a
-  developer account never has to go through a subscription login.
+  Code, xAI, Grok CLI, Meta, Meta Muse Code, and OpenRouter. Every one of them
+  except the pure subscriptions (OpenAI Codex, Grok CLI and Meta Muse Code,
+  whose API-key counterparts are `openai`, `xai` and `meta`) also accepts an API
+  key, so a developer account never has to go through a subscription login.
   - **Browser sign-in** answers the browser only after the code exchange, as
     pi's callback server does, so the page reports a rejected code instead of
     claiming success; a provider redirect carrying `error=` ends the login
@@ -696,8 +797,8 @@ Documented at the top of each ported file. The notable ones:
 - **Interface.** Interactive chat uses a Ratatui alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
-  Redirected input/output automatically falls back to the pipeable line-oriented
-  interface.
+  When standard input or standard error is redirected, chat falls back to the
+  pipeable line-oriented interface (redirecting only standard output does not).
 - **Session scope.** Sessions are persisted in pi's v3 JSONL format, including
   the entry tree, resume, branching, fork/clone, labels, and JSONL/Markdown
   export and import. pi's older v1 and v2 files are read and migrated in memory;
@@ -718,34 +819,39 @@ Documented at the top of each ported file. The notable ones:
   claim on a session file, which pi does not: two processes appending to one
   file is the realistic corruption mode for `chat -continue` run twice, and
   interleaved appends cross the parent links of two conversations. And `/clear`
-  appends a reset marker rather than starting a new file, so an accidental clear
-  stays recoverable with `sessions show --full`; pi reading such a file will
+  appends a reset marker rather than starting a new file, so the cleared
+  messages stay in the file: `sessions export <id> copy.jsonl` keeps them all,
+  and `/tree` plus `/fork` on the last message before the clear brings the
+  conversation back up to that message (`sessions show --full` only lists
+  one-line previews). `/new` does the same as `/clear`. pi reading such a file will
   still replay the cleared prefix, since only this build knows the marker cuts
   the context.
 
 ## Development
 
 ```sh
-make check          # rustfmt, cargo check, Clippy, and Rust tests
+make check          # rustfmt, cargo check, Clippy, tests, hermetic tests, cargo audit (if installed)
 make tools          # install cargo-audit, cargo-llvm-cov, and cargo-zigbuild
 ```
 
 Individual targets: `make test`, `make test-race`, `make cover`, `make lint`,
 `make vuln`. `make test-hermetic` runs the suite with deliberately wrong
-provider credentials exported, so a test that reads the developer's real
+`AWS_*` credentials exported, so a test that reads the developer's real AWS
 environment instead of its own fixtures fails loudly rather than passing on one
-machine and failing on another.
+machine and failing on another. `make vuln` and `make cover` print a note and
+succeed when their tool is not installed.
 
-GitHub Actions runs the same gate on Linux, macOS, and Windows, builds every
-release archive the way the release workflow does (Linux and Windows
-cross-compiled from Linux, the Apple targets natively on macOS), and exercises
-both installer scripts -- including a
-round-trip that serves real release archives over HTTP and drives the
-installer's actual download path, so the Makefile and the installers cannot
-drift apart into a release that 404s. Filesystem tools use Rust workspace
-confinement, planning mode disables shell execution, local callback
-servers bind only to loopback, and network, disk, and subprocess inputs have
-explicit resource limits.
+GitHub Actions builds and tests on Linux, macOS, and Windows; rustfmt, Clippy
+and `cargo audit` run on Linux. It builds every release archive the way the
+release workflow does (Linux and Windows cross-compiled from Linux, the Apple
+targets natively on macOS), ShellChecks `install.sh`, parse-checks
+`install.ps1`, runs a from-source install, and runs a round-trip that builds a
+release archive, serves it over HTTP and checks its name, checksum and binary.
+That round-trip derives the archive name from the Makefile and does not run
+either installer, so it does not prove the installers' download path. Filesystem
+tools use Rust workspace confinement, planning mode disables shell execution,
+local callback servers bind only to loopback, and network, disk, and subprocess
+inputs have explicit resource limits.
 
 Ports are written against a local clone of the upstream source, which lives at
 `reference/pi` and is gitignored — it is pi's code, not GoshCoder's, and is
@@ -758,6 +864,12 @@ git clone https://github.com/earendil-works/pi reference/pi
 Read the TypeScript before porting anything, and name the file you read in a
 comment at the top of the Rust file. That comment is what lets the next person
 check a port against its original instead of guessing at intent.
+
+The [handbook](docs/handbook/index.html) has the architecture, data-flow
+diagrams, module map and a way to exercise the interface without a provider
+account. `docs/handbook/index.html` is generated: edit the Python modules in
+`docs/handbook/src/` and run `python3 docs/handbook/src/build.py` (standard
+library only), and keep it in step with this README.
 
 ## License
 
