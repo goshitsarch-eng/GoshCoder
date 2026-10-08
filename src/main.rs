@@ -1668,7 +1668,7 @@ static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// `/hotkeys` for the interface in use: line mode has none of the editor.
 fn hotkeys_text(fullscreen: bool) -> String {
     if !fullscreen {
-        return "Enter       send the line\nCtrl-C      abort the active response; press twice at the prompt to exit\nCtrl-D      exit at an empty prompt\nLine editing is your terminal's own; -fullscreen (the default) has the full editor."
+        return "Enter       send the line\n←/→         move in the line; Home/End or Ctrl-A/Ctrl-E jump to its ends\nUp/Down     recall earlier lines\nCtrl-U/K/W  delete to the start, to the end, or the previous word\nCtrl-C      abort the active response; at the prompt clear it, twice to exit\nCtrl-D      exit at an empty prompt"
             .to_owned();
     }
     let newline = if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
