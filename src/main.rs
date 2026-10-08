@@ -4130,7 +4130,7 @@ fn resume_choices(prepared: &runtime::PreparedSession) -> Vec<state::Suggestion>
     };
     let current = prepared.runtime.id();
     let labels = sessionlog::short_ids(&sessions);
-    sessions
+    let choices = sessions
         .iter()
         .zip(labels)
         .filter(|(session, _)| current.as_deref() != Some(session.id.as_str()))
@@ -4144,7 +4144,18 @@ fn resume_choices(prepared: &runtime::PreparedSession) -> Vec<state::Suggestion>
                 execute: true,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if choices.is_empty() {
+        // An empty picker would not open at all and leave "/resume " hanging
+        // with no explanation.
+        return vec![state::Suggestion {
+            label: "No other saved sessions".to_owned(),
+            description: "this workspace has only the current one".to_owned(),
+            value: "/resume ".to_owned(),
+            execute: false,
+        }];
+    }
+    choices
 }
 
 fn render_interactive_session_list(
