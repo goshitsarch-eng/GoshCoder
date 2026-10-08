@@ -13,7 +13,7 @@ use crossterm::{
 
 use crate::{
     catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
-    config, grok_cli, oauth,
+    config, grok_accounts, grok_cli, oauth,
 };
 
 /// Executes `goshcoder providers`.
@@ -194,6 +194,61 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         _ => Err(command_error(format!(
             "unknown auth subcommand {subcommand:?}\n\n{AUTH_USAGE}"
         ))),
+    }
+}
+
+const GROK_CLI_USAGE: &str = "usage: goshcoder grok-cli <subcommand>
+
+  usage                        Show the subscription's weekly usage
+  accounts                     List the saved Grok CLI accounts
+  accounts add [label]         Add an account and sign in to it
+  accounts login <n>           Sign in to an account again
+  accounts logout <n>          Sign out of an account
+  accounts rename <n> <label>  Rename an account
+  accounts remove <n>          Remove an account (Account 1 stays)
+  accounts use <n>             Make an account the default for new sessions
+
+Accounts are named by their number in the list, their label, or their id.";
+
+/// Executes `goshcoder grok-cli usage|accounts`.
+pub fn grok_cli_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let catalog = Catalog::with_default_credentials()?;
+    match words.as_slice() {
+        ["usage"] => {
+            let agent_dir = catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir);
+            println!(
+                "{}",
+                grok_cli::usage_report(&catalog, &agent_dir, "").join("\n\n")
+            );
+            Ok(())
+        }
+        ["accounts", rest @ ..] => {
+            config::ensure_agent_dir()?;
+            let accounts = grok_accounts::Accounts::new(&catalog);
+            let output = grok_accounts::cli_command(&accounts, rest, &|client| {
+                client
+                    .login(
+                        oauth::OAuthProviderId::GrokCli,
+                        Arc::new(TerminalOAuthInteraction),
+                        &oauth::ProcessEnvironment,
+                        &oauth::CancellationToken::new(),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(command_error)?;
+            println!("{output}");
+            Ok(())
+        }
+        ["help" | "-h" | "--help"] => {
+            println!("{GROK_CLI_USAGE}");
+            Ok(())
+        }
+        _ => Err(command_error(GROK_CLI_USAGE)),
     }
 }
 

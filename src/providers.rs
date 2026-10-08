@@ -1049,6 +1049,12 @@ impl ProviderResponderFactory {
                 credentials = credentials.with_grok_cli_settings(
                     grok_cli::RequestSettings::from_lookup(|name| catalog.environment_value(name)),
                 );
+                // A session that chose another saved account sends its token.
+                if let Some(token) = crate::grok_accounts::Accounts::new(&catalog)
+                    .request_token(&options.session_id)?
+                {
+                    credentials = credentials.with_api_key(token);
+                }
             }
             // Native Aperture adaptation: a gateway-routed request carries the
             // provider-qualified model id and the provenance headers, and a
@@ -10113,5 +10119,77 @@ mod tests {
             "{sent}"
         );
         assert!(sent.get("instructions").is_none());
+    }
+
+    #[test]
+    fn grok_cli_requests_carry_the_token_of_the_account_the_session_chose() {
+        let (base_url, requests, server) = test_server(vec![
+            http_response(200, GROK_OK_BODY),
+            http_response(200, GROK_OK_BODY),
+        ]);
+        let (version_base, _version_requests, version_server) =
+            test_server(vec![http_response(200, "1.2.3")]);
+        let agent_dir = std::env::temp_dir().join(format!(
+            "goshcoder-grok-wire-accounts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(catalog::CredentialStore::in_memory());
+        store
+            .put(
+                grok_cli::PROVIDER_ID,
+                catalog::Credential::oauth("account-one-token", "refresh", i64::MAX),
+            )
+            .expect("account 1 login");
+        let environment = BTreeMap::from([
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base_url}/v1")),
+            (
+                grok_cli::VERSION_URL_ENV.to_owned(),
+                format!("{version_base}/cli/stable"),
+            ),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                Some(store),
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog")
+            .with_dynamic_paths(catalog::DynamicPaths::for_agent_dir(&agent_dir)),
+        );
+        let accounts = crate::grok_accounts::Accounts::new(&catalog);
+        let work = accounts.add("Work").expect("add");
+        accounts
+            .store_login(
+                &work,
+                0,
+                catalog::Credential::oauth("work-token", "refresh", i64::MAX),
+            )
+            .expect("store");
+        crate::grok_accounts::choose_for_session("grok-wire-chooser", &work).expect("choose");
+        let model = catalog
+            .model(grok_cli::PROVIDER_ID, "grok-4.3")
+            .expect("model");
+        let responder = factory(0).catalog_assistant_responder(catalog.clone());
+        for session in ["grok-wire-chooser", "grok-wire-default"] {
+            let (request_options, _) = grok_options(session);
+            responder(&model, &text_context(), request_options).expect("response");
+        }
+        server.join().expect("server");
+        version_server.join().expect("version server");
+        let tokens = requests
+            .try_iter()
+            .map(|request| header(&request, "authorization").map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            [
+                Some("Bearer work-token".to_owned()),
+                Some("Bearer account-one-token".to_owned()),
+            ]
+        );
+        let _ = fs::remove_dir_all(agent_dir);
     }
 }

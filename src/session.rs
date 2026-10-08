@@ -166,6 +166,21 @@ impl SessionCustomRecorder {
         self.recorder.handle()
     }
 
+    /// Every `custom_type` payload on the current branch, oldest first.
+    pub fn custom_values(&self, custom_type: &str) -> Vec<Value> {
+        self.recorder
+            .with_tree(|tree| {
+                tree.path(tree.leaf())
+                    .into_iter()
+                    .filter(|entry| {
+                        entry.kind == sessionlog::TYPE_CUSTOM && entry.custom_type == custom_type
+                    })
+                    .filter_map(|entry| entry.data.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The newest `custom_type` payload on the current branch that `decode`
     /// accepts, the way pi extensions scan `getBranch()` from the end. Walking
     /// one path is far cheaper than a full [`SessionRuntime::restored`]
@@ -2537,30 +2552,37 @@ mod tests {
 
     #[test]
     fn grok_cli_conversation_generation_follows_the_current_branch() {
-        use crate::grok_cli::{CONV_ENTRY, ConvStore};
+        use crate::grok_cli::{CONV_ENTRY, SessionStore, stored_generation_in};
+        let record = |recorder: &SessionCustomRecorder, generation: u64| {
+            SessionStore::append(
+                recorder,
+                CONV_ENTRY,
+                serde_json::json!({ "generation": generation }),
+            )
+        };
 
         let root = temp_root("grok-conv");
         let cwd = root.join("workspace");
         let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
         let recorder = runtime.custom_recorder();
-        assert_eq!(recorder.generation(), None);
-        assert_eq!(ConvStore::session_id(&recorder), runtime.id());
+        assert_eq!(stored_generation_in(&recorder), None);
+        assert_eq!(SessionStore::session_id(&recorder), runtime.id());
 
         runtime.agent().prompt("first question").expect("first");
-        assert_eq!(ConvStore::record(&recorder, 1), Ok(true));
+        assert_eq!(record(&recorder, 1), Ok(true));
         runtime.agent().prompt("second question").expect("second");
-        assert_eq!(ConvStore::record(&recorder, 2), Ok(true));
+        assert_eq!(record(&recorder, 2), Ok(true));
         // A malformed newer entry is skipped, as upstream's branch scan does.
         recorder
             .record(CONV_ENTRY, serde_json::json!({"generation": "two"}))
             .expect("record malformed");
-        assert_eq!(recorder.generation(), Some(2));
+        assert_eq!(stored_generation_in(&recorder), Some(2));
 
         // Rewinding to the second question leaves the later rotation behind.
         runtime.fork_to(2).expect("rewind");
-        assert_eq!(recorder.generation(), Some(1));
+        assert_eq!(stored_generation_in(&recorder), Some(1));
         runtime.fork_to(1).expect("rewind further");
-        assert_eq!(recorder.generation(), None);
+        assert_eq!(stored_generation_in(&recorder), None);
         close(&mut runtime);
 
         // Without a session file nothing is recorded and the store says so.
@@ -2568,8 +2590,8 @@ mod tests {
         options.selection = SessionSelection::NoSession;
         let mut detached = SessionRuntime::open(options).expect("open no-session");
         let recorder = detached.custom_recorder();
-        assert_eq!(ConvStore::record(&recorder, 1), Ok(false));
-        assert_eq!(recorder.generation(), None);
+        assert_eq!(record(&recorder, 1), Ok(false));
+        assert_eq!(stored_generation_in(&recorder), None);
         close(&mut detached);
         let _ = fs::remove_dir_all(root);
     }

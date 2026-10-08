@@ -2444,6 +2444,12 @@ impl Catalog {
         )
     }
 
+    /// The OAuth client stored-credential refreshes go through, shared with
+    /// integrations that keep further logins of their own.
+    pub fn oauth_client(&self) -> &oauth::OAuthClient {
+        &self.oauth_client
+    }
+
     /// Reads the catalog's injected environment, so request-path settings
     /// follow the same lookup tests substitute.
     pub fn environment_value(&self, name: &str) -> Option<String> {
@@ -2558,6 +2564,16 @@ impl Catalog {
             }
         }
 
+        // With no Grok CLI login in auth.json, an account added through
+        // `/grok-cli-accounts` keeps the provider usable, as upstream's
+        // vault does.
+        if provider_id == grok_cli::PROVIDER_ID {
+            return Ok(crate::grok_accounts::Accounts::new(self)
+                .fallback_token()
+                .map(|token| {
+                    Auth::with_api_key(token, BTreeMap::new(), BTreeMap::new(), "Grok CLI account")
+                }));
+        }
         if definition.auth_kind == AuthKind::OAuthOnly {
             return Ok(None);
         }

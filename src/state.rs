@@ -777,6 +777,11 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
             true,
         ),
         (
+            "/grok-cli-accounts",
+            "List, add, or switch Grok CLI accounts",
+            false,
+        ),
+        (
             "/grok-cli-conv",
             "Show or rotate the Grok CLI conversation ID",
             false,

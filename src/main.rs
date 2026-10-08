@@ -12,6 +12,7 @@ pub mod computeruse;
 pub mod config;
 pub mod export_html;
 pub mod google_auth;
+pub mod grok_accounts;
 pub mod grok_cli;
 pub mod grok_imagine;
 pub mod llm;
@@ -78,6 +79,7 @@ Usage:
   goshcoder auth <subcommand>        Manage credentials
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
+  goshcoder grok-cli <subcommand>    Grok CLI usage and accounts
   goshcoder ralph <subcommand>       Manage Ralph loops
   goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
@@ -236,6 +238,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("auth") => provider_cli::auth_command(&args[1..]),
         Some("omni") => omni_cli::command(&args[1..]),
         Some("aperture") => aperture_cli::command(&args[1..]),
+        Some("grok-cli") => provider_cli::grok_cli_command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),
@@ -257,6 +260,7 @@ fn unknown_command_message(command: &str) -> String {
         "auth",
         "omni",
         "aperture",
+        "grok-cli",
         "ralph",
         "sessions",
         "prompts",
@@ -2246,7 +2250,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-imagine <prompt> [--image <path>] [--aspect <r>] [--out <path>]  Generate or edit an image with Grok Imagine\n  /grok-cli-imagine:tool [on|off|status]  Offer the image_gen tool to the model, or not\n  /grok-cli-conv [status|rotate]  Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-imagine <prompt> [--image <path>] [--aspect <r>] [--out <path>]  Generate or edit an image with Grok Imagine\n  /grok-cli-imagine:tool [on|off|status]  Offer the image_gen tool to the model, or not\n  /grok-cli-accounts [list|use|add|login|logout|rename|remove]  Manage several Grok CLI accounts\n  /grok-cli-conv [status|rotate]  Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2758,9 +2762,31 @@ fn dispatch_runtime_slash_command<'a>(
                 .agent_dir
                 .clone()
                 .unwrap_or_else(config::agent_dir);
+            let session = prepared.request_session_id().to_owned();
             start_background_command(view, "/grok-cli-usage", move || {
-                Ok(grok_cli::usage_report(&catalog, &agent_dir).join("\n\n"))
+                Ok(grok_cli::usage_report(&catalog, &agent_dir, &session).join("\n\n"))
             });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-accounts" => {
+            let accounts = grok_accounts::Accounts::new(catalog);
+            match grok_accounts::chat_command(&accounts, prepared.request_session_id(), rest) {
+                Ok(grok_accounts::AccountsCommand::Done(message)) => {
+                    append_view_message(view, MessageRole::Command, message);
+                }
+                Ok(grok_accounts::AccountsCommand::Terminal(arguments)) => {
+                    // The OAuth login owns the terminal, as /login's does.
+                    return CommandDispatch::Suspended(Box::new(move || {
+                        let mut child = vec!["grok-cli"];
+                        child.extend(arguments.iter().map(String::as_str));
+                        run_self_subprocess(&child)?;
+                        catalog.clear_oauth_refresh_failure(grok_cli::PROVIDER_ID);
+                        prepared.sync_image_tool();
+                        Ok("Grok CLI accounts updated; /grok-cli-accounts lists them.".to_owned())
+                    }));
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
             CommandDispatch::Handled
         }
         "/grok-cli-conv" => {
@@ -3074,6 +3100,11 @@ fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
         "aperture",
         "aperture:onboarding",
         "aperture:settings",
+        "grok-cli-accounts",
+        "grok-cli-conv",
+        "grok-cli-imagine",
+        "grok-cli-imagine:tool",
+        "grok-cli-usage",
         "btw",
         "thinking",
         "system",

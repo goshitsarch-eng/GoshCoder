@@ -141,6 +141,7 @@ goshcoder auth login anthropic
 goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
 goshcoder auth login grok-cli # X Premium/SuperGrok via the Grok CLI endpoint
+goshcoder grok-cli usage      # its weekly usage; `grok-cli accounts` for more logins
 goshcoder auth login xai      # Grok subscription against api.x.ai
 goshcoder auth login meta     # Meta account; mints a Model API key
 
@@ -193,6 +194,7 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
 | `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation, usage |
 | `src/grok_imagine.rs` | Grok Imagine image generation, `/grok-cli-imagine`, and the `image_gen` tool |
+| `src/grok_accounts.rs` | Several Grok CLI accounts, per-session account choice, and exhaustion rotation |
 | `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
@@ -439,6 +441,24 @@ is recorded in [`NOTICE`](NOTICE).
     answer is cached in `grok-cli/quota-cache.json` under the agent directory
     (0600, upstream's format; an entry older than 30 minutes counts as
     stale), and a failed refresh falls back to the cached figures.
+  - **Accounts.** Several subscriptions can be kept side by side.
+    `/grok-cli-accounts` lists them with their cached quota;
+    `/grok-cli-accounts add [label]` and `login <n>` sign one in (the OAuth
+    flow takes over the terminal, as `/login` does), `use <n>` switches this
+    session and makes the account the default for new ones, and `rename`,
+    `logout` and `remove` do what they say. `goshcoder grok-cli accounts`
+    offers the same outside chat. Account 1 is the ordinary `grok-cli` login
+    in `auth.json`; the others, their labels and the default live in
+    `grok-cli/accounts.json` (0600, written under a lock file). A session's
+    choice is recorded as a `grok-cli-active-account-v1` entry, so resuming
+    or rewinding a session brings back the account it used, and requests are
+    sent with that account's token, refreshed when it is about to expire.
+    When the proxy answers that an account's Grok Build balance is
+    exhausted (HTTP 402), the session moves to the next logged-in account —
+    the one with the most weekly credit left by fresh cached figures, else
+    the next in the list — and the turn continues with upstream's
+    continuation message; a chain never returns to an account it used up,
+    and an exhausted account is skipped for five minutes.
   - **Grok Imagine.** With a Grok CLI login, `/grok-cli-imagine <prompt>
     [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]` generates
     an image, or edits a PNG, JPEG or WebP of up to 400 KiB (typed by its
@@ -462,7 +482,8 @@ is recorded in [`NOTICE`](NOTICE).
     `PI_GROK_CLI_BASE_URL`, `GROK_CLI_BASE_URL` or
     `GOSHCODER_GROK_CLI_BASE_URL` move the endpoint.
 
-  Not ported: the browser account dashboard, upstream's migrations from its
+  Not ported: the browser account dashboard (accounts are managed with the
+  subcommands above), upstream's migrations from its
   own earlier releases (there is nothing in GoshCoder to migrate from), the
   payload step that turns local image paths into data URIs (GoshCoder's
   request builders only ever send data URIs), and Imagine's inline image

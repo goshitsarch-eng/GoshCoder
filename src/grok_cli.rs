@@ -290,38 +290,49 @@ fn fetch_version(url: &str) -> String {
 // ---------------------------------------------------------------------------
 // Conversation id
 
-/// Where a session's conversation-id generation lives. The session-backed
-/// implementation reads the latest entry on the current branch, so resume,
-/// branch navigation and forks pick up the right generation without the
+/// The session state the Grok CLI integration keeps in custom entries (the
+/// conversation generation, the chosen account). The session-backed
+/// implementation reads the current branch on every call, so resume, branch
+/// navigation and forks see the right values without the
 /// session_start/session_tree hooks upstream needs.
-pub trait ConvStore: Send + Sync {
+pub trait SessionStore: Send + Sync {
     /// The id of the session currently open, which may differ from the id
     /// the store was registered under after `/resume` or `/new`.
     fn session_id(&self) -> Option<String>;
-    fn generation(&self) -> Option<u64>;
-    /// Persists `generation`. `Ok(false)` means nothing is being recorded
-    /// (no session file, read-only), in which case the rotation lives in
+    /// Every `custom_type` payload on the current branch, oldest first.
+    fn custom_values(&self, custom_type: &str) -> Vec<Value>;
+    /// Appends an entry. `Ok(false)` means nothing is being recorded (no
+    /// session file, read-only), in which case callers keep the value in
     /// memory for this process, as upstream's in-memory session manager does.
-    fn record(&self, generation: u64) -> Result<bool, String>;
+    fn append(&self, custom_type: &str, data: Value) -> Result<bool, String>;
 }
 
-impl ConvStore for session::SessionCustomRecorder {
+impl SessionStore for session::SessionCustomRecorder {
     fn session_id(&self) -> Option<String> {
         self.handle().map(|handle| handle.id)
     }
 
-    fn generation(&self) -> Option<u64> {
-        self.latest_custom(CONV_ENTRY, stored_generation)
+    fn custom_values(&self, custom_type: &str) -> Vec<Value> {
+        session::SessionCustomRecorder::custom_values(self, custom_type)
     }
 
-    fn record(&self, generation: u64) -> Result<bool, String> {
+    fn append(&self, custom_type: &str, data: Value) -> Result<bool, String> {
         if !self.recording() {
             return Ok(false);
         }
-        self.record(CONV_ENTRY, json!({ "generation": generation }))
+        self.record(custom_type, data)
             .map(|_| true)
             .map_err(|error| error.to_string())
     }
+}
+
+/// The newest valid generation on the store's branch.
+pub fn stored_generation_in(store: &dyn SessionStore) -> Option<u64> {
+    store
+        .custom_values(CONV_ENTRY)
+        .iter()
+        .rev()
+        .find_map(stored_generation)
 }
 
 /// upstream `storedGeneration`: a positive safe integer under `generation`.
@@ -335,7 +346,7 @@ pub fn stored_generation(data: &Value) -> Option<u64> {
 
 #[derive(Default)]
 struct ConvRegistry {
-    stores: HashMap<String, Arc<dyn ConvStore>>,
+    stores: HashMap<String, Arc<dyn SessionStore>>,
     /// Rotations that could not be recorded, by effective session id.
     memory: HashMap<String, u64>,
 }
@@ -346,29 +357,34 @@ fn conv_registry() -> &'static Mutex<ConvRegistry> {
 }
 
 /// Keeps a session's store registered for as long as the session lives.
-pub struct ConvRegistration {
+pub struct SessionRegistration {
     key: String,
 }
 
-impl ConvRegistration {
+impl SessionRegistration {
     /// The request session id the store answers for.
     pub fn key(&self) -> &str {
         &self.key
     }
 }
 
-impl Drop for ConvRegistration {
+impl Drop for SessionRegistration {
     fn drop(&mut self) {
         lock(conv_registry()).stores.remove(&self.key);
     }
 }
 
 /// Registers the store behind requests whose `session_id` is `key`.
-pub fn register_conv_store(key: &str, store: Arc<dyn ConvStore>) -> ConvRegistration {
+pub fn register_session_store(key: &str, store: Arc<dyn SessionStore>) -> SessionRegistration {
     lock(conv_registry()).stores.insert(key.to_owned(), store);
-    ConvRegistration {
+    SessionRegistration {
         key: key.to_owned(),
     }
+}
+
+/// The store registered for requests carrying `request_session`.
+pub fn session_store(request_session: &str) -> Option<Arc<dyn SessionStore>> {
+    lock(conv_registry()).stores.get(request_session).cloned()
 }
 
 /// The session id requests for `request_session` belong to now.
@@ -394,7 +410,9 @@ fn current_generation(request_session: &str) -> (String, u64) {
     };
     match store {
         Some((effective, store)) => {
-            let generation = remembered.or_else(|| store.generation()).unwrap_or(0);
+            let generation = remembered
+                .or_else(|| stored_generation_in(store.as_ref()))
+                .unwrap_or(0);
             (effective, generation)
         }
         None => (request_session.to_owned(), remembered.unwrap_or(0)),
@@ -429,7 +447,7 @@ pub fn rotate_conv(request_session: &str) -> Result<String, String> {
     let (session, generation) = current_generation(request_session);
     let next = generation.saturating_add(1);
     let recorded = match store {
-        Some(store) => store.record(next)?,
+        Some(store) => store.append(CONV_ENTRY, json!({ "generation": next }))?,
         None => false,
     };
     let mut registry = lock(conv_registry());
@@ -1314,7 +1332,11 @@ fn format_count(value: f64) -> String {
 
 /// `/grok-cli-usage`: the provider's status, quota and token health, as
 /// upstream's command reports them, one notice per line group.
-pub fn usage_report(catalog: &crate::catalog::Catalog, agent_dir: &Path) -> Vec<String> {
+pub fn usage_report(
+    catalog: &crate::catalog::Catalog,
+    agent_dir: &Path,
+    request_session: &str,
+) -> Vec<String> {
     let mut notices = Vec::new();
     if catalog.environment_value(TOKEN_ENV).is_some() {
         notices.push(
@@ -1322,28 +1344,23 @@ pub fn usage_report(catalog: &crate::catalog::Catalog, agent_dir: &Path) -> Vec<
                 .to_owned(),
         );
     }
-    let token = match catalog.resolve_auth(PROVIDER_ID) {
-        Ok(Some(auth)) => auth.api_key().map(str::to_owned),
-        Ok(None) => None,
-        Err(error) => {
-            let mut lines = format_quota(None);
-            lines.push(format!("    Reason     {error}"));
-            notices.push(lines.join("\n"));
-            return notices;
-        }
-    };
-    let Some(token) = token.filter(|token| !token.is_empty()) else {
-        let mut lines = format_quota(None);
-        lines.push("    Reason     Grok CLI login is required. Run /login grok-cli.".to_owned());
-        notices.push(lines.join("\n"));
-        return notices;
-    };
+    // The account this session's requests go to, as upstream reports on.
+    let (account, token) =
+        match crate::grok_accounts::Accounts::new(catalog).usage_route(request_session) {
+            Ok(route) => route,
+            Err(error) => {
+                let mut lines = format_quota(None);
+                lines.push(format!("    Reason     {error}"));
+                notices.push(lines.join("\n"));
+                return notices;
+            }
+        };
     let base_url = base_url(|name| catalog.environment_value(name));
     let cache = quota_cache_path(agent_dir);
     match fetch_billing_usage(&base_url, &token) {
         Ok(usage) => {
             if let Err(error) =
-                save_quota_usage(&cache, ACCOUNT_ID, &usage, OffsetDateTime::now_utc())
+                save_quota_usage(&cache, &account, &usage, OffsetDateTime::now_utc())
             {
                 notices.push(format!("Grok CLI quota cache update failed: {error}"));
             }
@@ -1351,7 +1368,7 @@ pub fn usage_report(catalog: &crate::catalog::Catalog, agent_dir: &Path) -> Vec<
         }
         Err(error) => {
             notices.push(format!("Grok CLI billing refresh failed: {error}"));
-            notices.push(match load_quota_cache(&cache).get(ACCOUNT_ID) {
+            notices.push(match load_quota_cache(&cache).get(&account) {
                 Some(cached) => format!(
                     "Grok CLI cached usage from {}:\n{}",
                     cached.updated_at,
@@ -1766,31 +1783,33 @@ mod tests {
         assert_eq!(resolve_version(&unreachable), FALLBACK_VERSION);
     }
 
-    /// A session log stand-in: entries recorded in order, the newest valid
-    /// one wins.
+    /// A session log stand-in: conversation entries recorded in order, the
+    /// newest valid one wins.
     struct FakeStore {
         session: String,
         recording: bool,
         recorded: Mutex<Vec<Value>>,
     }
 
-    impl ConvStore for FakeStore {
+    impl SessionStore for FakeStore {
         fn session_id(&self) -> Option<String> {
             Some(self.session.clone())
         }
 
-        fn generation(&self) -> Option<u64> {
-            lock(&self.recorded)
-                .iter()
-                .rev()
-                .find_map(stored_generation)
+        fn custom_values(&self, custom_type: &str) -> Vec<Value> {
+            if custom_type == CONV_ENTRY {
+                lock(&self.recorded).clone()
+            } else {
+                Vec::new()
+            }
         }
 
-        fn record(&self, generation: u64) -> Result<bool, String> {
+        fn append(&self, custom_type: &str, data: Value) -> Result<bool, String> {
             if !self.recording {
                 return Ok(false);
             }
-            lock(&self.recorded).push(json!({ "generation": generation }));
+            assert_eq!(custom_type, CONV_ENTRY);
+            lock(&self.recorded).push(data);
             Ok(true)
         }
     }
@@ -1802,7 +1821,7 @@ mod tests {
             recording: true,
             recorded: Mutex::new(vec![json!({"generation": 3}), json!({"generation": "bad"})]),
         });
-        let registration = register_conv_store("agent-session-a", store.clone());
+        let registration = register_session_store("agent-session-a", store.clone());
         // The latest *valid* entry wins, and the id is the open session's.
         assert_eq!(
             conv_id("agent-session-a").as_deref(),
@@ -1841,7 +1860,7 @@ mod tests {
             recording: false,
             recorded: Mutex::new(Vec::new()),
         });
-        let _registration = register_conv_store("agent-session-b", store.clone());
+        let _registration = register_session_store("agent-session-b", store.clone());
         assert_eq!(
             conv_id("agent-session-b").as_deref(),
             Some("unsaved-session")
@@ -1963,13 +1982,14 @@ mod tests {
         directory
     }
 
-    fn usage_catalog(base: &str) -> Catalog {
+    fn usage_catalog(base: &str, agent_dir: &Path) -> Catalog {
         let environment = BTreeMap::from([
             (TOKEN_ENV.to_owned(), "usage-token".to_owned()),
             ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base}/v1")),
         ]);
         Catalog::with_environment(None, Arc::new(move |name| environment.get(name).cloned()))
             .expect("catalog")
+            .with_dynamic_paths(crate::catalog::DynamicPaths::for_agent_dir(agent_dir))
     }
 
     const MONTHLY: &str = r#"{"config":{"monthlyLimit":{"val":0},"used":{"val":0},"billingPeriodEnd":"2026-09-01T00:00:00.000Z"}}"#;
@@ -1986,7 +2006,7 @@ mod tests {
             ),
         ]);
         let agent_dir = temp_agent_dir("usage");
-        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        let report = usage_report(&usage_catalog(&base, &agent_dir), &agent_dir, "");
         server.join().expect("server");
         assert_eq!(
             report,
@@ -2036,7 +2056,7 @@ mod tests {
 
         // A failed refresh reports itself and falls back to the cache.
         let (base, _seen, server) = json_server(vec![(500, "{}".to_owned())]);
-        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        let report = usage_report(&usage_catalog(&base, &agent_dir), &agent_dir, "");
         server.join().expect("server");
         assert_eq!(
             report[1],
@@ -2063,20 +2083,22 @@ mod tests {
             (404, "{}".to_owned()),
         ]);
         let agent_dir = temp_agent_dir("usage-monthly");
-        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        let report = usage_report(&usage_catalog(&base, &agent_dir), &agent_dir, "");
         server.join().expect("server");
         assert_eq!(report[1], "Weekly Limit\n    weekly usage unavailable");
 
         let (base, _seen, server) = json_server(vec![(200, r#"{"config":{}}"#.to_owned())]);
-        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        let report = usage_report(&usage_catalog(&base, &agent_dir), &agent_dir, "");
         server.join().expect("server");
         assert_eq!(
             report[1],
             "Grok CLI billing refresh failed: invalid billing payload"
         );
 
-        let logged_out = Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
-        let report = usage_report(&logged_out, &agent_dir);
+        let logged_out = Catalog::with_environment(None, Arc::new(|_| None))
+            .expect("catalog")
+            .with_dynamic_paths(crate::catalog::DynamicPaths::for_agent_dir(&agent_dir));
+        let report = usage_report(&logged_out, &agent_dir, "");
         assert_eq!(
             report,
             [

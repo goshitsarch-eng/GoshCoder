@@ -16,8 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, grok_cli, grok_imagine, llm, omni_cli, omniroute, planner_runtime,
-    plannotator, ralph, ralph_runtime,
+    computeruse, config, grok_accounts, grok_cli, grok_imagine, llm, omni_cli, omniroute,
+    planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -129,7 +129,9 @@ pub struct PreparedSession {
     desktop: Option<computeruse::McpSession>,
     /// Keeps the Grok CLI conversation id answering from this session's log
     /// for as long as the session lives.
-    grok_conv: Option<grok_cli::ConvRegistration>,
+    grok_conv: Option<grok_cli::SessionRegistration>,
+    /// Moves the session to the next Grok CLI account when one runs dry.
+    _grok_rotation: Option<agent::Subscription>,
     /// The absolute working directory, which Grok Imagine resolves paths in.
     cwd: PathBuf,
 }
@@ -198,7 +200,7 @@ impl PreparedSession {
     pub fn request_session_id(&self) -> &str {
         self.grok_conv
             .as_ref()
-            .map_or("", grok_cli::ConvRegistration::key)
+            .map_or("", grok_cli::SessionRegistration::key)
     }
 
     /// Returns a consistent snapshot of the resources currently available to
@@ -782,7 +784,15 @@ pub fn prepare_session(
     let grok_conv = runtime
         .id()
         .filter(|id| !id.is_empty())
-        .map(|id| grok_cli::register_conv_store(&id, Arc::new(runtime.custom_recorder())));
+        .map(|id| grok_cli::register_session_store(&id, Arc::new(runtime.custom_recorder())));
+    let grok_rotation = grok_conv.as_ref().map(|registration| {
+        grok_accounts::rotation_subscription(
+            runtime.agent(),
+            grok_accounts::Accounts::new(catalog),
+            registration.key().to_owned(),
+            runtime.notice_sender(),
+        )
+    });
     let prepared = PreparedSession {
         btw,
         ralph,
@@ -796,6 +806,7 @@ pub fn prepare_session(
         catalog: catalog.clone(),
         desktop,
         grok_conv,
+        _grok_rotation: grok_rotation,
         cwd: cwd.clone(),
     };
     prepared.aperture_session_start();

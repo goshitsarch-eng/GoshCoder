@@ -66,7 +66,7 @@ something goes wrong:
 | Session files (pi v3 JSONL) | `src/sessionlog.rs`, `src/session.rs` |
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
-| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
+| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`, `src/grok_accounts.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
 | Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
 
 ## Starting without credentials
@@ -175,6 +175,15 @@ is installed; the server is spawned lazily and closed with the session.
   branch, so forks and resumes need no extra bookkeeping. Note that the
   agent keeps the session id it was created with across `/new` and
   `/resume`; the Grok CLI store follows the open session instead.
+- Grok CLI accounts: Account 1 is `auth.json`'s `grok-cli` login; further
+  accounts live in `<agent_dir>/grok-cli/accounts.json`, which exists only
+  when the catalog knows an agent directory (an injected test environment
+  without one sees Account 1 alone). `catalog_assistant_responder` swaps in
+  the token of the account the session chose (`grok_accounts::Accounts::
+  request_token`), and `resolve_auth` falls back to a saved account when
+  `auth.json` has no login. Exhaustion rotation is an agent subscription
+  that queues upstream's continuation as a follow-up on the failed turn;
+  `turns::finish_run` picks it up like any queued message.
 
 ## Sessions
 
