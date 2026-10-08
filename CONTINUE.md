@@ -69,7 +69,8 @@ something goes wrong:
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
 | Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`, `src/grok_accounts.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
-| Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
+| Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands), `src/tui_login.rs` (`/login` inside the interface) |
+| Line-mode chat | `src/line_editor.rs` (raw-mode prompt, Ctrl-C handling) |
 
 ## Starting without credentials
 
