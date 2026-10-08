@@ -74,7 +74,8 @@ impl Default for SessionConfig {
         Self {
             model_ref: String::new(),
             system_prompt: String::new(),
-            thinking: llm::THINKING_OFF.to_owned(),
+            // pi's `DEFAULT_THINKING_LEVEL`; each model clamps it to what it supports.
+            thinking: llm::THINKING_MEDIUM.to_owned(),
             workdir: PathBuf::from("."),
             enable_tools: false,
             enable_ralph: false,

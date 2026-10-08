@@ -1824,6 +1824,7 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
     "out of budget",
     "quota exceeded",
     "billing",
+    "chatgpt usage limit",
 ];
 
 const RETRYABLE_ASSISTANT_PATTERNS: &[&str] = &[

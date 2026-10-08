@@ -204,12 +204,27 @@ fn interrupted(status: &std::process::ExitStatus) -> bool {
     }
 }
 
+/// A failure whose message the command already printed; the process only
+/// needs to exit non-zero.
+#[derive(Debug)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the run failed")
+    }
+}
+
+impl Error for AlreadyReported {}
+
 fn main() {
     if std::env::var_os(CHILD_ERROR_FILE_ENV).is_some() {
         interrupt::reset_default();
     }
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        if !error.is::<AlreadyReported>() {
+            eprintln!("error: {error}");
+        }
         if let Some(path) = std::env::var_os(CHILD_ERROR_FILE_ENV) {
             let _ = std::fs::write(path, error.to_string());
         }
@@ -354,6 +369,23 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
             eprintln!("{}", dim(&format!("session: {notice}"), color));
         }
+    }
+    // pi's print mode exits 1 when the final turn failed or was aborted, so
+    // scripts can tell a provider error from an answer.
+    let failed = agent
+        .state()
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            llm::Message::Assistant(message) => Some(
+                message.stop_reason == stream::STOP_ERROR
+                    || message.stop_reason == stream::STOP_ABORTED,
+            ),
+            _ => None,
+        });
+    if failed == Some(true) {
+        return Err(Box::new(AlreadyReported));
     }
     Ok(())
 }
@@ -1942,7 +1974,7 @@ fn dispatch_login_command<'a>(
         return CommandDispatch::Handled;
     }
     let provider_id = (*provider_id).to_owned();
-    if use_key && !api_key_login_available(&provider_id) {
+    if use_key && !api_key_login_available(catalog, &provider_id) {
         append_view_message(
             view,
             MessageRole::Error,
@@ -2086,7 +2118,7 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
                 label: provider.id.clone(),
                 execute: true,
             });
-            if !api_key_login_available(&provider.id) {
+            if !api_key_login_available(catalog, &provider.id) {
                 continue;
             }
         }
@@ -2100,10 +2132,12 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
     choices
 }
 
-/// Whether a provider with a login flow also takes an API key. A ChatGPT
-/// subscription has none; the `openai` provider is the API-key route.
-fn api_key_login_available(provider_id: &str) -> bool {
-    provider_id != "openai-codex"
+/// Whether a provider with a login flow also takes an API key. Subscription
+/// providers such as a ChatGPT plan have none; `openai` is the API-key route.
+fn api_key_login_available(catalog: &catalog::Catalog, provider_id: &str) -> bool {
+    catalog
+        .provider(provider_id)
+        .is_some_and(|provider| provider.auth_kind != catalog::AuthKind::OAuthOnly)
 }
 
 fn login_flow_available(provider_id: &str) -> bool {

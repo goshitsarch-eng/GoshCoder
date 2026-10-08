@@ -1053,7 +1053,18 @@ impl LoopbackCallbackServer {
         let _ = stream.set_nonblocking(false);
         let request = match read_callback_request(&mut stream, self.request_timeout, cancellation)?
         {
-            CallbackRead::Request(line) => line,
+            CallbackRead::Request { line, host } => {
+                // A page on another site can reach a loopback port through
+                // DNS rebinding; its requests then carry that site's name.
+                if host
+                    .as_deref()
+                    .is_some_and(|host| !is_loopback_authority(host))
+                {
+                    let _ = write_callback_page(&mut stream, 400, "Unexpected Host header.");
+                    return Ok(None);
+                }
+                line
+            }
             CallbackRead::Reject { status, message } => {
                 let _ = write_callback_page(&mut stream, status, message);
                 return Ok(None);
@@ -1144,6 +1155,17 @@ impl PendingCallback {
     }
 }
 
+/// Whether a `Host` header value names this machine, with or without a port.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    is_loopback_host(host)
+}
+
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -1156,7 +1178,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// carries the response the caller sends, so exactly one response is written
 /// per connection.
 enum CallbackRead {
-    Request(String),
+    Request { line: String, host: Option<String> },
     Reject { status: u16, message: &'static str },
 }
 
@@ -1230,7 +1252,15 @@ fn read_callback_request(
         .next()
         .filter(|line| !line.trim().is_empty())
     {
-        Some(line) => Ok(CallbackRead::Request(line.to_owned())),
+        Some(line) => Ok(CallbackRead::Request {
+            line: line.to_owned(),
+            host: request.lines().skip(1).find_map(|header| {
+                let (name, value) = header.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("host")
+                    .then(|| value.trim().to_owned())
+            }),
+        }),
         None => Ok(CallbackRead::Reject {
             status: 400,
             message: "Callback request was empty.",
@@ -4311,6 +4341,28 @@ mod tests {
                 .access(),
             "sk-or-v1-minted"
         );
+    }
+
+    #[test]
+    fn callback_host_header_must_name_this_machine() {
+        assert!(is_loopback_authority("localhost:53692"));
+        assert!(is_loopback_authority("127.0.0.1:1455"));
+        assert!(is_loopback_authority("[::1]:1455"));
+        assert!(is_loopback_authority("localhost"));
+        assert!(!is_loopback_authority("evil.example:53692"));
+        assert!(!is_loopback_authority("127.0.0.1.evil.example"));
+
+        let server = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state")
+            .expect("bind callback listener");
+        let port = server.local_addr().expect("address").port();
+        let rebound = callback_client(port, |stream| {
+            let _ = stream.write_all(
+                b"GET /callback?code=x&state=state HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            );
+        });
+        let (accepted, response) = serve_until_done(&server, rebound);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
     }
 
     #[test]

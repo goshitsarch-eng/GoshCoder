@@ -379,7 +379,10 @@ pub struct ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            max_retries: 2,
+            // pi's provider layer does not retry (`options.maxRetries ?? 0`);
+            // the turn policy one level up does. Retrying here as well turned
+            // one 429 into twelve requests.
+            max_retries: 0,
             retry_delay_limit: stream::RetryDelayLimit::Default,
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
@@ -897,8 +900,11 @@ impl ProviderResponderFactory {
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
-                    let error =
-                        provider_error_from_response(response, self.config.max_error_body_bytes);
+                    let error = provider_error_from_response(
+                        response,
+                        self.config.max_error_body_bytes,
+                        protocol,
+                    );
                     if !stream::is_retryable_provider_error(&error)
                         || retry_index >= self.config.max_retries
                     {
@@ -1098,13 +1104,25 @@ fn describe_body_read_error(error: io::Error) -> io::Error {
         .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
         .is_some_and(reqwest::Error::is_timeout);
     if timed_out {
-        io::Error::new(
+        return io::Error::new(
             io::ErrorKind::TimedOut,
             format!("provider stream timed out waiting for data: {error}"),
-        )
-    } else {
-        error
+        );
     }
+    // reqwest reports a connection dropped mid-body as a bare "request or
+    // response body error". pi sees undici's "terminated" there and retries;
+    // saying what happened also lets the turn policy recognise it.
+    let dropped = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        .is_some_and(|inner| inner.is_body() || inner.is_decode() || inner.is_request());
+    if dropped {
+        return io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "provider stream terminated: the connection was lost mid-response",
+        );
+    }
+    error
 }
 
 impl Read for CancellableBody {
@@ -1522,6 +1540,7 @@ fn extract_codex_account_id(token: &str) -> Result<String> {
 fn provider_error_from_response(
     mut response: Response,
     maximum_body_bytes: usize,
+    protocol: ProviderProtocol,
 ) -> stream::ProviderError {
     let status = response.status().as_u16();
     let headers = response
@@ -1550,17 +1569,103 @@ fn provider_error_from_response(
     } else {
         text.to_owned()
     };
-    let suffix = if body.is_empty() {
+    // The raw body stays on the error for callers that inspect it; the
+    // message carries only the provider's own sentence, and keeps the status
+    // so the retry classifier still sees it.
+    let detail = provider_error_detail(text).unwrap_or_else(|| body.clone());
+    let suffix = if detail.is_empty() {
         String::new()
     } else {
-        format!(": {body}")
+        format!(": {detail}")
     };
+    let message = match protocol {
+        ProviderProtocol::OpenAiCodexResponses => codex_usage_limit_message(status, text),
+        _ => None,
+    }
+    .unwrap_or_else(|| format!("provider request failed with status {status}{suffix}"));
     stream::ProviderError {
         status,
         headers,
         body,
-        message: format!("provider request failed with status {status}{suffix}"),
+        message,
     }
+}
+
+/// The human-readable sentence in a JSON error body, whichever of the usual
+/// shapes the provider uses.
+fn provider_error_detail(text: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    // Some gateways wrap the body in a one-element array.
+    let value = match value {
+        Value::Array(mut items) if items.len() == 1 => items.remove(0),
+        value => value,
+    };
+    let string = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+    };
+    let error = value.get("error");
+    string(error.and_then(|error| error.get("message")))
+        .or_else(|| string(value.get("message")))
+        .or_else(|| string(value.get("error_description")))
+        .or_else(|| string(value.get("detail")))
+        .or_else(|| string(error))
+        .map(|detail| truncate_error_text(&detail, MAX_PROVIDER_ERROR_BODY_CHARS))
+}
+
+/// pi's `parseErrorResponse` for Codex: a usage limit gets a sentence the
+/// user can act on, and since it carries no status code the turn policy does
+/// not retry a limit that will not lift for minutes or hours.
+fn codex_usage_limit_message(status: u16, text: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let error = value.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let limited = [
+        "usage_limit_reached",
+        "usage_not_included",
+        "rate_limit_exceeded",
+    ]
+    .iter()
+    .any(|pattern| code.contains(pattern));
+    if !limited && status != 429 {
+        return None;
+    }
+    let plan = error
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(|plan| format!(" ({} plan)", plan.to_lowercase()))
+        .unwrap_or_default();
+    let when = error
+        .get("resets_at")
+        .and_then(Value::as_f64)
+        .map(|resets_at| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+            let minutes = ((resets_at - now) / 60.0).round().max(0.0);
+            // pi always says minutes; a weekly limit reads better in days.
+            if minutes >= 2.0 * 24.0 * 60.0 {
+                format!(
+                    " Try again in ~{:.0} days.",
+                    (minutes / (24.0 * 60.0)).round()
+                )
+            } else if minutes >= 90.0 {
+                format!(" Try again in ~{:.0} h.", (minutes / 60.0).round())
+            } else {
+                format!(" Try again in ~{minutes:.0} min.")
+            }
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "You have hit your ChatGPT usage limit{plan}.{when}"
+    ))
 }
 
 /// pi's `truncateErrorText`: keeps the first `max_chars` characters and says
@@ -2129,6 +2234,21 @@ fn compat_map(model: &llm::Model, name: &str) -> Map<String, Value> {
 fn requested_max_tokens(model: &llm::Model, context: &llm::Context) -> Option<u64> {
     (model.max_tokens != 0)
         .then(|| stream::clamp_max_tokens_to_context(model, context, model.max_tokens))
+}
+
+/// The effort a Responses request names when thinking is off. Leaving the
+/// field out lets the server apply its default effort, which still bills
+/// reasoning tokens, so pi sends the model's `off` mapping or `"none"`; an
+/// explicit `off: null` means the model cannot turn reasoning off.
+fn responses_off_effort(model: &llm::Model, requested: &str) -> Option<String> {
+    if !model.reasoning || stream::clamp_thinking_level(model, requested) != llm::THINKING_OFF {
+        return None;
+    }
+    match model.thinking_level_map.get(llm::THINKING_OFF) {
+        Some(None) => None,
+        Some(Some(mapped)) => Some(mapped.clone()),
+        None => Some("none".to_owned()),
+    }
 }
 
 fn mapped_thinking_level(model: &llm::Model, requested: &str) -> Option<String> {
@@ -3556,6 +3676,18 @@ fn build_openai_responses_request(
                 "reasoning.encrypted_content".to_owned(),
             )]),
         );
+    } else if model.provider != "github-copilot"
+        && let Some(effort) = responses_off_effort(model, &options.thinking_level)
+    {
+        body.insert("reasoning".to_owned(), json!({"effort": effort}));
+    }
+    if model.reasoning && model.provider == "xai" {
+        body.insert(
+            "include".to_owned(),
+            Value::Array(vec![Value::String(
+                "reasoning.encrypted_content".to_owned(),
+            )]),
+        );
     }
     if !options.session_id.is_empty() {
         body.insert(
@@ -3759,6 +3891,8 @@ fn build_openai_codex_responses_request(
             "reasoning".to_owned(),
             json!({"effort": effort, "summary": "auto"}),
         );
+    } else if let Some(effort) = responses_off_effort(model, &options.thinking_level) {
+        body.insert("reasoning".to_owned(), json!({"effort": effort}));
     }
     merge_sampling_params(&mut body, model);
     Ok(Value::Object(body))
@@ -4219,6 +4353,14 @@ fn responses_input(
                                         .unwrap_or_else(|_| "{}".to_owned()),
                                 })
                             };
+                            // `json!` writes `None` as `null`, which the API
+                            // rejects as a non-string id; pi's JSON.stringify
+                            // drops the undefined field instead.
+                            if item.get("id").is_some_and(Value::is_null) {
+                                item.as_object_mut()
+                                    .expect("Responses tool call is an object")
+                                    .remove("id");
+                            }
                             if (same_model || deferred_tools.contains_key(&call.name))
                                 && !call.namespace.is_empty()
                             {
@@ -5723,6 +5865,25 @@ fn consume_google_generate_content(
             continue;
         }
         let chunk = serde_json::from_str::<Value>(data)?;
+        // Google sends a failure mid-stream as `{"error":{code,message,status}}`.
+        // Read past, it surfaced only as "ended without finishReason", which
+        // lost the reason and retried even a request that can never succeed.
+        if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .map(|code| format!(" {code}"))
+                .unwrap_or_default();
+            let status = value_string(error, "status")
+                .map(|status| format!(" {status}"))
+                .unwrap_or_default();
+            let message = value_string(error, "message")
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(ProviderAdapterError::Protocol(format!(
+                "Google API error{code}{status}: {message}"
+            )));
+        }
         if emitter.message().response_id.is_empty()
             && let Some(response_id) =
                 value_string(&chunk, "responseId").filter(|response_id| !response_id.is_empty())
@@ -8861,6 +9022,96 @@ mod tests {
         assert_eq!(params["input"][3]["tools"][0]["defer_loading"], true);
     }
 
+    #[test]
+    fn responses_requests_turn_reasoning_off_explicitly() {
+        let context = llm::Context {
+            messages: vec![llm::Message::User(llm::UserMessage::text("hi", 0))],
+            ..llm::Context::default()
+        };
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.thinking_level = llm::THINKING_OFF.to_owned();
+        let mut reasoning = model(API_OPENAI_RESPONSES, "https://example.test".to_owned());
+        reasoning.reasoning = true;
+
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert_eq!(sent["reasoning"], json!({"effort": "none"}));
+        assert!(sent.get("include").is_none());
+
+        let mut codex = model(API_OPENAI_CODEX_RESPONSES, String::new());
+        codex.reasoning = true;
+        let sent = build_openai_codex_responses_request(
+            &codex,
+            &context,
+            &request_options,
+            &BTreeMap::new(),
+        )
+        .expect("codex body");
+        assert_eq!(sent["reasoning"], json!({"effort": "none"}));
+
+        // A model that maps off to its own value sends that; one that cannot
+        // turn reasoning off is clamped up to its lowest real effort.
+        reasoning
+            .thinking_level_map
+            .insert(llm::THINKING_OFF.to_owned(), Some("minimal".to_owned()));
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert_eq!(sent["reasoning"]["effort"], "minimal");
+        reasoning
+            .thinking_level_map
+            .insert(llm::THINKING_OFF.to_owned(), None);
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert!(
+            sent["reasoning"]["effort"]
+                .as_str()
+                .is_some_and(|effort| effort != "none"),
+            "{sent}"
+        );
+
+        // Negative control: a model without reasoning never gets the field.
+        let plain = model(API_OPENAI_RESPONSES, "https://example.test".to_owned());
+        let sent = build_openai_responses_request(&plain, &context, &request_options)
+            .expect("responses body");
+        assert!(sent.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn provider_errors_carry_the_providers_sentence_and_codex_limits_are_final() {
+        assert_eq!(
+            provider_error_detail(r#"{"error":{"message":"Invalid API key","type":"auth"}}"#)
+                .as_deref(),
+            Some("Invalid API key")
+        );
+        assert_eq!(
+            provider_error_detail(r#"[{"error":{"code":429,"message":"Quota\n exceeded"}}]"#)
+                .as_deref(),
+            Some("Quota exceeded")
+        );
+        assert_eq!(provider_error_detail("<html>Bad Gateway</html>"), None);
+
+        let limit = codex_usage_limit_message(
+            429,
+            r#"{"error":{"type":"usage_limit_reached","plan_type":"Plus"}}"#,
+        )
+        .expect("usage limit message");
+        assert_eq!(limit, "You have hit your ChatGPT usage limit (plus plan).");
+        let mut message = llm::AssistantMessage {
+            stop_reason: stream::STOP_ERROR.to_owned(),
+            error_message: limit,
+            ..llm::AssistantMessage::default()
+        };
+        assert!(
+            !stream::is_retryable_assistant_error(&message),
+            "a usage limit does not lift within the retry window"
+        );
+        message.error_message = "provider request failed with status 429: slow down".to_owned();
+        assert!(stream::is_retryable_assistant_error(&message));
+        assert!(
+            codex_usage_limit_message(400, r#"{"error":{"type":"invalid_request"}}"#).is_none()
+        );
+    }
+
     /// Streams a chunked response with pauses so idle and total deadlines can
     /// be told apart. The client may drop a stalled stream, so writes are
     /// allowed to fail.
@@ -9186,7 +9437,8 @@ mod tests {
             .iter()
             .find(|item| item["type"] == "function_call")
             .expect("function call item");
-        assert!(call["id"].is_null(), "{call}");
+        // Omitted, not `null`: the API rejects a null id.
+        assert!(call.get("id").is_none(), "{call}");
         assert_eq!(call["call_id"], "call_1");
         let message = items
             .iter()

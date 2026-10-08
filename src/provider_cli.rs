@@ -12,7 +12,9 @@ use crossterm::{
 };
 
 use crate::{
-    catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
+    catalog::{
+        AuthKind, Catalog, CatalogError, Credential, CredentialKind, CredentialStore, Provider,
+    },
     config, oauth,
 };
 
@@ -107,12 +109,18 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if credentials.is_empty() {
                 println!("No stored credentials.");
             } else {
+                let width = credentials
+                    .iter()
+                    .map(|credential| credential.provider_id.chars().count())
+                    .max()
+                    .unwrap_or(0);
                 for credential in credentials {
-                    println!(
-                        "{:<24} {}",
-                        credential.provider_id,
-                        credential.kind.as_str()
-                    );
+                    let kind = match credential.kind.as_str() {
+                        "oauth" => "signed in (OAuth)",
+                        "api_key" => "API key",
+                        other => other,
+                    };
+                    println!("{:<width$}  {kind}", credential.provider_id);
                 }
             }
             Ok(())
@@ -121,11 +129,34 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let Some(provider_id) = arguments.get(1) else {
                 return Err(command_error("usage: goshcoder auth set <provider>"));
             };
+            if arguments.len() > 2 {
+                return Err(command_error(format!(
+                    "auth set takes no key argument; it prompts for the key so it stays out of your shell history (or pipe it: echo $KEY | goshcoder auth set {provider_id})"
+                )));
+            }
             let catalog = Catalog::with_default_credentials()?;
-            if catalog.provider(provider_id).is_none() {
+            let Some(provider) = catalog.provider(provider_id) else {
                 return Err(command_error(format!("unknown provider {provider_id:?}")));
+            };
+            if provider.auth_kind == AuthKind::OAuthOnly {
+                let alternative = if provider_id == "openai-codex" {
+                    "; for the OpenAI API use `goshcoder auth set openai`"
+                } else {
+                    ""
+                };
+                return Err(command_error(format!(
+                    "{provider_id} signs in with a subscription and takes no API key; run `goshcoder auth login {provider_id}`{alternative}"
+                )));
             }
             config::ensure_agent_dir()?;
+            if store
+                .read_raw(provider_id)?
+                .is_some_and(|credential| credential.kind() == &CredentialKind::OAuth)
+            {
+                eprintln!(
+                    "note: this replaces your {provider_id} sign-in with an API key; `goshcoder auth login {provider_id}` signs in again."
+                );
+            }
             let key = read_secret(&format!("Enter the API key for {provider_id}: "))?;
             if key.is_empty() {
                 return Err(command_error("no key provided"));
@@ -133,6 +164,27 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let mut credential = Credential::api_key(key);
             // Cloudflare resolves nothing from a key alone; the ids are
             // stored beside it so the provider is usable right away.
+            // Azure needs to know which resource to call; a key alone is not
+            // usable, so the endpoint is stored beside it unless the
+            // environment already names one.
+            if provider_id == "azure-openai-responses"
+                && ["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME"]
+                    .iter()
+                    .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+            {
+                let endpoint = read_visible(
+                    "Enter the Azure OpenAI resource name or base URL (https://<resource>.openai.azure.com/openai/v1): ",
+                )?;
+                if endpoint.is_empty() {
+                    return Err(command_error("no Azure resource name or base URL provided"));
+                }
+                let name = if endpoint.contains("://") {
+                    "AZURE_OPENAI_BASE_URL"
+                } else {
+                    "AZURE_OPENAI_RESOURCE_NAME"
+                };
+                credential.set_environment(name, endpoint);
+            }
             for (name, prompt) in cloudflare_credential_fields(provider_id) {
                 let value = read_secret(prompt)?;
                 if value.is_empty() {
@@ -186,8 +238,27 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let Some(provider_id) = arguments.get(1) else {
                 return Err(command_error("usage: goshcoder auth logout <provider>"));
             };
-            store.delete(provider_id)?;
-            println!("Removed the stored credential for {provider_id}");
+            let catalog = Catalog::with_default_credentials()?;
+            let Some(provider) = catalog.provider(provider_id) else {
+                return Err(command_error(format!("unknown provider {provider_id:?}")));
+            };
+            if store.read_raw(provider_id)?.is_none() {
+                println!("No stored credential for {provider_id}.");
+            } else {
+                store.delete(provider_id)?;
+                println!("Removed the stored credential for {provider_id}.");
+            }
+            // A key in the environment keeps the provider usable, which would
+            // otherwise look like the logout did not work.
+            if let Some(name) = provider
+                .env_keys
+                .iter()
+                .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+            {
+                println!(
+                    "{name} is still set in your environment, so {provider_id} remains configured."
+                );
+            }
             Ok(())
         }
         _ => Err(command_error(format!(
@@ -327,6 +398,12 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
             ),
         };
     }
+    if provider.id == "azure-openai-responses" {
+        return format!(
+            "set {environment} and AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE_NAME), or run: goshcoder auth set {}",
+            provider.id
+        );
+    }
     if !environment.is_empty() {
         return format!(
             "set {environment}, or run: goshcoder auth set {}",
@@ -343,10 +420,20 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
                 .to_owned()
         }
         "azure" | "azure-openai-responses" => {
-            "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT".to_owned()
+            "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE_NAME)"
+                .to_owned()
         }
         _ => format!("run: goshcoder auth set {}", provider.id),
     }
+}
+
+/// Reads one echoed line, for values that are not secret.
+fn read_visible(prompt: &str) -> io::Result<String> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_owned())
 }
 
 pub(crate) fn read_secret(prompt: &str) -> io::Result<String> {

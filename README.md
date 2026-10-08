@@ -160,7 +160,7 @@ Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 | --- | --- |
 | `-m`, `-model` | Model as `provider/model`, or a bare id when unambiguous |
 | `-s`, `-system` | System prompt |
-| `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `-thinking` | `off`, `minimal`, `low`, `medium` (default, as in pi), `high`, `xhigh`, `max`; clamped to what the model supports |
 | `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
 | `-ralph` | Enable long-running Ralph loops (default in chat; use `-ralph=false` to disable) |
 | `-planner` | Start in native Planner review mode (`-plan` remains an alias) |
