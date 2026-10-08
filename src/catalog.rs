@@ -34,7 +34,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{aperture, config, llm, oauth, omniroute};
+use crate::{aperture, config, grok_cli, llm, meta_muse, oauth, omniroute};
 
 const CATALOG_JSON: &str = include_str!("../data/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../data/catalog_extra.json");
@@ -401,6 +401,17 @@ const PROVIDER_DEFINITIONS: &[ProviderDefinition] = &[
         auth_kind: AuthKind::Vertex,
         supports_oauth: false,
     },
+    // pi-grok-cli: a Grok subscription through the official CLI's endpoint.
+    // The base URL here is the default; `grok_cli::BASE_URL_ENV` overrides it.
+    ProviderDefinition {
+        id: "grok-cli",
+        name: "Grok CLI",
+        base_url: "https://cli-chat-proxy.grok.com/v1",
+        key_name: "",
+        env_keys: &["GROK_CLI_OAUTH_TOKEN"],
+        auth_kind: AuthKind::OAuthOnly,
+        supports_oauth: true,
+    },
     ProviderDefinition {
         id: "groq",
         name: "Groq",
@@ -435,6 +446,17 @@ const PROVIDER_DEFINITIONS: &[ProviderDefinition] = &[
         key_name: "Meta Model API key",
         env_keys: &["META_API_KEY"],
         auth_kind: AuthKind::MetaBearer,
+        supports_oauth: true,
+    },
+    // pi-meta-muse-auth: a Muse Code subscription login, never an API key,
+    // so a pay-as-you-go key cannot be configured here by accident.
+    ProviderDefinition {
+        id: "meta-muse",
+        name: "Meta Muse Code",
+        base_url: meta_muse::DEFAULT_API_BASE_URL,
+        key_name: "",
+        env_keys: &[],
+        auth_kind: AuthKind::OAuthOnly,
         supports_oauth: true,
     },
     ProviderDefinition {
@@ -2001,6 +2023,8 @@ pub struct Auth {
     environment: BTreeMap<String, String>,
     headers: AuthHeaders,
     source: String,
+    /// Replaces the model's base URL when the credential names its own.
+    base_url: Option<String>,
 }
 
 impl Auth {
@@ -2015,6 +2039,7 @@ impl Auth {
             environment,
             headers,
             source: source.into(),
+            base_url: None,
         }
     }
 
@@ -2028,6 +2053,7 @@ impl Auth {
             environment,
             headers,
             source: source.into(),
+            base_url: None,
         }
     }
 
@@ -2069,6 +2095,13 @@ impl Auth {
 
     pub fn is_ambient(&self) -> bool {
         self.api_key.as_deref() == Some(AUTHENTICATED_SENTINEL)
+    }
+
+    /// The API base URL the stored credential carries, which requests use
+    /// instead of the model's. Meta returns one with every Muse Code key, so
+    /// it travels with the key rather than living in the catalog.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 }
 
@@ -2312,12 +2345,15 @@ impl Catalog {
     fn provider_with_layer(&self, layer: &DynamicLayer, id: &str) -> Option<Provider> {
         let definition = provider_definition(id)?;
         let mut base_url = definition.base_url.to_owned();
-        let mut models: Vec<llm::Model> = self
-            .data
-            .models
-            .get(id)
-            .map(|models| models.values().cloned().collect())
-            .unwrap_or_default();
+        let mut models: Vec<llm::Model> = match layer.live_models(id) {
+            Some(models) => models.clone(),
+            None => self
+                .data
+                .models
+                .get(id)
+                .map(|models| models.values().cloned().collect())
+                .unwrap_or_default(),
+        };
         if id == omniroute::OMNI_PROVIDER_ID {
             if let Some(omni) = &layer.omni {
                 base_url = omni.base_url.clone();
@@ -2328,6 +2364,9 @@ impl Catalog {
                 base_url = dedicated.base_url.clone();
                 models = dedicated.models.clone();
             }
+        } else if id == grok_cli::PROVIDER_ID {
+            base_url = grok_cli::base_url(|name| environment_value(&self.environment, name));
+            models = self.grok_cli_models(models, &base_url);
         } else if let Some(route) = layer.aperture.routes.get(id) {
             base_url = route.base_url.clone();
             models = models
@@ -2392,11 +2431,57 @@ impl Catalog {
                 .find(|model| model.id == model_id)
                 .cloned();
         }
-        let model = self.data.models.get(provider_id)?.get(model_id)?;
+        if provider_id == grok_cli::PROVIDER_ID {
+            let base_url = grok_cli::base_url(|name| environment_value(&self.environment, name));
+            let models = self
+                .data
+                .models
+                .get(provider_id)
+                .map(|models| models.values().cloned().collect())
+                .unwrap_or_default();
+            return self
+                .grok_cli_models(models, &base_url)
+                .into_iter()
+                .find(|model| model.id == model_id);
+        }
+        let model = match layer.live_models(provider_id) {
+            Some(models) => models.iter().find(|model| model.id == model_id)?,
+            None => self.data.models.get(provider_id)?.get(model_id)?,
+        };
         match layer.aperture.routes.get(provider_id) {
             Some(route) => aperture::apply_proxy_route(model, route),
             None => Some(model.clone()),
         }
+    }
+
+    /// The Grok CLI models as the environment configures them: every model
+    /// points at the configured base URL, and `PI_GROK_CLI_MODELS` filters,
+    /// reorders, or adds generic definitions for ids the catalog lacks.
+    fn grok_cli_models(&self, models: Vec<llm::Model>, base_url: &str) -> Vec<llm::Model> {
+        let models = models
+            .into_iter()
+            .map(|model| llm::Model {
+                base_url: base_url.to_owned(),
+                ..model
+            })
+            .collect();
+        grok_cli::filter_models(
+            models,
+            environment_value(&self.environment, grok_cli::MODELS_ENV).as_deref(),
+            base_url,
+        )
+    }
+
+    /// The OAuth client stored-credential refreshes go through, shared with
+    /// integrations that keep further logins of their own.
+    pub fn oauth_client(&self) -> &oauth::OAuthClient {
+        &self.oauth_client
+    }
+
+    /// Reads the catalog's injected environment, so request-path settings
+    /// follow the same lookup tests substitute.
+    pub fn environment_value(&self, name: &str) -> Option<String> {
+        environment_value(&self.environment, name)
     }
 
     /// Returns raw protocol compatibility metadata for one model.
@@ -2438,6 +2523,19 @@ impl Catalog {
             }
             let override_credential = Credential::api_key(override_key);
             return Ok(self.build_api_key_auth(definition, Some(&override_credential), "override"));
+        }
+
+        // pi-grok-cli's environment bypass: a bearer token with no refresh
+        // that takes precedence over a stored login.
+        if provider_id == grok_cli::PROVIDER_ID
+            && let Some(token) = environment_value(&self.environment, grok_cli::TOKEN_ENV)
+        {
+            return Ok(Some(Auth::with_api_key(
+                token,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                grok_cli::TOKEN_ENV,
+            )));
         }
 
         let layer = self.dynamic();
@@ -2494,6 +2592,16 @@ impl Catalog {
             }
         }
 
+        // With no Grok CLI login in auth.json, an account added through
+        // `/grok-cli-accounts` keeps the provider usable, as upstream's
+        // vault does.
+        if provider_id == grok_cli::PROVIDER_ID {
+            return Ok(crate::grok_accounts::Accounts::new(self)
+                .fallback_token()
+                .map(|token| {
+                    Auth::with_api_key(token, BTreeMap::new(), BTreeMap::new(), "Grok CLI account")
+                }));
+        }
         if definition.auth_kind == AuthKind::OAuthOnly {
             return Ok(None);
         }
@@ -2574,11 +2682,13 @@ impl Catalog {
         {
             Ok(Some(auth)) => {
                 self.clear_oauth_refresh_failure(provider_id);
+                let base_url = auth.base_url().map(str::to_owned);
                 let (api_key, headers, source) = auth.into_parts();
-                let auth = match api_key {
+                let mut auth = match api_key {
                     Some(api_key) => Auth::with_api_key(api_key, BTreeMap::new(), headers, source),
                     None => Auth::without_api_key(BTreeMap::new(), headers, source),
                 };
+                auth.base_url = base_url;
                 Ok(Some(auth))
             }
             Ok(None) => {
@@ -3007,7 +3117,10 @@ impl Catalog {
         }
     }
 
-    fn resolved_model(&self, model: llm::Model, auth: Auth) -> ResolvedModel {
+    fn resolved_model(&self, mut model: llm::Model, auth: Auth) -> ResolvedModel {
+        if let Some(base_url) = auth.base_url() {
+            model.base_url = base_url.to_owned();
+        }
         let mut effective_headers: AuthHeaders =
             resolve_headers(&model.headers, auth.environment(), &self.environment)
                 .into_iter()
@@ -3048,6 +3161,9 @@ pub struct DynamicPaths {
     pub omniroute_url: Option<String>,
     pub aperture: Option<PathBuf>,
     pub aperture_cache: Option<PathBuf>,
+    /// Meta Muse Code's last fetched model list, which replaces the bundled
+    /// `meta-muse` models while it parses.
+    pub meta_muse_models: Option<PathBuf>,
 }
 
 impl DynamicPaths {
@@ -3064,6 +3180,7 @@ impl DynamicPaths {
             omniroute_url: None,
             aperture: Some(config::aperture_path_in(agent_dir)),
             aperture_cache: Some(config::aperture_cache_path_in(agent_dir)),
+            meta_muse_models: Some(config::meta_muse_models_path_in(agent_dir)),
         }
     }
 
@@ -3091,10 +3208,15 @@ impl DynamicPaths {
 
     fn fingerprint(&self) -> DynamicFingerprint {
         DynamicFingerprint(
-            [&self.omniroute, &self.aperture, &self.aperture_cache]
-                .into_iter()
-                .map(|path| file_fingerprint(path.as_deref()))
-                .collect(),
+            [
+                &self.omniroute,
+                &self.aperture,
+                &self.aperture_cache,
+                &self.meta_muse_models,
+            ]
+            .into_iter()
+            .map(|path| file_fingerprint(path.as_deref()))
+            .collect(),
         )
     }
 }
@@ -3124,6 +3246,17 @@ struct DynamicLayer {
     omni: Option<GatewayModels>,
     dedicated: Option<GatewayModels>,
     aperture: aperture::ApertureState,
+    meta_muse: Option<Vec<llm::Model>>,
+}
+
+impl DynamicLayer {
+    /// The live model list for a provider whose catalog is fetched rather
+    /// than bundled, when one has been fetched.
+    fn live_models(&self, provider_id: &str) -> Option<&Vec<llm::Model>> {
+        (provider_id == meta_muse::PROVIDER_ID)
+            .then_some(self.meta_muse.as_ref())
+            .flatten()
+    }
 }
 
 fn build_dynamic_layer(
@@ -3166,11 +3299,18 @@ fn build_dynamic_layer(
             base_url: aperture::provider_base_url(&aperture.resolved.base_url),
             models: aperture.dedicated_models.clone(),
         });
+    // A missing or unusable cache keeps the bundled models, as the
+    // extension falls back to its own list.
+    let meta_muse = paths
+        .meta_muse_models
+        .as_deref()
+        .and_then(meta_muse::load_cache);
     DynamicLayer {
         fingerprint,
         omni,
         dedicated,
         aperture,
+        meta_muse,
     }
 }
 
@@ -4443,5 +4583,333 @@ mod tests {
                 .is_none()
         );
         fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    fn muse_credential(base_url: &str) -> Credential {
+        let mut credential = Credential::oauth("muse-model-key", "identity", i64::MAX);
+        credential
+            .set_extra("baseUrl", json!(base_url))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        credential
+    }
+
+    fn muse_catalog(store: Arc<CredentialStore>, agent_dir: &Path) -> Catalog {
+        Catalog::with_environment_and_file_exists(
+            Some(store),
+            test_environment(&[]),
+            Arc::new(|_| false),
+        )
+        .expect("catalog")
+        .with_dynamic_paths(DynamicPaths::for_agent_dir(agent_dir))
+    }
+
+    fn muse_model_ids(catalog: &Catalog) -> Vec<String> {
+        catalog
+            .provider(meta_muse::PROVIDER_ID)
+            .expect("meta-muse provider")
+            .models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect()
+    }
+
+    #[test]
+    fn meta_muse_requests_use_the_credentials_base_url_and_the_cached_live_models() {
+        let agent_dir = test_directory("meta-muse");
+        let store = Arc::new(CredentialStore::in_memory());
+        store
+            .put("meta-muse", muse_credential("https://api.meta.ai/v2/"))
+            .expect("store");
+        let catalog = muse_catalog(store, &agent_dir);
+
+        // Nothing fetched yet: the bundled list.
+        assert_eq!(
+            muse_model_ids(&catalog),
+            [
+                "muse-spark-1.1",
+                "muse-spark-1.2",
+                "muse-spark-1.2-contributor",
+                "muse-spark-1.3",
+                "muse-spark-1.3-contributor"
+            ]
+        );
+        let resolved = catalog
+            .resolve_model("meta-muse/muse-spark-1.3")
+            .expect("resolves");
+        // The stored URL wins over the provider default, sanitised again.
+        assert_eq!(resolved.model.base_url, "https://api.meta.ai/v2");
+        assert_eq!(resolved.auth().api_key(), Some("muse-model-key"));
+        assert_eq!(resolved.auth().base_url(), Some("https://api.meta.ai/v2"));
+        assert_eq!(
+            resolved.effective_headers().get("User-Agent"),
+            Some(&Some(meta_muse::MUSE_USER_AGENT.to_owned()))
+        );
+
+        // A fetched catalog replaces the bundled models.
+        let cache = config::meta_muse_models_path_in(&agent_dir);
+        fs::create_dir_all(cache.parent().expect("extensions dir")).expect("create dir");
+        fs::write(
+            &cache,
+            r#"{"data":[{"id":"muse-spark-2.0"},{"id":"muse-voice-1"}]}"#,
+        )
+        .expect("write cache");
+        catalog.refresh_dynamic();
+        assert_eq!(muse_model_ids(&catalog), ["muse-spark-2.0"]);
+        assert!(catalog.model("meta-muse", "muse-spark-1.3").is_none());
+        let live = catalog
+            .resolve_model("meta-muse/muse-spark-2.0")
+            .expect("live model resolves");
+        assert_eq!(live.model.base_url, "https://api.meta.ai/v2");
+        // Other providers keep their own data.
+        assert!(catalog.model("meta", "muse-spark-1.2").is_some());
+
+        // An unusable cache falls back to the bundled list.
+        fs::write(&cache, r#"{"data":[]}"#).expect("rewrite cache");
+        catalog.refresh_dynamic();
+        assert_eq!(muse_model_ids(&catalog).len(), 5);
+        let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    #[test]
+    fn meta_muse_is_configured_only_by_a_complete_subscription_login() {
+        let agent_dir = test_directory("meta-muse-auth");
+        let store = Arc::new(CredentialStore::in_memory());
+        let catalog = muse_catalog(store.clone(), &agent_dir);
+        assert!(!catalog.is_configured("meta-muse").expect("status"));
+
+        // An API key never configures the subscription provider.
+        store
+            .put("meta-muse", Credential::api_key("paygo-key"))
+            .expect("store");
+        assert!(
+            catalog
+                .resolve_auth("meta-muse")
+                .expect("resolve")
+                .is_none()
+        );
+
+        // An entry without the subscription fields needs a new login.
+        store
+            .put(
+                "meta-muse",
+                Credential::oauth("muse-model-key", "identity", i64::MAX),
+            )
+            .expect("store");
+        assert!(matches!(
+            catalog.resolve_auth("meta-muse"),
+            Err(CatalogError::OAuthRefreshFailed {
+                unauthorized: true,
+                ..
+            })
+        ));
+        assert!(!catalog.is_configured("meta-muse").expect("status"));
+
+        // A stored URL off api.meta.ai is never used.
+        store
+            .put("meta-muse", muse_credential("https://example.com/v1"))
+            .expect("store");
+        assert!(catalog.resolve_auth("meta-muse").is_err());
+
+        store
+            .put("meta-muse", muse_credential("https://api.meta.ai/v1"))
+            .expect("store");
+        assert!(catalog.is_configured("meta-muse").expect("status"));
+        // The `meta` provider is unaffected by a `meta-muse` login.
+        assert!(!catalog.is_configured("meta").expect("status"));
+        let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    // -- Grok CLI (pi-grok-cli) --------------------------------------------------
+
+    fn grok_catalog(store: Option<Arc<CredentialStore>>, values: &[(&str, &str)]) -> Catalog {
+        Catalog::with_environment_and_file_exists(
+            store,
+            test_environment(values),
+            Arc::new(|_| false),
+        )
+        .expect("catalog")
+    }
+
+    #[test]
+    fn grok_cli_carries_upstreams_ten_models_with_their_identity_headers() {
+        let catalog = test_catalog(&[]);
+        let provider = catalog.provider("grok-cli").expect("grok-cli provider");
+        assert_eq!(provider.name, "Grok CLI");
+        assert_eq!(provider.base_url, "https://cli-chat-proxy.grok.com/v1");
+        let mut ids = provider
+            .models()
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "grok-4.20-0309-non-reasoning",
+                "grok-4.20-0309-reasoning",
+                "grok-4.20-multi-agent-0309",
+                "grok-4.3",
+                "grok-4.5",
+                "grok-4.6",
+                "grok-4.7",
+                "grok-4.7-build-fast",
+                "grok-build",
+                "grok-composer-2.5-fast",
+            ]
+        );
+        for model in provider.models() {
+            assert_eq!(model.api, "openai-responses", "{}", model.id);
+            assert_eq!(model.max_tokens, 30_000, "{}", model.id);
+            assert_eq!(model.input, ["text", "image"], "{}", model.id);
+            assert_eq!(
+                model.headers,
+                grok_cli::model_headers(&model.id),
+                "{}",
+                model.id
+            );
+        }
+        let composer = catalog
+            .model("grok-cli", "grok-composer-2.5-fast")
+            .expect("composer");
+        assert!(!composer.reasoning);
+        assert_eq!(composer.context_window, 200_000);
+        assert_eq!(composer.cost.rates.input, 3.0);
+        assert_eq!(composer.cost.rates.output, 15.0);
+        assert_eq!(crate::stream::supported_thinking_levels(&composer), ["off"]);
+        let fast = catalog
+            .model("grok-cli", "grok-4.7-build-fast")
+            .expect("4.7 fast");
+        assert_eq!(fast.cost.rates.input, 4.0);
+        assert_eq!(fast.cost.rates.cache_read, 1.0);
+        assert!(crate::stream::supports_thinking_level(&fast, "xhigh"));
+        // Without an explicit mapping xhigh stays unoffered.
+        let build = catalog.model("grok-cli", "grok-build").expect("build");
+        assert_eq!(build.cost.rates.cache_write, 0.2);
+        assert!(!crate::stream::supports_thinking_level(&build, "xhigh"));
+        assert_eq!(
+            catalog
+                .model("grok-cli", "grok-4.20-0309-reasoning")
+                .expect("4.20")
+                .context_window,
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn grok_cli_base_url_and_model_list_follow_the_environment() {
+        let catalog = test_catalog(&[
+            ("GROK_CLI_BASE_URL", "https://second.example/v1"),
+            ("PI_GROK_CLI_BASE_URL", "https://proxy.example/v1///"),
+            ("PI_GROK_CLI_MODELS", "grok-4.6, future-grok, grok-build"),
+        ]);
+        let provider = catalog.provider("grok-cli").expect("provider");
+        assert_eq!(provider.base_url, "https://proxy.example/v1");
+        let models = provider.models();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["grok-4.6", "future-grok", "grok-build"]
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.base_url == "https://proxy.example/v1")
+        );
+        let future = catalog
+            .model("grok-cli", "future-grok")
+            .expect("generic definition for an unknown id");
+        assert_eq!(future.name, "future-grok");
+        assert_eq!(future.headers["x-grok-model-override"], "future-grok");
+        // A filtered-out model is no longer selectable.
+        assert!(catalog.model("grok-cli", "grok-4.3").is_none());
+        // Other providers are untouched by the Grok CLI variables.
+        assert_eq!(
+            catalog
+                .model("xai", "grok-4.3")
+                .expect("xai model")
+                .base_url,
+            "https://api.x.ai/v1"
+        );
+    }
+
+    #[test]
+    fn grok_cli_environment_token_wins_over_a_stored_login_and_keys_are_ignored() {
+        let store = Arc::new(CredentialStore::in_memory());
+        store
+            .put(
+                "grok-cli",
+                Credential::oauth("stored-access", "stored-refresh", i64::MAX),
+            )
+            .expect("store login");
+        let with_token = grok_catalog(
+            Some(store.clone()),
+            &[("GROK_CLI_OAUTH_TOKEN", "env-token")],
+        );
+        let auth = with_token
+            .resolve_auth("grok-cli")
+            .expect("resolve")
+            .expect("environment token");
+        assert_eq!(auth.api_key(), Some("env-token"));
+        assert_eq!(auth.source(), "GROK_CLI_OAUTH_TOKEN");
+
+        let stored = grok_catalog(Some(store), &[]);
+        let auth = stored
+            .resolve_auth("grok-cli")
+            .expect("resolve")
+            .expect("stored login");
+        assert_eq!(auth.api_key(), Some("stored-access"));
+        assert_eq!(auth.source(), "OAuth");
+
+        // Neither an API key nor xAI's credentials configure Grok CLI.
+        let keys = Arc::new(CredentialStore::in_memory());
+        keys.put("grok-cli", Credential::api_key("sk-key"))
+            .expect("store key");
+        let keyed = grok_catalog(Some(keys), &[("XAI_API_KEY", "xai-key")]);
+        assert!(!keyed.is_configured("grok-cli").expect("configured"));
+        assert!(keyed.is_configured("xai").expect("configured"));
+        assert!(
+            keyed
+                .resolve_auth_with_key("grok-cli", "override")
+                .expect("resolve")
+                .is_none()
+        );
+    }
+
+    /// CONTINUE.md promises these two checks: an extra model pi has since
+    /// shipped must be deleted rather than silently shadowed, and an
+    /// override must still correct something.
+    #[test]
+    fn extras_and_overrides_never_restate_the_generated_catalog() {
+        let generated = parse_raw_catalog(CATALOG_JSON, "catalog.json").expect("generated");
+        let extras = parse_raw_catalog(CATALOG_EXTRA_JSON, "catalog_extra.json").expect("extras");
+        for (provider_id, models) in &extras {
+            for model_id in models.keys() {
+                assert!(
+                    generated
+                        .get(provider_id)
+                        .is_none_or(|generated| !generated.contains_key(model_id)),
+                    "catalog_extra.json duplicates generated model {provider_id}/{model_id}; delete the extra"
+                );
+            }
+        }
+        let overrides =
+            parse_raw_catalog(CATALOG_OVERRIDES_JSON, "catalog_overrides.json").expect("overrides");
+        for (provider_id, models) in &overrides {
+            for (model_id, patch) in models {
+                let model = &generated[provider_id][model_id];
+                for (field, value) in patch {
+                    assert_ne!(
+                        model.get(field),
+                        Some(value),
+                        "catalog_overrides.json restates {provider_id}/{model_id}.{field}"
+                    );
+                }
+            }
+        }
     }
 }

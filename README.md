@@ -140,16 +140,23 @@ goshcoder prompts restore goshcoder-prompts-2026-08-23.tar.gz
 goshcoder auth login anthropic
 goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
-goshcoder auth login xai      # Grok subscription; device code or browser
+goshcoder auth login grok-cli # X Premium/SuperGrok via the Grok CLI endpoint
+goshcoder grok-cli usage      # its weekly usage; `grok-cli accounts` for more logins
+goshcoder auth login xai      # Grok subscription against api.x.ai
 goshcoder auth login meta     # Meta account; mints a Model API key
+goshcoder auth login meta-muse  # Muse Code subscription; then meta-muse/muse-spark-1.3
+goshcoder auth login openrouter # mints an OpenRouter key: hundreds of models, one login
 
 # The same providers by API key, for a developer account
 goshcoder auth set xai        # then select xai/grok-4.6 or grok-build-0.1
 goshcoder auth set meta       # then select meta/muse-spark-1.2
+goshcoder auth set anthropic  # an Anthropic API key instead of Claude Pro/Max
 ```
 
-Inside chat, `/login` opens a provider picker. OAuth subscriptions and API-key
-providers are added to `auth.json` independently, so signing in to one does not
+Inside chat, `/login` opens a provider picker. A provider that has both a
+subscription login and an API key gets a row for each; `/login <provider> key`
+asks for the key directly. OAuth subscriptions and API-key providers are added
+to `auth.json` independently, so signing in to one does not
 remove existing logins. A session that has no model yet switches to the new
 provider's default model as soon as the login finishes; otherwise use `/model`
 to search models across every authenticated provider.
@@ -160,7 +167,7 @@ Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 | --- | --- |
 | `-m`, `-model` | Model as `provider/model`, or a bare id when unambiguous |
 | `-s`, `-system` | System prompt |
-| `-thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `-thinking` | `off`, `minimal`, `low`, `medium` (default, as in pi), `high`, `xhigh`, `max`; clamped to what the model supports |
 | `-tools` | Enable built-in file and shell tools (default true in chat; use `-tools=false` for read-only chat) |
 | `-ralph` | Enable long-running Ralph loops (default in chat; use `-ralph=false` to disable) |
 | `-planner` | Start in native Planner review mode (`-plan` remains an alias) |
@@ -190,10 +197,14 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | Package | Contents |
 | --- | --- |
 | `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
+| `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation, usage |
+| `src/grok_imagine.rs` | Grok Imagine image generation, `/grok-cli-imagine`, and the `image_gen` tool |
+| `src/grok_accounts.rs` | Several Grok CLI accounts, per-session account choice, and exhaustion rotation |
 | `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `src/webaccess.rs` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
+| `src/meta_muse.rs` | Meta Muse Code subscription login, key mint, and live Muse Spark model list |
 | `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
 | `src/{aperture,aperture_mcp}.rs` | Tailscale Aperture core, routing, cache, and connector MCP client |
 | `src/computeruse.rs` | computer-use-linux discovery, mcp.json upkeep, stdio MCP client, and `mcp` tool |
@@ -384,6 +395,129 @@ is recorded in [`NOTICE`](NOTICE).
   install it with `npm install -g @agent-sh/computer-use-linux` or `cargo
   install computer-use-linux` and check readiness with
   `computer-use-linux doctor`.
+- [`pi-meta-muse-auth`](https://github.com/sadiksaifi/pi-meta-muse-auth) by
+  Sadik Saifi — **Meta Muse Code** (native adaptation of version 0.1.2): a
+  `meta-muse` provider for a Muse Code subscription, beside the existing
+  `meta` provider rather than replacing it, so pi's `auth.json` entries for
+  both keep working. `goshcoder auth login meta-muse` (or `/login`, "sign in
+  with your Muse Code subscription") runs the auth.meta.com device flow,
+  accepting a verification page only on `https://auth.meta.com`, and then
+  mints a Model API key at `api.meta.ai/muse-code/key`. A key Meta does not
+  confirm as subscription-backed is refused rather than stored, so a login
+  can never fall back to pay-as-you-go billing; for the same reason the
+  provider takes no API key (`meta` is the API-key route). The key is
+  re-minted from the stored identity token every twelve hours, and the base
+  URL Meta returns with it is honoured only on `https://api.meta.ai`. Requests
+  use OpenAI Responses with the Muse client identity and a `system`-role
+  prompt. Five Muse Spark models (1.1 to 1.3, plus the Contributor variants)
+  are bundled; the live list from `/v1/models`, with Meta's names, limits and
+  reasoning levels, replaces them after login and is revalidated in the
+  background at session start, cached in `extensions/meta-muse-models.json`
+  so it loads offline. Not ported: pi's own models store (the sibling cache
+  file stands in for it) and the extension's npm packaging; a reported poll
+  interval under a second is treated as five seconds by the shared device
+  poller.
+- [`pi-grok-cli`](https://github.com/kenryu42/pi-grok-cli) by J Liew
+  (kenryu42) — **Grok CLI** (native adaptation of version 0.9.3): a separate
+  `grok-cli` provider that puts an X Premium or SuperGrok subscription to
+  work through the endpoint the official Grok CLI talks to
+  (`https://cli-chat-proxy.grok.com/v1`, `openai-responses`). No grok binary
+  is involved; requests carry the official client's identification instead.
+  The `xai` provider is unchanged, and the two keep separate `auth.json`
+  entries.
+
+  - **Login.** `goshcoder auth login grok-cli` (or `/login grok-cli`) signs in
+    at `auth.x.ai` with the Grok CLI's client id and scope. The browser flow is
+    the default: it listens on port 56122 (falling back to any free port, with
+    the redirect URI naming the one bound), answers the CORS preflight xAI's
+    account pages send from `accounts.x.ai`/`auth.x.ai`, adds `plan=generic`,
+    and exchanges the code with the PKCE verifier alone. A pasted callback must
+    carry the matching state, or be a bare one-time code; anything else is
+    reported and ignored while the browser callback keeps waiting. Device code
+    is offered for headless machines. A refresh answered with 400, 401 or 403
+    asks for a new login. `GROK_CLI_OAUTH_TOKEN` is a bearer token with no
+    refresh that wins over a stored login, and `auth login grok-cli` refuses
+    to run while it is set. `PI_GROK_CLI_OAUTH_CLIENT_ID`,
+    `PI_GROK_CLI_OAUTH_SCOPE`, `PI_GROK_CLI_CALLBACK_PORT` and
+    `PI_GROK_CLI_CALLBACK_HOST` override the login parameters.
+  - **Requests.** Every request carries `x-grok-client-identifier`,
+    `x-xai-token-auth` and `x-grok-model-override`, plus the client version as
+    `x-grok-client-version` and in the user agent. The version is the latest
+    stable release read once per process from `https://x.ai/cli/stable`
+    (`PI_GROK_CLI_VERSION_URL`), with 1.0.46 as the fallback; an HTTP 426 from
+    the version gate looks it up again and retries once. `x-grok-conv-id` is
+    the session id, then `<id>:<n>` after the proxy answers 401, 502 or 520
+    before streaming: the conversation is rotated (at most twice per request)
+    and the generation recorded as a `grok-cli-conv-id-v1` session entry, so
+    resume, `/fork` and `/tree` navigation find the right one.
+    `/grok-cli-conv [status|rotate]` shows or rotates it by hand. The generic
+    provider retry is off for this provider, as upstream sets `maxRetries: 0`,
+    because it would resend a conversation id the proxy just rejected.
+  - **Payload.** The Responses body is sanitised as upstream's `sanitize.ts`
+    does: system and developer messages move into `instructions`, replayed
+    reasoning items lose `status` and carry typed `reasoning_text`, empty
+    messages are dropped, image parts become `input_image` with a `detail`,
+    tool results with images keep their text and hand the images to a
+    following user message, `response_format` becomes `text.format`,
+    `reasoning.effort` reaches only the models that accept it (`minimal`
+    becomes `low`), `prompt_cache_retention` is removed and the session id is
+    the `prompt_cache_key`.
+  - **Usage.** `/grok-cli-usage` reads the subscription's billing endpoints
+    (`/billing`, `/billing?format=credits`, `/settings`, relative to the base
+    URL) and prints the weekly limit, tier, share used and reset time, which
+    GoshCoder shows in UTC because it carries no time-zone database. Each
+    answer is cached in `grok-cli/quota-cache.json` under the agent directory
+    (0600, upstream's format; an entry older than 30 minutes counts as
+    stale), and a failed refresh falls back to the cached figures.
+  - **Accounts.** Several subscriptions can be kept side by side.
+    `/grok-cli-accounts` lists them with their cached quota;
+    `/grok-cli-accounts add [label]` and `login <n>` sign one in (the OAuth
+    flow takes over the terminal, as `/login` does), `use <n>` switches this
+    session and makes the account the default for new ones, and `rename`,
+    `logout` and `remove` do what they say. `goshcoder grok-cli accounts`
+    offers the same outside chat. Account 1 is the ordinary `grok-cli` login
+    in `auth.json`; the others, their labels and the default live in
+    `grok-cli/accounts.json` (0600, written under a lock file). A session's
+    choice is recorded as a `grok-cli-active-account-v1` entry, so resuming
+    or rewinding a session brings back the account it used, and requests are
+    sent with that account's token, refreshed when it is about to expire.
+    When the proxy answers that an account's Grok Build balance is
+    exhausted (HTTP 402), the session moves to the next logged-in account —
+    the one with the most weekly credit left by fresh cached figures, else
+    the next in the list — and the turn continues with upstream's
+    continuation message; a chain never returns to an account it used up,
+    and an exhausted account is skipped for five minutes.
+  - **Grok Imagine.** With a Grok CLI login, `/grok-cli-imagine <prompt>
+    [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]` generates
+    an image, or edits a PNG, JPEG or WebP of up to 400 KiB (typed by its
+    bytes, not its name), through `https://api.x.ai/v1/images/generations`
+    or `/edits` (`PI_GROK_CLI_IMAGINE_BASE_URL`, model
+    `grok-imagine-image-quality` or `PI_GROK_CLI_IMAGINE_MODEL`), with
+    upstream's 14 aspect ratios, three attempts on retryable failures and
+    its error messages. Images are numbered `N.jpg` in
+    `<session dir>/<session id>/images/`, or a temporary directory without a
+    session, and recorded as `grok-cli-imagine` session entries. The
+    `image_gen` tool gives the model the same ability; it is offered only
+    while coding tools are on, a Grok CLI credential exists and the switch in
+    `grok-cli/config.json` (`/grok-cli-imagine:tool [on|off|status]`) is on.
+    Its source image is read through the workspace confinement the other
+    file tools use, where upstream accepts any path. The interface shows the
+    saved path rather than drawing the image.
+  - **Models.** Upstream's ten (Composer 2.5 Fast, Grok Build, Grok 4.3 to
+    4.7, Grok 4.7 Fast and the three Grok 4.20 variants) with its context
+    windows, prices and effort maps. `PI_GROK_CLI_MODELS` filters and reorders
+    them, and an id the list does not know gets upstream's generic definition.
+    `PI_GROK_CLI_BASE_URL`, `GROK_CLI_BASE_URL` or
+    `GOSHCODER_GROK_CLI_BASE_URL` move the endpoint.
+
+  Not ported: the browser account dashboard (accounts are managed with the
+  subcommands above), upstream's migrations from its own earlier releases
+  (there is nothing in GoshCoder to migrate from), the payload step that
+  turns local image paths into data URIs (GoshCoder's request builders only
+  ever send data URIs), and Imagine's inline image preview (GoshCoder has no
+  terminal image renderer). One deliberate difference: the base URL comes
+  from the environment on every request, where upstream pins the one a login
+  recorded; the recorded `baseUrl` is kept in the credential for reference.
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
@@ -492,8 +626,18 @@ Documented at the top of each ported file. The notable ones:
 - **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
-  Code, xAI, and Meta. Every one of them also accepts an API key, so a
+  Code, xAI, Grok CLI, Meta, Meta Muse Code, and OpenRouter. Every one of them except the
+  pure subscriptions (OpenAI Codex, Grok CLI and Meta Muse Code, whose API-key
+  counterparts are `openai`, `xai` and `meta`) also accepts an API key, so a
   developer account never has to go through a subscription login.
+  - **Browser sign-in** answers the browser only after the code exchange, as
+    pi's callback server does, so the page reports a rejected code instead of
+    claiming success; a provider redirect carrying `error=` ends the login
+    with its reason. Anthropic falls back to a free loopback port when 53692
+    is taken, and offers pi's copy-code login for a machine whose browser
+    cannot reach this one.
+  - **OpenRouter** uses pi's PKCE flow, which mints a permanent API key
+    through a state-less callback on an ephemeral port with a random path.
   - **xAI (Grok)** uses xAI's own OIDC server at `auth.x.ai`: PKCE S256 over a
     loopback callback, or RFC 8628 device code for a headless session, against
     the public desktop client. Discovered endpoints are pinned to the issuer's
@@ -501,16 +645,26 @@ Documented at the top of each ported file. The notable ones:
     What this authenticates is a consumer Grok subscription, and xAI applies
     its own entitlement checks afterwards: a login can succeed and inference
     still answer 403 for an account without the plan the endpoint wants. That
-    is xAI's decision, not a client bug, and `XAI_API_KEY` is unaffected.
+    is xAI's decision, not a client bug, and `XAI_API_KEY` is unaffected. A
+    subscription is what the separate **`grok-cli`** provider is for: it
+    signs in the same way but sends requests to the endpoint the official
+    Grok CLI uses, which accepts subscription tokens (see **Extensions**).
   - **Meta** signs in by device code at `auth.meta.com` and then mints a Model
     API key at `api.meta.ai/muse-code/key`; the key is what requests carry, and
     Meta re-mints it about once a day, which the stored expiry accounts for.
     Meta's Model API speaks the Anthropic Messages shape but authenticates with
     `Authorization`, so the key travels as a header and never as `x-api-key`.
+  - **Meta Muse Code** (`meta-muse`, from the `pi-meta-muse-auth` extension)
+    uses the same device sign-in but mints the key with the Muse Code
+    subscription request and stores it only when Meta confirms an active
+    subscription. Its requests are OpenAI Responses calls to the base URL Meta
+    returned with the key (always `https://api.meta.ai`), and it takes no API
+    key at all; see [Extensions](#extensions).
   - The client ids both flows use are public desktop clients with no secret --
     PKCE and the device flow replace one. `GOSHCODER_XAI_OAUTH_CLIENT_ID` and
     `GOSHCODER_META_OAUTH_CLIENT_ID` override them for an account registered
-    against a different application.
+    against a different application. Meta Muse Code always uses the Muse Code
+    launcher's client, as the extension does.
 - **Interface.** Interactive chat uses a Ratatui alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
@@ -585,6 +739,7 @@ It is a derivative work of [pi](https://github.com/earendil-works/pi),
 Copyright (c) 2025 Mario Zechner, used under the MIT License.
 [`NOTICE`](NOTICE) reproduces that copyright and credits every other project
 adapted here — `pi-web-access`, Plannotator, `pi-ralph-wiggum`,
-`pi-claude-code-tui`, OmniRoute and `pi-btw` — with its author, repository and
+`pi-claude-code-tui`, OmniRoute, `pi-btw`, Aperture, computer-use-linux,
+`pi-grok-cli` and `pi-meta-muse-auth` — with its author, repository and
 licence. If you redistribute GoshCoder or a build of it, carry `NOTICE` with
 it: that is the condition every one of those licences attaches.

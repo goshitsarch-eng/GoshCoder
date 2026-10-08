@@ -78,6 +78,23 @@ pub enum Action {
 pub struct ComposerPrompt {
     pub label: String,
     pub secret: bool,
+    /// An example of what to enter, shown while the composer is empty.
+    pub placeholder: String,
+    /// Choices for a select question, offered in the palette; Enter answers
+    /// with the highlighted choice's value.
+    pub options: Vec<Suggestion>,
+}
+
+impl ComposerPrompt {
+    /// A free-text question.
+    pub fn text(label: impl Into<String>, secret: bool) -> Self {
+        Self {
+            label: label.into(),
+            secret,
+            placeholder: String::new(),
+            options: Vec::new(),
+        }
+    }
 }
 
 /// State shared by the Ratatui renderer and terminal event loop.
@@ -231,8 +248,18 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
-        if self.prompt.is_some() {
-            return Vec::new();
+        if let Some(prompt) = self.prompt.as_ref() {
+            let query = self.input.trim().to_lowercase();
+            return prompt
+                .options
+                .iter()
+                .filter(|option| {
+                    query.is_empty()
+                        || option.label.to_lowercase().contains(&query)
+                        || option.value.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect();
         }
         if let Some(argument) = dynamic_palette_argument(&self.input) {
             let query = argument.to_lowercase();
@@ -351,9 +378,14 @@ impl App {
                 (KeyCode::Enter, modifiers)
                     if !modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
                 {
-                    let answer = std::mem::take(&mut self.input);
+                    let choices = self.suggestions();
+                    let chosen = choices
+                        .get(self.clamped_suggestion(choices.len()))
+                        .map(|choice| choice.value.clone());
+                    let typed = std::mem::take(&mut self.input);
                     self.cursor = 0;
-                    return Action::Answer(answer.trim().to_owned());
+                    self.selected_suggestion = 0;
+                    return Action::Answer(chosen.unwrap_or_else(|| typed.trim().to_owned()));
                 }
                 _ => {}
             }
@@ -920,6 +952,7 @@ const REQUIRES_ARGUMENT: &[&str] = &[
     "/steer",
     "/followup",
     "/planner-annotate",
+    "/grok-cli-imagine",
 ];
 
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
@@ -970,6 +1003,33 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/planner-last", "Annotate last response", true),
         ("/ralph", "Manage Ralph loops", false),
         ("/system", "Show or replace system prompt", false),
+        // Provider-specific commands come after the general ones, so the
+        // palette opens on the commands everyone uses.
+        (
+            "/grok-cli-imagine",
+            "Generate or edit an image with Grok Imagine",
+            false,
+        ),
+        (
+            "/grok-cli-imagine:tool",
+            "Turn the image_gen tool on or off",
+            false,
+        ),
+        (
+            "/grok-cli-usage",
+            "Show the Grok CLI subscription's usage",
+            true,
+        ),
+        (
+            "/grok-cli-accounts",
+            "List, add, or switch Grok CLI accounts",
+            false,
+        ),
+        (
+            "/grok-cli-conv",
+            "Show or rotate the Grok CLI conversation ID",
+            false,
+        ),
         ("/exit", "Exit GoshCoder", true),
         ("/quit", "Exit GoshCoder", true),
     ];
@@ -1261,10 +1321,7 @@ mod tests {
     #[test]
     fn a_composer_prompt_takes_enter_and_escape() {
         let mut app = App::new();
-        app.prompt = Some(ComposerPrompt {
-            label: "API key for openai".to_owned(),
-            secret: true,
-        });
+        app.prompt = Some(ComposerPrompt::text("API key for openai", true));
         app.set_input("/model");
         assert!(app.suggestions().is_empty(), "no palette while answering");
         app.set_input("sk-test");
@@ -1277,6 +1334,38 @@ mod tests {
         app.set_input("half");
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::CancelPrompt);
         assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn a_select_question_is_answered_from_the_palette() {
+        let mut app = App::new();
+        let option = |label: &str, value: &str| Suggestion {
+            label: label.to_owned(),
+            description: String::new(),
+            value: value.to_owned(),
+            execute: true,
+        };
+        app.prompt = Some(ComposerPrompt {
+            label: "anthropic login method".to_owned(),
+            secret: false,
+            placeholder: String::new(),
+            options: vec![
+                option("Browser login (default)", "browser"),
+                option("Copy code login (headless)", "copy_code"),
+            ],
+        });
+        assert_eq!(app.suggestions().len(), 2);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Answer("copy_code".to_owned())
+        );
+        // Typing filters the choices.
+        app.set_input("brow");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Answer("browser".to_owned())
+        );
     }
 
     #[test]

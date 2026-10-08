@@ -324,7 +324,9 @@ pub fn install_interrupt_handler() {
         use std::os::raw::c_int;
         const SIGINT: c_int = 2;
         unsafe extern "C" {
-            fn signal(signum: c_int, handler: extern "C" fn(c_int)) -> usize;
+            // Declared as main.rs declares it (the handler as an address),
+            // since one symbol must have one signature.
+            fn signal(signum: c_int, handler: usize) -> usize;
         }
         extern "C" fn count(_: c_int) {
             // An atomic increment is async-signal-safe.
@@ -332,7 +334,7 @@ pub fn install_interrupt_handler() {
         }
         // SAFETY: installs a handler that only touches an atomic counter.
         unsafe {
-            signal(SIGINT, count);
+            signal(SIGINT, count as extern "C" fn(c_int) as usize);
         }
     }
 }

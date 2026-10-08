@@ -12,9 +12,13 @@ pub mod computeruse;
 pub mod config;
 pub mod export_html;
 pub mod google_auth;
+pub mod grok_accounts;
+pub mod grok_cli;
+pub mod grok_imagine;
 mod line_editor;
 pub mod llm;
 pub mod markdown;
+pub mod meta_muse;
 pub mod mistral;
 pub mod oauth;
 pub mod omni_cli;
@@ -67,6 +71,83 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::state::{Action, App, Message, MessageRole};
 
+const SESSION_FLAGS: &str = r#"Flags:
+  -m, -model <ref>      Model as provider/model, or a bare id when unambiguous
+  -s, -system <text>    System prompt
+  -thinking <level>     off, minimal, low, medium (default), high, xhigh, max
+  -tools[=false]        Built-in file and shell tools (on in chat)
+  -ralph[=false]        Long-running Ralph loops (on in chat)
+  -planner              Start in Planner review mode (-plan is an alias)
+  -C <dir>              Workspace directory for tools
+  -continue             Reopen the most recent session for this workspace
+  -resume               Choose a session to resume (chat only)
+  -session <ref>        Session id, id prefix, or path
+  -name <text>          Display name for the session
+  -no-session           Do not record this session
+  -read-only            Open a session without claiming it
+  -sessions-dir <dir>   Session storage root
+  -fullscreen[=false]   Full-screen interface (chat; default on a terminal)
+  -claude-tui[=false]   pi-claude-code-tui look in line mode (chat)
+  -quiet                Suppress session notices
+"#;
+
+/// `goshcoder <command> --help`. Commands with their own `help` keep it; the
+/// rest get their usage here instead of an "unknown flag" error.
+fn subcommand_help(args: &[String]) -> Option<String> {
+    let command = args.first()?.as_str();
+    let asks = |argument: &String| matches!(argument.as_str(), "-h" | "-help" | "--help");
+    let asked = args.iter().skip(1).any(asks)
+        || (args.get(1).is_some_and(|argument| argument == "help")
+            && matches!(command, "sessions" | "prompts" | "ralph" | "auth"));
+    // A bare `goshcoder -h` is the top-level usage, handled by `run`.
+    if !asked {
+        return None;
+    }
+    Some(match command {
+        "run" => format!(
+            "Usage: goshcoder run [flags] <prompt>\n\nRuns one prompt and exits; non-zero when the turn fails.\nRecords a session only with -continue, -session or -name.\n\n{SESSION_FLAGS}"
+        ),
+        "chat" => format!(
+            "Usage: goshcoder [chat] [flags]\n\nInteractive session. Type / inside chat for commands.\n\n{SESSION_FLAGS}"
+        ),
+        "sessions" => "Usage: goshcoder sessions <subcommand>
+
+  list [--all]                 Saved sessions for this workspace
+  show <id>                    Print a session
+  export <id> [--md] <path>    Save as HTML, Markdown (.md) or JSONL
+  import <path>                Adopt a session file
+  share <id> --yes             Upload as a secret GitHub gist (needs gh)
+  rm <id>                      Delete a session
+  gc --older-than 30d [--keep-named] [--yes]
+                               Delete old sessions (a dry run without --yes)
+"
+        .to_owned(),
+        "prompts" => "Usage: goshcoder prompts <subcommand>
+
+  list                 Saved prompt templates
+  backup [path]        Archive every template to a .tar.gz
+  restore <archive>    Restore templates from a backup
+"
+        .to_owned(),
+        "ralph" => "Usage: goshcoder ralph <subcommand>
+
+  start <name> <task>  Start a loop
+  list                 Loops in this workspace
+  status [name]        Progress of a loop
+  resume <name>        Resume a paused loop
+  stop <name>          Stop a loop
+  archive <name>       Archive a finished loop
+  delete <name>        Delete a loop
+"
+        .to_owned(),
+        "models" => "Usage: goshcoder models [provider]\n\nLists models for configured providers, or every model of one provider.\n".to_owned(),
+        "providers" => "Usage: goshcoder providers\n\nLists providers, whether each is configured, and how to set up the rest.\n".to_owned(),
+        "auth" => return None,
+        "omni" | "aperture" => return None,
+        _ => return None,
+    })
+}
+
 const USAGE: &str = r#"GoshCoder - a Rust coding agent
 
 Usage:
@@ -79,6 +160,7 @@ Usage:
   goshcoder auth <subcommand>        Manage credentials
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
+  goshcoder grok-cli <subcommand>    Grok CLI usage and accounts
   goshcoder ralph <subcommand>       Manage Ralph loops
   goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
@@ -92,15 +174,155 @@ Usage:
 Tailscale Aperture. Type /help inside chat for the slash commands.
 "#;
 
+/// Set by [`run_self_subprocess`]: where a child reports why it failed, since
+/// the fullscreen interface redraws over whatever the child printed.
+const CHILD_ERROR_FILE_ENV: &str = "GOSHCODER_CHILD_ERROR_FILE";
+
+/// Ctrl-C while a child owns the terminal. With raw mode off the terminal
+/// turns it into SIGINT for the whole foreground process group, which would
+/// take the interface down with a login the user only meant to back out of.
+mod interrupt {
+    #[cfg(unix)]
+    mod sys {
+        use std::os::raw::c_int;
+
+        const SIGINT: c_int = 2;
+        const SIG_DFL: usize = 0;
+        const SIG_IGN: usize = 1;
+
+        unsafe extern "C" {
+            fn signal(signum: c_int, handler: usize) -> usize;
+        }
+
+        pub fn ignore() -> usize {
+            // SAFETY: installs a disposition constant, not a handler.
+            unsafe { signal(SIGINT, SIG_IGN) }
+        }
+
+        pub fn restore(previous: usize) {
+            // SAFETY: reinstates the disposition `ignore` returned.
+            unsafe {
+                signal(SIGINT, previous);
+            }
+        }
+
+        pub fn reset_default() {
+            // SAFETY: installs a disposition constant, not a handler.
+            unsafe {
+                signal(SIGINT, SIG_DFL);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod sys {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetConsoleCtrlHandler(handler: usize, add: i32) -> i32;
+        }
+
+        pub fn ignore() -> usize {
+            // SAFETY: a null handler toggles the process's Ctrl-C flag.
+            unsafe {
+                SetConsoleCtrlHandler(0, 1);
+            }
+            0
+        }
+
+        pub fn restore(_: usize) {
+            reset_default();
+        }
+
+        pub fn reset_default() {
+            // SAFETY: a null handler toggles the process's Ctrl-C flag.
+            unsafe {
+                SetConsoleCtrlHandler(0, 0);
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    mod sys {
+        pub fn ignore() -> usize {
+            0
+        }
+        pub fn restore(_: usize) {}
+        pub fn reset_default() {}
+    }
+
+    /// Ignores Ctrl-C in this process until the guard drops.
+    pub struct Ignored(usize);
+
+    pub fn ignore() -> Ignored {
+        Ignored(sys::ignore())
+    }
+
+    impl Drop for Ignored {
+        fn drop(&mut self) {
+            sys::restore(self.0);
+        }
+    }
+
+    /// An ignored disposition is inherited, so a child started by
+    /// [`super::run_self_subprocess`] takes Ctrl-C back for itself.
+    pub fn reset_default() {
+        sys::reset_default();
+    }
+}
+
+/// Whether a child ended because the user pressed Ctrl-C.
+fn interrupted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(2)
+    }
+    #[cfg(windows)]
+    {
+        // STATUS_CONTROL_C_EXIT
+        status.code() == Some(0xC000_013A_u32 as i32)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = status;
+        false
+    }
+}
+
+/// A failure whose message the command already printed; the process only
+/// needs to exit non-zero.
+#[derive(Debug)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the run failed")
+    }
+}
+
+impl Error for AlreadyReported {}
+
 fn main() {
+    if std::env::var_os(CHILD_ERROR_FILE_ENV).is_some() {
+        interrupt::reset_default();
+    }
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        if !error.is::<AlreadyReported>() {
+            eprintln!("error: {error}");
+        }
+        if let Some(path) = std::env::var_os(CHILD_ERROR_FILE_ENV) {
+            let _ = std::fs::write(path, error.to_string());
+        }
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(help) = subcommand_help(&args) {
+        print!("{help}");
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
         Some("--version" | "-v" | "version") => {
             print_version();
@@ -114,8 +336,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("providers") => provider_cli::providers_command(),
         Some("models") => provider_cli::models_command(&args[1..]),
         Some("auth") => provider_cli::auth_command(&args[1..]),
+        // OmniRoute names its help `help`; accept the usual flags too.
+        Some("omni")
+            if args
+                .get(1)
+                .is_some_and(|flag| matches!(flag.as_str(), "-h" | "-help" | "--help")) =>
+        {
+            omni_cli::command(&["help".to_owned()])
+        }
         Some("omni") => omni_cli::command(&args[1..]),
         Some("aperture") => aperture_cli::command(&args[1..]),
+        Some("grok-cli") => provider_cli::grok_cli_command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),
@@ -137,6 +368,7 @@ fn unknown_command_message(command: &str) -> String {
         "auth",
         "omni",
         "aperture",
+        "grok-cli",
         "ralph",
         "sessions",
         "prompts",
@@ -193,20 +425,14 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Arc::clone(&catalog),
         providers::ProviderConfig::default(),
     )?;
-    let prepared = runtime::prepare_session(
-        catalog.as_ref(),
-        invocation.config,
-        Some(responder),
-        Vec::new(),
-    )?;
+    let mut config = invocation.config;
+    config.live_notices = !quiet;
+    let prepared = runtime::prepare_session(catalog.as_ref(), config, Some(responder), Vec::new())?;
 
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color_enabled()));
-        }
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
-        }
+    // Notices were printed as they arrived (`live_notices`); only clear them.
+    let _ = runtime::drain_session_notices(&prepared.runtime);
+    if !quiet && let Some(banner) = runtime::session_banner(&prepared.runtime) {
+        eprintln!("{}", dim(&banner, color_enabled()));
     }
 
     let render_lock = Arc::new(Mutex::new(()));
@@ -232,10 +458,24 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some(&prepared.runtime.notice_sender()),
     )?;
     prepared.runtime.sync()?;
-    if !quiet {
-        for notice in runtime::drain_session_notices(&prepared.runtime) {
-            eprintln!("{}", dim(&format!("session: {notice}"), color));
-        }
+    // Notices were printed as they arrived (`live_notices`); only clear them.
+    let _ = runtime::drain_session_notices(&prepared.runtime);
+    // pi's print mode exits 1 when the final turn failed or was aborted, so
+    // scripts can tell a provider error from an answer.
+    let failed = agent
+        .state()
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            llm::Message::Assistant(message) => Some(
+                message.stop_reason == stream::STOP_ERROR
+                    || message.stop_reason == stream::STOP_ABORTED,
+            ),
+            _ => None,
+        });
+    if failed == Some(true) {
+        return Err(Box::new(AlreadyReported));
     }
     Ok(())
 }
@@ -569,18 +809,41 @@ fn with_suspended_terminal<T>(
 fn run_self_subprocess(arguments: &[&str]) -> Result<(), String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("locate goshcoder: {error}"))?;
-    let status = std::process::Command::new(&executable)
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("run goshcoder {}: {error}", arguments.join(" ")))?;
+    let error_file = std::env::temp_dir().join(format!(
+        "goshcoder-child-error-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let status = {
+        let _interrupt = interrupt::ignore();
+        std::process::Command::new(&executable)
+            .args(arguments)
+            .env(CHILD_ERROR_FILE_ENV, &error_file)
+            .status()
+            .map_err(|error| format!("run goshcoder {}: {error}", arguments.join(" ")))?
+    };
+    let reported = std::fs::read_to_string(&error_file).ok();
+    let _ = std::fs::remove_file(&error_file);
     if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "goshcoder {} exited with {status}",
-            arguments.join(" ")
-        ))
+        return Ok(());
     }
+    // Ctrl-C at a prompt is the user backing out, not a failure to dwell on.
+    if interrupted(&status) {
+        return Err(format!("goshcoder {} was cancelled", arguments.join(" ")));
+    }
+    let cancelled = reported
+        .as_deref()
+        .is_some_and(|message| message.contains("cancelled"));
+    if !cancelled {
+        eprint!("\nPress Enter to return to GoshCoder. ");
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+    }
+    Err(match reported {
+        Some(message) if !message.trim().is_empty() => message.trim().to_owned(),
+        _ => format!("goshcoder {} exited with {status}", arguments.join(" ")),
+    })
 }
 
 /// Runs a network-bound command off the terminal thread. Its output arrives
@@ -1463,16 +1726,42 @@ fn drain_login_events(
                 }
             }
             tui_login::LoginEvent::Prompt { prompt, .. } => {
-                append_view_message(view, MessageRole::Notice, tui_login::prompt_notice(&prompt));
+                // A choice is made in the palette, like any other picker;
+                // a paste goes into the composer.
+                let options = if prompt.select {
+                    prompt
+                        .options
+                        .iter()
+                        .map(|option| state::Suggestion {
+                            label: option.label.clone(),
+                            description: option.description.clone(),
+                            value: option.id.clone(),
+                            execute: true,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                append_view_message(
+                    view,
+                    MessageRole::Notice,
+                    if prompt.select {
+                        prompt.message.clone()
+                    } else {
+                        tui_login::prompt_notice(&prompt)
+                    },
+                );
                 app.prompt = Some(state::ComposerPrompt {
                     label: if prompt.select {
-                        "Choose an option".to_owned()
+                        format!("{provider} login method")
                     } else {
                         format!("{provider} login")
                     },
                     secret: false,
+                    placeholder: prompt.placeholder.clone(),
+                    options,
                 });
-                view.activity = format!("Waiting for your answer · {provider} login");
+                view.activity = "Waiting for your answer".to_owned();
             }
             tui_login::LoginEvent::Finished(result) => {
                 finish_login(app, view, prepared, catalog, &provider, result, true);
@@ -1549,7 +1838,7 @@ fn answer_composer_prompt(
         None => {
             app.prompt = flow
                 .api_key_question()
-                .map(|(label, secret)| state::ComposerPrompt { label, secret });
+                .map(|(label, secret)| state::ComposerPrompt::text(label, secret));
             if oauth {
                 view.activity = format!("Signing in to {provider}");
             }
@@ -2124,7 +2413,7 @@ fn dispatch_login_command<'a>(
             view,
             MessageRole::Command,
             format!(
-                "Usage: /login <provider>\nOAuth subscriptions: {}\nOther providers prompt for an API key; existing provider credentials are preserved.",
+                "Usage: /login <provider> [key]\nBrowser or device sign-in: {}\nAdd `key` to store an API key instead; other providers always prompt for one. Existing credentials are preserved.",
                 oauth::implemented_provider_ids().join(", ")
             ),
         );
@@ -2158,12 +2447,13 @@ fn dispatch_login_command<'a>(
         return CommandDispatch::Handled;
     }
     let provider_id = (*provider_id).to_owned();
-    if use_key && !api_key_login_available(&provider_id) {
+    if use_key && !api_key_login_available(catalog, &provider_id) {
+        let (key_provider, key_api) = api_key_alternative(&provider_id);
         append_view_message(
             view,
             MessageRole::Error,
             format!(
-                "{provider_id} has no API key; use /login {provider_id}, or /login openai key for the OpenAI API"
+                "{provider_id} has no API key; use /login {provider_id}, or /login {key_provider} key for the {key_api}"
             ),
         );
         return CommandDispatch::Handled;
@@ -2206,7 +2496,7 @@ fn dispatch_login_command<'a>(
             );
             app.prompt = flow
                 .api_key_question()
-                .map(|(label, secret)| state::ComposerPrompt { label, secret });
+                .map(|(label, secret)| state::ComposerPrompt::text(label, secret));
             view.login = Some(flow);
         }
         return CommandDispatch::Handled;
@@ -2215,8 +2505,47 @@ fn dispatch_login_command<'a>(
     CommandDispatch::Suspended(Box::new(move || {
         run_self_subprocess(&["auth", subcommand, &provider_id])?;
         catalog.clear_oauth_refresh_failure(&provider_id);
+        // A Grok CLI login is what makes `image_gen` available.
+        prepared.sync_image_tool();
         Ok(after_login_message(prepared, catalog, &provider_id))
     }))
+}
+
+/// `/grok-cli-imagine:tool [on|off|status]`: the persisted `image_gen`
+/// switch. With no argument it toggles, as upstream does.
+fn image_tool_command(prepared: &runtime::PreparedSession, rest: &str) -> Result<String, String> {
+    let argument = rest.trim().to_ascii_lowercase();
+    if !matches!(argument.as_str(), "" | "on" | "off" | "status") {
+        return Err("Usage: /grok-cli-imagine:tool [on|off|status]".to_owned());
+    }
+    let path = prepared.imagine_config_path();
+    let loaded = grok_imagine::load_config(&path);
+    let mut lines = loaded.warning.into_iter().collect::<Vec<_>>();
+    let on_off = |value: bool| if value { "on" } else { "off" };
+    if argument == "status" {
+        lines.push(format!(
+            "image_gen persisted: {}; active: {}",
+            on_off(loaded.enabled),
+            on_off(prepared.image_tool_active())
+        ));
+        return Ok(lines.join("\n"));
+    }
+    let enabled = if argument.is_empty() {
+        !loaded.enabled
+    } else {
+        argument == "on"
+    };
+    grok_imagine::save_config(&path, enabled)
+        .map_err(|error| format!("Could not save image_gen setting: {error}"))?;
+    let active = prepared.sync_image_tool();
+    lines.push(format!("image_gen: {}", on_off(enabled)));
+    if enabled && !active {
+        lines.push(
+            "It becomes available once Grok CLI is signed in (/login grok-cli) and tools are on."
+                .to_owned(),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The in-chat command that configures a gateway provider; `/login` would
@@ -2261,6 +2590,25 @@ fn after_login_message(
             model.provider, model.id
         ),
         Err(error) => format!("{reference} could not be selected: {error}. Pick a model to start."),
+    }
+}
+
+/// Whether a provider with a login flow also takes an API key. Subscription
+/// providers (a ChatGPT plan, Grok CLI, Meta Muse Code, which refuses any key
+/// Meta does not confirm as subscription-backed) have none.
+fn api_key_login_available(catalog: &catalog::Catalog, provider_id: &str) -> bool {
+    catalog
+        .provider(provider_id)
+        .is_some_and(|provider| provider.auth_kind != catalog::AuthKind::OAuthOnly)
+}
+
+/// The provider that takes an API key for the same models as a
+/// subscription-only one, and what that key is called.
+fn api_key_alternative(provider_id: &str) -> (&'static str, &'static str) {
+    match provider_id {
+        "meta-muse" => ("meta", "Meta Model API"),
+        "grok-cli" => ("xai", "xAI API"),
+        _ => ("openai", "OpenAI API"),
     }
 }
 
@@ -2365,7 +2713,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>\n                        Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>\n                        Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-imagine <prompt> [--image <path>] [--aspect <r>] [--out <path>]\n                        Generate or edit an image with Grok Imagine\n  /grok-cli-imagine:tool [on|off|status]\n                        Offer the image_gen tool to the model, or not\n  /grok-cli-accounts [list|use|add|login|logout|rename|remove]\n                        Manage several Grok CLI accounts\n  /grok-cli-conv [status|rotate]\n                        Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2853,6 +3201,70 @@ fn dispatch_runtime_slash_command<'a>(
             CommandDispatch::Handled
         }
         "/login" => dispatch_login_command(app, view, prepared, catalog, rest, fullscreen),
+        "/grok-cli-imagine" => {
+            if rest.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Usage: /grok-cli-imagine <prompt> [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]",
+                );
+                return CommandDispatch::Handled;
+            }
+            let context = prepared.imagine_context();
+            let arguments = rest.to_owned();
+            start_background_command(view, "/grok-cli-imagine", move || {
+                grok_imagine::run_command(&context, &arguments).map(|lines| lines.join("\n"))
+            });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-imagine:tool" => {
+            match image_tool_command(prepared, rest) {
+                Ok(message) => append_view_message(view, MessageRole::Command, message),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/grok-cli-usage" => {
+            let catalog = catalog.clone();
+            let agent_dir = catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir);
+            let session = prepared.request_session_id().to_owned();
+            start_background_command(view, "/grok-cli-usage", move || {
+                Ok(grok_cli::usage_report(&catalog, &agent_dir, &session).join("\n\n"))
+            });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-accounts" => {
+            let accounts = grok_accounts::Accounts::new(catalog);
+            match grok_accounts::chat_command(&accounts, prepared.request_session_id(), rest) {
+                Ok(grok_accounts::AccountsCommand::Done(message)) => {
+                    append_view_message(view, MessageRole::Command, message);
+                }
+                Ok(grok_accounts::AccountsCommand::Terminal(arguments)) => {
+                    // The OAuth login owns the terminal, as /login's does.
+                    return CommandDispatch::Suspended(Box::new(move || {
+                        let mut child = vec!["grok-cli"];
+                        child.extend(arguments.iter().map(String::as_str));
+                        run_self_subprocess(&child)?;
+                        catalog.clear_oauth_refresh_failure(grok_cli::PROVIDER_ID);
+                        prepared.sync_image_tool();
+                        Ok("Grok CLI accounts updated; /grok-cli-accounts lists them.".to_owned())
+                    }));
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/grok-cli-conv" => {
+            match grok_cli::conv_command(prepared.request_session_id(), rest) {
+                Ok(message) => append_view_message(view, MessageRole::Command, message),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
         "/omni" => dispatch_omni_command(view, catalog, rest),
         "/aperture" => dispatch_aperture_command(view, catalog, rest),
         _ if command.starts_with('/') => {
@@ -3157,6 +3569,11 @@ fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
         "aperture",
         "aperture:onboarding",
         "aperture:settings",
+        "grok-cli-accounts",
+        "grok-cli-conv",
+        "grok-cli-imagine",
+        "grok-cli-imagine:tool",
+        "grok-cli-usage",
         "btw",
         "thinking",
         "system",
@@ -3819,8 +4236,10 @@ fn short_token_count(tokens: u64) -> String {
 const FEATURED_PROVIDERS: &[&str] = &[
     "anthropic",
     "openai-codex",
+    "grok-cli",
     "xai",
     "meta",
+    "meta-muse",
     "kimi-coding",
     "openai",
     "google",
@@ -3888,7 +4307,7 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
                 label: provider.id.clone(),
                 execute: true,
             });
-            if api_key_login_available(&provider.id) {
+            if api_key_login_available(catalog, &provider.id) {
                 let api_key = match provider.id.as_str() {
                     "anthropic" => "API key · ANTHROPIC_API_KEY".to_owned(),
                     _ => api_key,
@@ -3927,18 +4346,17 @@ fn oauth_login_description(id: &str, name: &str) -> String {
     match id {
         "anthropic" => "Claude Pro / Max subscription · OAuth".to_owned(),
         "openai-codex" => "ChatGPT Plus / Pro · OAuth".to_owned(),
-        "xai" => "Grok subscription · device code or browser".to_owned(),
+        // Grok CLI is the route a consumer Grok subscription works on;
+        // xAI's own login reaches api.x.ai, which often refuses one.
+        "grok-cli" => "X Premium / SuperGrok subscription · OAuth".to_owned(),
+        "xai" => "xAI account · device code or browser".to_owned(),
         "meta" => "Meta account · mints a Model API key".to_owned(),
+        "meta-muse" => "Muse Code subscription · OAuth".to_owned(),
+        "openrouter" => "OpenRouter account · OAuth".to_owned(),
         "kimi-coding" => "Kimi Code · OAuth".to_owned(),
         _ if name.is_empty() => "Browser sign-in · OAuth".to_owned(),
         _ => format!("{} · OAuth", name),
     }
-}
-
-/// Whether a provider with a login flow also takes an API key. A ChatGPT
-/// subscription has none; the `openai` provider is the API-key route.
-fn api_key_login_available(provider_id: &str) -> bool {
-    provider_id != "openai-codex"
 }
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -4873,6 +5291,36 @@ mod tests {
     }
 
     #[test]
+    fn the_login_picker_offers_muse_code_as_a_subscription_without_a_key_row() {
+        let catalog = catalog::Catalog::with_environment(
+            Some(std::sync::Arc::new(catalog::CredentialStore::in_memory())),
+            std::sync::Arc::new(|_| None),
+        )
+        .expect("catalog")
+        .with_dynamic_paths(catalog::DynamicPaths::disabled());
+        let choices = login_choices(&catalog);
+        let values = choices
+            .iter()
+            .map(|choice| choice.value.as_str())
+            .collect::<Vec<_>>();
+        let muse = choices
+            .iter()
+            .find(|choice| choice.value == "/login meta-muse")
+            .expect("Muse Code sign-in row");
+        assert_eq!(muse.description, "Muse Code subscription · OAuth");
+        assert!(!values.contains(&"/login meta-muse key"));
+        // The Meta Model API keeps both ways in: its sign-in row comes just
+        // before Muse Code, its key row with the other key rows below.
+        let position = |value: &str| values.iter().position(|candidate| *candidate == value);
+        let meta = position("/login meta").expect("Meta sign-in row");
+        assert_eq!(values[meta + 1], "/login meta-muse");
+        assert!(position("/login meta key").expect("Meta API-key row") > meta + 1);
+        assert!(!api_key_login_available(&catalog, "meta-muse"));
+        assert!(api_key_login_available(&catalog, "meta"));
+        assert_eq!(api_key_alternative("meta-muse"), ("meta", "Meta Model API"));
+    }
+
+    #[test]
     fn the_unselected_model_is_labelled_instead_of_rendering_a_bare_slash() {
         assert_eq!(
             model_label(&runtime::unselected_model()),
@@ -5371,8 +5819,8 @@ mod tests {
             "Claude Pro / Max subscription · OAuth"
         );
         assert_eq!(
-            oauth_login_description("meta-muse", "Meta Muse"),
-            "Meta Muse · OAuth"
+            oauth_login_description("acme-cloud", "Acme Cloud"),
+            "Acme Cloud · OAuth"
         );
         assert_eq!(thinking_level_description("medium"), "Balanced");
     }
@@ -5388,5 +5836,29 @@ mod tests {
         assert!(summary.starts_with("a=\"value\" z=\""));
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= "a=\"value\" z=".len() + 63);
+    }
+
+    #[test]
+    fn the_login_picker_offers_grok_cli_as_a_subscription_without_a_key_row() {
+        let catalog =
+            catalog::Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
+        let choices = login_choices(&catalog);
+        let values = choices
+            .iter()
+            .map(|choice| choice.value.as_str())
+            .collect::<Vec<_>>();
+        let grok = choices
+            .iter()
+            .find(|choice| choice.value == "/login grok-cli")
+            .expect("grok-cli row");
+        assert_eq!(
+            grok.description,
+            "X Premium / SuperGrok subscription · OAuth"
+        );
+        assert!(!values.contains(&"/login grok-cli key"));
+        // xAI keeps both of its ways in, and Grok CLI is listed before it.
+        assert!(values.contains(&"/login xai key"));
+        let position = |value: &str| values.iter().position(|candidate| *candidate == value);
+        assert!(position("/login grok-cli") < position("/login xai"));
     }
 }

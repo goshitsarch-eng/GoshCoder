@@ -38,6 +38,8 @@ pub struct PromptRequest {
     pub message: String,
     pub options: Vec<oauth::OAuthPromptOption>,
     pub select: bool,
+    /// An example of what to paste (a redirect URL), not a label.
+    pub placeholder: String,
 }
 
 /// Bridges `oauth`'s blocking interaction trait to a channel the event loop
@@ -64,6 +66,7 @@ impl oauth::OAuthInteraction for TuiInteraction {
                     message: prompt.message.clone(),
                     options: prompt.options.clone(),
                     select,
+                    placeholder: prompt.placeholder.clone(),
                 },
                 reply,
             })

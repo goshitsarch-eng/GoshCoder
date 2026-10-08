@@ -60,8 +60,12 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use crate::catalog::{
-    Auth, AuthHeaders, CatalogError, Credential, CredentialKind, CredentialStore, EnvironmentLookup,
+use crate::{
+    catalog::{
+        Auth, AuthHeaders, CatalogError, Credential, CredentialKind, CredentialStore,
+        EnvironmentLookup,
+    },
+    meta_muse,
 };
 
 /// A token request is bounded independently from a model request.
@@ -84,6 +88,7 @@ const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_CALLBACK_PORT: u16 = 53692;
 const ANTHROPIC_CALLBACK_PATH: &str = "/callback";
 const ANTHROPIC_REDIRECT_URI: &str = "http://localhost:53692/callback";
+const ANTHROPIC_COPY_CODE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const ANTHROPIC_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const ANTHROPIC_REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
 
@@ -158,13 +163,27 @@ pub enum OAuthError {
     DeviceTimedOut,
     Jwt(String),
     Storage(CatalogError),
+    /// A provider-specific failure whose wording is the provider's own (the
+    /// Meta Muse port keeps the extension's messages verbatim).
+    /// `unauthorized` marks one only a new login can fix.
+    Message {
+        message: String,
+        unauthorized: bool,
+    },
 }
 
 impl OAuthError {
     /// Whether retrying cannot repair this credential and a fresh login is
     /// required.
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Unauthorized { .. })
+        matches!(
+            self,
+            Self::Unauthorized { .. }
+                | Self::Message {
+                    unauthorized: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -178,10 +197,19 @@ impl fmt::Display for OAuthError {
                 operation,
                 detail,
             } => {
-                write!(
-                    formatter,
-                    "{provider} token {operation} is no longer authorized; log in again"
-                )?;
+                // Only a refresh can lose an authorization the user had; a
+                // rejected login step just has to be started over.
+                if *operation == "refresh" {
+                    write!(
+                        formatter,
+                        "{provider} token refresh is no longer authorized; log in again"
+                    )?;
+                } else {
+                    write!(
+                        formatter,
+                        "{provider} rejected the token {operation}; start the login again"
+                    )?;
+                }
                 if let Some(detail) = detail.as_ref().filter(|detail| !detail.is_empty()) {
                     write!(formatter, ": {detail}")?;
                 }
@@ -234,6 +262,7 @@ impl fmt::Display for OAuthError {
                 "failed to extract account ID from token: {message}"
             ),
             Self::Storage(error) => write!(formatter, "OAuth credential storage failed: {error}"),
+            Self::Message { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -397,9 +426,11 @@ pub enum OAuthProviderId {
     Anthropic,
     KimiCoding,
     Meta,
+    MetaMuse,
     OpenAiCodex,
     OpenRouter,
     Xai,
+    GrokCli,
     GithubCopilot,
     Radius,
 }
@@ -410,9 +441,11 @@ impl OAuthProviderId {
             Self::Anthropic => "anthropic",
             Self::KimiCoding => "kimi-coding",
             Self::Meta => "meta",
+            Self::MetaMuse => "meta-muse",
             Self::OpenAiCodex => "openai-codex",
             Self::OpenRouter => "openrouter",
             Self::Xai => "xai",
+            Self::GrokCli => "grok-cli",
             Self::GithubCopilot => "github-copilot",
             Self::Radius => "radius",
         }
@@ -423,9 +456,11 @@ impl OAuthProviderId {
             "anthropic" => Some(Self::Anthropic),
             "kimi-coding" => Some(Self::KimiCoding),
             "meta" => Some(Self::Meta),
+            "meta-muse" => Some(Self::MetaMuse),
             "openai-codex" => Some(Self::OpenAiCodex),
             "openrouter" => Some(Self::OpenRouter),
             "xai" => Some(Self::Xai),
+            "grok-cli" => Some(Self::GrokCli),
             "github-copilot" => Some(Self::GithubCopilot),
             "radius" => Some(Self::Radius),
             _ => None,
@@ -437,9 +472,11 @@ impl OAuthProviderId {
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::KimiCoding => "Kimi Code (subscription)",
             Self::Meta => "Meta (Model API)",
+            Self::MetaMuse => "Meta Muse Code (subscription)",
             Self::OpenAiCodex => "OpenAI (ChatGPT Plus/Pro)",
             Self::OpenRouter => "OpenRouter",
             Self::Xai => "xAI (Grok subscription)",
+            Self::GrokCli => "Grok CLI",
             Self::GithubCopilot => "GitHub Copilot",
             Self::Radius => "Radius",
         }
@@ -474,6 +511,7 @@ const BROWSER_METHOD: &[LoginMethod] = &[LoginMethod::BrowserPkce];
 const DEVICE_METHOD: &[LoginMethod] = &[LoginMethod::DeviceCode];
 const CODEX_METHODS: &[LoginMethod] = &[LoginMethod::BrowserPkce, LoginMethod::DeviceCode];
 const XAI_METHODS: &[LoginMethod] = &[LoginMethod::DeviceCode, LoginMethod::BrowserPkce];
+const GROK_CLI_METHODS: &[LoginMethod] = &[LoginMethod::BrowserPkce, LoginMethod::DeviceCode];
 const API_KEY_METHOD: &[LoginMethod] = &[LoginMethod::ApiKeyOnly];
 
 const PROVIDER_METADATA: &[ProviderMetadata] = &[
@@ -495,25 +533,39 @@ const PROVIDER_METADATA: &[ProviderMetadata] = &[
         methods: DEVICE_METHOD,
         flow_support: OAuthFlowSupport::Implemented,
     },
+    // The pi-meta-muse-auth extension: the same auth.meta.com device flow,
+    // but the key is minted against the Muse Code subscription.
+    ProviderMetadata {
+        id: OAuthProviderId::MetaMuse,
+        display_name: "Meta Muse Code (subscription)",
+        methods: DEVICE_METHOD,
+        flow_support: OAuthFlowSupport::Implemented,
+    },
     ProviderMetadata {
         id: OAuthProviderId::OpenAiCodex,
         display_name: "OpenAI (ChatGPT Plus/Pro)",
         methods: CODEX_METHODS,
         flow_support: OAuthFlowSupport::Implemented,
     },
-    // The Go provider metadata marks OpenRouter as OAuth-capable, but no
-    // OpenRouter authorization, device, or refresh implementation exists in
-    // any `oauth*.go` file. Preserve that fact instead of inventing endpoints.
+    // pi's `auth/oauth/openrouter.ts`: a PKCE browser flow that mints a
+    // permanent, user-controlled API key rather than a refreshable token.
     ProviderMetadata {
         id: OAuthProviderId::OpenRouter,
         display_name: "OpenRouter",
-        methods: API_KEY_METHOD,
-        flow_support: OAuthFlowSupport::MetadataOnly,
+        methods: BROWSER_METHOD,
+        flow_support: OAuthFlowSupport::Implemented,
     },
     ProviderMetadata {
         id: OAuthProviderId::Xai,
         display_name: "xAI (Grok subscription)",
         methods: XAI_METHODS,
+        flow_support: OAuthFlowSupport::Implemented,
+    },
+    // pi-grok-cli: the xAI flow with the official Grok CLI's parameters.
+    ProviderMetadata {
+        id: OAuthProviderId::GrokCli,
+        display_name: "Grok CLI",
+        methods: GROK_CLI_METHODS,
         flow_support: OAuthFlowSupport::Implemented,
     },
     // These are also `oauth: true` in Go provider metadata, but Go has no
@@ -563,6 +615,7 @@ pub struct OAuthAuth {
     api_key: Option<String>,
     headers: AuthHeaders,
     source: String,
+    base_url: Option<String>,
 }
 
 impl OAuthAuth {
@@ -576,6 +629,13 @@ impl OAuthAuth {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The API base URL the credential itself names, which replaces the
+    /// provider default. Only Meta Muse sets one: Meta returns it with the
+    /// minted key.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 
     /// Moves the secret-bearing parts across the catalog integration seam.
@@ -610,6 +670,7 @@ pub fn auth_from_credential(
     }
 
     let mut headers = AuthHeaders::new();
+    let mut base_url = None;
     let api_key = match provider {
         OAuthProviderId::KimiCoding => {
             headers.insert("Authorization".to_owned(), Some(format!("Bearer {access}")));
@@ -619,10 +680,18 @@ pub fn auth_from_credential(
             headers.insert("Authorization".to_owned(), Some(format!("Bearer {access}")));
             None
         }
+        // An openai-responses provider, so the key is an ordinary bearer API
+        // key; the stored base URL is re-validated on every use (`toAuth`).
+        OAuthProviderId::MetaMuse => {
+            let (api_key, sanctioned) = meta_muse::request_auth(credential)?;
+            base_url = Some(sanctioned);
+            Some(api_key)
+        }
         OAuthProviderId::Anthropic
         | OAuthProviderId::OpenAiCodex
         | OAuthProviderId::OpenRouter
         | OAuthProviderId::Xai
+        | OAuthProviderId::GrokCli
         | OAuthProviderId::GithubCopilot
         | OAuthProviderId::Radius => Some(access.to_owned()),
     };
@@ -630,6 +699,7 @@ pub fn auth_from_credential(
         api_key,
         headers,
         source: "OAuth".to_owned(),
+        base_url,
     })
 }
 
@@ -763,6 +833,22 @@ pub fn parse_authorization_input(input: &str) -> Option<AuthorizationResponse> {
     })
 }
 
+/// The provider's reason when a pasted redirect URL carries `error=` rather
+/// than a code.
+fn redirect_error(input: &str) -> Option<String> {
+    let url = Url::parse(input.trim()).ok()?;
+    let error = query_value(&url, "error");
+    if error.is_empty() {
+        return None;
+    }
+    let description = query_value(&url, "error_description");
+    Some(if description.is_empty() {
+        error
+    } else {
+        description
+    })
+}
+
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
@@ -851,7 +937,7 @@ impl OAuthEvent {
         }
     }
 
-    fn device_code(
+    pub(crate) fn device_code(
         user_code: impl Into<String>,
         verification_uri: impl Into<String>,
         interval: Duration,
@@ -869,7 +955,7 @@ impl OAuthEvent {
         }
     }
 
-    fn progress(message: impl Into<String>) -> Self {
+    pub(crate) fn progress(message: impl Into<String>) -> Self {
         Self {
             kind: OAuthEventKind::Progress,
             message: message.into(),
@@ -944,6 +1030,9 @@ const CALLBACK_REQUEST_LIMIT: usize = 16 * 1024;
 /// A validated loopback callback listener. It accepts only the expected path
 /// and CSRF state, and returns an escaped, no-store browser response.
 ///
+/// An empty expected state means the provider sends none (OpenRouter); its
+/// random callback path then keeps stray requests from completing a login.
+///
 /// Anything one connection does wrong (a malformed or oversized request, a
 /// reset socket, a client that never finishes) is answered or dropped and
 /// then forgotten: the login keeps waiting for the browser's real callback or
@@ -953,6 +1042,10 @@ pub struct LoopbackCallbackServer {
     expected_path: String,
     expected_state: String,
     request_timeout: Duration,
+    /// Browser origins whose CORS preflight is answered. Empty for every
+    /// provider except Grok CLI, whose authorization pages probe the
+    /// loopback listener from their own origin before redirecting.
+    cors_origins: Vec<String>,
 }
 
 impl LoopbackCallbackServer {
@@ -989,7 +1082,17 @@ impl LoopbackCallbackServer {
             expected_path: path.to_owned(),
             expected_state: expected_state.to_owned(),
             request_timeout: CALLBACK_REQUEST_TIMEOUT,
+            cors_origins: Vec::new(),
         })
+    }
+
+    /// Answers `OPTIONS` preflights with `204` and grants these origins CORS
+    /// access (including Chrome's private-network access) on every reply,
+    /// as pi-grok-cli's callback server does for xAI's account pages.
+    #[must_use]
+    pub fn with_cors_origins(mut self, origins: &[&str]) -> Self {
+        self.cors_origins = origins.iter().map(|origin| (*origin).to_owned()).collect();
+        self
     }
 
     /// Bounds how long one connection may take to send its request line.
@@ -1005,10 +1108,7 @@ impl LoopbackCallbackServer {
     }
 
     /// Accepts and validates at most one pending callback.
-    pub fn try_accept(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<AuthorizationResponse>> {
+    pub fn try_accept(&self, cancellation: &CancellationToken) -> Result<Option<CallbackOutcome>> {
         let (stream, _) = match self.listener.accept() {
             Ok(pair) => pair,
             // A peer that vanished between connect and accept, or a passing
@@ -1022,61 +1122,145 @@ impl LoopbackCallbackServer {
         &self,
         mut stream: TcpStream,
         cancellation: &CancellationToken,
-    ) -> Result<Option<AuthorizationResponse>> {
+    ) -> Result<Option<CallbackOutcome>> {
         // macOS and Windows hand out the accepted socket in the listener's
         // non-blocking mode, which would turn the timed reads below into a
         // busy loop and could drop the confirmation page on a full buffer.
         let _ = stream.set_nonblocking(false);
-        let request = match read_callback_request(&mut stream, self.request_timeout, cancellation)?
-        {
-            CallbackRead::Request(line) => line,
-            CallbackRead::Reject { status, message } => {
-                let _ = write_callback_page(&mut stream, status, message);
-                return Ok(None);
-            }
-        };
+        let (request, origin) =
+            match read_callback_request(&mut stream, self.request_timeout, cancellation)? {
+                CallbackRead::Request { line, host, origin } => {
+                    // A page on another site can reach a loopback port through
+                    // DNS rebinding; its requests then carry that site's name.
+                    if host
+                        .as_deref()
+                        .is_some_and(|host| !is_loopback_authority(host))
+                    {
+                        let _ =
+                            write_callback_page(&mut stream, 400, "Unexpected Host header.", &[]);
+                        return Ok(None);
+                    }
+                    (line, origin)
+                }
+                CallbackRead::Reject { status, message } => {
+                    let _ = write_callback_page(&mut stream, status, message, &[]);
+                    return Ok(None);
+                }
+            };
+        let cors = origin
+            .filter(|origin| self.cors_origins.iter().any(|allowed| allowed == origin))
+            .map(|origin| cors_headers(&origin))
+            .unwrap_or_default();
         let mut fields = request.split_whitespace();
         let method = fields.next().unwrap_or_default();
         let target = fields.next().unwrap_or_default();
+        if method == "OPTIONS" && !self.cors_origins.is_empty() {
+            let _ = write_empty_response(&mut stream, 204, &cors);
+            return Ok(None);
+        }
         if method != "GET" {
-            let _ = write_callback_page(&mut stream, 405, "Only GET callbacks are supported.");
+            let _ =
+                write_callback_page(&mut stream, 405, "Only GET callbacks are supported.", &cors);
             return Ok(None);
         }
 
         let Ok(parsed) = Url::parse(&format!("http://localhost{target}")) else {
-            let _ = write_callback_page(&mut stream, 400, "Callback request target is invalid.");
+            let _ = write_callback_page(
+                &mut stream,
+                400,
+                "Callback request target is invalid.",
+                &cors,
+            );
             return Ok(None);
         };
         if parsed.path() != self.expected_path {
-            let _ = write_callback_page(&mut stream, 404, "Callback route not found.");
+            let _ = write_callback_page(&mut stream, 404, "Callback route not found.", &cors);
+            return Ok(None);
+        }
+        let state = query_value(&parsed, "state");
+        // The state is checked before anything else is believed, so a forged
+        // request can neither complete nor abort someone else's login.
+        if !self.expected_state.is_empty() && !constant_time_eq(&state, &self.expected_state) {
+            let _ = write_callback_page(&mut stream, 400, "State mismatch.", &cors);
             return Ok(None);
         }
         let error = query_value(&parsed, "error");
         if !error.is_empty() {
+            let description = query_value(&parsed, "error_description");
+            let reason = if description.is_empty() {
+                error
+            } else {
+                description
+            };
             let _ = write_callback_page(
                 &mut stream,
                 400,
-                &format!("Authentication did not complete: {error}"),
+                &format!("Sign-in did not complete: {reason}"),
+                &cors,
             );
-            return Ok(None);
+            return Ok(Some(CallbackOutcome::Denied(reason)));
         }
         let code = query_value(&parsed, "code");
-        let state = query_value(&parsed, "state");
-        if code.is_empty() || state.is_empty() {
-            let _ = write_callback_page(&mut stream, 400, "Missing code or state parameter.");
+        if code.is_empty() {
+            let _ = write_callback_page(&mut stream, 400, "Missing authorization code.", &cors);
             return Ok(None);
         }
-        if !constant_time_eq(&state, &self.expected_state) {
-            let _ = write_callback_page(&mut stream, 400, "State mismatch.");
-            return Ok(None);
-        }
-        let _ = write_callback_page(
-            &mut stream,
-            200,
-            "Authentication completed. You can close this window.",
-        );
-        Ok(Some(AuthorizationResponse { code, state }))
+        // The browser waits on this connection while the code is exchanged,
+        // so its page reports how the sign-in actually ended.
+        Ok(Some(CallbackOutcome::Authorized(PendingCallback {
+            response: AuthorizationResponse { code, state },
+            stream,
+            cors,
+        })))
     }
+}
+
+/// What one valid callback request carried.
+pub enum CallbackOutcome {
+    /// The provider redirected with a code; the browser is still waiting for
+    /// its page.
+    Authorized(PendingCallback),
+    /// The provider redirected with an error, already shown in the browser.
+    Denied(String),
+}
+
+/// An authorization code whose browser connection has not been answered yet.
+/// Dropping it closes the connection without a page.
+pub struct PendingCallback {
+    pub response: AuthorizationResponse,
+    stream: TcpStream,
+    cors: Vec<(String, String)>,
+}
+
+impl PendingCallback {
+    /// Answers the browser with the outcome of the code exchange.
+    pub fn finish<T>(mut self, provider: &str, outcome: &Result<T>) {
+        let _ = match outcome {
+            Ok(_) => write_callback_page(
+                &mut self.stream,
+                200,
+                &format!(
+                    "Signed in to {provider}. You can close this window and return to GoshCoder."
+                ),
+                &self.cors,
+            ),
+            // Every error already names its provider.
+            Err(error) => {
+                write_callback_page(&mut self.stream, 502, &error.to_string(), &self.cors)
+            }
+        };
+    }
+}
+
+/// Whether a `Host` header value names this machine, with or without a port.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    is_loopback_host(host)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1091,8 +1275,17 @@ fn is_loopback_host(host: &str) -> bool {
 /// carries the response the caller sends, so exactly one response is written
 /// per connection.
 enum CallbackRead {
-    Request(String),
-    Reject { status: u16, message: &'static str },
+    Request {
+        line: String,
+        /// The `Host` header, checked against DNS rebinding.
+        host: Option<String>,
+        /// The `Origin` header, which only a CORS-enabled server reads.
+        origin: Option<String>,
+    },
+    Reject {
+        status: u16,
+        message: &'static str,
+    },
 }
 
 fn read_callback_request(
@@ -1160,12 +1353,31 @@ fn read_callback_request(
             message: "Callback request was not UTF-8.",
         });
     };
+    let origin = request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("origin")
+                .then(|| value.trim().to_owned())
+        });
     match request
         .lines()
         .next()
         .filter(|line| !line.trim().is_empty())
     {
-        Some(line) => Ok(CallbackRead::Request(line.to_owned())),
+        Some(line) => Ok(CallbackRead::Request {
+            line: line.to_owned(),
+            host: request.lines().skip(1).find_map(|header| {
+                let (name, value) = header.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("host")
+                    .then(|| value.trim().to_owned())
+            }),
+            origin,
+        }),
         None => Ok(CallbackRead::Reject {
             status: 400,
             message: "Callback request was empty.",
@@ -1173,18 +1385,82 @@ fn read_callback_request(
     }
 }
 
-fn write_callback_page(stream: &mut TcpStream, status: u16, message: &str) -> io::Result<()> {
-    let escaped = escape_html(message);
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>GoshCoder</title>\
-         <body style=\"font:16px system-ui;padding:3rem\"><p>{escaped}</p>"
-    );
+/// pi-grok-cli's CORS grant for a trusted xAI origin.
+fn cors_headers(origin: &str) -> Vec<(String, String)> {
+    [
+        ("Access-Control-Allow-Origin", origin),
+        ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+        ("Access-Control-Allow-Headers", "Content-Type"),
+        ("Access-Control-Allow-Private-Network", "true"),
+        ("Vary", "Origin"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect()
+}
+
+fn write_header_lines(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect()
+}
+
+fn write_empty_response(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(String, String)],
+) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\n\
+        "HTTP/1.1 {status} No Content\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+        write_header_lines(headers)
+    )?;
+    stream.flush()
+}
+
+fn write_callback_page(
+    stream: &mut TcpStream,
+    status: u16,
+    message: &str,
+    headers: &[(String, String)],
+) -> io::Result<()> {
+    let escaped = escape_html(message);
+    let (heading, accent) = if status < 400 {
+        ("You're signed in", "#16a34a")
+    } else {
+        ("Sign-in did not finish", "#dc2626")
+    };
+    let body = format!(
+        "<!doctype html><html lang=en><meta charset=utf-8>\
+         <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>GoshCoder sign-in</title><style>\
+         :root{{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1f2328;--muted:#59636e}}\
+         @media (prefers-color-scheme:dark){{:root{{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#9198a1}}}}\
+         body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);\
+         color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}}\
+         main{{max-width:30rem;margin:1rem;padding:2rem 2.25rem;background:var(--card);\
+         border-radius:12px;border-top:4px solid {accent};box-shadow:0 1px 3px #0002}}\
+         .brand{{font-size:.75rem;letter-spacing:.12em;font-weight:700;color:var(--muted)}}\
+         h1{{font-size:1.35rem;margin:.4rem 0 .6rem}}p{{margin:0;color:var(--muted);overflow-wrap:anywhere}}\
+         </style><main><div class=brand>GOSHCODER</div><h1>{heading}</h1><p>{escaped}</p></main></html>"
+    );
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
+        status if status >= 500 => "Internal Server Error",
+        _ => "Bad Request",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
          Cache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        if status < 400 { "OK" } else { "Bad Request" },
+         {}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        write_header_lines(headers),
         body.len()
     )?;
     stream.flush()
@@ -1224,22 +1500,128 @@ impl Drop for CancelOnDrop {
 /// This intentionally does not implement `Debug`: the authorization URL
 /// contains a state value and the request keeps the matching value.
 pub struct LoopbackLoginRequest {
+    /// Names the provider on the browser page and in errors.
+    pub provider_name: &'static str,
     pub authorization_url: Url,
     pub redirect_uri: String,
     pub expected_state: String,
     pub callback_host: String,
     pub callback_port: u16,
     pub callback_path: String,
+    /// How a pasted redirect or code is judged.
+    pub manual_input: ManualInputPolicy,
+}
+
+/// How [`run_loopback_login`] treats what the user pastes instead of
+/// letting the browser reach the loopback listener.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ManualInputPolicy {
+    /// Any code is accepted; a state, when one is pasted, must match.
+    #[default]
+    Lenient,
+    /// pi-grok-cli's rule: a pasted callback URL or query must carry the
+    /// matching state, and a bare value is accepted only when it looks like
+    /// xAI's one-time code (`^[A-Za-z0-9._~-]{32,2048}$`). Anything else is
+    /// reported and ignored while the browser callback keeps waiting.
+    StateOrOneTimeCode,
+}
+
+/// What a strictly judged paste carried.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ManualCallback {
+    Code(String),
+    Denied(String),
+}
+
+fn is_one_time_code(value: &str) -> bool {
+    (32..=2048).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-'))
+}
+
+fn strict_callback_params<'a>(
+    pairs: impl Iterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+    expected_state: &str,
+) -> std::result::Result<ManualCallback, String> {
+    let mut fields = BTreeMap::new();
+    for (name, value) in pairs {
+        fields
+            .entry(name.into_owned())
+            .or_insert_with(|| value.into_owned());
+    }
+    let state = fields.get("state").filter(|state| !state.is_empty());
+    let Some(state) = state else {
+        return Err("OAuth state is missing.".to_owned());
+    };
+    if !constant_time_eq(state, expected_state) {
+        return Err("OAuth state did not match.".to_owned());
+    }
+    let non_empty = |name: &str| fields.get(name).filter(|value| !value.is_empty()).cloned();
+    if let Some(error) = non_empty("error") {
+        return Ok(ManualCallback::Denied(
+            non_empty("error_description").unwrap_or(error),
+        ));
+    }
+    non_empty("code")
+        .map(ManualCallback::Code)
+        .ok_or_else(|| "Callback did not include an authorization code or OAuth error.".to_owned())
+}
+
+/// pi-grok-cli `parseManualCallback`.
+pub fn parse_strict_manual_input(
+    input: &str,
+    expected_state: &str,
+    callback_path: &str,
+) -> std::result::Result<ManualCallback, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Err("Pasted callback was empty.".to_owned());
+    }
+    if let Ok(url) = Url::parse(value) {
+        if url.path() != callback_path {
+            return Err("Callback URL path was not recognized.".to_owned());
+        }
+        return strict_callback_params(url.query_pairs(), expected_state);
+    }
+    if !value.contains('=') && is_one_time_code(value) {
+        return Ok(ManualCallback::Code(value.to_owned()));
+    }
+    strict_callback_params(
+        url::form_urlencoded::parse(value.trim_start_matches('?').as_bytes()),
+        expected_state,
+    )
+}
+
+fn spawn_manual_prompt(
+    interaction: &Arc<dyn OAuthInteraction>,
+    prompt: OAuthPrompt,
+) -> Result<mpsc::Receiver<Result<String>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let prompter = interaction.clone();
+    thread::Builder::new()
+        .name("oauth-manual-code".to_owned())
+        .spawn(move || {
+            let result = prompter.prompt(prompt);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            OAuthError::Callback(format!("cannot start manual-code prompt: {error}"))
+        })?;
+    Ok(receiver)
 }
 
 /// Runs a browser authorization flow, racing a loopback callback against a
-/// cancellable manual-paste prompt.
-pub fn run_loopback_login(
+/// cancellable manual-paste prompt, and finishes it with `complete`, which
+/// exchanges the code. As in pi's callback server, the browser is answered
+/// only after the exchange, so its page reports failures too.
+pub fn run_loopback_login<T>(
     interaction: Arc<dyn OAuthInteraction>,
     browser: Arc<dyn BrowserOpener>,
     cancellation: &CancellationToken,
     request: LoopbackLoginRequest,
-) -> Result<String> {
+    complete: impl FnOnce(String) -> Result<T>,
+) -> Result<T> {
     let server = match LoopbackCallbackServer::bind(
         &request.callback_host,
         request.callback_port,
@@ -1255,6 +1637,26 @@ pub fn run_loopback_login(
             None
         }
     };
+    run_loopback_login_with_server(
+        interaction,
+        browser,
+        cancellation,
+        request,
+        server,
+        complete,
+    )
+}
+
+/// [`run_loopback_login`] with a listener the caller already bound, for a
+/// provider whose authorization URL names the port the system picked.
+pub fn run_loopback_login_with_server<T>(
+    interaction: Arc<dyn OAuthInteraction>,
+    browser: Arc<dyn BrowserOpener>,
+    cancellation: &CancellationToken,
+    request: LoopbackLoginRequest,
+    server: Option<LoopbackCallbackServer>,
+    complete: impl FnOnce(String) -> Result<T>,
+) -> Result<T> {
     interaction.notify(OAuthEvent::authorization_url(&request.authorization_url));
     let _ = browser.open(&request.authorization_url);
 
@@ -1262,46 +1664,113 @@ pub fn run_loopback_login(
     let _cancel_manual = CancelOnDrop(manual_cancellation.clone());
     let prompt = OAuthPrompt {
         kind: OAuthPromptKind::ManualCode,
-        message:
-            "Complete login in your browser, or paste the authorization code / redirect URL here:"
-                .to_owned(),
-        placeholder: request.redirect_uri,
+        message: "Waiting for the browser. Or paste the redirect URL / authorization code:"
+            .to_owned(),
+        placeholder: request.redirect_uri.clone(),
         options: Vec::new(),
         cancellation: manual_cancellation,
     };
-    let (manual_sender, manual_receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("oauth-manual-code".to_owned())
-        .spawn(move || {
-            let result = interaction.prompt(prompt);
-            let _ = manual_sender.send(result);
-        })
-        .map_err(|error| {
-            OAuthError::Callback(format!("cannot start manual-code prompt: {error}"))
-        })?;
+    // `None` once a strictly judged paste was ignored: like upstream, the
+    // prompt is asked once and the browser callback keeps the login alive.
+    let mut manual_receiver = Some(spawn_manual_prompt(&interaction, prompt)?);
 
-    loop {
+    let code = loop {
         cancellation.check()?;
-        if let Some(server) = &server
-            && let Some(callback) = server.try_accept(cancellation)?
+        match server
+            .as_ref()
+            .map(|server| server.try_accept(cancellation))
+            .transpose()?
+            .flatten()
         {
-            return Ok(callback.code);
-        }
-        match manual_receiver.try_recv() {
-            Ok(result) => {
-                let parsed = parse_authorization_input(&result?)
-                    .ok_or(OAuthError::InvalidAuthorizationInput)?;
-                if !parsed.state.is_empty()
-                    && !constant_time_eq(&parsed.state, &request.expected_state)
-                {
-                    return Err(OAuthError::StateMismatch);
-                }
-                return Ok(parsed.code);
+            Some(CallbackOutcome::Authorized(pending)) => {
+                // The manual prompt is pointless now; stop it before the
+                // exchange prints its progress over it.
+                drop(_cancel_manual);
+                interaction.notify(OAuthEvent::progress(
+                    "Browser sign-in received; exchanging the authorization code...",
+                ));
+                let outcome = complete(pending.response.code.clone());
+                pending.finish(request.provider_name, &outcome);
+                return outcome;
             }
-            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
-            Err(TryRecvError::Disconnected) => return Err(OAuthError::Cancelled),
+            Some(CallbackOutcome::Denied(reason)) => {
+                return Err(OAuthError::Callback(format!(
+                    "{} sign-in was not authorized in the browser: {reason}",
+                    request.provider_name
+                )));
+            }
+            None => {}
         }
-    }
+        let manual = match manual_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            None | Some(Err(TryRecvError::Empty)) => None,
+            Some(Ok(result)) => Some(result?),
+            Some(Err(TryRecvError::Disconnected)) => {
+                if server.is_none() {
+                    return Err(OAuthError::Cancelled);
+                }
+                manual_receiver = None;
+                None
+            }
+        };
+        let Some(input) = manual else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        // An empty line, or a stdin that is not a terminal, must not abandon
+        // a browser sign-in that is still on its way back.
+        if input.trim().is_empty() && server.is_some() {
+            manual_receiver = None;
+            interaction.notify(OAuthEvent::info(
+                "Still waiting for the browser sign-in; press Ctrl-C to cancel.",
+            ));
+            continue;
+        }
+        if request.manual_input == ManualInputPolicy::StateOrOneTimeCode {
+            match parse_strict_manual_input(&input, &request.expected_state, &request.callback_path)
+            {
+                Ok(ManualCallback::Code(code)) => break code,
+                Ok(ManualCallback::Denied(reason)) => {
+                    return Err(OAuthError::Callback(format!(
+                        "{} sign-in was not authorized in the browser: {reason}",
+                        request.provider_name
+                    )));
+                }
+                // A stray paste must not end a login the browser can still
+                // complete. Without a listener nothing else can.
+                Err(reason) => {
+                    if server.is_none() {
+                        return Err(OAuthError::Callback(format!(
+                            "the pasted callback was not accepted: {reason}"
+                        )));
+                    }
+                    interaction.notify(OAuthEvent::progress(format!(
+                        "Ignored pasted callback: {reason} Paste the complete callback URL or xAI's one-time code."
+                    )));
+                    manual_receiver = None;
+                    continue;
+                }
+            }
+        }
+        if let Some(reason) = redirect_error(&input) {
+            return Err(OAuthError::Callback(format!(
+                "{} sign-in was not authorized in the browser: {reason}",
+                request.provider_name
+            )));
+        }
+        let parsed =
+            parse_authorization_input(&input).ok_or(OAuthError::InvalidAuthorizationInput)?;
+        if !parsed.state.is_empty()
+            && !request.expected_state.is_empty()
+            && !constant_time_eq(&parsed.state, &request.expected_state)
+        {
+            return Err(OAuthError::StateMismatch);
+        }
+        break parsed.code;
+    };
+    interaction.notify(OAuthEvent::progress(
+        "Exchanging the authorization code for tokens...",
+    ));
+    complete(code)
 }
 
 /// A request the OAuth transport receives. It deliberately has no `Debug`
@@ -1316,6 +1785,23 @@ pub struct OAuthRequest {
 }
 
 impl OAuthRequest {
+    /// Builds a request for a flow implemented outside this module.
+    pub(crate) fn new(
+        method: Method,
+        url: Url,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body,
+            timeout,
+        }
+    }
+
     pub fn method(&self) -> &Method {
         &self.method
     }
@@ -1528,14 +2014,6 @@ struct TokenResponse {
     refresh_token: String,
     #[serde(default)]
     expires_in: i64,
-    #[serde(default)]
-    error: String,
-    #[serde(default)]
-    error_description: String,
-}
-
-fn parse_token_response(body: &[u8]) -> Option<TokenResponse> {
-    serde_json::from_slice(body).ok()
 }
 
 fn token_error(
@@ -1543,17 +2021,14 @@ fn token_error(
     operation: &'static str,
     response: &OAuthResponse,
 ) -> OAuthError {
-    let parsed = parse_token_response(&response.body);
-    let detail = parsed
-        .as_ref()
-        .map(|response| response.error_description.trim().to_owned())
-        .filter(|detail| !detail.is_empty())
-        .unwrap_or_else(|| truncate_response(&response.body, 500));
+    let detail = truncate_response(&response.body, 500);
+    let code = error_code(&response.body);
     if response.status == 401
         || response.status == 403
-        || parsed
-            .as_ref()
-            .is_some_and(|response| response.error == "invalid_grant")
+        || matches!(
+            code.as_deref(),
+            Some("invalid_grant" | "invalid_refresh_token" | "token_expired")
+        )
     {
         OAuthError::Unauthorized {
             provider,
@@ -1570,8 +2045,44 @@ fn token_error(
     }
 }
 
+/// The human-readable part of an error body. Providers disagree on the
+/// shape (`error_description`, `{"error":{"message"}}`, `message`, a bare
+/// `error` string), so they are tried in the order pi's `errorDetail` uses,
+/// and anything else falls back to the raw text.
+fn error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    text(value.get("error_description"))
+        .or_else(|| text(value.get("error").and_then(|error| error.get("message"))))
+        .or_else(|| text(value.get("message")))
+        .or_else(|| text(value.get("error")))
+}
+
+/// The machine-readable error code, top-level or nested under `error`.
+fn error_code(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let error = value.get("error")?;
+    error
+        .as_str()
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 fn truncate_response(body: &[u8], limit: usize) -> String {
-    let body = String::from_utf8_lossy(body);
+    let detail = error_detail(body);
+    let body = match &detail {
+        Some(detail) => detail.clone(),
+        None => String::from_utf8_lossy(body).into_owned(),
+    };
+    // A multi-line HTML or JSON dump reads as noise on one terminal line.
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut text = body.trim().chars();
     let truncated: String = text.by_ref().take(limit).collect();
     if text.next().is_some() {
@@ -1637,7 +2148,7 @@ fn append_query(url: &Url, fields: &[(&str, &str)]) -> Url {
     url
 }
 
-fn endpoint(base: &Url, path: &str) -> Result<Url> {
+pub(crate) fn endpoint(base: &Url, path: &str) -> Result<Url> {
     if !path.starts_with('/') {
         return Err(OAuthError::InvalidConfiguration(format!(
             "OAuth endpoint path {path:?} must start with '/'"
@@ -1681,6 +2192,8 @@ pub struct OAuthEndpoints {
     pub xai_issuer_url: Url,
     pub meta_auth_base_url: Url,
     pub meta_api_base_url: Url,
+    pub openrouter_authorize_url: Url,
+    pub openrouter_key_url: Url,
 }
 
 impl Default for OAuthEndpoints {
@@ -1701,6 +2214,8 @@ impl Default for OAuthEndpoints {
             xai_issuer_url: fixed_url("https://auth.x.ai"),
             meta_auth_base_url: fixed_url("https://auth.meta.com"),
             meta_api_base_url: fixed_url("https://api.meta.ai"),
+            openrouter_authorize_url: fixed_url("https://openrouter.ai/auth"),
+            openrouter_key_url: fixed_url("https://openrouter.ai/api/v1/auth/keys"),
         }
     }
 }
@@ -1801,15 +2316,22 @@ impl OAuthClient {
             }
             OAuthProviderId::KimiCoding => self.login_kimi(interaction, environment, cancellation),
             OAuthProviderId::Meta => self.login_meta(interaction, environment, cancellation),
+            OAuthProviderId::MetaMuse => self
+                .meta_muse_flow()
+                .login(interaction.as_ref(), cancellation),
             OAuthProviderId::OpenAiCodex => {
                 self.login_codex(interaction, environment, cancellation)
             }
             OAuthProviderId::Xai => self.login_xai(interaction, environment, cancellation),
-            OAuthProviderId::OpenRouter
-            | OAuthProviderId::GithubCopilot
-            | OAuthProviderId::Radius => Err(OAuthError::UnsupportedFlow {
-                provider: provider.as_str().to_owned(),
-            }),
+            OAuthProviderId::GrokCli => self.login_grok_cli(interaction, environment, cancellation),
+            OAuthProviderId::OpenRouter => {
+                self.login_openrouter(interaction, environment, cancellation)
+            }
+            OAuthProviderId::GithubCopilot | OAuthProviderId::Radius => {
+                Err(OAuthError::UnsupportedFlow {
+                    provider: provider.as_str().to_owned(),
+                })
+            }
         }
     }
 
@@ -1842,13 +2364,17 @@ impl OAuthClient {
             OAuthProviderId::Anthropic => self.refresh_anthropic(current, cancellation),
             OAuthProviderId::KimiCoding => self.refresh_kimi(current, environment, cancellation),
             OAuthProviderId::Meta => self.refresh_meta(current, environment, cancellation),
+            OAuthProviderId::MetaMuse => self.meta_muse_flow().refresh(current, cancellation),
             OAuthProviderId::OpenAiCodex => self.refresh_codex(current, cancellation),
             OAuthProviderId::Xai => self.refresh_xai(current, environment, cancellation),
-            OAuthProviderId::OpenRouter
-            | OAuthProviderId::GithubCopilot
-            | OAuthProviderId::Radius => Err(OAuthError::UnsupportedFlow {
-                provider: provider.as_str().to_owned(),
-            }),
+            OAuthProviderId::GrokCli => self.refresh_grok_cli(current, environment, cancellation),
+            // The minted key does not expire; pi's refresh returns it as is.
+            OAuthProviderId::OpenRouter => Ok(current.clone()),
+            OAuthProviderId::GithubCopilot | OAuthProviderId::Radius => {
+                Err(OAuthError::UnsupportedFlow {
+                    provider: provider.as_str().to_owned(),
+                })
+            }
         }
     }
 
@@ -2086,14 +2612,14 @@ fn meta_client_id(environment: &dyn OAuthEnvironment) -> String {
 
 impl OAuthClient {
     /// Builds Anthropic's registered PKCE authorization URL.
-    pub fn anthropic_authorization_url(&self, pkce: &PkcePair) -> Url {
+    pub fn anthropic_authorization_url(&self, pkce: &PkcePair, redirect_uri: &str) -> Url {
         append_query(
             &self.endpoints.anthropic_authorize_url,
             &[
                 ("code", "true"),
                 ("client_id", ANTHROPIC_CLIENT_ID),
                 ("response_type", "code"),
-                ("redirect_uri", ANTHROPIC_REDIRECT_URI),
+                ("redirect_uri", redirect_uri),
                 ("scope", ANTHROPIC_SCOPES),
                 ("code_challenge", pkce.challenge()),
                 ("code_challenge_method", "S256"),
@@ -2110,33 +2636,92 @@ impl OAuthClient {
         environment: &dyn OAuthEnvironment,
         cancellation: &CancellationToken,
     ) -> Result<Credential> {
+        let method = interaction.prompt(OAuthPrompt {
+            kind: OAuthPromptKind::Select,
+            message: "Select the Anthropic login method:".to_owned(),
+            placeholder: String::new(),
+            options: vec![
+                OAuthPromptOption {
+                    id: "browser".to_owned(),
+                    label: "Browser login (default)".to_owned(),
+                    description: String::new(),
+                },
+                OAuthPromptOption {
+                    id: "copy_code".to_owned(),
+                    label: "Copy code login (headless)".to_owned(),
+                    description: "for a machine whose browser cannot reach this one".to_owned(),
+                },
+            ],
+            cancellation: cancellation.clone(),
+        })?;
+        cancellation.check()?;
+        match method.as_str() {
+            "" | "browser" => self.login_anthropic_browser(interaction, environment, cancellation),
+            "copy_code" => self.login_anthropic_copy_code(interaction, cancellation),
+            _ => Err(OAuthError::InvalidConfiguration(format!(
+                "unknown Anthropic login method {method:?}"
+            ))),
+        }
+    }
+
+    /// pi's `loginAnthropicCopyCode`: Anthropic's own page shows the code,
+    /// so a login on a remote or headless machine needs no loopback at all.
+    fn login_anthropic_copy_code(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
         let pkce = generate_pkce();
-        let authorization_url = self.anthropic_authorization_url(&pkce);
-        let code = run_loopback_login(
-            interaction.clone(),
-            self.browser.clone(),
-            cancellation,
-            LoopbackLoginRequest {
-                authorization_url,
-                redirect_uri: ANTHROPIC_REDIRECT_URI.to_owned(),
-                expected_state: pkce.verifier().to_owned(),
-                callback_host: callback_host(environment),
-                callback_port: ANTHROPIC_CALLBACK_PORT,
-                callback_path: ANTHROPIC_CALLBACK_PATH.to_owned(),
-            },
-        )?;
+        interaction.notify(OAuthEvent {
+            instructions:
+                "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+                    .to_owned(),
+            ..OAuthEvent::authorization_url(
+                &self.anthropic_authorization_url(&pkce, ANTHROPIC_COPY_CODE_REDIRECT_URI),
+            )
+        });
+        let _ = self
+            .browser
+            .open(&self.anthropic_authorization_url(&pkce, ANTHROPIC_COPY_CODE_REDIRECT_URI));
+        let input = interaction.prompt(OAuthPrompt {
+            kind: OAuthPromptKind::ManualCode,
+            message: "Paste the code Anthropic shows after you sign in:".to_owned(),
+            placeholder: "code#state".to_owned(),
+            options: Vec::new(),
+            cancellation: cancellation.clone(),
+        })?;
+        let parsed =
+            parse_authorization_input(&input).ok_or(OAuthError::InvalidAuthorizationInput)?;
+        if !parsed.state.is_empty() && !constant_time_eq(&parsed.state, pkce.verifier()) {
+            return Err(OAuthError::StateMismatch);
+        }
         interaction.notify(OAuthEvent::progress(
             "Exchanging the authorization code for tokens...",
         ));
+        self.exchange_anthropic_code(
+            &parsed.code,
+            pkce.verifier(),
+            ANTHROPIC_COPY_CODE_REDIRECT_URI,
+            cancellation,
+        )
+    }
+
+    fn exchange_anthropic_code(
+        &self,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
         let response = self.post_json(
             &self.endpoints.anthropic_token_url,
             json!({
                 "grant_type": "authorization_code",
                 "client_id": ANTHROPIC_CLIENT_ID,
                 "code": code,
-                "state": pkce.verifier(),
-                "redirect_uri": ANTHROPIC_REDIRECT_URI,
-                "code_verifier": pkce.verifier(),
+                "state": verifier,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
             }),
             cancellation,
         )?;
@@ -2147,6 +2732,72 @@ impl OAuthClient {
             token,
             self.clock.now_ms(),
             ANTHROPIC_REFRESH_SKEW,
+        )
+    }
+
+    fn login_anthropic_browser(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let pkce = generate_pkce();
+        let host = callback_host(environment);
+        // pi's anthropic.ts: Anthropic accepts any loopback port, so a busy
+        // 53692 falls back to a free one rather than sending the browser's
+        // code to whatever holds the port.
+        let server = LoopbackCallbackServer::bind(
+            &host,
+            ANTHROPIC_CALLBACK_PORT,
+            ANTHROPIC_CALLBACK_PATH,
+            pkce.verifier(),
+        )
+        .or_else(|_| {
+            LoopbackCallbackServer::bind(&host, 0, ANTHROPIC_CALLBACK_PATH, pkce.verifier())
+        });
+        let redirect_uri = match server.as_ref().map(LoopbackCallbackServer::local_addr) {
+            Ok(Ok(address)) if address.port() != ANTHROPIC_CALLBACK_PORT => {
+                format!(
+                    "http://localhost:{}{ANTHROPIC_CALLBACK_PATH}",
+                    address.port()
+                )
+            }
+            _ => ANTHROPIC_REDIRECT_URI.to_owned(),
+        };
+        let server = match server {
+            Ok(server) => Some(server),
+            Err(error) => {
+                interaction.notify(OAuthEvent::info(format!(
+                    "Could not listen for the browser callback ({error}). Complete login in the browser and paste the redirect URL below."
+                )));
+                None
+            }
+        };
+        let authorization_url = self.anthropic_authorization_url(&pkce, &redirect_uri);
+        let exchange_redirect_uri = redirect_uri.clone();
+        run_loopback_login_with_server(
+            interaction,
+            self.browser.clone(),
+            cancellation,
+            LoopbackLoginRequest {
+                provider_name: OAuthProviderId::Anthropic.display_name(),
+                authorization_url,
+                redirect_uri,
+                expected_state: pkce.verifier().to_owned(),
+                callback_host: host,
+                callback_port: ANTHROPIC_CALLBACK_PORT,
+                callback_path: ANTHROPIC_CALLBACK_PATH.to_owned(),
+                manual_input: ManualInputPolicy::Lenient,
+            },
+            server,
+            |code| {
+                self.exchange_anthropic_code(
+                    &code,
+                    pkce.verifier(),
+                    &exchange_redirect_uri,
+                    cancellation,
+                )
+            },
         )
     }
 
@@ -2408,7 +3059,87 @@ fn operation_failure(
     }
 }
 
+/// pi stores OpenRouter's permanent key with `Number.MAX_SAFE_INTEGER` as its
+/// expiry; the same value keeps `auth.json` interchangeable.
+const OPENROUTER_KEY_EXPIRES_MS: i64 = 9_007_199_254_740_991;
+
 impl OAuthClient {
+    fn login_openrouter(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let pkce = generate_pkce();
+        // OpenRouter sends no `state`; the random path keeps stray requests
+        // from completing the sign-in, and the port is whatever is free.
+        let path = format!("/oauth/callback/{}", random_state());
+        let host = callback_host(environment);
+        let server = LoopbackCallbackServer::bind(&host, 0, &path, "")?;
+        let port = server.local_addr()?.port();
+        let redirect_host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let redirect_uri = format!("http://{redirect_host}:{port}{path}");
+        let authorization_url = append_query(
+            &self.endpoints.openrouter_authorize_url,
+            &[
+                ("callback_url", redirect_uri.as_str()),
+                ("code_challenge", pkce.challenge()),
+                ("code_challenge_method", "S256"),
+            ],
+        );
+        run_loopback_login_with_server(
+            interaction,
+            self.browser.clone(),
+            cancellation,
+            LoopbackLoginRequest {
+                provider_name: OAuthProviderId::OpenRouter.display_name(),
+                authorization_url,
+                redirect_uri,
+                expected_state: String::new(),
+                callback_host: host,
+                callback_port: port,
+                callback_path: path,
+                manual_input: ManualInputPolicy::Lenient,
+            },
+            Some(server),
+            |code| self.exchange_openrouter_code(&code, pkce.verifier(), cancellation),
+        )
+    }
+
+    fn exchange_openrouter_code(
+        &self,
+        code: &str,
+        verifier: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let provider = OAuthProviderId::OpenRouter.display_name();
+        let response = self.post_json(
+            &self.endpoints.openrouter_key_url,
+            json!({
+                "code": code,
+                "code_verifier": verifier,
+                "code_challenge_method": "S256",
+            }),
+            cancellation,
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(operation_failure(provider, "exchange", &response));
+        }
+        let key = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body.get("key").and_then(Value::as_str).map(str::to_owned))
+            .filter(|key| !key.is_empty())
+            .ok_or(OAuthError::InvalidTokenResponse {
+                provider,
+                operation: "exchange",
+            })?;
+        Ok(Credential::oauth(key, "", OPENROUTER_KEY_EXPIRES_MS))
+    }
+
     /// Builds OpenAI Codex's registered browser PKCE authorization URL.
     pub fn codex_authorization_url(&self, pkce: &PkcePair, state: &str) -> Url {
         append_query(
@@ -2470,23 +3201,24 @@ impl OAuthClient {
     ) -> Result<Credential> {
         let pkce = generate_pkce();
         let state = random_state();
-        let code = run_loopback_login(
-            interaction.clone(),
+        run_loopback_login(
+            interaction,
             self.browser.clone(),
             cancellation,
             LoopbackLoginRequest {
+                provider_name: OAuthProviderId::OpenAiCodex.display_name(),
                 authorization_url: self.codex_authorization_url(&pkce, &state),
                 redirect_uri: CODEX_REDIRECT_URI.to_owned(),
                 expected_state: state,
                 callback_host: callback_host(environment),
                 callback_port: CODEX_CALLBACK_PORT,
                 callback_path: CODEX_CALLBACK_PATH.to_owned(),
+                manual_input: ManualInputPolicy::Lenient,
             },
-        )?;
-        interaction.notify(OAuthEvent::progress(
-            "Exchanging the authorization code for tokens...",
-        ));
-        self.exchange_codex_code(&code, pkce.verifier(), CODEX_REDIRECT_URI, cancellation)
+            |code| {
+                self.exchange_codex_code(&code, pkce.verifier(), CODEX_REDIRECT_URI, cancellation)
+            },
+        )
     }
 
     fn login_codex_device(
@@ -2875,38 +3607,40 @@ impl OAuthClient {
         let pkce = generate_pkce();
         let state = random_state();
         let nonce = random_state();
-        let code = run_loopback_login(
-            interaction.clone(),
+        let authorization_url =
+            self.xai_authorization_url(&endpoints, &client_id, &pkce, &state, &nonce);
+        run_loopback_login(
+            interaction,
             self.browser.clone(),
             cancellation,
             LoopbackLoginRequest {
-                authorization_url: self
-                    .xai_authorization_url(&endpoints, &client_id, &pkce, &state, &nonce),
+                provider_name: OAuthProviderId::Xai.display_name(),
+                authorization_url,
                 redirect_uri: XAI_REDIRECT_URI.to_owned(),
                 expected_state: state,
                 callback_host: callback_host(environment),
                 callback_port: XAI_CALLBACK_PORT,
                 callback_path: XAI_CALLBACK_PATH.to_owned(),
+                manual_input: ManualInputPolicy::Lenient,
             },
-        )?;
-        interaction.notify(OAuthEvent::progress(
-            "Exchanging the authorization code for tokens...",
-        ));
-        let response = self.post_form(
-            &endpoints.token,
-            fields([
-                ("grant_type", "authorization_code".to_owned()),
-                ("client_id", client_id),
-                ("code", code),
-                ("redirect_uri", XAI_REDIRECT_URI.to_owned()),
-                ("code_verifier", pkce.verifier().to_owned()),
-                ("code_challenge", pkce.challenge().to_owned()),
-                ("code_challenge_method", "S256".to_owned()),
-            ]),
-            cancellation,
-        )?;
-        let token = self.successful_token(OAuthProviderId::Xai, "exchange", response)?;
-        self.xai_credential("exchange", token, "")
+            |code| {
+                let response = self.post_form(
+                    &endpoints.token,
+                    fields([
+                        ("grant_type", "authorization_code".to_owned()),
+                        ("client_id", client_id),
+                        ("code", code),
+                        ("redirect_uri", XAI_REDIRECT_URI.to_owned()),
+                        ("code_verifier", pkce.verifier().to_owned()),
+                        ("code_challenge", pkce.challenge().to_owned()),
+                        ("code_challenge_method", "S256".to_owned()),
+                    ]),
+                    cancellation,
+                )?;
+                let token = self.successful_token(OAuthProviderId::Xai, "exchange", response)?;
+                self.xai_credential("exchange", token, "")
+            },
+        )
     }
 
     fn login_xai_device(
@@ -3077,6 +3811,494 @@ impl OAuthClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Grok CLI (pi-grok-cli v0.9.3 `src/auth/oauth.ts` and `src/auth/config.ts`)
+//
+// The same auth.x.ai issuer and discovery as xAI above, with the official
+// Grok CLI's parameters: its own callback port with an ephemeral fallback,
+// `plan=generic` on the authorization URL, a PKCE exchange that sends only
+// the verifier, a CORS-answering callback listener, a stricter manual paste,
+// and 400/401/403 refresh failures treated as a revoked login.
+
+const GROK_CLI_DEFAULT_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const GROK_CLI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const GROK_CLI_CALLBACK_PORT: u16 = 56122;
+const GROK_CLI_CALLBACK_PATH: &str = "/callback";
+/// Stored expiries run this far ahead of the token's real one, as
+/// upstream's `REFRESH_SKEW_MS` makes them.
+const GROK_CLI_REFRESH_SKEW: Duration = Duration::from_secs(120);
+const GROK_CLI_DEVICE_TIMEOUT: Duration = Duration::from_secs(1800);
+/// xAI's account pages probe the loopback listener from these origins.
+pub const GROK_CLI_CORS_ORIGINS: &[&str] = &["https://accounts.x.ai", "https://auth.x.ai"];
+const GROK_CLI_TOKEN_ENV_MESSAGE: &str =
+    "Unset GROK_CLI_OAUTH_TOKEN before logging in to Grok CLI.";
+
+fn grok_cli_client_id(environment: &dyn OAuthEnvironment) -> String {
+    environment
+        .value("PI_GROK_CLI_OAUTH_CLIENT_ID")
+        .unwrap_or_else(|| GROK_CLI_DEFAULT_CLIENT_ID.to_owned())
+}
+
+fn grok_cli_scope(environment: &dyn OAuthEnvironment) -> String {
+    environment
+        .value("PI_GROK_CLI_OAUTH_SCOPE")
+        .unwrap_or_else(|| GROK_CLI_SCOPE.to_owned())
+}
+
+fn grok_cli_callback_host(environment: &dyn OAuthEnvironment) -> String {
+    environment
+        .value("PI_GROK_CLI_CALLBACK_HOST")
+        .unwrap_or_else(|| callback_host(environment))
+}
+
+fn grok_cli_callback_port(environment: &dyn OAuthEnvironment) -> u16 {
+    environment
+        .value("PI_GROK_CLI_CALLBACK_PORT")
+        .and_then(|port| port.trim().parse().ok())
+        .unwrap_or(GROK_CLI_CALLBACK_PORT)
+}
+
+/// upstream `validateEndpoint`: HTTPS on x.ai or a subdomain. An endpoint
+/// on the configured issuer's own origin is accepted too, so a test issuer
+/// on loopback works the way the xAI flow's pinning allows.
+fn grok_cli_trusted_endpoint(issuer: &Url, value: &str) -> Option<Url> {
+    if let Some(pinned) = pin_xai_endpoint(issuer, value) {
+        return Some(pinned);
+    }
+    let url = Url::parse(value).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    (url.scheme() == "https" && (host == "x.ai" || host.ends_with(".x.ai"))).then_some(url)
+}
+
+/// `String(payload[field])` for the scalar shapes a token endpoint returns.
+fn grok_cli_token_field(payload: &Value, field: &str) -> Option<String> {
+    match payload.get(field)? {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn grok_cli_discovery(endpoints: &XaiEndpoints) -> Value {
+    json!({
+        "authorization_endpoint": endpoints.authorize.as_str(),
+        "token_endpoint": endpoints.token.as_str(),
+        "device_authorization_endpoint": endpoints.device.as_str(),
+    })
+}
+
+fn grok_cli_base_url(environment: &dyn OAuthEnvironment) -> String {
+    crate::grok_cli::base_url(|name| environment.value(name))
+}
+
+impl OAuthClient {
+    /// Builds the Grok CLI browser authorization URL. `referrer` names
+    /// GoshCoder (upstream names its own package), as the xAI flow does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grok_cli_authorization_url(
+        &self,
+        endpoints: &XaiEndpoints,
+        client_id: &str,
+        scope: &str,
+        redirect_uri: &str,
+        pkce: &PkcePair,
+        state: &str,
+        nonce: &str,
+    ) -> Url {
+        append_query(
+            &endpoints.authorize,
+            &[
+                ("response_type", "code"),
+                ("client_id", client_id),
+                ("redirect_uri", redirect_uri),
+                ("scope", scope),
+                ("code_challenge", pkce.challenge()),
+                ("code_challenge_method", "S256"),
+                ("state", state),
+                ("nonce", nonce),
+                ("plan", "generic"),
+                ("referrer", "goshcoder"),
+            ],
+        )
+    }
+
+    fn login_grok_cli(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        // The environment token would shadow whatever this login stores.
+        if environment.value(crate::grok_cli::TOKEN_ENV).is_some() {
+            return Err(OAuthError::InvalidConfiguration(
+                GROK_CLI_TOKEN_ENV_MESSAGE.to_owned(),
+            ));
+        }
+        let endpoints = self.discover_xai_endpoints(cancellation)?;
+        let method = interaction.prompt(OAuthPrompt {
+            kind: OAuthPromptKind::Select,
+            message: "Select Grok CLI login method:".to_owned(),
+            placeholder: String::new(),
+            options: vec![
+                OAuthPromptOption {
+                    id: "browser".to_owned(),
+                    label: "Browser login (default)".to_owned(),
+                    description: "Opens accounts.x.ai and waits on a loopback callback.".to_owned(),
+                },
+                OAuthPromptOption {
+                    id: "device".to_owned(),
+                    label: "Device code login (headless)".to_owned(),
+                    description: "Shows a code to enter at accounts.x.ai.".to_owned(),
+                },
+            ],
+            cancellation: cancellation.clone(),
+        })?;
+        cancellation.check()?;
+        match method.as_str() {
+            "" | "browser" => {
+                self.login_grok_cli_browser(interaction, environment, &endpoints, cancellation)
+            }
+            "device" | "device_code" => {
+                self.login_grok_cli_device(interaction, environment, &endpoints, cancellation)
+            }
+            _ => Err(OAuthError::InvalidConfiguration(format!(
+                "unknown Grok CLI login method {method:?}"
+            ))),
+        }
+    }
+
+    fn login_grok_cli_browser(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        endpoints: &XaiEndpoints,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let client_id = grok_cli_client_id(environment);
+        let scope = grok_cli_scope(environment);
+        let host = grok_cli_callback_host(environment);
+        let port = grok_cli_callback_port(environment);
+        let pkce = generate_pkce();
+        let state = random_state();
+        let nonce = random_state();
+        // The registered port first; when another login holds it, any free
+        // port, since the redirect URI names whichever one was bound.
+        let bound = LoopbackCallbackServer::bind(&host, port, GROK_CLI_CALLBACK_PATH, &state)
+            .or_else(|first| {
+                LoopbackCallbackServer::bind(&host, 0, GROK_CLI_CALLBACK_PATH, &state).map_err(
+                    |second| {
+                        OAuthError::Callback(format!(
+                            "could not bind {host}:{port} or an ephemeral port: {second} (initial error: {first})"
+                        ))
+                    },
+                )
+            });
+        let (server, bound_port) = match bound {
+            Ok(server) => {
+                let bound_port = server.local_addr()?.port();
+                (
+                    Some(server.with_cors_origins(GROK_CLI_CORS_ORIGINS)),
+                    bound_port,
+                )
+            }
+            Err(error) => {
+                interaction.notify(OAuthEvent::info(format!(
+                    "{error}. Complete login in the browser and paste the callback URL or one-time code below."
+                )));
+                (None, port)
+            }
+        };
+        let redirect_host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let redirect_uri = format!("http://{redirect_host}:{bound_port}{GROK_CLI_CALLBACK_PATH}");
+        let authorization_url = self.grok_cli_authorization_url(
+            endpoints,
+            &client_id,
+            &scope,
+            &redirect_uri,
+            &pkce,
+            &state,
+            &nonce,
+        );
+        run_loopback_login_with_server(
+            interaction,
+            self.browser.clone(),
+            cancellation,
+            LoopbackLoginRequest {
+                provider_name: OAuthProviderId::GrokCli.display_name(),
+                authorization_url,
+                redirect_uri: redirect_uri.clone(),
+                expected_state: state,
+                callback_host: host,
+                callback_port: bound_port,
+                callback_path: GROK_CLI_CALLBACK_PATH.to_owned(),
+                manual_input: ManualInputPolicy::StateOrOneTimeCode,
+            },
+            server,
+            |code| {
+                let response = self.post_form(
+                    &endpoints.token,
+                    fields([
+                        ("grant_type", "authorization_code".to_owned()),
+                        ("client_id", client_id.clone()),
+                        ("code", code),
+                        ("redirect_uri", redirect_uri.clone()),
+                        ("code_verifier", pkce.verifier().to_owned()),
+                    ]),
+                    cancellation,
+                )?;
+                let payload = self.grok_cli_payload("exchange", response)?;
+                self.grok_cli_login_credential("exchange", &payload, endpoints, environment)
+            },
+        )
+    }
+
+    fn login_grok_cli_device(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        endpoints: &XaiEndpoints,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let provider = OAuthProviderId::GrokCli.display_name();
+        let client_id = grok_cli_client_id(environment);
+        let response = self.post_form(
+            &endpoints.device,
+            fields([
+                ("client_id", client_id.clone()),
+                ("scope", grok_cli_scope(environment)),
+            ]),
+            cancellation,
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(operation_failure(
+                provider,
+                "device authorization",
+                &response,
+            ));
+        }
+        let invalid = || OAuthError::InvalidTokenResponse {
+            provider,
+            operation: "device authorization",
+        };
+        let device: DeviceAuthorization =
+            serde_json::from_slice(&response.body).map_err(|_| invalid())?;
+        let verification = if device.verification_uri_complete.is_empty() {
+            device.verification_uri.as_str()
+        } else {
+            device.verification_uri_complete.as_str()
+        };
+        if device.device_code.is_empty() || device.user_code.is_empty() || verification.is_empty() {
+            return Err(invalid());
+        }
+        let verification = grok_cli_trusted_endpoint(&self.endpoints.xai_issuer_url, verification)
+            .ok_or_else(|| {
+                OAuthError::InvalidConfiguration(format!(
+                    "Refusing non-xAI OAuth verification_uri: {verification}"
+                ))
+            })?;
+        let interval = reported_device_interval(device.interval, DEFAULT_DEVICE_INTERVAL);
+        let timeout = reported_device_timeout(device.expires_in, GROK_CLI_DEVICE_TIMEOUT);
+        interaction.notify(OAuthEvent::device_code(
+            device.user_code.clone(),
+            verification.to_string(),
+            interval,
+            timeout,
+        ));
+        interaction.notify(OAuthEvent::progress(
+            "Waiting for xAI device authorization...",
+        ));
+        // Upstream waits one interval before every poll, the first included.
+        poll_device_code(
+            self.clock.as_ref(),
+            cancellation,
+            DevicePollingPolicy::new(interval, timeout).wait_before_first_poll(),
+            || {
+                let response = self.post_form(
+                    &endpoints.token,
+                    fields([
+                        ("grant_type", XAI_DEVICE_GRANT.to_owned()),
+                        ("client_id", client_id.clone()),
+                        ("device_code", device.device_code.clone()),
+                    ]),
+                    cancellation,
+                )?;
+                if (200..300).contains(&response.status) {
+                    let payload = self.grok_cli_payload("device poll", response)?;
+                    return self
+                        .grok_cli_login_credential("device poll", &payload, endpoints, environment)
+                        .map(DevicePoll::Complete);
+                }
+                match parse_device_failure(&response).error.as_str() {
+                    "authorization_pending" => Ok(DevicePoll::Pending),
+                    "slow_down" => Ok(DevicePoll::SlowDown(None)),
+                    "expired_token" => Err(OAuthError::DeviceExpired { provider }),
+                    "access_denied" => Err(OAuthError::DeviceDenied { provider }),
+                    _ => Err(operation_failure(
+                        provider,
+                        "device token request",
+                        &response,
+                    )),
+                }
+            },
+        )
+    }
+
+    fn refresh_grok_cli(
+        &self,
+        current: &Credential,
+        environment: &dyn OAuthEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let provider = OAuthProviderId::GrokCli.display_name();
+        let stored = current
+            .extra_string("tokenEndpoint")
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                current
+                    .extra("discovery")
+                    .and_then(|discovery| json_string(discovery, "token_endpoint"))
+            });
+        let token_endpoint = match stored {
+            Some(endpoint) => grok_cli_trusted_endpoint(&self.endpoints.xai_issuer_url, &endpoint)
+                .ok_or_else(|| {
+                    OAuthError::InvalidConfiguration(format!(
+                        "Refusing non-xAI OAuth token_endpoint: {endpoint}"
+                    ))
+                })?,
+            None => self.discover_xai_endpoints(cancellation)?.token,
+        };
+        if current.refresh().is_empty() {
+            return Err(OAuthError::Unauthorized {
+                provider,
+                operation: "refresh",
+                detail: Some("Missing refresh_token. Re-login required.".to_owned()),
+            });
+        }
+        let response = self.post_form(
+            &token_endpoint,
+            fields([
+                ("grant_type", "refresh_token".to_owned()),
+                ("client_id", grok_cli_client_id(environment)),
+                ("refresh_token", current.refresh().to_owned()),
+            ]),
+            cancellation,
+        )?;
+        // Upstream treats 400 like 401 and 403: the refresh token is spent
+        // or revoked and only a new login helps.
+        if matches!(response.status, 400 | 401 | 403) {
+            let detail = truncate_response(&response.body, 500);
+            return Err(OAuthError::Unauthorized {
+                provider,
+                operation: "refresh",
+                detail: (!detail.is_empty()).then_some(detail),
+            });
+        }
+        let payload = self.grok_cli_payload("refresh", response)?;
+        let access = grok_cli_token_field(&payload, "access_token").unwrap_or_default();
+        if access.is_empty() {
+            return Err(OAuthError::Unauthorized {
+                provider,
+                operation: "refresh",
+                detail: Some("the refresh returned no access_token".to_owned()),
+            });
+        }
+        let refresh = grok_cli_token_field(&payload, "refresh_token")
+            .filter(|refresh| !refresh.is_empty())
+            .unwrap_or_else(|| current.refresh().to_owned());
+        let mut refreshed = current.clone();
+        refreshed.set_access(access);
+        refreshed.set_refresh(refresh);
+        refreshed.set_expires_at_ms(self.grok_cli_expiry(&payload));
+        let id_token = grok_cli_token_field(&payload, "id_token")
+            .or_else(|| current.extra_string("idToken").map(str::to_owned))
+            .unwrap_or_default();
+        let token_type = grok_cli_token_field(&payload, "token_type")
+            .or_else(|| current.extra_string("tokenType").map(str::to_owned))
+            .unwrap_or_else(|| "Bearer".to_owned());
+        for (name, value) in [
+            ("tokenEndpoint", Value::String(token_endpoint.to_string())),
+            ("idToken", Value::String(id_token)),
+            ("tokenType", Value::String(token_type)),
+            ("baseUrl", Value::String(grok_cli_base_url(environment))),
+        ] {
+            refreshed.set_extra(name, value)?;
+        }
+        Ok(refreshed)
+    }
+
+    fn grok_cli_payload(&self, operation: &'static str, response: OAuthResponse) -> Result<Value> {
+        let provider = OAuthProviderId::GrokCli.display_name();
+        if !(200..300).contains(&response.status) {
+            return Err(token_error(provider, operation, &response));
+        }
+        serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or(OAuthError::InvalidTokenResponse {
+                provider,
+                operation,
+            })
+    }
+
+    fn grok_cli_expiry(&self, payload: &Value) -> i64 {
+        let seconds = payload
+            .get("expires_in")
+            .and_then(json_seconds)
+            .unwrap_or(3_600.0);
+        self.clock
+            .now_ms()
+            .saturating_add((seconds * 1_000.0) as i64)
+            .saturating_sub(duration_millis(GROK_CLI_REFRESH_SKEW))
+    }
+
+    /// upstream `credentialsFromLoginPayload` plus the discovery document a
+    /// login records: both tokens are required, and the extras keep the
+    /// endpoint a later refresh uses.
+    fn grok_cli_login_credential(
+        &self,
+        operation: &'static str,
+        payload: &Value,
+        endpoints: &XaiEndpoints,
+        environment: &dyn OAuthEnvironment,
+    ) -> Result<Credential> {
+        let provider = OAuthProviderId::GrokCli.display_name();
+        let access = grok_cli_token_field(payload, "access_token").unwrap_or_default();
+        let refresh = grok_cli_token_field(payload, "refresh_token").unwrap_or_default();
+        if access.is_empty() || refresh.is_empty() {
+            return Err(OAuthError::InvalidTokenResponse {
+                provider,
+                operation,
+            });
+        }
+        let mut credential = Credential::oauth(access, refresh, self.grok_cli_expiry(payload));
+        for (name, value) in [
+            ("tokenEndpoint", Value::String(endpoints.token.to_string())),
+            ("discovery", grok_cli_discovery(endpoints)),
+            (
+                "idToken",
+                Value::String(grok_cli_token_field(payload, "id_token").unwrap_or_default()),
+            ),
+            (
+                "tokenType",
+                Value::String(
+                    grok_cli_token_field(payload, "token_type")
+                        .unwrap_or_else(|| "Bearer".to_owned()),
+                ),
+            ),
+            ("baseUrl", Value::String(grok_cli_base_url(environment))),
+        ] {
+            credential.set_extra(name, value)?;
+        }
+        Ok(credential)
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct XaiDiscoveryDocument {
     #[serde(default)]
@@ -3123,6 +4345,18 @@ fn is_loopback_hostname(host: &str) -> bool {
 }
 
 impl OAuthClient {
+    /// The Meta Muse flow lives in `meta_muse.rs`; it shares Meta's two
+    /// hosts, so a test pointing them at a fake server covers both flows.
+    fn meta_muse_flow(&self) -> meta_muse::Flow<'_> {
+        meta_muse::Flow {
+            transport: self.transport.as_ref(),
+            clock: self.clock.as_ref(),
+            auth_base_url: &self.endpoints.meta_auth_base_url,
+            api_base_url: &self.endpoints.meta_api_base_url,
+            timeout: self.token_request_timeout,
+        }
+    }
+
     fn meta_device_authorization_url(&self) -> Result<Url> {
         endpoint(
             &self.endpoints.meta_auth_base_url,
@@ -3661,11 +4895,22 @@ mod tests {
     fn provider_registry_is_explicit_about_metadata_only_entries() {
         assert_eq!(
             implemented_provider_ids(),
-            vec!["anthropic", "kimi-coding", "meta", "openai-codex", "xai"]
+            vec![
+                "anthropic",
+                "kimi-coding",
+                "meta",
+                "meta-muse",
+                "openai-codex",
+                "openrouter",
+                "xai",
+                "grok-cli"
+            ]
         );
         let openrouter = metadata_for(OAuthProviderId::OpenRouter);
-        assert_eq!(openrouter.flow_support, OAuthFlowSupport::MetadataOnly);
-        assert_eq!(openrouter.methods, &[LoginMethod::ApiKeyOnly]);
+        assert_eq!(openrouter.flow_support, OAuthFlowSupport::Implemented);
+        assert_eq!(openrouter.methods, &[LoginMethod::BrowserPkce]);
+        let radius = metadata_for(OAuthProviderId::Radius);
+        assert_eq!(radius.flow_support, OAuthFlowSupport::MetadataOnly);
         assert_eq!(
             OAuthProviderId::parse("openai-codex"),
             Some(OAuthProviderId::OpenAiCodex)
@@ -3726,7 +4971,7 @@ mod tests {
         let client = test_client(transport, clock, OAuthEndpoints::default());
         let pkce = generate_pkce();
 
-        let anthropic = client.anthropic_authorization_url(&pkce);
+        let anthropic = client.anthropic_authorization_url(&pkce, ANTHROPIC_REDIRECT_URI);
         assert_eq!(query_value(&anthropic, "client_id"), ANTHROPIC_CLIENT_ID);
         assert_eq!(
             query_value(&anthropic, "redirect_uri"),
@@ -3781,8 +5026,22 @@ mod tests {
 
     struct CallbackInteraction {
         port: u16,
-        state: String,
+        /// The query the fake browser sends to the callback.
+        query: String,
         events: Mutex<Vec<OAuthEvent>>,
+        /// The page the fake browser received.
+        page: Arc<Mutex<String>>,
+    }
+
+    impl CallbackInteraction {
+        fn new(port: u16, query: &str) -> Arc<Self> {
+            Arc::new(Self {
+                port,
+                query: query.to_owned(),
+                events: Mutex::new(Vec::new()),
+                page: Arc::new(Mutex::new(String::new())),
+            })
+        }
     }
 
     impl OAuthInteraction for CallbackInteraction {
@@ -3796,17 +5055,19 @@ mod tests {
         fn notify(&self, event: OAuthEvent) {
             if event.kind == OAuthEventKind::AuthorizationUrl {
                 let port = self.port;
-                let state = self.state.clone();
+                let query = self.query.clone();
+                let page = self.page.clone();
                 thread::spawn(move || {
                     let mut stream =
                         TcpStream::connect(("127.0.0.1", port)).expect("connect callback listener");
                     write!(
                         stream,
-                        "GET /callback?code=callback-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                        "GET /callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
                     )
                     .expect("write callback");
                     let mut body = String::new();
                     let _ = stream.read_to_string(&mut body);
+                    *lock_unpoisoned(&page) = body;
                 });
             }
             lock_unpoisoned(&self.events).push(event);
@@ -3820,34 +5081,325 @@ mod tests {
         port
     }
 
+    fn test_loopback_request(port: u16, expected_state: &str) -> LoopbackLoginRequest {
+        LoopbackLoginRequest {
+            provider_name: "Example",
+            authorization_url: fixed_url("https://example.test/authorize"),
+            redirect_uri: "http://localhost/callback".to_owned(),
+            expected_state: expected_state.to_owned(),
+            callback_host: "127.0.0.1".to_owned(),
+            callback_port: port,
+            callback_path: "/callback".to_owned(),
+            manual_input: ManualInputPolicy::Lenient,
+        }
+    }
+
+    /// Waits for the fake browser thread to store the page it was sent.
+    fn received_page(interaction: &CallbackInteraction) -> String {
+        let started = Instant::now();
+        loop {
+            let page = lock_unpoisoned(&interaction.page).clone();
+            if !page.is_empty() || started.elapsed() > Duration::from_secs(5) {
+                return page;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
-    fn loopback_login_accepts_callback_and_cancels_manual_prompt() {
+    fn loopback_login_answers_the_browser_only_after_the_exchange() {
         let port = unused_loopback_port();
-        let interaction = Arc::new(CallbackInteraction {
-            port,
-            state: "expected-state".to_owned(),
-            events: Mutex::new(Vec::new()),
-        });
+        let interaction = CallbackInteraction::new(port, "code=callback-code&state=expected-state");
+        let exchanged = Arc::new(Mutex::new(false));
         let result = run_loopback_login(
             interaction.clone(),
             Arc::new(NoopBrowser),
             &CancellationToken::new(),
-            LoopbackLoginRequest {
-                authorization_url: fixed_url("https://example.test/authorize"),
-                redirect_uri: "http://localhost/callback".to_owned(),
-                expected_state: "expected-state".to_owned(),
-                callback_host: "127.0.0.1".to_owned(),
-                callback_port: port,
-                callback_path: "/callback".to_owned(),
+            test_loopback_request(port, "expected-state"),
+            |code| {
+                // The browser has no page yet while the exchange runs.
+                assert!(lock_unpoisoned(&interaction.page).is_empty());
+                *lock_unpoisoned(&exchanged) = true;
+                Ok(format!("exchanged {code}"))
             },
         )
         .expect("callback completes login");
-        assert_eq!(result, "callback-code");
+        assert_eq!(result, "exchanged callback-code");
+        assert!(*lock_unpoisoned(&exchanged));
+        let page = received_page(&interaction);
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("Signed in to Example"), "{page}");
         assert!(
             lock_unpoisoned(&interaction.events)
                 .iter()
                 .any(|event| event.kind == OAuthEventKind::AuthorizationUrl)
         );
+    }
+
+    /// Leaves the manual-paste prompt open until the login cancels it.
+    struct WaitingInteraction;
+
+    impl OAuthInteraction for WaitingInteraction {
+        fn prompt(&self, prompt: OAuthPrompt) -> Result<String> {
+            while !prompt.cancellation.is_cancelled() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(OAuthError::Cancelled)
+        }
+
+        fn notify(&self, _: OAuthEvent) {}
+    }
+
+    /// A browser that follows OpenRouter's authorize URL straight back to its
+    /// `callback_url`, as a user who approves the request would.
+    struct ApprovingOpenRouterBrowser {
+        page: Arc<Mutex<String>>,
+    }
+
+    impl BrowserOpener for ApprovingOpenRouterBrowser {
+        fn open(&self, url: &Url) -> Result<()> {
+            let callback = Url::parse(&query_value(url, "callback_url")).expect("callback URL");
+            let page = self.page.clone();
+            thread::spawn(move || {
+                let port = callback.port().expect("callback port");
+                let mut stream =
+                    TcpStream::connect(("127.0.0.1", port)).expect("connect callback listener");
+                write!(
+                    stream,
+                    "GET {}?code=granted HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                    callback.path()
+                )
+                .expect("write callback");
+                let mut body = String::new();
+                let _ = stream.read_to_string(&mut body);
+                *lock_unpoisoned(&page) = body;
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn openrouter_login_mints_a_permanent_key_through_an_ephemeral_callback() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"key":"sk-or-v1-minted"}"#.to_vec(),
+        )]));
+        let page = Arc::new(Mutex::new(String::new()));
+        let client = OAuthClient::new(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            Arc::new(ApprovingOpenRouterBrowser { page: page.clone() }),
+            OAuthEndpoints::default(),
+        );
+        let interaction: Arc<dyn OAuthInteraction> = Arc::new(WaitingInteraction);
+        let credential = client
+            .login(
+                OAuthProviderId::OpenRouter,
+                interaction,
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("OpenRouter login");
+        assert_eq!(credential.access(), "sk-or-v1-minted");
+        assert_eq!(credential.expires_at_ms(), OPENROUTER_KEY_EXPIRES_MS);
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url().as_str(),
+            "https://openrouter.ai/api/v1/auth/keys"
+        );
+        let body: Value = serde_json::from_slice(requests[0].body()).expect("JSON body");
+        assert_eq!(body["code"], "granted");
+        assert_eq!(body["code_challenge_method"], "S256");
+        assert!(
+            body["code_verifier"]
+                .as_str()
+                .is_some_and(|verifier| verifier.len() >= 43)
+        );
+
+        let started = Instant::now();
+        while lock_unpoisoned(&page).is_empty() && started.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lock_unpoisoned(&page).contains("Signed in to OpenRouter"));
+        // The minted key is never refreshed away.
+        assert_eq!(
+            client
+                .refresh(
+                    OAuthProviderId::OpenRouter,
+                    &credential,
+                    &BTreeMap::new(),
+                    &CancellationToken::new()
+                )
+                .expect("refresh")
+                .access(),
+            "sk-or-v1-minted"
+        );
+    }
+
+    #[test]
+    fn anthropic_copy_code_login_needs_no_loopback() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"access_token":"sk-ant-oat-new","refresh_token":"rt","expires_in":3600}"#.to_vec(),
+        )]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let interaction = Arc::new(PromptInteraction::answers(["copy_code", "pasted-code"]));
+        let credential = client
+            .login(
+                OAuthProviderId::Anthropic,
+                interaction.clone(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("copy-code login");
+        assert_eq!(credential.access(), "sk-ant-oat-new");
+
+        let shown = lock_unpoisoned(&interaction.events)
+            .iter()
+            .find_map(|event| event.authorization_url.clone())
+            .expect("authorization URL shown");
+        assert_eq!(
+            query_value(&Url::parse(&shown).expect("URL"), "redirect_uri"),
+            ANTHROPIC_COPY_CODE_REDIRECT_URI
+        );
+        let requests = transport.requests();
+        let body: Value = serde_json::from_slice(requests[0].body()).expect("JSON body");
+        assert_eq!(body["code"], "pasted-code");
+        assert_eq!(body["redirect_uri"], ANTHROPIC_COPY_CODE_REDIRECT_URI);
+        assert_eq!(body["state"], body["code_verifier"]);
+    }
+
+    #[test]
+    fn callback_host_header_must_name_this_machine() {
+        assert!(is_loopback_authority("localhost:53692"));
+        assert!(is_loopback_authority("127.0.0.1:1455"));
+        assert!(is_loopback_authority("[::1]:1455"));
+        assert!(is_loopback_authority("localhost"));
+        assert!(!is_loopback_authority("evil.example:53692"));
+        assert!(!is_loopback_authority("127.0.0.1.evil.example"));
+
+        let server = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state")
+            .expect("bind callback listener");
+        let port = server.local_addr().expect("address").port();
+        let rebound = callback_client(port, |stream| {
+            let _ = stream.write_all(
+                b"GET /callback?code=x&state=state HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+            );
+        });
+        let (accepted, response) = serve_until_done(&server, rebound);
+        assert!(accepted.is_none());
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+
+    #[test]
+    fn error_bodies_are_reduced_to_their_message() {
+        let nested = br#"{
+  "error": {
+    "message": "Could not validate your token.",
+    "type": "invalid_request_error",
+    "code": "token_expired"
+  }
+}"#;
+        assert_eq!(
+            truncate_response(nested, 500),
+            "Could not validate your token."
+        );
+        assert_eq!(error_code(nested).as_deref(), Some("token_expired"));
+        assert!(
+            token_error("Example", "refresh", &response(400, nested.to_vec())).is_unauthorized(),
+            "an expired token code means log in again, whatever the status"
+        );
+        assert_eq!(
+            truncate_response(
+                br#"{"error":"invalid_grant","error_description":"Bad code"}"#,
+                500
+            ),
+            "Bad code"
+        );
+        assert_eq!(
+            truncate_response(b"<html>\n  <b>oops</b>\n</html>", 500),
+            "<html> <b>oops</b> </html>"
+        );
+        // A transient failure stays retryable.
+        assert!(
+            !token_error(
+                "Example",
+                "refresh",
+                &response(400, br#"{"error":"invalid_request"}"#.to_vec())
+            )
+            .is_unauthorized()
+        );
+    }
+
+    #[test]
+    fn loopback_login_shows_a_failed_exchange_in_the_browser() {
+        let port = unused_loopback_port();
+        let interaction = CallbackInteraction::new(port, "code=callback-code&state=expected-state");
+        let error = run_loopback_login(
+            interaction.clone(),
+            Arc::new(NoopBrowser),
+            &CancellationToken::new(),
+            test_loopback_request(port, "expected-state"),
+            |_| -> Result<()> {
+                Err(OAuthError::Unauthorized {
+                    provider: "Example",
+                    operation: "exchange",
+                    detail: Some("Invalid 'code' in request.".to_owned()),
+                })
+            },
+        )
+        .expect_err("a rejected code fails the login");
+        assert!(error.to_string().contains("Invalid 'code'"), "{error}");
+        assert!(
+            error.to_string().contains("start the login again"),
+            "{error}"
+        );
+        let page = received_page(&interaction);
+        assert!(page.starts_with("HTTP/1.1 502"), "{page}");
+        assert!(page.contains("Sign-in did not finish"), "{page}");
+        assert!(page.contains("Invalid &#39;code&#39;"), "{page}");
+        assert!(!page.contains("Signed in"), "{page}");
+    }
+
+    #[test]
+    fn loopback_login_ends_when_the_provider_redirects_with_an_error() {
+        let port = unused_loopback_port();
+        let interaction = CallbackInteraction::new(
+            port,
+            "error=access_denied&error_description=User+declined&state=expected-state",
+        );
+        let error = run_loopback_login(
+            interaction.clone(),
+            Arc::new(NoopBrowser),
+            &CancellationToken::new(),
+            test_loopback_request(port, "expected-state"),
+            |_| -> Result<()> { panic!("a denied login has no code to exchange") },
+        )
+        .expect_err("a denied login fails instead of waiting forever");
+        assert!(error.to_string().contains("User declined"), "{error}");
+        assert!(received_page(&interaction).contains("User declined"));
+    }
+
+    #[test]
+    fn loopback_server_without_state_accepts_any_callback_on_its_path() {
+        let server = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "")
+            .expect("bind callback listener");
+        let port = server.local_addr().expect("address").port();
+        let client = callback_client(port, |stream| {
+            let _ = stream.write_all(b"GET /callback?code=abc HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        });
+        let (accepted, response) = serve_until_done(&server, client);
+        assert_eq!(
+            accepted.map(|callback| callback.code).as_deref(),
+            Some("abc")
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[test]
@@ -4400,11 +5952,15 @@ mod tests {
                 started.elapsed() < Duration::from_secs(10),
                 "callback client never finished"
             );
-            if let Some(response) = server
+            match server
                 .try_accept(&cancellation)
                 .expect("a misbehaving connection is not a login failure")
             {
-                accepted = Some(response);
+                Some(CallbackOutcome::Authorized(pending)) => {
+                    accepted = Some(pending.response.clone());
+                    pending.finish("Example", &Ok(()));
+                }
+                Some(CallbackOutcome::Denied(_)) | None => {}
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -4590,5 +6146,1222 @@ mod tests {
             Err(OAuthError::TimedOut)
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    // --- Meta Muse Code (pi-meta-muse-auth) --------------------------------
+
+    fn muse_device_response(body: &str) -> OAuthResponse {
+        response(200, body.as_bytes().to_vec())
+    }
+
+    fn muse_standard_device() -> OAuthResponse {
+        muse_device_response(
+            r#"{
+                "device_code":"device-secret",
+                "user_code":"ABCD-EFGH",
+                "verification_uri":"https://auth.meta.com/oauth/device/",
+                "verification_uri_complete":"https://auth.meta.com/oauth/device/?code=ABCD-EFGH",
+                "expires_in":900,
+                "interval":1
+            }"#,
+        )
+    }
+
+    fn muse_identity() -> OAuthResponse {
+        response(
+            200,
+            br#"{"access_token":"identity-token","token_type":"Bearer","refresh_token":"unused"}"#
+                .to_vec(),
+        )
+    }
+
+    type MuseLogin = (
+        Result<Credential>,
+        Arc<FakeTransport>,
+        Arc<FakeClock>,
+        Arc<PromptInteraction>,
+    );
+
+    fn muse_login(responses: Vec<OAuthResponse>) -> MuseLogin {
+        let transport = Arc::new(FakeTransport::with_responses(responses));
+        let clock = Arc::new(FakeClock::new(1_000));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = Arc::new(PromptInteraction::answers([]));
+        let result = client.login(
+            OAuthProviderId::MetaMuse,
+            interaction.clone(),
+            &BTreeMap::new(),
+            &CancellationToken::new(),
+        );
+        (result, transport, clock, interaction)
+    }
+
+    fn device_events(interaction: &PromptInteraction) -> Vec<(String, String, u64, u64)> {
+        lock_unpoisoned(&interaction.events)
+            .iter()
+            .filter(|event| event.kind == OAuthEventKind::DeviceCode)
+            .map(|event| {
+                (
+                    event.user_code.clone(),
+                    event.verification_uri.clone(),
+                    event.interval_seconds,
+                    event.expires_in_seconds,
+                )
+            })
+            .collect()
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn meta_muse_device_login_mints_a_subscription_key_and_stores_pis_shape() {
+        let directory = env::temp_dir().join(format!(
+            "goshcoder-oauth-meta-muse-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = CredentialStore::file(directory.join("auth.json"));
+        let transport = Arc::new(FakeTransport::with_responses([
+            muse_standard_device(),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+            muse_identity(),
+            response(
+                200,
+                br#"{
+                    "api_key":"model-api-key",
+                    "base_url":"https://api.meta.ai/v1/",
+                    "is_subs_active":true,
+                    "subs_tier_name":"Everyday Usage"
+                }"#
+                .to_vec(),
+            ),
+        ]));
+        let clock = Arc::new(FakeClock::new(1_000));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = Arc::new(PromptInteraction::answers([]));
+        client
+            .login_and_persist(
+                OAuthProviderId::MetaMuse,
+                &store,
+                interaction.clone(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("Meta Muse login");
+
+        // One interval before the first poll and one after "pending", as the
+        // extension sleeps before every poll.
+        assert_eq!(
+            clock.sleeps(),
+            vec![Duration::from_secs(1), Duration::from_secs(1)]
+        );
+        assert_eq!(
+            device_events(&interaction),
+            vec![(
+                "ABCD-EFGH".to_owned(),
+                "https://auth.meta.com/oauth/device/?code=ABCD-EFGH".to_owned(),
+                1,
+                900
+            )]
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        let launcher = header_map(&[
+            ("Accept", "application/json"),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("User-Agent", "muse-code/launcher-2"),
+        ]);
+        assert_eq!(requests[0].method(), &Method::POST);
+        assert_eq!(
+            requests[0].url().as_str(),
+            "https://auth.meta.com/oidc/device/authorization/"
+        );
+        assert_eq!(requests[0].headers(), &launcher);
+        assert_eq!(
+            form(&requests[0]),
+            BTreeMap::from([("client_id".to_owned(), "1031625952748946".to_owned())])
+        );
+        for poll in &requests[1..3] {
+            assert_eq!(poll.method(), &Method::POST);
+            assert_eq!(
+                poll.url().as_str(),
+                "https://auth.meta.com/oidc/device/token/"
+            );
+            assert_eq!(poll.headers(), &launcher);
+            assert_eq!(
+                form(poll),
+                BTreeMap::from([
+                    (
+                        "grant_type".to_owned(),
+                        "urn:ietf:params:oauth:grant-type:device_code".to_owned()
+                    ),
+                    ("device_code".to_owned(), "device-secret".to_owned()),
+                    ("client_id".to_owned(), "1031625952748946".to_owned()),
+                ])
+            );
+        }
+        let mint = &requests[3];
+        assert_eq!(mint.method(), &Method::POST);
+        assert_eq!(mint.url().as_str(), "https://api.meta.ai/muse-code/key");
+        // No User-Agent of its own: only the launcher requests carry one.
+        assert_eq!(
+            mint.headers(),
+            &header_map(&[
+                ("Accept", "application/json"),
+                ("Authorization", "Bearer identity-token"),
+                ("Content-Type", "application/json"),
+                ("x-api-version", "1.0.0"),
+            ])
+        );
+        let body: Value = serde_json::from_slice(mint.body()).expect("mint JSON");
+        assert_eq!(body, json!({"show_subs_upsell": false}));
+
+        // auth.json holds exactly the extension's credential shape, with the
+        // trailing slash of Meta's base URL removed.
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(directory.join("auth.json")).expect("auth.json"))
+                .expect("auth.json JSON");
+        assert_eq!(
+            stored,
+            json!({"meta-muse": {
+                "type": "oauth",
+                "access": "model-api-key",
+                "refresh": "identity-token",
+                // Twelve hours from the mint, after the two one-second waits.
+                "expires": 3_000 + 12 * 60 * 60 * 1_000,
+                "baseUrl": "https://api.meta.ai/v1",
+                "subscriptionActive": true,
+                "subscriptionTier": "Everyday Usage"
+            }})
+        );
+        let credential = store
+            .read_raw("meta-muse")
+            .expect("read")
+            .expect("stored credential");
+        let auth = auth_from_credential(OAuthProviderId::MetaMuse, &credential).expect("auth");
+        assert_eq!(auth.api_key(), Some("model-api-key"));
+        assert_eq!(auth.base_url(), Some("https://api.meta.ai/v1"));
+        assert!(auth.headers().is_empty());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn meta_muse_refuses_a_key_without_a_confirmed_subscription() {
+        for mint in [
+            r#"{"api_key":"paygo-key","base_url":"https://api.meta.ai/v1","is_subs_active":false}"#,
+            r#"{"api_key":"paygo-key","is_subs_active":"true"}"#,
+            r#"{"api_key":"paygo-key"}"#,
+        ] {
+            let store = CredentialStore::in_memory();
+            let transport = Arc::new(FakeTransport::with_responses([
+                muse_standard_device(),
+                muse_identity(),
+                response(200, mint.as_bytes().to_vec()),
+            ]));
+            let client = test_client(
+                transport,
+                Arc::new(FakeClock::new(0)),
+                OAuthEndpoints::default(),
+            );
+            let error = client
+                .login_and_persist(
+                    OAuthProviderId::MetaMuse,
+                    &store,
+                    Arc::new(PromptInteraction::answers([])),
+                    &BTreeMap::new(),
+                    &CancellationToken::new(),
+                )
+                .err()
+                .expect("pay-as-you-go key refused");
+            assert_eq!(
+                error.to_string(),
+                "Meta did not confirm an active Muse Code subscription; refusing to use a potentially pay-as-you-go key",
+                "{mint}"
+            );
+            assert!(
+                store.read_raw("meta-muse").expect("read").is_none(),
+                "{mint}"
+            );
+        }
+
+        // Control: the same exchange with the subscription confirmed works.
+        let (result, ..) = muse_login(vec![
+            muse_standard_device(),
+            muse_identity(),
+            response(
+                200,
+                br#"{"api_key":"model-api-key","is_subs_active":true}"#.to_vec(),
+            ),
+        ]);
+        let credential = result.expect("subscription confirmed");
+        // Without base_url or tier: the default URL and no tier field.
+        assert_eq!(
+            credential.extra_string("baseUrl"),
+            Some("https://api.meta.ai/v1")
+        );
+        assert!(credential.extra("subscriptionTier").is_none());
+    }
+
+    #[test]
+    fn meta_muse_mint_failures_keep_the_extension_wording() {
+        let cases: [(OAuthResponse, &str, bool); 4] = [
+            (
+                response(200, br#"{"api_key":"","is_subs_active":true}"#.to_vec()),
+                "Meta Muse key exchange returned no API key",
+                false,
+            ),
+            (
+                response(403, b"{}".to_vec()),
+                "Meta Muse subscription key exchange failed with status 403",
+                true,
+            ),
+            (
+                response(503, b"busy".to_vec()),
+                "Meta Muse subscription key exchange failed with status 503",
+                false,
+            ),
+            (
+                response(
+                    200,
+                    br#"{"api_key":"k","is_subs_active":true,"base_url":"https://evil.example/v1"}"#
+                        .to_vec(),
+                ),
+                "Meta returned an untrusted Model API base URL",
+                false,
+            ),
+        ];
+        for (mint, message, unauthorized) in cases {
+            let (result, ..) = muse_login(vec![muse_standard_device(), muse_identity(), mint]);
+            let error = result.err().expect(message);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.is_unauthorized(), unauthorized, "{message}");
+        }
+    }
+
+    #[test]
+    fn meta_muse_device_responses_are_validated_and_clamped() {
+        // An untrusted complete URI falls back to a trusted plain one.
+        let (result, transport, _, interaction) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device",
+                    "verification_uri_complete":"http://auth.meta.com/device?code=U","expires_in":5}"#,
+            ),
+            response(400, br#"{"error":"access_denied"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("denied").to_string(),
+            "Meta Muse login was denied"
+        );
+        // expires_in is clamped to at least a minute; interval defaults to 5.
+        assert_eq!(
+            device_events(&interaction),
+            vec![(
+                "U".to_owned(),
+                "https://auth.meta.com/device".to_owned(),
+                5,
+                60
+            )]
+        );
+        assert_eq!(transport.requests().len(), 2);
+
+        let (result, _, _, interaction) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device","expires_in":99999,"interval":"7"}"#,
+            ),
+            response(400, br#"{"error":"expired_token"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("expired").to_string(),
+            "Meta Muse device authorization expired; run /login again"
+        );
+        assert_eq!(device_events(&interaction)[0].2, 5, "a string interval");
+        assert_eq!(
+            device_events(&interaction)[0].3,
+            1_800,
+            "clamped to 30 minutes"
+        );
+
+        // A page anywhere but https://auth.meta.com is refused before polling.
+        for device in [
+            r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com.example/device"}"#,
+            r#"{"device_code":"d","user_code":"U","verification_uri":"http://auth.meta.com/device"}"#,
+            r#"{"device_code":"","user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+            r#"{"user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+        ] {
+            let (result, transport, _, interaction) =
+                muse_login(vec![muse_device_response(device)]);
+            assert_eq!(
+                result.err().expect(device).to_string(),
+                "Meta Muse returned an invalid device authorization response",
+                "{device}"
+            );
+            assert_eq!(transport.requests().len(), 1, "{device}");
+            assert!(device_events(&interaction).is_empty(), "{device}");
+        }
+
+        let (result, ..) = muse_login(vec![response(500, b"down".to_vec())]);
+        assert_eq!(
+            result.err().expect("status").to_string(),
+            "Meta Muse device authorization failed with status 500"
+        );
+    }
+
+    #[test]
+    fn meta_muse_polling_backs_off_and_expires_with_the_extension_messages() {
+        // slow_down adds five seconds to every later wait.
+        let (result, _, clock, _) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+            ),
+            response(400, br#"{"error":"slow_down"}"#.to_vec()),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+            response(400, br#"{"error":"server_error"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("unknown error").to_string(),
+            "Meta Muse device token request failed with status 400"
+        );
+        assert_eq!(
+            clock.sleeps(),
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(10)
+            ]
+        );
+
+        let (result, transport, ..) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device","expires_in":60,"interval":30}"#,
+            ),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("deadline").to_string(),
+            "Meta Muse device authorization expired; run /login again"
+        );
+        assert_eq!(transport.requests().len(), 2);
+
+        for token in [
+            r#"{"access_token":"identity","token_type":"mac"}"#,
+            r#"{"access_token":"identity","token_type":null}"#,
+            r#"{"access_token":"","token_type":"Bearer"}"#,
+        ] {
+            let (result, ..) = muse_login(vec![
+                muse_standard_device(),
+                response(200, token.as_bytes().to_vec()),
+            ]);
+            assert_eq!(
+                result.err().expect(token).to_string(),
+                "Meta Muse returned an invalid device token response",
+                "{token}"
+            );
+        }
+        // Control: an absent token_type is accepted.
+        let (result, ..) = muse_login(vec![
+            muse_standard_device(),
+            response(200, br#"{"access_token":"identity"}"#.to_vec()),
+            response(
+                200,
+                br#"{"api_key":"model-api-key","is_subs_active":true}"#.to_vec(),
+            ),
+        ]);
+        assert_eq!(result.expect("logged in").refresh(), "identity");
+    }
+
+    fn complete_muse_credential() -> Credential {
+        let mut credential = Credential::oauth("old-model-key", "identity-token", 0);
+        credential
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        credential
+    }
+
+    #[test]
+    fn meta_muse_refresh_re_mints_from_the_stored_identity_token() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"api_key":"renewed-model-key","base_url":"https://api.meta.ai/v2","is_subs_active":true,"subs_tier_name":"Everyday Usage"}"#
+                .to_vec(),
+        )]));
+        let clock = Arc::new(FakeClock::new(50_000));
+        let client = test_client(transport.clone(), clock, OAuthEndpoints::default());
+        let refreshed = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &complete_muse_credential(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("refresh");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url().as_str(),
+            "https://api.meta.ai/muse-code/key"
+        );
+        assert_eq!(
+            requests[0]
+                .headers()
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer identity-token")
+        );
+        assert_eq!(refreshed.access(), "renewed-model-key");
+        assert_eq!(refreshed.refresh(), "identity-token");
+        assert_eq!(refreshed.expires_at_ms(), 50_000 + 12 * 60 * 60 * 1_000);
+        assert_eq!(
+            refreshed.extra_string("baseUrl"),
+            Some("https://api.meta.ai/v2")
+        );
+        assert_eq!(
+            refreshed.extra_string("subscriptionTier"),
+            Some("Everyday Usage")
+        );
+
+        // A rejected identity token needs a new login, not a retry.
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            401,
+            b"{}".to_vec(),
+        )]));
+        let client = test_client(
+            transport,
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let error = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &complete_muse_credential(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("rejected");
+        assert!(error.is_unauthorized());
+    }
+
+    #[test]
+    fn an_incomplete_meta_muse_credential_is_refused_without_a_request() {
+        let transport = Arc::new(FakeTransport::with_responses([]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let mut incomplete = Credential::oauth("model-key", "identity-token", 0);
+        incomplete
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        let error = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &incomplete,
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("incomplete");
+        assert_eq!(
+            error.to_string(),
+            "Stored Meta Muse credential is incomplete; run /login and configure Meta Muse Code again"
+        );
+        assert!(error.is_unauthorized());
+        assert!(transport.requests().is_empty());
+        let error = auth_from_credential(OAuthProviderId::MetaMuse, &incomplete)
+            .err()
+            .expect("unusable");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Stored Meta Muse credential is incomplete")
+        );
+        // The `meta` provider has no such requirement for the same entry.
+        assert!(auth_from_credential(OAuthProviderId::Meta, &incomplete).is_ok());
+    }
+
+    // -- Grok CLI (pi-grok-cli) ------------------------------------------------
+
+    /// A browser that answers xAI's preflight probe and then follows the
+    /// authorization URL back to the redirect URI it names, as a user who
+    /// approves the login would.
+    struct ApprovingGrokBrowser {
+        preflight: Arc<Mutex<String>>,
+        page: Arc<Mutex<String>>,
+        authorization_url: Arc<Mutex<Option<Url>>>,
+        /// How long the user takes to approve.
+        delay: Duration,
+    }
+
+    impl ApprovingGrokBrowser {
+        fn new() -> Arc<Self> {
+            Self::delayed(Duration::ZERO)
+        }
+
+        fn delayed(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                preflight: Arc::new(Mutex::new(String::new())),
+                page: Arc::new(Mutex::new(String::new())),
+                authorization_url: Arc::new(Mutex::new(None)),
+                delay,
+            })
+        }
+    }
+
+    impl BrowserOpener for ApprovingGrokBrowser {
+        fn open(&self, url: &Url) -> Result<()> {
+            *lock_unpoisoned(&self.authorization_url) = Some(url.clone());
+            let redirect = Url::parse(&query_value(url, "redirect_uri")).expect("redirect URI");
+            let state = query_value(url, "state");
+            let preflight = self.preflight.clone();
+            let page = self.page.clone();
+            let delay = self.delay;
+            thread::spawn(move || {
+                thread::sleep(delay);
+                let port = redirect.port().expect("redirect port");
+                let mut stream =
+                    TcpStream::connect(("127.0.0.1", port)).expect("connect for preflight");
+                write!(
+                    stream,
+                    "OPTIONS {} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://auth.x.ai\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Private-Network: true\r\n\r\n",
+                    redirect.path()
+                )
+                .expect("write preflight");
+                let mut answer = String::new();
+                let _ = stream.read_to_string(&mut answer);
+                *lock_unpoisoned(&preflight) = answer;
+
+                let mut stream =
+                    TcpStream::connect(("127.0.0.1", port)).expect("connect for callback");
+                write!(
+                    stream,
+                    "GET {}?code=granted-code&state={state} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://auth.x.ai\r\n\r\n",
+                    redirect.path()
+                )
+                .expect("write callback");
+                let mut body = String::new();
+                let _ = stream.read_to_string(&mut body);
+                *lock_unpoisoned(&page) = body;
+            });
+            Ok(())
+        }
+    }
+
+    /// Chooses a login method, then either waits out the manual prompt or
+    /// pastes the given inputs one prompt at a time.
+    struct GrokInteraction {
+        method: &'static str,
+        pastes: Mutex<VecDeque<String>>,
+        authorization_url: Mutex<Option<Url>>,
+        events: Mutex<Vec<OAuthEvent>>,
+    }
+
+    impl GrokInteraction {
+        fn new(method: &'static str, pastes: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                method,
+                pastes: Mutex::new(pastes.iter().map(|paste| (*paste).to_owned()).collect()),
+                authorization_url: Mutex::new(None),
+                events: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn progress(&self) -> Vec<String> {
+            lock_unpoisoned(&self.events)
+                .iter()
+                .filter(|event| event.kind == OAuthEventKind::Progress)
+                .map(|event| event.message.clone())
+                .collect()
+        }
+    }
+
+    impl OAuthInteraction for GrokInteraction {
+        fn prompt(&self, prompt: OAuthPrompt) -> Result<String> {
+            if prompt.kind == OAuthPromptKind::Select {
+                assert_eq!(prompt.message, "Select Grok CLI login method:");
+                assert_eq!(prompt.options[0].label, "Browser login (default)");
+                assert_eq!(prompt.options[1].label, "Device code login (headless)");
+                return Ok(self.method.to_owned());
+            }
+            let next = lock_unpoisoned(&self.pastes).pop_front();
+            match next {
+                Some(paste) => {
+                    // A paste can only name the state the URL carried.
+                    let state = lock_unpoisoned(&self.authorization_url)
+                        .as_ref()
+                        .map(|url| query_value(url, "state"))
+                        .unwrap_or_default();
+                    Ok(paste.replace("{state}", &state))
+                }
+                None => {
+                    while !prompt.cancellation.is_cancelled() {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(OAuthError::Cancelled)
+                }
+            }
+        }
+
+        fn notify(&self, event: OAuthEvent) {
+            if let Some(url) = event.authorization_url.as_deref() {
+                *lock_unpoisoned(&self.authorization_url) = Url::parse(url).ok();
+            }
+            lock_unpoisoned(&self.events).push(event);
+        }
+    }
+
+    fn grok_token_body() -> Vec<u8> {
+        br#"{"access_token":"grok-access","refresh_token":"grok-refresh","expires_in":3600,"id_token":"grok-id","token_type":"Bearer"}"#
+            .to_vec()
+    }
+
+    fn grok_environment(port: u16) -> BTreeMap<String, String> {
+        BTreeMap::from([("PI_GROK_CLI_CALLBACK_PORT".to_owned(), port.to_string())])
+    }
+
+    fn wait_for(cell: &Mutex<String>) -> String {
+        let started = Instant::now();
+        loop {
+            let value = lock_unpoisoned(cell).clone();
+            if !value.is_empty() || started.elapsed() > Duration::from_secs(5) {
+                return value;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn grok_cli_browser_login_uses_its_own_port_plan_and_verifier_only_exchange() {
+        let port = unused_loopback_port();
+        let transport = Arc::new(FakeTransport::with_responses([
+            // Discovery is unavailable; the documented endpoints are used.
+            response(404, b"no discovery".to_vec()),
+            response(200, grok_token_body()),
+        ]));
+        let browser = ApprovingGrokBrowser::new();
+        let client = OAuthClient::new(
+            transport.clone(),
+            Arc::new(FakeClock::new(1_000_000)),
+            browser.clone(),
+            OAuthEndpoints::default(),
+        );
+        let interaction = GrokInteraction::new("browser", &[]);
+        let credential = client
+            .login(
+                OAuthProviderId::GrokCli,
+                interaction.clone(),
+                &grok_environment(port),
+                &CancellationToken::new(),
+            )
+            .expect("Grok CLI browser login");
+
+        let url = lock_unpoisoned(&browser.authorization_url)
+            .clone()
+            .expect("browser opened");
+        assert_eq!(url.host_str(), Some("auth.x.ai"));
+        assert_eq!(url.path(), "/oauth2/authorize");
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        assert_eq!(query_value(&url, "redirect_uri"), redirect_uri);
+        assert_eq!(query_value(&url, "client_id"), GROK_CLI_DEFAULT_CLIENT_ID);
+        assert_eq!(query_value(&url, "scope"), GROK_CLI_SCOPE);
+        assert_eq!(query_value(&url, "plan"), "generic");
+        assert_eq!(query_value(&url, "referrer"), "goshcoder");
+        assert_eq!(query_value(&url, "code_challenge_method"), "S256");
+        assert!(!query_value(&url, "nonce").is_empty());
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].url().as_str(), "https://auth.x.ai/oauth2/token");
+        let exchange = form(&requests[1]);
+        assert_eq!(exchange["grant_type"], "authorization_code");
+        assert_eq!(exchange["code"], "granted-code");
+        assert_eq!(exchange["redirect_uri"], redirect_uri);
+        assert_eq!(exchange["client_id"], GROK_CLI_DEFAULT_CLIENT_ID);
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(Sha256::digest(exchange["code_verifier"].as_bytes())),
+            query_value(&url, "code_challenge")
+        );
+        // Unlike the xAI flow, the exchange carries the verifier alone.
+        assert!(!exchange.contains_key("code_challenge"));
+        assert!(!exchange.contains_key("code_challenge_method"));
+
+        assert_eq!(credential.access(), "grok-access");
+        assert_eq!(credential.refresh(), "grok-refresh");
+        // Expiry runs 120 s ahead of the token's own, as upstream stores it.
+        assert_eq!(credential.expires_at_ms(), 1_000_000 + 3_600_000 - 120_000);
+        assert_eq!(
+            credential.extra_string("tokenEndpoint"),
+            Some("https://auth.x.ai/oauth2/token")
+        );
+        assert_eq!(credential.extra_string("idToken"), Some("grok-id"));
+        assert_eq!(credential.extra_string("tokenType"), Some("Bearer"));
+        assert_eq!(
+            credential.extra_string("baseUrl"),
+            Some("https://cli-chat-proxy.grok.com/v1")
+        );
+        assert_eq!(
+            credential
+                .extra("discovery")
+                .and_then(|discovery| json_string(discovery, "device_authorization_endpoint")),
+            Some("https://auth.x.ai/oauth2/device/code".to_owned())
+        );
+
+        let preflight = wait_for(&browser.preflight);
+        assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+        assert!(
+            preflight.contains("Access-Control-Allow-Origin: https://auth.x.ai\r\n"),
+            "{preflight}"
+        );
+        assert!(
+            preflight.contains("Access-Control-Allow-Private-Network: true\r\n"),
+            "{preflight}"
+        );
+        let page = wait_for(&browser.page);
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("Signed in to Grok CLI"), "{page}");
+        assert!(
+            page.contains("Access-Control-Allow-Origin: https://auth.x.ai\r\n"),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn grok_cli_browser_login_falls_back_to_a_free_port_when_its_own_is_taken() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupy a port");
+        let port = occupied.local_addr().expect("address").port();
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(404, b"no discovery".to_vec()),
+            response(200, grok_token_body()),
+        ]));
+        let browser = ApprovingGrokBrowser::new();
+        let client = OAuthClient::new(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            browser.clone(),
+            OAuthEndpoints::default(),
+        );
+        client
+            .login(
+                OAuthProviderId::GrokCli,
+                GrokInteraction::new("", &[]),
+                &grok_environment(port),
+                &CancellationToken::new(),
+            )
+            .expect("login on the fallback port");
+        let url = lock_unpoisoned(&browser.authorization_url)
+            .clone()
+            .expect("browser opened");
+        let redirect = Url::parse(&query_value(&url, "redirect_uri")).expect("redirect URI");
+        assert_ne!(redirect.port(), Some(port));
+        assert_eq!(redirect.path(), "/callback");
+        // The exchange names the port that was actually bound.
+        assert_eq!(
+            form(&transport.requests()[1])["redirect_uri"],
+            redirect.as_str()
+        );
+        drop(occupied);
+    }
+
+    #[test]
+    fn grok_cli_an_ignored_paste_leaves_the_browser_callback_to_finish_the_login() {
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(404, b"no discovery".to_vec()),
+            response(200, grok_token_body()),
+        ]));
+        let browser = ApprovingGrokBrowser::delayed(Duration::from_millis(300));
+        let client = OAuthClient::new(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            browser.clone(),
+            OAuthEndpoints::default(),
+        );
+        // A URL without the state is not trusted, however plausible.
+        let interaction =
+            GrokInteraction::new("browser", &["http://127.0.0.1:1/callback?code=pasted-code"]);
+        client
+            .login(
+                OAuthProviderId::GrokCli,
+                interaction.clone(),
+                &grok_environment(unused_loopback_port()),
+                &CancellationToken::new(),
+            )
+            .expect("the browser callback completes the login");
+        assert_eq!(form(&transport.requests()[1])["code"], "granted-code");
+        let progress = interaction.progress();
+        assert!(
+            progress.iter().any(|message| message
+                == "Ignored pasted callback: OAuth state is missing. Paste the complete callback URL or xAI's one-time code."),
+            "{progress:?}"
+        );
+        assert!(wait_for(&browser.page).contains("Signed in to Grok CLI"));
+    }
+
+    #[test]
+    fn grok_cli_a_pasted_callback_with_the_matching_state_completes_the_login() {
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(404, b"no discovery".to_vec()),
+            response(200, grok_token_body()),
+        ]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let interaction = GrokInteraction::new(
+            "browser",
+            &["http://127.0.0.1:1/callback?code=pasted-code&state={state}"],
+        );
+        client
+            .login(
+                OAuthProviderId::GrokCli,
+                interaction.clone(),
+                &grok_environment(unused_loopback_port()),
+                &CancellationToken::new(),
+            )
+            .expect("the matching paste completes the login");
+        assert_eq!(form(&transport.requests()[1])["code"], "pasted-code");
+        assert!(
+            !interaction
+                .progress()
+                .iter()
+                .any(|message| message.starts_with("Ignored"))
+        );
+    }
+
+    #[test]
+    fn grok_cli_strict_manual_input_matches_upstream_rules() {
+        let code = "a".repeat(32);
+        assert_eq!(
+            parse_strict_manual_input(&code, "s", "/callback"),
+            Ok(ManualCallback::Code(code.clone()))
+        );
+        // One character short of a one-time code is neither code nor query.
+        assert!(parse_strict_manual_input(&"a".repeat(31), "s", "/callback").is_err());
+        assert_eq!(
+            parse_strict_manual_input("?code=abc&state=s", "s", "/callback"),
+            Ok(ManualCallback::Code("abc".to_owned()))
+        );
+        assert_eq!(
+            parse_strict_manual_input(
+                "http://127.0.0.1:56122/callback?error=access_denied&error_description=No&state=s",
+                "s",
+                "/callback"
+            ),
+            Ok(ManualCallback::Denied("No".to_owned()))
+        );
+        assert_eq!(
+            parse_strict_manual_input("http://127.0.0.1/other?code=abc&state=s", "s", "/callback"),
+            Err("Callback URL path was not recognized.".to_owned())
+        );
+        assert_eq!(
+            parse_strict_manual_input("code=abc&state=other", "s", "/callback"),
+            Err("OAuth state did not match.".to_owned())
+        );
+        assert_eq!(
+            parse_strict_manual_input("code=abc", "s", "/callback"),
+            Err("OAuth state is missing.".to_owned())
+        );
+        assert_eq!(
+            parse_strict_manual_input("  ", "s", "/callback"),
+            Err("Pasted callback was empty.".to_owned())
+        );
+        // The lenient parser other providers use takes any bare code.
+        assert!(parse_authorization_input("too-short").is_some());
+    }
+
+    #[test]
+    fn cors_preflight_is_answered_only_where_enabled_and_only_for_xai_origins() {
+        let preflight = |server: &LoopbackCallbackServer, origin: &'static str| {
+            let port = server.local_addr().expect("address").port();
+            let client = callback_client(port, move |stream| {
+                let _ = write!(
+                    stream,
+                    "OPTIONS /callback HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {origin}\r\n\r\n"
+                );
+            });
+            serve_until_done(server, client).1
+        };
+        let grok = LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state")
+            .expect("bind")
+            .with_cors_origins(GROK_CLI_CORS_ORIGINS);
+        let trusted = preflight(&grok, "https://accounts.x.ai");
+        assert!(trusted.starts_with("HTTP/1.1 204"), "{trusted}");
+        for header in [
+            "Access-Control-Allow-Origin: https://accounts.x.ai",
+            "Access-Control-Allow-Methods: GET, OPTIONS",
+            "Access-Control-Allow-Headers: Content-Type",
+            "Access-Control-Allow-Private-Network: true",
+            "Vary: Origin",
+        ] {
+            assert!(trusted.contains(&format!("{header}\r\n")), "{trusted}");
+        }
+        let untrusted = preflight(&grok, "https://evil.example");
+        assert!(untrusted.starts_with("HTTP/1.1 204"), "{untrusted}");
+        assert!(
+            !untrusted.contains("Access-Control-Allow-Origin"),
+            "{untrusted}"
+        );
+
+        // Every other provider's listener still refuses a non-GET request.
+        let plain =
+            LoopbackCallbackServer::bind("127.0.0.1", 0, "/callback", "state").expect("bind");
+        let refused = preflight(&plain, "https://accounts.x.ai");
+        assert!(refused.starts_with("HTTP/1.1 405"), "{refused}");
+        assert!(
+            !refused.contains("Access-Control-Allow-Origin"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn grok_cli_device_login_waits_before_polling_and_records_the_grant() {
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(404, b"no discovery".to_vec()),
+            response(
+                200,
+                br#"{
+                    "device_code":"grok-device",
+                    "user_code":"GROK-CODE",
+                    "verification_uri":"https://accounts.x.ai/device",
+                    "verification_uri_complete":"https://accounts.x.ai/device?code=GROK-CODE",
+                    "interval":2
+                }"#
+                .to_vec(),
+            ),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+            response(400, br#"{"error":"slow_down"}"#.to_vec()),
+            response(200, grok_token_body()),
+        ]));
+        let clock = Arc::new(FakeClock::new(0));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = GrokInteraction::new("device", &[]);
+        let environment = BTreeMap::from([(
+            "PI_GROK_CLI_OAUTH_SCOPE".to_owned(),
+            "openid custom".to_owned(),
+        )]);
+        let credential = client
+            .login(
+                OAuthProviderId::GrokCli,
+                interaction.clone(),
+                &environment,
+                &CancellationToken::new(),
+            )
+            .expect("device login");
+        assert_eq!(credential.access(), "grok-access");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 5);
+        let device = form(&requests[1]);
+        assert_eq!(device["scope"], "openid custom");
+        assert_eq!(device["client_id"], GROK_CLI_DEFAULT_CLIENT_ID);
+        assert_eq!(form(&requests[2])["grant_type"], XAI_DEVICE_GRANT);
+        assert_eq!(form(&requests[2])["device_code"], "grok-device");
+        // One interval before the first poll, then slow_down adds five.
+        assert_eq!(
+            clock.sleeps(),
+            vec![
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(7)
+            ]
+        );
+        let events = lock_unpoisoned(&interaction.events);
+        let code = events
+            .iter()
+            .find(|event| event.kind == OAuthEventKind::DeviceCode)
+            .expect("device code shown");
+        assert_eq!(code.user_code, "GROK-CODE");
+        assert_eq!(
+            code.verification_uri,
+            "https://accounts.x.ai/device?code=GROK-CODE"
+        );
+        // Upstream's default device window is 30 minutes.
+        assert_eq!(code.expires_in_seconds, 1800);
+    }
+
+    #[test]
+    fn grok_cli_device_login_refuses_a_verification_page_off_xai() {
+        let transport = Arc::new(FakeTransport::with_responses([
+            response(404, b"no discovery".to_vec()),
+            response(
+                200,
+                br#"{"device_code":"d","user_code":"u","verification_uri":"https://phish.example/device"}"#
+                    .to_vec(),
+            ),
+        ]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let error = client
+            .login(
+                OAuthProviderId::GrokCli,
+                GrokInteraction::new("device", &[]),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("a foreign verification page is refused");
+        assert!(error.to_string().contains("phish.example"), "{error}");
+        assert_eq!(transport.requests().len(), 2, "nothing was polled");
+    }
+
+    #[test]
+    fn grok_cli_login_refuses_while_the_environment_token_is_set() {
+        let transport = Arc::new(FakeTransport::with_responses([]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let environment = BTreeMap::from([(
+            crate::grok_cli::TOKEN_ENV.to_owned(),
+            "env-token".to_owned(),
+        )]);
+        let error = client
+            .login(
+                OAuthProviderId::GrokCli,
+                GrokInteraction::new("browser", &[]),
+                &environment,
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("login refuses");
+        assert_eq!(
+            error.to_string(),
+            "Unset GROK_CLI_OAUTH_TOKEN before logging in to Grok CLI."
+        );
+        assert!(transport.requests().is_empty());
+        // The xAI login is unaffected by the Grok CLI token.
+        assert!(matches!(
+            test_client(
+                Arc::new(FakeTransport::with_responses([])),
+                Arc::new(FakeClock::new(0)),
+                OAuthEndpoints::default()
+            )
+            .login(
+                OAuthProviderId::Xai,
+                Arc::new(PromptInteraction::answers([])),
+                &environment,
+                &CancellationToken::new(),
+            ),
+            Err(OAuthError::Cancelled)
+        ));
+    }
+
+    fn stored_grok_credential(token_endpoint: &str) -> Credential {
+        let mut credential = Credential::oauth("old-access", "old-refresh", 0);
+        credential
+            .set_extra("tokenEndpoint", Value::String(token_endpoint.to_owned()))
+            .expect("extra");
+        credential
+            .set_extra("idToken", Value::String("old-id".to_owned()))
+            .expect("extra");
+        credential
+    }
+
+    #[test]
+    fn grok_cli_refresh_uses_the_stored_endpoint_and_keeps_a_nonrotating_token() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"access_token":"new-access","expires_in":"60"}"#.to_vec(),
+        )]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(5_000)),
+            OAuthEndpoints::default(),
+        );
+        let environment = BTreeMap::from([(
+            "PI_GROK_CLI_BASE_URL".to_owned(),
+            "https://proxy.example/v1/".to_owned(),
+        )]);
+        let refreshed = client
+            .refresh(
+                OAuthProviderId::GrokCli,
+                &stored_grok_credential("https://auth.x.ai/oauth2/token"),
+                &environment,
+                &CancellationToken::new(),
+            )
+            .expect("refresh");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1, "no discovery request");
+        assert_eq!(requests[0].url().as_str(), "https://auth.x.ai/oauth2/token");
+        let body = form(&requests[0]);
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "old-refresh");
+        assert_eq!(body["client_id"], GROK_CLI_DEFAULT_CLIENT_ID);
+        assert_eq!(refreshed.access(), "new-access");
+        assert_eq!(refreshed.refresh(), "old-refresh");
+        assert_eq!(refreshed.expires_at_ms(), 5_000 + 60_000 - 120_000);
+        assert_eq!(refreshed.extra_string("idToken"), Some("old-id"));
+        assert_eq!(refreshed.extra_string("tokenType"), Some("Bearer"));
+        assert_eq!(
+            refreshed.extra_string("baseUrl"),
+            Some("https://proxy.example/v1")
+        );
+    }
+
+    #[test]
+    fn grok_cli_refresh_treats_400_401_403_as_a_lost_login_and_5xx_as_transient() {
+        for (status, unauthorized) in [(400, true), (401, true), (403, true), (500, false)] {
+            let transport = Arc::new(FakeTransport::with_responses([response(
+                status,
+                br#"{"error":"invalid_request"}"#.to_vec(),
+            )]));
+            let client = test_client(
+                transport,
+                Arc::new(FakeClock::new(0)),
+                OAuthEndpoints::default(),
+            );
+            let error = client
+                .refresh(
+                    OAuthProviderId::GrokCli,
+                    &stored_grok_credential("https://auth.x.ai/oauth2/token"),
+                    &BTreeMap::new(),
+                    &CancellationToken::new(),
+                )
+                .err()
+                .expect("refresh fails");
+            assert_eq!(
+                error.is_unauthorized(),
+                unauthorized,
+                "status {status}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_cli_refresh_refuses_a_stored_endpoint_off_xai_before_sending_the_token() {
+        let transport = Arc::new(FakeTransport::with_responses([]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        for endpoint in [
+            "https://evil.example/token",
+            "http://auth.x.ai/oauth2/token",
+        ] {
+            let error = client
+                .refresh(
+                    OAuthProviderId::GrokCli,
+                    &stored_grok_credential(endpoint),
+                    &BTreeMap::new(),
+                    &CancellationToken::new(),
+                )
+                .err()
+                .expect("untrusted endpoint");
+            assert!(error.to_string().contains("Refusing non-xAI"), "{error}");
+        }
+        assert!(transport.requests().is_empty());
     }
 }

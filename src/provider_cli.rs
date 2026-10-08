@@ -12,13 +12,16 @@ use crossterm::{
 };
 
 use crate::{
-    catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
-    config, oauth,
+    catalog::{
+        AuthKind, Catalog, CatalogError, Credential, CredentialKind, CredentialStore, Provider,
+    },
+    config, grok_accounts, grok_cli, meta_muse, oauth,
 };
 
 /// Executes `goshcoder providers`.
 pub fn providers_command() -> Result<(), Box<dyn Error>> {
     let catalog = Catalog::with_default_credentials()?;
+    let mut rows = Vec::new();
     for provider in catalog.providers() {
         let (status, detail) = match catalog.resolve_auth(&provider.id) {
             Ok(Some(authentication)) => {
@@ -35,10 +38,20 @@ pub fn providers_command() -> Result<(), Box<dyn Error>> {
             Err(error @ CatalogError::OAuthRefreshFailed { .. }) => ("!", error.to_string()),
             Err(error) => return Err(error.into()),
         };
-        println!(
-            "{status} {:<24} {:<22} {detail}",
-            provider.id, provider.name
-        );
+        rows.push((status, provider.id.clone(), provider.name.clone(), detail));
+    }
+    let id_width = rows
+        .iter()
+        .map(|row| row.1.chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_width = rows
+        .iter()
+        .map(|row| row.2.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (status, id, name, detail) in rows {
+        println!("{status} {id:<id_width$}  {name:<name_width$}  {detail}");
     }
     if let Some(warning) = catalog.credential_store_warning() {
         eprintln!("warning: {warning}; stored credentials were ignored");
@@ -70,11 +83,26 @@ pub fn models_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const AUTH_USAGE: &str = "usage: goshcoder auth <subcommand>
+
+  login <provider>   Sign in through the browser or a device code
+                     (anthropic, openai-codex, grok-cli, xai, meta, meta-muse, kimi-coding,
+                     openrouter)
+  set <provider>     Store an API key for any provider
+  list               Show stored credentials
+  logout <provider>  Remove a stored credential
+
+`goshcoder providers` shows which providers are configured and how to set up the rest.";
+
 /// Executes `goshcoder auth set|login|list|logout`.
 pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
-        return Err(command_error("usage: goshcoder auth set|login|list|logout"));
+        return Err(command_error(AUTH_USAGE));
     };
+    if matches!(subcommand, "help" | "-h" | "-help" | "--help") {
+        println!("{AUTH_USAGE}");
+        return Ok(());
+    }
     let store = CredentialStore::default_file();
     match subcommand {
         "list" => {
@@ -82,12 +110,18 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if credentials.is_empty() {
                 println!("No stored credentials.");
             } else {
+                let width = credentials
+                    .iter()
+                    .map(|credential| credential.provider_id.chars().count())
+                    .max()
+                    .unwrap_or(0);
                 for credential in credentials {
-                    println!(
-                        "{:<24} {}",
-                        credential.provider_id,
-                        credential.kind.as_str()
-                    );
+                    let kind = match credential.kind.as_str() {
+                        "oauth" => "signed in (OAuth)",
+                        "api_key" => "API key",
+                        other => other,
+                    };
+                    println!("{:<width$}  {kind}", credential.provider_id);
                 }
             }
             Ok(())
@@ -96,11 +130,34 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let Some(provider_id) = arguments.get(1) else {
                 return Err(command_error("usage: goshcoder auth set <provider>"));
             };
+            if arguments.len() > 2 {
+                return Err(command_error(format!(
+                    "auth set takes no key argument; it prompts for the key so it stays out of your shell history (or pipe it: echo $KEY | goshcoder auth set {provider_id})"
+                )));
+            }
             let catalog = Catalog::with_default_credentials()?;
-            if catalog.provider(provider_id).is_none() {
+            let Some(provider) = catalog.provider(provider_id) else {
                 return Err(command_error(format!("unknown provider {provider_id:?}")));
+            };
+            if provider.auth_kind == AuthKind::OAuthOnly {
+                let alternative = if provider_id == "openai-codex" {
+                    "; for the OpenAI API use `goshcoder auth set openai`"
+                } else {
+                    ""
+                };
+                return Err(command_error(format!(
+                    "{provider_id} signs in with a subscription and takes no API key; run `goshcoder auth login {provider_id}`{alternative}"
+                )));
             }
             config::ensure_agent_dir()?;
+            if store
+                .read_raw(provider_id)?
+                .is_some_and(|credential| credential.kind() == &CredentialKind::OAuth)
+            {
+                eprintln!(
+                    "note: this replaces your {provider_id} sign-in with an API key; `goshcoder auth login {provider_id}` signs in again."
+                );
+            }
             let key = read_secret(&format!("Enter the API key for {provider_id}: "))?;
             if key.is_empty() {
                 return Err(command_error("no key provided"));
@@ -108,6 +165,27 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let mut credential = Credential::api_key(key);
             // Cloudflare resolves nothing from a key alone; the ids are
             // stored beside it so the provider is usable right away.
+            // Azure needs to know which resource to call; a key alone is not
+            // usable, so the endpoint is stored beside it unless the
+            // environment already names one.
+            if provider_id == "azure-openai-responses"
+                && ["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME"]
+                    .iter()
+                    .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()))
+            {
+                let endpoint = read_visible(
+                    "Enter the Azure OpenAI resource name or base URL (https://<resource>.openai.azure.com/openai/v1): ",
+                )?;
+                if endpoint.is_empty() {
+                    return Err(command_error("no Azure resource name or base URL provided"));
+                }
+                let name = if endpoint.contains("://") {
+                    "AZURE_OPENAI_BASE_URL"
+                } else {
+                    "AZURE_OPENAI_RESOURCE_NAME"
+                };
+                credential.set_environment(name, endpoint);
+            }
             for (name, prompt) in cloudflare_credential_fields(provider_id) {
                 let value = read_secret(prompt)?;
                 if value.is_empty() {
@@ -155,19 +233,96 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 "Logged in to {provider_id} with OAuth; credentials are stored in {}",
                 config::auth_path().display()
             );
+            if provider == oauth::OAuthProviderId::MetaMuse {
+                refresh_muse_models(&catalog);
+            }
             Ok(())
         }
         "logout" => {
             let Some(provider_id) = arguments.get(1) else {
                 return Err(command_error("usage: goshcoder auth logout <provider>"));
             };
-            store.delete(provider_id)?;
-            println!("Removed the stored credential for {provider_id}");
+            let catalog = Catalog::with_default_credentials()?;
+            let Some(provider) = catalog.provider(provider_id) else {
+                return Err(command_error(format!("unknown provider {provider_id:?}")));
+            };
+            if store.read_raw(provider_id)?.is_none() {
+                println!("No stored credential for {provider_id}.");
+            } else {
+                store.delete(provider_id)?;
+                println!("Removed the stored credential for {provider_id}.");
+            }
+            // A key in the environment keeps the provider usable, which would
+            // otherwise look like the logout did not work.
+            if let Some(name) = provider
+                .env_keys
+                .iter()
+                .find(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+            {
+                println!(
+                    "{name} is still set in your environment, so {provider_id} remains configured."
+                );
+            }
             Ok(())
         }
         _ => Err(command_error(format!(
-            "unknown auth subcommand {subcommand:?}"
+            "unknown auth subcommand {subcommand:?}\n\n{AUTH_USAGE}"
         ))),
+    }
+}
+
+const GROK_CLI_USAGE: &str = "usage: goshcoder grok-cli <subcommand>
+
+  usage                        Show the subscription's weekly usage
+  accounts                     List the saved Grok CLI accounts
+  accounts add [label]         Add an account and sign in to it
+  accounts login <n>           Sign in to an account again
+  accounts logout <n>          Sign out of an account
+  accounts rename <n> <label>  Rename an account
+  accounts remove <n>          Remove an account (Account 1 stays)
+  accounts use <n>             Make an account the default for new sessions
+
+Accounts are named by their number in the list, their label, or their id.";
+
+/// Executes `goshcoder grok-cli usage|accounts`.
+pub fn grok_cli_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let catalog = Catalog::with_default_credentials()?;
+    match words.as_slice() {
+        ["usage"] => {
+            let agent_dir = catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir);
+            println!(
+                "{}",
+                grok_cli::usage_report(&catalog, &agent_dir, "").join("\n\n")
+            );
+            Ok(())
+        }
+        ["accounts", rest @ ..] => {
+            config::ensure_agent_dir()?;
+            let accounts = grok_accounts::Accounts::new(&catalog);
+            let output = grok_accounts::cli_command(&accounts, rest, &|client| {
+                client
+                    .login(
+                        oauth::OAuthProviderId::GrokCli,
+                        Arc::new(TerminalOAuthInteraction),
+                        &oauth::ProcessEnvironment,
+                        &oauth::CancellationToken::new(),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(command_error)?;
+            println!("{output}");
+            Ok(())
+        }
+        ["help" | "-h" | "--help"] => {
+            println!("{GROK_CLI_USAGE}");
+            Ok(())
+        }
+        _ => Err(command_error(GROK_CLI_USAGE)),
     }
 }
 
@@ -190,11 +345,9 @@ impl oauth::OAuthInteraction for TerminalOAuthInteraction {
                 eprintln!("  {}. {} — {}", index + 1, option.label, option.description);
             }
         }
-        if prompt.placeholder.is_empty() {
-            eprint!("> ");
-        } else {
-            eprint!("{}: ", prompt.placeholder);
-        }
+        // The placeholder is an example of what to paste (the redirect URL),
+        // not a label; printed as one it reads like something to type.
+        eprint!("> ");
         io::stderr()
             .flush()
             .map_err(|error| oauth::OAuthError::Callback(format!("write prompt: {error}")))?;
@@ -239,6 +392,22 @@ impl oauth::OAuthInteraction for TerminalOAuthInteraction {
     }
 }
 
+/// Loads Meta's live Muse Spark list right after login, as pi fetches an
+/// extension's models once it has a credential. A failure only costs the live
+/// list; the bundled models stay selectable.
+fn refresh_muse_models(catalog: &Catalog) {
+    let cancellation = oauth::CancellationToken::with_timeout(meta_muse::REQUEST_TIMEOUT);
+    let refreshed = meta_muse::models_transport()
+        .and_then(|transport| meta_muse::refresh_model_cache(catalog, &transport, &cancellation));
+    match refreshed {
+        Ok(Some(count)) => println!("Meta lists {count} Muse Spark models for this subscription."),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "warning: could not load Meta's Muse Spark model list ({error}); the bundled models remain available"
+        ),
+    }
+}
+
 fn select_oauth_option(input: &str, options: &[oauth::OAuthPromptOption]) -> String {
     if let Ok(index) = input.parse::<usize>()
         && let Some(option) = index.checked_sub(1).and_then(|index| options.get(index))
@@ -280,12 +449,44 @@ pub(crate) fn cloudflare_credential_fields(
 
 pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
     let environment = provider.env_keys.join(" or ");
-    if provider.supports_oauth {
-        if environment.is_empty() {
-            return format!("run: goshcoder auth login {}", provider.id);
-        }
+    // Some providers are marked OAuth-capable without a login GoshCoder can
+    // run; pointing at `auth login` there only leads to a refusal.
+    let login_available = provider.supports_oauth
+        && oauth::OAuthProviderId::parse(&provider.id).is_some_and(|id| {
+            oauth::metadata_for(id).flow_support == oauth::OAuthFlowSupport::Implemented
+        });
+    if login_available {
+        // Anthropic's key variables are resolved outside the catalog's
+        // `env_keys`, which only lists them for providers without OAuth.
+        let environment = match provider.id.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY".to_owned(),
+            _ => environment,
+        };
+        return match (environment.is_empty(), provider.id.as_str()) {
+            // A ChatGPT subscription has no API key; that is `openai`. Meta
+            // Muse Code refuses keys outright; that is `meta`.
+            (_, "openai-codex" | "meta-muse") => {
+                format!("run: goshcoder auth login {}", provider.id)
+            }
+            // Grok CLI takes a login or a bearer token, never a stored key.
+            (_, "grok-cli") => format!(
+                "run: goshcoder auth login {}, or set {}",
+                provider.id,
+                grok_cli::TOKEN_ENV
+            ),
+            (true, _) => format!(
+                "run: goshcoder auth login {id}, or goshcoder auth set {id} for an API key",
+                id = provider.id
+            ),
+            (false, _) => format!(
+                "run: goshcoder auth login {id}, or set {environment} / goshcoder auth set {id}",
+                id = provider.id
+            ),
+        };
+    }
+    if provider.id == "azure-openai-responses" {
         return format!(
-            "run: goshcoder auth login {} (or set {environment})",
+            "set {environment} and AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE_NAME), or run: goshcoder auth set {}",
             provider.id
         );
     }
@@ -305,10 +506,20 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
                 .to_owned()
         }
         "azure" | "azure-openai-responses" => {
-            "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT".to_owned()
+            "set AZURE_OPENAI_API_KEY and AZURE_OPENAI_BASE_URL (or AZURE_OPENAI_RESOURCE_NAME)"
+                .to_owned()
         }
         _ => format!("run: goshcoder auth set {}", provider.id),
     }
+}
+
+/// Reads one echoed line, for values that are not secret.
+fn read_visible(prompt: &str) -> io::Result<String> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_owned())
 }
 
 pub(crate) fn read_secret(prompt: &str) -> io::Result<String> {
@@ -400,6 +611,15 @@ mod tests {
         assert!(
             provider_setup_hint(&catalog.provider("amazon-bedrock").expect("Bedrock"))
                 .contains("AWS_ACCESS_KEY_ID")
+        );
+        // A subscription-only provider must not suggest `auth set`.
+        assert_eq!(
+            provider_setup_hint(&catalog.provider("meta-muse").expect("Meta Muse")),
+            "run: goshcoder auth login meta-muse"
+        );
+        assert!(
+            provider_setup_hint(&catalog.provider("meta").expect("Meta"))
+                .contains("goshcoder auth set meta")
         );
     }
 

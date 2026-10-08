@@ -247,6 +247,9 @@ fn render_suggestions(
         .saturating_sub(item_capacity)
         .min(suggestions.len().saturating_sub(item_capacity));
     let visible = &suggestions[first..suggestions.len().min(first + item_capacity)];
+    // Label, two spaces, description in one colour, as the mockup draws the
+    // pickers; an aligned column would push short labels' descriptions
+    // away from them.
     let items: Vec<ListItem<'_>> = visible
         .iter()
         .map(|suggestion| {
@@ -261,7 +264,10 @@ fn render_suggestions(
             ListItem::new(Line::from(text))
         })
         .collect();
-    let title = suggestion_title(&app.input);
+    let title = match app.prompt.as_ref() {
+        Some(prompt) => format!(" {} ", prompt.label.to_uppercase()),
+        None => suggestion_title(&app.input).to_owned(),
+    };
     let list = List::new(items)
         .style(Style::default().fg(TEXT).bg(BACKGROUND))
         .block(
@@ -300,13 +306,18 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow
         ..inner
     };
     let lines: Vec<Line<'_>> = if app.input.is_empty() {
-        let placeholder = if app.prompt.is_some() {
-            "Type the answer and press Enter · esc cancels"
-        } else {
-            "Tell GoshCoder what to build…  / for commands"
+        let placeholder = match app.prompt.as_ref() {
+            Some(prompt) if !prompt.options.is_empty() => {
+                "↑↓ choose, Enter confirms · esc cancels".to_owned()
+            }
+            Some(prompt) if !prompt.placeholder.is_empty() => {
+                format!("Paste here, e.g. {}", prompt.placeholder)
+            }
+            Some(_) => "Type the answer and press Enter · esc cancels".to_owned(),
+            None => "Tell GoshCoder what to build…  / for commands".to_owned(),
         };
         vec![Line::from(Span::styled(
-            truncate(placeholder, inner.width as usize),
+            truncate(&placeholder, inner.width as usize),
             Style::default().fg(MUTED),
         ))]
     } else {
@@ -334,7 +345,13 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow
 
 /// The key hints for what the keyboard does right now.
 fn status_hint(app: &App) -> &'static str {
-    if app.prompt.is_some() {
+    if app
+        .prompt
+        .as_ref()
+        .is_some_and(|prompt| !prompt.options.is_empty())
+    {
+        "↑↓ select · enter choose · esc cancel"
+    } else if app.prompt.is_some() {
         "enter submit · esc cancel"
     } else if !app.suggestions().is_empty() {
         "↑↓ select · enter choose · esc close"
@@ -1147,10 +1164,7 @@ mod tests {
         assert!(screen.contains("esc abort  ·  type to steer"));
 
         let mut app = quiet_app();
-        app.prompt = Some(ComposerPrompt {
-            label: "API key for openai".to_owned(),
-            secret: true,
-        });
+        app.prompt = Some(ComposerPrompt::text("API key for openai", true));
         app.set_input("sk-secret");
         let screen = rows(&render(&app, 90, 20)).join("\n");
         assert!(screen.contains("API key for openai"));

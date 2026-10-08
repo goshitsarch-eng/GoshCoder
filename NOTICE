@@ -83,6 +83,22 @@ omniroute-agent-extension — OmniRoute
   upstream npm package, crates.io, or its release binaries, under its own
   licence.
 
+pi-meta-muse-auth — Meta Muse Code subscription provider
+  Sadik Saifi — https://github.com/sadiksaifi/pi-meta-muse-auth
+  Copyright (c) 2026 pi-meta-muse-auth contributors — MIT License
+  Adapted from version 0.1.2. Meta, Muse Code and Muse Spark are Meta's; the
+  adaptation talks to Meta's public endpoints with the user's own
+  subscription and bundles nothing of Meta's.
+pi-grok-cli — Grok CLI provider
+  J Liew (kenryu42) — https://github.com/kenryu42/pi-grok-cli
+  Copyright (c) 2026 kenryu42 — MIT License
+  The adaptation (version 0.9.3) reimplements the extension's provider,
+  OAuth flow, payload sanitisation, usage command, Grok Imagine feature,
+  and multiple-account support with exhaustion rotation. It bundles none of the package's code or its browser dashboard
+  assets, and no part of the official Grok CLI. Grok, X Premium and
+  SuperGrok are products of xAI / X Corp.; GoshCoder is not affiliated
+  with them.
+
 
 Third-party Rust crates
 -----------------------
