@@ -140,7 +140,8 @@ goshcoder prompts restore goshcoder-prompts-2026-08-23.tar.gz
 goshcoder auth login anthropic
 goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
-goshcoder auth login xai      # Grok subscription; device code or browser
+goshcoder auth login grok-cli # X Premium/SuperGrok via the Grok CLI endpoint
+goshcoder auth login xai      # Grok subscription against api.x.ai
 goshcoder auth login meta     # Meta account; mints a Model API key
 
 # The same providers by API key, for a developer account
@@ -190,6 +191,7 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | Package | Contents |
 | --- | --- |
 | `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
+| `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation |
 | `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
@@ -384,6 +386,62 @@ is recorded in [`NOTICE`](NOTICE).
   install it with `npm install -g @agent-sh/computer-use-linux` or `cargo
   install computer-use-linux` and check readiness with
   `computer-use-linux doctor`.
+- [`pi-grok-cli`](https://github.com/kenryu42/pi-grok-cli) by J Liew
+  (kenryu42) — **Grok CLI** (native adaptation of version 0.9.3): a separate
+  `grok-cli` provider that puts an X Premium or SuperGrok subscription to
+  work through the endpoint the official Grok CLI talks to
+  (`https://cli-chat-proxy.grok.com/v1`, `openai-responses`). No grok binary
+  is involved; requests carry the official client's identification instead.
+  The `xai` provider is unchanged, and the two keep separate `auth.json`
+  entries.
+
+  - **Login.** `goshcoder auth login grok-cli` (or `/login grok-cli`) signs in
+    at `auth.x.ai` with the Grok CLI's client id and scope. The browser flow is
+    the default: it listens on port 56122 (falling back to any free port, with
+    the redirect URI naming the one bound), answers the CORS preflight xAI's
+    account pages send from `accounts.x.ai`/`auth.x.ai`, adds `plan=generic`,
+    and exchanges the code with the PKCE verifier alone. A pasted callback must
+    carry the matching state, or be a bare one-time code; anything else is
+    reported and ignored while the browser callback keeps waiting. Device code
+    is offered for headless machines. A refresh answered with 400, 401 or 403
+    asks for a new login. `GROK_CLI_OAUTH_TOKEN` is a bearer token with no
+    refresh that wins over a stored login, and `auth login grok-cli` refuses
+    to run while it is set. `PI_GROK_CLI_OAUTH_CLIENT_ID`,
+    `PI_GROK_CLI_OAUTH_SCOPE`, `PI_GROK_CLI_CALLBACK_PORT` and
+    `PI_GROK_CLI_CALLBACK_HOST` override the login parameters.
+  - **Requests.** Every request carries `x-grok-client-identifier`,
+    `x-xai-token-auth` and `x-grok-model-override`, plus the client version as
+    `x-grok-client-version` and in the user agent. The version is the latest
+    stable release read once per process from `https://x.ai/cli/stable`
+    (`PI_GROK_CLI_VERSION_URL`), with 1.0.46 as the fallback; an HTTP 426 from
+    the version gate looks it up again and retries once. `x-grok-conv-id` is
+    the session id, then `<id>:<n>` after the proxy answers 401, 502 or 520
+    before streaming: the conversation is rotated (at most twice per request)
+    and the generation recorded as a `grok-cli-conv-id-v1` session entry, so
+    resume, `/fork` and `/tree` navigation find the right one.
+    `/grok-cli-conv [status|rotate]` shows or rotates it by hand. The generic
+    provider retry is off for this provider, as upstream sets `maxRetries: 0`,
+    because it would resend a conversation id the proxy just rejected.
+  - **Payload.** The Responses body is sanitised as upstream's `sanitize.ts`
+    does: system and developer messages move into `instructions`, replayed
+    reasoning items lose `status` and carry typed `reasoning_text`, empty
+    messages are dropped, image parts become `input_image` with a `detail`,
+    tool results with images keep their text and hand the images to a
+    following user message, `response_format` becomes `text.format`,
+    `reasoning.effort` reaches only the models that accept it (`minimal`
+    becomes `low`), `prompt_cache_retention` is removed and the session id is
+    the `prompt_cache_key`.
+  - **Models.** Upstream's ten (Composer 2.5 Fast, Grok Build, Grok 4.3 to
+    4.7, Grok 4.7 Fast and the three Grok 4.20 variants) with its context
+    windows, prices and effort maps. `PI_GROK_CLI_MODELS` filters and reorders
+    them, and an id the list does not know gets upstream's generic definition.
+    `PI_GROK_CLI_BASE_URL`, `GROK_CLI_BASE_URL` or
+    `GOSHCODER_GROK_CLI_BASE_URL` move the endpoint.
+
+  Not ported: the browser account dashboard, upstream's migrations from its
+  own earlier releases (there is nothing in GoshCoder to migrate from), and
+  the payload step that turns local image paths into data URIs (GoshCoder's
+  request builders only ever send data URIs).
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
@@ -492,8 +550,10 @@ Documented at the top of each ported file. The notable ones:
 - **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
-  Code, xAI, and Meta. Every one of them also accepts an API key, so a
-  developer account never has to go through a subscription login.
+  Code, xAI, Grok CLI, and Meta. Every one of them except the two pure
+  subscriptions (OpenAI Codex and Grok CLI, whose API-key counterparts are
+  `openai` and `xai`) also accepts an API key, so a developer account never
+  has to go through a subscription login.
   - **xAI (Grok)** uses xAI's own OIDC server at `auth.x.ai`: PKCE S256 over a
     loopback callback, or RFC 8628 device code for a headless session, against
     the public desktop client. Discovered endpoints are pinned to the issuer's
@@ -501,7 +561,10 @@ Documented at the top of each ported file. The notable ones:
     What this authenticates is a consumer Grok subscription, and xAI applies
     its own entitlement checks afterwards: a login can succeed and inference
     still answer 403 for an account without the plan the endpoint wants. That
-    is xAI's decision, not a client bug, and `XAI_API_KEY` is unaffected.
+    is xAI's decision, not a client bug, and `XAI_API_KEY` is unaffected. A
+    subscription is what the separate **`grok-cli`** provider is for: it
+    signs in the same way but sends requests to the endpoint the official
+    Grok CLI uses, which accepts subscription tokens (see **Extensions**).
   - **Meta** signs in by device code at `auth.meta.com` and then mints a Model
     API key at `api.meta.ai/muse-code/key`; the key is what requests carry, and
     Meta re-mints it about once a day, which the stored expiry accounts for.
@@ -585,6 +648,7 @@ It is a derivative work of [pi](https://github.com/earendil-works/pi),
 Copyright (c) 2025 Mario Zechner, used under the MIT License.
 [`NOTICE`](NOTICE) reproduces that copyright and credits every other project
 adapted here — `pi-web-access`, Plannotator, `pi-ralph-wiggum`,
-`pi-claude-code-tui`, OmniRoute and `pi-btw` — with its author, repository and
+`pi-claude-code-tui`, OmniRoute, `pi-btw`, Aperture, computer-use-linux and
+`pi-grok-cli` — with its author, repository and
 licence. If you redistribute GoshCoder or a build of it, carry `NOTICE` with
 it: that is the condition every one of those licences attaches.

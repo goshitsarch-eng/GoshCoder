@@ -16,7 +16,7 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
+    computeruse, config, grok_cli, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
     ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
@@ -127,9 +127,20 @@ pub struct PreparedSession {
     /// The lazily spawned computer-use-linux server behind the `mcp` tool.
     /// Closed with the session so the desktop server never outlives it.
     desktop: Option<computeruse::McpSession>,
+    /// Keeps the Grok CLI conversation id answering from this session's log
+    /// for as long as the session lives.
+    grok_conv: Option<grok_cli::ConvRegistration>,
 }
 
 impl PreparedSession {
+    /// The session id this session's provider requests carry, which keys the
+    /// Grok CLI conversation id. Empty without a session log.
+    pub fn request_session_id(&self) -> &str {
+        self.grok_conv
+            .as_ref()
+            .map_or("", grok_cli::ConvRegistration::key)
+    }
+
     /// Returns a consistent snapshot of the resources currently available to
     /// this session. Resource changes are serialized so a slash command can
     /// save a prompt while the terminal event loop continues to inspect it.
@@ -462,6 +473,7 @@ pub const CURATED_MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-5.6-terra"),
     ("azure-openai-responses", "gpt-5.6-terra"),
     ("deepseek", "deepseek-v4-pro"),
+    ("grok-cli", "grok-composer-2.5-fast"),
     ("xai", "grok-build-0.1"),
     ("meta", "muse-spark-1.2"),
     ("google", "gemini-3.6-flash"),
@@ -705,6 +717,12 @@ pub fn prepare_session(
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
+    // Requests carry the id the agent was created with; the store follows
+    // whichever session file is open behind the recorder.
+    let grok_conv = runtime
+        .id()
+        .filter(|id| !id.is_empty())
+        .map(|id| grok_cli::register_conv_store(&id, Arc::new(runtime.custom_recorder())));
     let prepared = PreparedSession {
         btw,
         ralph,
@@ -717,6 +735,7 @@ pub fn prepare_session(
         config,
         catalog: catalog.clone(),
         desktop,
+        grok_conv,
     };
     prepared.aperture_session_start();
     prepared.omni_session_start();
@@ -1524,14 +1543,15 @@ mod tests {
             }
         }
         // Cloudflare needs an account (and gateway) id, which `auth set`
-        // prompts for; Aperture is configured by its gateway; Codex is OAuth
-        // only.
+        // prompts for; Aperture is configured by its gateway; Codex and Grok
+        // CLI are OAuth only.
         assert_eq!(
             unconfigured,
             [
                 "aperture",
                 "cloudflare-ai-gateway",
                 "cloudflare-workers-ai",
+                "grok-cli",
                 "openai-codex"
             ]
         );

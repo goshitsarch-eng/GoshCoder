@@ -13,7 +13,7 @@ use crossterm::{
 
 use crate::{
     catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
-    config, oauth,
+    config, grok_cli, oauth,
 };
 
 /// Executes `goshcoder providers`.
@@ -84,7 +84,8 @@ pub fn models_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 const AUTH_USAGE: &str = "usage: goshcoder auth <subcommand>
 
   login <provider>   Sign in through the browser or a device code
-                     (anthropic, openai-codex, xai, meta, kimi-coding, openrouter)
+                     (anthropic, openai-codex, grok-cli, xai, meta, kimi-coding,
+                     openrouter)
   set <provider>     Store an API key for any provider
   list               Show stored credentials
   logout <provider>  Remove a stored credential
@@ -317,6 +318,12 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
         return match (environment.is_empty(), provider.id.as_str()) {
             // A ChatGPT subscription has no API key; that is `openai`.
             (_, "openai-codex") => format!("run: goshcoder auth login {}", provider.id),
+            // Grok CLI takes a login or a bearer token, never a stored key.
+            (_, "grok-cli") => format!(
+                "run: goshcoder auth login {}, or set {}",
+                provider.id,
+                grok_cli::TOKEN_ENV
+            ),
             (true, _) => format!(
                 "run: goshcoder auth login {id}, or goshcoder auth set {id} for an API key",
                 id = provider.id

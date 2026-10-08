@@ -66,6 +66,7 @@ something goes wrong:
 | Session files (pi v3 JSONL) | `src/sessionlog.rs`, `src/session.rs` |
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
+| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`; its OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
 | Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
 
 ## Starting without credentials
@@ -162,6 +163,18 @@ is installed; the server is spawned lazily and closed with the session.
 - OAuth token endpoints and callback ports are the ones pi uses; xAI's
   discovered endpoints are pinned to the issuer host. `Auth` deliberately
   implements no `Debug` or `Display`.
+- Grok CLI (`grok-cli`) is an `openai-responses` provider with three hooks
+  in the request path, all keyed on the provider id: `run_stream` passes the
+  body through `grok_cli::prepare_payload`, and `send_streaming_request`
+  adds the version and conversation headers per attempt and owns the retry
+  budget (`grok_cli::RequestAttempt`: 426 refreshes the version, 401/502/520
+  rotate the conversation, the generic retry is off). The conversation
+  generation lives in the session log; `runtime::prepare_session` registers
+  the session's `SessionCustomRecorder` under the agent's request session id,
+  and the store reads the newest `grok-cli-conv-id-v1` entry on the current
+  branch, so forks and resumes need no extra bookkeeping. Note that the
+  agent keeps the session id it was created with across `/new` and
+  `/resume`; the Grok CLI store follows the open session instead.
 
 ## Sessions
 

@@ -34,7 +34,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{aperture, config, llm, oauth, omniroute};
+use crate::{aperture, config, grok_cli, llm, oauth, omniroute};
 
 const CATALOG_JSON: &str = include_str!("../data/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../data/catalog_extra.json");
@@ -400,6 +400,17 @@ const PROVIDER_DEFINITIONS: &[ProviderDefinition] = &[
         env_keys: &[],
         auth_kind: AuthKind::Vertex,
         supports_oauth: false,
+    },
+    // pi-grok-cli: a Grok subscription through the official CLI's endpoint.
+    // The base URL here is the default; `grok_cli::BASE_URL_ENV` overrides it.
+    ProviderDefinition {
+        id: "grok-cli",
+        name: "Grok CLI",
+        base_url: "https://cli-chat-proxy.grok.com/v1",
+        key_name: "",
+        env_keys: &["GROK_CLI_OAUTH_TOKEN"],
+        auth_kind: AuthKind::OAuthOnly,
+        supports_oauth: true,
     },
     ProviderDefinition {
         id: "groq",
@@ -2328,6 +2339,9 @@ impl Catalog {
                 base_url = dedicated.base_url.clone();
                 models = dedicated.models.clone();
             }
+        } else if id == grok_cli::PROVIDER_ID {
+            base_url = grok_cli::base_url(|name| environment_value(&self.environment, name));
+            models = self.grok_cli_models(models, &base_url);
         } else if let Some(route) = layer.aperture.routes.get(id) {
             base_url = route.base_url.clone();
             models = models
@@ -2392,11 +2406,48 @@ impl Catalog {
                 .find(|model| model.id == model_id)
                 .cloned();
         }
+        if provider_id == grok_cli::PROVIDER_ID {
+            let base_url = grok_cli::base_url(|name| environment_value(&self.environment, name));
+            let models = self
+                .data
+                .models
+                .get(provider_id)
+                .map(|models| models.values().cloned().collect())
+                .unwrap_or_default();
+            return self
+                .grok_cli_models(models, &base_url)
+                .into_iter()
+                .find(|model| model.id == model_id);
+        }
         let model = self.data.models.get(provider_id)?.get(model_id)?;
         match layer.aperture.routes.get(provider_id) {
             Some(route) => aperture::apply_proxy_route(model, route),
             None => Some(model.clone()),
         }
+    }
+
+    /// The Grok CLI models as the environment configures them: every model
+    /// points at the configured base URL, and `PI_GROK_CLI_MODELS` filters,
+    /// reorders, or adds generic definitions for ids the catalog lacks.
+    fn grok_cli_models(&self, models: Vec<llm::Model>, base_url: &str) -> Vec<llm::Model> {
+        let models = models
+            .into_iter()
+            .map(|model| llm::Model {
+                base_url: base_url.to_owned(),
+                ..model
+            })
+            .collect();
+        grok_cli::filter_models(
+            models,
+            environment_value(&self.environment, grok_cli::MODELS_ENV).as_deref(),
+            base_url,
+        )
+    }
+
+    /// Reads the catalog's injected environment, so request-path settings
+    /// follow the same lookup tests substitute.
+    pub fn environment_value(&self, name: &str) -> Option<String> {
+        environment_value(&self.environment, name)
     }
 
     /// Returns raw protocol compatibility metadata for one model.
@@ -2438,6 +2489,19 @@ impl Catalog {
             }
             let override_credential = Credential::api_key(override_key);
             return Ok(self.build_api_key_auth(definition, Some(&override_credential), "override"));
+        }
+
+        // pi-grok-cli's environment bypass: a bearer token with no refresh
+        // that takes precedence over a stored login.
+        if provider_id == grok_cli::PROVIDER_ID
+            && let Some(token) = environment_value(&self.environment, grok_cli::TOKEN_ENV)
+        {
+            return Ok(Some(Auth::with_api_key(
+                token,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                grok_cli::TOKEN_ENV,
+            )));
         }
 
         let layer = self.dynamic();
@@ -4443,5 +4507,163 @@ mod tests {
                 .is_none()
         );
         fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    // -- Grok CLI (pi-grok-cli) --------------------------------------------------
+
+    fn grok_catalog(store: Option<Arc<CredentialStore>>, values: &[(&str, &str)]) -> Catalog {
+        Catalog::with_environment_and_file_exists(
+            store,
+            test_environment(values),
+            Arc::new(|_| false),
+        )
+        .expect("catalog")
+    }
+
+    #[test]
+    fn grok_cli_carries_upstreams_ten_models_with_their_identity_headers() {
+        let catalog = test_catalog(&[]);
+        let provider = catalog.provider("grok-cli").expect("grok-cli provider");
+        assert_eq!(provider.name, "Grok CLI");
+        assert_eq!(provider.base_url, "https://cli-chat-proxy.grok.com/v1");
+        let mut ids = provider
+            .models()
+            .iter()
+            .map(|model| model.id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "grok-4.20-0309-non-reasoning",
+                "grok-4.20-0309-reasoning",
+                "grok-4.20-multi-agent-0309",
+                "grok-4.3",
+                "grok-4.5",
+                "grok-4.6",
+                "grok-4.7",
+                "grok-4.7-build-fast",
+                "grok-build",
+                "grok-composer-2.5-fast",
+            ]
+        );
+        for model in provider.models() {
+            assert_eq!(model.api, "openai-responses", "{}", model.id);
+            assert_eq!(model.max_tokens, 30_000, "{}", model.id);
+            assert_eq!(model.input, ["text", "image"], "{}", model.id);
+            assert_eq!(
+                model.headers,
+                grok_cli::model_headers(&model.id),
+                "{}",
+                model.id
+            );
+        }
+        let composer = catalog
+            .model("grok-cli", "grok-composer-2.5-fast")
+            .expect("composer");
+        assert!(!composer.reasoning);
+        assert_eq!(composer.context_window, 200_000);
+        assert_eq!(composer.cost.rates.input, 3.0);
+        assert_eq!(composer.cost.rates.output, 15.0);
+        assert_eq!(crate::stream::supported_thinking_levels(&composer), ["off"]);
+        let fast = catalog
+            .model("grok-cli", "grok-4.7-build-fast")
+            .expect("4.7 fast");
+        assert_eq!(fast.cost.rates.input, 4.0);
+        assert_eq!(fast.cost.rates.cache_read, 1.0);
+        assert!(crate::stream::supports_thinking_level(&fast, "xhigh"));
+        // Without an explicit mapping xhigh stays unoffered.
+        let build = catalog.model("grok-cli", "grok-build").expect("build");
+        assert_eq!(build.cost.rates.cache_write, 0.2);
+        assert!(!crate::stream::supports_thinking_level(&build, "xhigh"));
+        assert_eq!(
+            catalog
+                .model("grok-cli", "grok-4.20-0309-reasoning")
+                .expect("4.20")
+                .context_window,
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn grok_cli_base_url_and_model_list_follow_the_environment() {
+        let catalog = test_catalog(&[
+            ("GROK_CLI_BASE_URL", "https://second.example/v1"),
+            ("PI_GROK_CLI_BASE_URL", "https://proxy.example/v1///"),
+            ("PI_GROK_CLI_MODELS", "grok-4.6, future-grok, grok-build"),
+        ]);
+        let provider = catalog.provider("grok-cli").expect("provider");
+        assert_eq!(provider.base_url, "https://proxy.example/v1");
+        let models = provider.models();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["grok-4.6", "future-grok", "grok-build"]
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.base_url == "https://proxy.example/v1")
+        );
+        let future = catalog
+            .model("grok-cli", "future-grok")
+            .expect("generic definition for an unknown id");
+        assert_eq!(future.name, "future-grok");
+        assert_eq!(future.headers["x-grok-model-override"], "future-grok");
+        // A filtered-out model is no longer selectable.
+        assert!(catalog.model("grok-cli", "grok-4.3").is_none());
+        // Other providers are untouched by the Grok CLI variables.
+        assert_eq!(
+            catalog
+                .model("xai", "grok-4.3")
+                .expect("xai model")
+                .base_url,
+            "https://api.x.ai/v1"
+        );
+    }
+
+    #[test]
+    fn grok_cli_environment_token_wins_over_a_stored_login_and_keys_are_ignored() {
+        let store = Arc::new(CredentialStore::in_memory());
+        store
+            .put(
+                "grok-cli",
+                Credential::oauth("stored-access", "stored-refresh", i64::MAX),
+            )
+            .expect("store login");
+        let with_token = grok_catalog(
+            Some(store.clone()),
+            &[("GROK_CLI_OAUTH_TOKEN", "env-token")],
+        );
+        let auth = with_token
+            .resolve_auth("grok-cli")
+            .expect("resolve")
+            .expect("environment token");
+        assert_eq!(auth.api_key(), Some("env-token"));
+        assert_eq!(auth.source(), "GROK_CLI_OAUTH_TOKEN");
+
+        let stored = grok_catalog(Some(store), &[]);
+        let auth = stored
+            .resolve_auth("grok-cli")
+            .expect("resolve")
+            .expect("stored login");
+        assert_eq!(auth.api_key(), Some("stored-access"));
+        assert_eq!(auth.source(), "OAuth");
+
+        // Neither an API key nor xAI's credentials configure Grok CLI.
+        let keys = Arc::new(CredentialStore::in_memory());
+        keys.put("grok-cli", Credential::api_key("sk-key"))
+            .expect("store key");
+        let keyed = grok_catalog(Some(keys), &[("XAI_API_KEY", "xai-key")]);
+        assert!(!keyed.is_configured("grok-cli").expect("configured"));
+        assert!(keyed.is_configured("xai").expect("configured"));
+        assert!(
+            keyed
+                .resolve_auth_with_key("grok-cli", "override")
+                .expect("resolve")
+                .is_none()
+        );
     }
 }

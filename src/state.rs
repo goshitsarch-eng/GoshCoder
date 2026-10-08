@@ -761,6 +761,11 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/help", "Show all commands", true),
         ("/model", "Open the model picker", false),
         ("/login", "Open the provider picker and log in", false),
+        (
+            "/grok-cli-conv",
+            "Show or rotate the Grok CLI conversation ID",
+            false,
+        ),
         ("/omni", "Manage an OmniRoute gateway", false),
         (
             "/aperture",
