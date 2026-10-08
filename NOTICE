@@ -87,7 +87,7 @@ pi-grok-cli — Grok CLI provider
   J Liew (kenryu42) — https://github.com/kenryu42/pi-grok-cli
   Copyright (c) 2026 kenryu42 — MIT License
   The adaptation (version 0.9.3) reimplements the extension's provider,
-  OAuth flow and payload sanitisation. It bundles none of the package's code or its browser dashboard
+  OAuth flow, payload sanitisation and usage command. It bundles none of the package's code or its browser dashboard
   assets, and no part of the official Grok CLI. Grok, X Premium and
   SuperGrok are products of xAI / X Corp.; GoshCoder is not affiliated
   with them.

@@ -431,6 +431,13 @@ is recorded in [`NOTICE`](NOTICE).
     `reasoning.effort` reaches only the models that accept it (`minimal`
     becomes `low`), `prompt_cache_retention` is removed and the session id is
     the `prompt_cache_key`.
+  - **Usage.** `/grok-cli-usage` reads the subscription's billing endpoints
+    (`/billing`, `/billing?format=credits`, `/settings`, relative to the base
+    URL) and prints the weekly limit, tier, share used and reset time, which
+    GoshCoder shows in UTC because it carries no time-zone database. Each
+    answer is cached in `grok-cli/quota-cache.json` under the agent directory
+    (0600, upstream's format; an entry older than 30 minutes counts as
+    stale), and a failed refresh falls back to the cached figures.
   - **Models.** Upstream's ten (Composer 2.5 Fast, Grok Build, Grok 4.3 to
     4.7, Grok 4.7 Fast and the three Grok 4.20 variants) with its context
     windows, prices and effort maps. `PI_GROK_CLI_MODELS` filters and reorders

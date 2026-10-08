@@ -21,11 +21,15 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{llm, session};
 
@@ -935,6 +939,417 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// ---------------------------------------------------------------------------
+// Usage (upstream src/provider/billing.ts, usage.ts and quotaCache.ts)
+
+const BILLING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cached quota older than this is reported as stale.
+pub const QUOTA_FRESHNESS: Duration = Duration::from_secs(30 * 60);
+/// The cache key for the single login GoshCoder keeps; upstream's first
+/// vault account has the same id, so a cache file reads the same in both.
+pub const ACCOUNT_ID: &str = "account-1";
+
+/// The directory this integration keeps its files in, like upstream's
+/// `~/.pi/grok-cli`.
+pub fn state_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join(PROVIDER_ID)
+}
+
+pub fn quota_cache_path(agent_dir: &Path) -> PathBuf {
+    state_dir(agent_dir).join("quota-cache.json")
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthlyUsage {
+    pub monthly_limit: f64,
+    pub used: f64,
+    pub billing_period_end: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyUsage {
+    pub credit_usage_percent: f64,
+    pub billing_period_end: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    pub monthly: MonthlyUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly: Option<WeeklyUsage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedQuota {
+    pub updated_at: String,
+    #[serde(flatten)]
+    pub usage: BillingUsage,
+}
+
+fn parse_date(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
+fn finite_number(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+}
+
+fn date_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| parse_date(text).is_some())
+        .map(str::to_owned)
+}
+
+/// `GET /billing`: the monthly figures are required.
+fn parse_monthly_usage(payload: &Value) -> Option<MonthlyUsage> {
+    let config = payload.get("config")?.as_object()?;
+    Some(MonthlyUsage {
+        monthly_limit: finite_number(
+            config
+                .get("monthlyLimit")
+                .and_then(|limit| limit.get("val")),
+        )?,
+        used: finite_number(config.get("used").and_then(|used| used.get("val")))?,
+        billing_period_end: date_string(config.get("billingPeriodEnd"))?,
+    })
+}
+
+/// `GET /billing?format=credits`: present only for weekly plans.
+fn parse_weekly_usage(payload: &Value) -> Option<WeeklyUsage> {
+    let config = payload.get("config")?.as_object()?;
+    if config
+        .get("currentPeriod")
+        .and_then(|period| period.get("type"))
+        .and_then(Value::as_str)
+        != Some("USAGE_PERIOD_TYPE_WEEKLY")
+    {
+        return None;
+    }
+    Some(WeeklyUsage {
+        billing_period_end: date_string(config.get("billingPeriodEnd"))?,
+        credit_usage_percent: finite_number(config.get("creditUsagePercent"))
+            .map_or(0.0, |percent| percent.clamp(0.0, 100.0)),
+    })
+}
+
+fn billing_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+) -> Result<(u16, Value), String> {
+    let response = client
+        .get(url)
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-xai-token-auth", "xai-grok-cli")
+        .header("accept", "application/json")
+        .send()
+        .map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Ok((status, Value::Null));
+    }
+    let body = response
+        .json::<Value>()
+        .map_err(|error| error.to_string())?;
+    Ok((status, body))
+}
+
+/// Reads the subscription's usage. The weekly figures and the tier name
+/// are best effort, as upstream treats them.
+pub fn fetch_billing_usage(base_url: &str, token: &str) -> Result<BillingUsage, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(BILLING_TIMEOUT)
+        .user_agent(crate::oauth::OAUTH_USER_AGENT)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let base_url = base_url.trim_end_matches('/');
+    let (status, payload) = billing_get(&client, &format!("{base_url}/billing"), token)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("billing endpoint returned {status}"));
+    }
+    let monthly = parse_monthly_usage(&payload).ok_or("invalid billing payload")?;
+    let weekly = billing_get(
+        &client,
+        &format!("{base_url}/billing?format=credits"),
+        token,
+    )
+    .ok()
+    .and_then(|(_, payload)| parse_weekly_usage(&payload));
+    let tier = billing_get(&client, &format!("{base_url}/settings"), token)
+        .ok()
+        .and_then(|(_, payload)| {
+            payload
+                .get("subscription_tier_display")
+                .and_then(Value::as_str)
+                .filter(|tier| !tier.is_empty())
+                .map(str::to_owned)
+        });
+    Ok(BillingUsage {
+        tier,
+        monthly,
+        weekly,
+    })
+}
+
+/// Upstream formats the reset in the viewer's time zone. GoshCoder has no
+/// time-zone database, so it is shown in UTC and says so.
+fn format_reset(iso: &str) -> String {
+    let Some(date) = parse_date(iso) else {
+        return iso.to_owned();
+    };
+    let date = date.to_offset(time::UtcOffset::UTC);
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][usize::from(u8::from(date.month())) - 1];
+    format!(
+        "{month} {}, {:02}:{:02} UTC",
+        date.day(),
+        date.hour(),
+        date.minute()
+    )
+}
+
+/// JavaScript's `Math.round`, which rounds halves up.
+fn js_round(value: f64) -> f64 {
+    (value + 0.5).floor()
+}
+
+fn detail(label: &str, value: &str) -> String {
+    format!("   {label:<11}{value}")
+}
+
+/// upstream `formatQuota`.
+pub fn format_quota(usage: Option<&BillingUsage>) -> Vec<String> {
+    let Some(usage) = usage else {
+        return vec![
+            "  Usage:".to_owned(),
+            "    no billing data available — run /login grok-cli or set GROK_CLI_OAUTH_TOKEN"
+                .to_owned(),
+        ];
+    };
+    let tier = usage
+        .tier
+        .as_deref()
+        .map(|tier| format!(" ({tier})"))
+        .unwrap_or_default();
+    let Some(weekly) = usage.weekly.as_ref() else {
+        return vec![
+            format!("Weekly Limit{tier}"),
+            "    weekly usage unavailable".to_owned(),
+        ];
+    };
+    vec![
+        format!("Weekly Limit{tier}"),
+        detail(
+            "Used",
+            &format!("{}%", js_round(weekly.credit_usage_percent)),
+        ),
+        detail("Reset", &format_reset(&weekly.billing_period_end)),
+    ]
+}
+
+fn valid_cached_quota(value: &Value) -> Option<CachedQuota> {
+    let entry = serde_json::from_value::<CachedQuota>(value.clone()).ok()?;
+    let valid = parse_date(&entry.updated_at).is_some()
+        && entry.usage.monthly.monthly_limit.is_finite()
+        && entry.usage.monthly.used.is_finite()
+        && parse_date(&entry.usage.monthly.billing_period_end).is_some()
+        && entry.usage.weekly.as_ref().is_none_or(|weekly| {
+            weekly.credit_usage_percent.is_finite()
+                && parse_date(&weekly.billing_period_end).is_some()
+        });
+    valid.then(|| CachedQuota {
+        usage: BillingUsage {
+            tier: entry.usage.tier.clone().filter(|tier| !tier.is_empty()),
+            ..entry.usage
+        },
+        ..entry
+    })
+}
+
+/// upstream `loadQuotaCache`: anything unreadable is an empty cache, and an
+/// invalid entry is dropped without losing the others.
+pub fn load_quota_cache(path: &Path) -> BTreeMap<String, CachedQuota> {
+    let Ok(raw) = fs::read(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(document) = serde_json::from_slice::<Value>(&raw) else {
+        return BTreeMap::new();
+    };
+    if document.get("version").and_then(Value::as_u64) != Some(1) {
+        return BTreeMap::new();
+    }
+    document
+        .get("accounts")
+        .and_then(Value::as_object)
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter_map(|(id, entry)| Some((id.clone(), valid_cached_quota(entry)?)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Stores one account's usage (0600 file in a 0700 directory, written
+/// atomically). Concurrent writers last-write-win per file rather than
+/// taking upstream's lock: the cache is advisory and rebuilt on demand.
+pub fn save_quota_usage(
+    path: &Path,
+    account_id: &str,
+    usage: &BillingUsage,
+    updated_at: OffsetDateTime,
+) -> Result<(), String> {
+    let mut accounts = load_quota_cache(path);
+    accounts.insert(
+        account_id.to_owned(),
+        CachedQuota {
+            updated_at: updated_at
+                .format(&Rfc3339)
+                .map_err(|error| error.to_string())?,
+            usage: usage.clone(),
+        },
+    );
+    let document = json!({ "version": 1, "accounts": accounts });
+    let mut contents = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    contents.push(b'\n');
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent).map_err(|error| error.to_string())?;
+    }
+    crate::config::write_atomic(path, &contents, 0o600).map_err(|error| error.to_string())
+}
+
+fn create_private_dir(directory: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)
+}
+
+pub fn is_cached_quota_fresh(entry: &CachedQuota, now: OffsetDateTime) -> bool {
+    parse_date(&entry.updated_at).is_some_and(|updated| {
+        let age = (now - updated).whole_seconds().max(0);
+        age < QUOTA_FRESHNESS.as_secs() as i64
+    })
+}
+
+fn format_age(updated_at: &str, now: OffsetDateTime) -> String {
+    let age = parse_date(updated_at)
+        .map(|updated| (now - updated).max(time::Duration::ZERO).whole_seconds())
+        .unwrap_or_default();
+    match age {
+        age if age < 60 => "just now".to_owned(),
+        age if age < 3_600 => format!("{}m ago", age / 60),
+        age if age < 86_400 => format!("{}h ago", age / 3_600),
+        age => format!("{}d ago", age / 86_400),
+    }
+}
+
+/// upstream `formatCachedQuota`, the one-line summary of a cached entry.
+pub fn format_cached_quota(entry: &CachedQuota, now: OffsetDateTime) -> String {
+    let mut parts = vec![format!(
+        "Monthly {} / {} used",
+        format_count(entry.usage.monthly.used),
+        format_count(entry.usage.monthly.monthly_limit)
+    )];
+    parts.push(match entry.usage.weekly.as_ref() {
+        Some(weekly) => format!("Weekly {}% used", js_round(weekly.credit_usage_percent)),
+        None => "Weekly unavailable".to_owned(),
+    });
+    if !is_cached_quota_fresh(entry, now) {
+        parts.push("stale".to_owned());
+    }
+    parts.push(format_age(&entry.updated_at, now));
+    parts.join(" · ")
+}
+
+/// `toLocaleString()` for the en-US locale: thousands separators and up to
+/// three fraction digits.
+fn format_count(value: f64) -> String {
+    let rounded = (value * 1_000.0).round() / 1_000.0;
+    let negative = rounded < 0.0;
+    let whole = rounded.abs().trunc() as u64;
+    let fraction = format!("{:.3}", rounded.abs().fract());
+    let digits = whole.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    let fraction = fraction
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .trim_end_matches('.');
+    format!("{}{grouped}{fraction}", if negative { "-" } else { "" })
+}
+
+/// `/grok-cli-usage`: the provider's status, quota and token health, as
+/// upstream's command reports them, one notice per line group.
+pub fn usage_report(catalog: &crate::catalog::Catalog, agent_dir: &Path) -> Vec<String> {
+    let mut notices = Vec::new();
+    if catalog.environment_value(TOKEN_ENV).is_some() {
+        notices.push(
+            "Grok CLI: using GROK_CLI_OAUTH_TOKEN env bypass — no auto-refresh available"
+                .to_owned(),
+        );
+    }
+    let token = match catalog.resolve_auth(PROVIDER_ID) {
+        Ok(Some(auth)) => auth.api_key().map(str::to_owned),
+        Ok(None) => None,
+        Err(error) => {
+            let mut lines = format_quota(None);
+            lines.push(format!("    Reason     {error}"));
+            notices.push(lines.join("\n"));
+            return notices;
+        }
+    };
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        let mut lines = format_quota(None);
+        lines.push("    Reason     Grok CLI login is required. Run /login grok-cli.".to_owned());
+        notices.push(lines.join("\n"));
+        return notices;
+    };
+    let base_url = base_url(|name| catalog.environment_value(name));
+    let cache = quota_cache_path(agent_dir);
+    match fetch_billing_usage(&base_url, &token) {
+        Ok(usage) => {
+            if let Err(error) =
+                save_quota_usage(&cache, ACCOUNT_ID, &usage, OffsetDateTime::now_utc())
+            {
+                notices.push(format!("Grok CLI quota cache update failed: {error}"));
+            }
+            notices.push(format_quota(Some(&usage)).join("\n"));
+        }
+        Err(error) => {
+            notices.push(format!("Grok CLI billing refresh failed: {error}"));
+            notices.push(match load_quota_cache(&cache).get(ACCOUNT_ID) {
+                Some(cached) => format!(
+                    "Grok CLI cached usage from {}:\n{}",
+                    cached.updated_at,
+                    format_quota(Some(&cached.usage)).join("\n")
+                ),
+                None => format_quota(None).join("\n"),
+            });
+        }
+    }
+    notices
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1469,5 +1884,287 @@ mod tests {
         assert_eq!(generic.headers["x-grok-model-override"], "brand-new");
         assert_eq!(filter_models(models.clone(), Some(" , "), "x").len(), 2);
         assert_eq!(filter_models(models, None, "x").len(), 2);
+    }
+
+    // -- usage --------------------------------------------------------------
+
+    struct Seen {
+        target: String,
+        headers: BTreeMap<String, String>,
+    }
+
+    /// Answers successive requests with `responses`, reporting what each
+    /// carried.
+    fn json_server(
+        responses: Vec<(u16, String)>,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<Seen>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("address"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buffer[..read]);
+                }
+                let head = String::from_utf8_lossy(&raw).into_owned();
+                let mut lines = head.lines();
+                let target = lines
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or_default()
+                    .to_owned();
+                let headers = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                    .collect();
+                let _ = sender.send(Seen { target, headers });
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (base, receiver, handle)
+    }
+
+    fn temp_agent_dir(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-grok-cli-{label}-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("agent dir");
+        directory
+    }
+
+    fn usage_catalog(base: &str) -> Catalog {
+        let environment = BTreeMap::from([
+            (TOKEN_ENV.to_owned(), "usage-token".to_owned()),
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base}/v1")),
+        ]);
+        Catalog::with_environment(None, Arc::new(move |name| environment.get(name).cloned()))
+            .expect("catalog")
+    }
+
+    const MONTHLY: &str = r#"{"config":{"monthlyLimit":{"val":0},"used":{"val":0},"billingPeriodEnd":"2026-09-01T00:00:00.000Z"}}"#;
+    const WEEKLY: &str = r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"},"creditUsagePercent":41.5,"billingPeriodEnd":"2026-08-18T00:19:56.260346+00:00"}}"#;
+
+    #[test]
+    fn usage_reads_three_billing_endpoints_and_caches_the_result_privately() {
+        let (base, seen, server) = json_server(vec![
+            (200, MONTHLY.to_owned()),
+            (200, WEEKLY.to_owned()),
+            (
+                200,
+                r#"{"subscription_tier_display":"X Premium"}"#.to_owned(),
+            ),
+        ]);
+        let agent_dir = temp_agent_dir("usage");
+        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        server.join().expect("server");
+        assert_eq!(
+            report,
+            [
+                "Grok CLI: using GROK_CLI_OAUTH_TOKEN env bypass — no auto-refresh available",
+                "Weekly Limit (X Premium)\n   Used       42%\n   Reset      Aug 18, 00:19 UTC",
+            ]
+        );
+        let seen = seen.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            seen.iter()
+                .map(|seen| seen.target.as_str())
+                .collect::<Vec<_>>(),
+            ["/v1/billing", "/v1/billing?format=credits", "/v1/settings"]
+        );
+        for request in &seen {
+            assert_eq!(request.headers["authorization"], "Bearer usage-token");
+            assert_eq!(request.headers["x-xai-token-auth"], "xai-grok-cli");
+            assert_eq!(request.headers["accept"], "application/json");
+        }
+
+        let path = quota_cache_path(&agent_dir);
+        assert_eq!(path, agent_dir.join("grok-cli").join("quota-cache.json"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().expect("parent")), 0o700);
+        }
+        let document: Value =
+            serde_json::from_slice(&fs::read(&path).expect("cache")).expect("json");
+        assert_eq!(document["version"], 1);
+        let entry = &document["accounts"][ACCOUNT_ID];
+        assert_eq!(entry["tier"], "X Premium");
+        assert_eq!(
+            entry["monthly"]["billingPeriodEnd"],
+            "2026-09-01T00:00:00.000Z"
+        );
+        assert_eq!(entry["weekly"]["creditUsagePercent"], 41.5);
+        assert!(
+            entry["updatedAt"]
+                .as_str()
+                .is_some_and(|stamp| parse_date(stamp).is_some())
+        );
+
+        // A failed refresh reports itself and falls back to the cache.
+        let (base, _seen, server) = json_server(vec![(500, "{}".to_owned())]);
+        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        server.join().expect("server");
+        assert_eq!(
+            report[1],
+            "Grok CLI billing refresh failed: billing endpoint returned 500"
+        );
+        assert!(
+            report[2].starts_with("Grok CLI cached usage from "),
+            "{report:?}"
+        );
+        assert!(
+            report[2].ends_with(
+                "\nWeekly Limit (X Premium)\n   Used       42%\n   Reset      Aug 18, 00:19 UTC"
+            ),
+            "{report:?}"
+        );
+        let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    #[test]
+    fn usage_without_weekly_figures_or_a_login_says_so() {
+        let (base, _seen, server) = json_server(vec![
+            (200, MONTHLY.to_owned()),
+            (200, r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_MONTHLY"},"billingPeriodEnd":"2026-09-01T00:00:00Z"}}"#.to_owned()),
+            (404, "{}".to_owned()),
+        ]);
+        let agent_dir = temp_agent_dir("usage-monthly");
+        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        server.join().expect("server");
+        assert_eq!(report[1], "Weekly Limit\n    weekly usage unavailable");
+
+        let (base, _seen, server) = json_server(vec![(200, r#"{"config":{}}"#.to_owned())]);
+        let report = usage_report(&usage_catalog(&base), &agent_dir);
+        server.join().expect("server");
+        assert_eq!(
+            report[1],
+            "Grok CLI billing refresh failed: invalid billing payload"
+        );
+
+        let logged_out = Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
+        let report = usage_report(&logged_out, &agent_dir);
+        assert_eq!(
+            report,
+            [
+                "  Usage:\n    no billing data available — run /login grok-cli or set GROK_CLI_OAUTH_TOKEN\n    Reason     Grok CLI login is required. Run /login grok-cli."
+            ]
+        );
+        let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    #[test]
+    fn weekly_percent_is_clamped_and_quota_formatting_matches_upstream() {
+        let weekly = parse_weekly_usage(&json!({"config": {
+            "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+            "creditUsagePercent": 140,
+            "billingPeriodEnd": "2026-08-18T00:19:56Z"
+        }}))
+        .expect("weekly");
+        assert_eq!(weekly.credit_usage_percent, 100.0);
+        let missing = parse_weekly_usage(&json!({"config": {
+            "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+            "billingPeriodEnd": "2026-08-18T00:19:56Z"
+        }}))
+        .expect("weekly without a percent");
+        assert_eq!(missing.credit_usage_percent, 0.0);
+        assert!(
+            parse_weekly_usage(&json!({"config": {
+                "currentPeriod": {"type": "USAGE_PERIOD_TYPE_WEEKLY"},
+                "billingPeriodEnd": "not a date"
+            }}))
+            .is_none()
+        );
+        assert!(parse_monthly_usage(&json!({"config": {"monthlyLimit": {"val": 1}, "used": {"val": "1"}, "billingPeriodEnd": "2026-08-18T00:19:56Z"}})).is_none());
+        assert_eq!(
+            format_quota(None),
+            [
+                "  Usage:",
+                "    no billing data available — run /login grok-cli or set GROK_CLI_OAUTH_TOKEN"
+            ]
+        );
+        assert_eq!(js_round(0.5), 1.0);
+        assert_eq!(js_round(2.49), 2.0);
+    }
+
+    #[test]
+    fn the_quota_cache_drops_invalid_entries_and_reports_staleness() {
+        let agent_dir = temp_agent_dir("quota-cache");
+        let path = quota_cache_path(&agent_dir);
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &path,
+            json!({"version": 1, "accounts": {
+                "account-1": {"updatedAt": "2026-08-10T00:00:00Z", "monthly": {"monthlyLimit": 1500, "used": 1234.5, "billingPeriodEnd": "2026-09-01T00:00:00Z"}, "weekly": {"creditUsagePercent": 12.4, "billingPeriodEnd": "2026-08-18T00:00:00Z"}},
+                "broken": {"updatedAt": "yesterday", "monthly": {"monthlyLimit": 1, "used": 1, "billingPeriodEnd": "2026-09-01T00:00:00Z"}}
+            }})
+            .to_string(),
+        )
+        .expect("write cache");
+        let cache = load_quota_cache(&path);
+        assert_eq!(cache.keys().collect::<Vec<_>>(), ["account-1"]);
+        let entry = &cache["account-1"];
+        let updated = parse_date("2026-08-10T00:00:00Z").expect("date");
+        assert!(is_cached_quota_fresh(
+            entry,
+            updated + time::Duration::minutes(29)
+        ));
+        assert!(!is_cached_quota_fresh(
+            entry,
+            updated + time::Duration::minutes(30)
+        ));
+        assert_eq!(
+            format_cached_quota(entry, updated + time::Duration::minutes(5)),
+            "Monthly 1,234.5 / 1,500 used · Weekly 12% used · 5m ago"
+        );
+        assert_eq!(
+            format_cached_quota(entry, updated + time::Duration::hours(3)),
+            "Monthly 1,234.5 / 1,500 used · Weekly 12% used · stale · 3h ago"
+        );
+
+        // Saving keeps the other accounts and rejects nothing valid.
+        let usage = BillingUsage {
+            tier: None,
+            monthly: MonthlyUsage {
+                monthly_limit: 10.0,
+                used: 1.0,
+                billing_period_end: "2026-09-01T00:00:00Z".to_owned(),
+            },
+            weekly: None,
+        };
+        save_quota_usage(&path, "account-2", &usage, updated).expect("save");
+        let cache = load_quota_cache(&path);
+        assert_eq!(cache.keys().collect::<Vec<_>>(), ["account-1", "account-2"]);
+        assert_eq!(cache["account-2"].usage, usage);
+
+        for unreadable in [
+            "",
+            "[]",
+            r#"{"version":2,"accounts":{}}"#,
+            r#"{"version":1,"accounts":[]}"#,
+        ] {
+            fs::write(&path, unreadable).expect("write");
+            assert!(load_quota_cache(&path).is_empty(), "{unreadable}");
+        }
+        let _ = fs::remove_dir_all(agent_dir);
     }
 }

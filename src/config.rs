@@ -213,6 +213,12 @@ fn read_default_model_from(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Replaces `path` atomically with a file of the given mode, creating the
+/// parent directory when it is missing.
+pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write(path, contents, mode)
+}
+
 fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
