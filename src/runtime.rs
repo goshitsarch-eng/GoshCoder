@@ -16,8 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
-    ralph_runtime,
+    computeruse, config, grok_accounts, grok_cli, grok_imagine, llm, meta_muse, oauth, omni_cli,
+    omniroute, planner_runtime, plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -67,6 +67,9 @@ pub struct SessionConfig {
     /// provider is authenticated yet, so the user can log in and pick a model
     /// from inside the interface instead of being refused at startup.
     pub allow_unselected_model: bool,
+    /// Prints session notices to stderr as they happen. `run` has no screen
+    /// to queue them on, and a retry's backoff otherwise passes in silence.
+    pub live_notices: bool,
 }
 
 impl Default for SessionConfig {
@@ -74,7 +77,8 @@ impl Default for SessionConfig {
         Self {
             model_ref: String::new(),
             system_prompt: String::new(),
-            thinking: llm::THINKING_OFF.to_owned(),
+            // pi's `DEFAULT_THINKING_LEVEL`; each model clamps it to what it supports.
+            thinking: llm::THINKING_MEDIUM.to_owned(),
             workdir: PathBuf::from("."),
             enable_tools: false,
             enable_ralph: false,
@@ -92,6 +96,7 @@ impl Default for SessionConfig {
             sessions_dir: None,
             model_from_flag: false,
             allow_unselected_model: false,
+            live_notices: false,
         }
     }
 }
@@ -127,9 +132,83 @@ pub struct PreparedSession {
     /// The lazily spawned computer-use-linux server behind the `mcp` tool.
     /// Closed with the session so the desktop server never outlives it.
     desktop: Option<computeruse::McpSession>,
+    /// Keeps the Grok CLI conversation id answering from this session's log
+    /// for as long as the session lives.
+    grok_conv: Option<grok_cli::SessionRegistration>,
+    /// Moves the session to the next Grok CLI account when one runs dry.
+    _grok_rotation: Option<agent::Subscription>,
+    /// The absolute working directory, which Grok Imagine resolves paths in.
+    cwd: PathBuf,
 }
 
 impl PreparedSession {
+    /// What Grok Imagine needs from this session: credentials, the session
+    /// file its images are saved beside, and the workspace that confines
+    /// the tool's source images.
+    pub fn imagine_context(&self) -> Arc<grok_imagine::Context> {
+        Arc::new(grok_imagine::Context {
+            catalog: self.catalog.clone(),
+            request_session: self.request_session_id().to_owned(),
+            recorder: self.runtime.custom_recorder(),
+            cwd: self.cwd.clone(),
+            workspace: self.workspace.clone(),
+            fallback_dir: grok_imagine::fallback_image_dir(),
+        })
+    }
+
+    pub fn imagine_config_path(&self) -> PathBuf {
+        grok_imagine::config_path(
+            &self
+                .catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir),
+        )
+    }
+
+    /// Whether `image_gen` is in the live tool set.
+    pub fn image_tool_active(&self) -> bool {
+        self.runtime
+            .agent()
+            .state()
+            .tools
+            .iter()
+            .any(|tool| tool.name == grok_imagine::TOOL_NAME)
+    }
+
+    /// Offers `image_gen` exactly when coding tools are on, the persisted
+    /// switch is on, and a Grok CLI credential exists; upstream re-applies
+    /// its switch on session start and model selection, GoshCoder at start,
+    /// after a login and after `/grok-cli-imagine:tool`.
+    pub fn sync_image_tool(&self) -> bool {
+        let wanted = self.config.enable_tools
+            && grok_imagine::load_config(&self.imagine_config_path()).enabled
+            && grok_cli::credential_present(&self.catalog);
+        let active = self.image_tool_active();
+        if wanted && !active {
+            self.register_tools(vec![grok_imagine::tool(self.imagine_context())]);
+        } else if !wanted && active {
+            match self.planner.as_ref() {
+                Some(planner) => planner.remove_normal_tools(&[grok_imagine::TOOL_NAME]),
+                None => {
+                    let mut tools = self.runtime.agent().state().tools;
+                    tools.retain(|tool| tool.name != grok_imagine::TOOL_NAME);
+                    self.runtime.agent().set_tools(tools);
+                }
+            }
+        }
+        self.image_tool_active()
+    }
+
+    /// The session id this session's provider requests carry, which keys the
+    /// Grok CLI conversation id. Empty without a session log.
+    pub fn request_session_id(&self) -> &str {
+        self.grok_conv
+            .as_ref()
+            .map_or("", grok_cli::SessionRegistration::key)
+    }
+
     /// Returns a consistent snapshot of the resources currently available to
     /// this session. Resource changes are serialized so a slash command can
     /// save a prompt while the terminal event loop continues to inspect it.
@@ -462,8 +541,10 @@ pub const CURATED_MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-5.6-terra"),
     ("azure-openai-responses", "gpt-5.6-terra"),
     ("deepseek", "deepseek-v4-pro"),
+    ("grok-cli", "grok-composer-2.5-fast"),
     ("xai", "grok-build-0.1"),
     ("meta", "muse-spark-1.2"),
+    ("meta-muse", "muse-spark-1.3"),
     ("google", "gemini-3.6-flash"),
     ("google-vertex", "gemini-3.6-flash"),
     ("zai", "glm-5.2"),
@@ -598,7 +679,11 @@ pub fn session_options(
         steering_mode: agent::QueueMode::OneAtATime,
         follow_up_mode: agent::QueueMode::OneAtATime,
         tool_execution: agent::ToolExecutionMode::Parallel,
-        on_notice: None,
+        on_notice: config.live_notices.then(|| {
+            Arc::new(|notice: crate::session::SessionNotice| {
+                eprintln!("{}: {}", notice.kind, notice.text);
+            }) as crate::session::SessionNoticeCallback
+        }),
     })
 }
 
@@ -705,6 +790,20 @@ pub fn prepare_session(
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
+    // Requests carry the id the agent was created with; the store follows
+    // whichever session file is open behind the recorder.
+    let grok_conv = runtime
+        .id()
+        .filter(|id| !id.is_empty())
+        .map(|id| grok_cli::register_session_store(&id, Arc::new(runtime.custom_recorder())));
+    let grok_rotation = grok_conv.as_ref().map(|registration| {
+        grok_accounts::rotation_subscription(
+            runtime.agent(),
+            grok_accounts::Accounts::new(catalog),
+            registration.key().to_owned(),
+            runtime.notice_sender(),
+        )
+    });
     let prepared = PreparedSession {
         btw,
         ralph,
@@ -717,9 +816,14 @@ pub fn prepare_session(
         config,
         catalog: catalog.clone(),
         desktop,
+        grok_conv,
+        _grok_rotation: grok_rotation,
+        cwd: cwd.clone(),
     };
     prepared.aperture_session_start();
     prepared.omni_session_start();
+    prepared.meta_muse_session_start();
+    prepared.sync_image_tool();
     Ok(prepared)
 }
 
@@ -806,6 +910,32 @@ impl PreparedSession {
                             configuration.server_url
                         ),
                     );
+                }
+            })
+            .ok();
+    }
+
+    /// Revalidates the Meta Muse Code model list in the background, as the
+    /// extension's `fetchModels` does whenever pi refreshes its catalog. The
+    /// cached or bundled list serves the picker meanwhile, and a failure
+    /// (offline, an expired subscription) leaves it in place silently: the
+    /// request path reports a credential problem when it matters.
+    fn meta_muse_session_start(&self) {
+        let catalog = self.catalog.clone();
+        let stored_login = catalog
+            .credentials()
+            .and_then(|store| store.read_raw(meta_muse::PROVIDER_ID).ok().flatten())
+            .is_some();
+        if !stored_login || catalog.dynamic_paths().meta_muse_models.is_none() {
+            return;
+        }
+        thread::Builder::new()
+            .name("meta-muse-models".to_owned())
+            .spawn(move || {
+                let cancellation =
+                    oauth::CancellationToken::with_timeout(meta_muse::REQUEST_TIMEOUT);
+                if let Ok(transport) = meta_muse::models_transport() {
+                    let _ = meta_muse::refresh_model_cache(&catalog, &transport, &cancellation);
                 }
             })
             .ok();
@@ -968,14 +1098,10 @@ fn desktop_mcp_tool(
     }
     let agent_dir = catalog.dynamic_paths().agent_dir.clone()?;
     let Some(binary) = computeruse::find_binary() else {
-        // The extension warns on session_start when the binary is missing.
-        notices.push((
-            computeruse::PACKAGE_NAME,
-            format!(
-                "computer-use-linux binary not found. {}",
-                computeruse::INSTALL_HINT
-            ),
-        ));
+        // The extension warns on every session_start when the binary is
+        // missing. Desktop control is an optional add-on most people never
+        // install, and the warning landed on the first screen a new user
+        // sees, so its absence stays quiet; the README covers installing it.
         return None;
     };
     // Keep the pi-mcp-adapter-compatible mcp.json entry registered, exactly
@@ -1524,14 +1650,16 @@ mod tests {
             }
         }
         // Cloudflare needs an account (and gateway) id, which `auth set`
-        // prompts for; Aperture is configured by its gateway; Codex is OAuth
-        // only.
+        // prompts for; Aperture is configured by its gateway; Codex, Grok CLI
+        // and Meta Muse Code are subscription logins only.
         assert_eq!(
             unconfigured,
             [
                 "aperture",
                 "cloudflare-ai-gateway",
                 "cloudflare-workers-ai",
+                "grok-cli",
+                "meta-muse",
                 "openai-codex"
             ]
         );
@@ -1839,5 +1967,75 @@ mod tests {
         reopened.runtime.close().expect("close session");
         drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove workspace");
+    }
+
+    #[test]
+    fn image_gen_is_offered_only_with_a_grok_cli_credential_and_the_switch_on() {
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-image-gen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let agent_dir = directory.join("agent");
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let catalog_with = |token: bool| {
+            Catalog::with_environment(
+                None,
+                Arc::new(move |name| match name {
+                    "OPENAI_API_KEY" => Some("test-key".to_owned()),
+                    grok_cli::TOKEN_ENV if token => Some("grok-token".to_owned()),
+                    _ => None,
+                }),
+            )
+            .expect("catalog")
+            .with_dynamic_paths(crate::catalog::DynamicPaths::for_agent_dir(&agent_dir))
+        };
+        let prepare = |catalog: &Catalog, tools: bool, planner: bool| {
+            let model_id = catalog
+                .provider("openai")
+                .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+                .expect("OpenAI model");
+            prepare_session(
+                catalog,
+                SessionConfig {
+                    model_ref: format!("openai/{model_id}"),
+                    workdir: workspace.clone(),
+                    enable_tools: tools,
+                    enable_planner: planner,
+                    no_session: true,
+                    ..SessionConfig::default()
+                },
+                None,
+                Vec::new(),
+            )
+            .expect("prepare session")
+        };
+
+        for planner in [false, true] {
+            let catalog = catalog_with(true);
+            let mut prepared = prepare(&catalog, true, planner);
+            assert!(prepared.image_tool_active(), "planner {planner}");
+            // Switching it off takes it away, through the planner's own set
+            // when one is attached, and switching back restores it.
+            grok_imagine::save_config(&prepared.imagine_config_path(), false).expect("save");
+            assert!(!prepared.sync_image_tool(), "planner {planner}");
+            assert!(!prepared.image_tool_active());
+            grok_imagine::save_config(&prepared.imagine_config_path(), true).expect("save");
+            assert!(prepared.sync_image_tool());
+            prepared.runtime.close().expect("close");
+        }
+
+        // No credential, or no coding tools: never offered.
+        let mut logged_out = prepare(&catalog_with(false), true, false);
+        assert!(!logged_out.image_tool_active());
+        logged_out.runtime.close().expect("close");
+        let mut read_only = prepare(&catalog_with(true), false, false);
+        assert!(!read_only.image_tool_active());
+        read_only.runtime.close().expect("close");
+        std::fs::remove_dir_all(directory).expect("remove");
     }
 }

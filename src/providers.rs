@@ -47,8 +47,8 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::{
-    agent, aperture, bedrock, catalog, google_auth, llm, mistral, oauth, omni_prompt_tools,
-    omniroute, stream,
+    agent, aperture, bedrock, catalog, google_auth, grok_cli, llm, mistral, oauth,
+    omni_prompt_tools, omniroute, stream,
 };
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
@@ -301,6 +301,9 @@ pub struct ProviderCredentials {
     api_key: Option<String>,
     headers: BTreeMap<String, Option<String>>,
     environment: BTreeMap<String, String>,
+    /// Grok CLI request settings from the catalog's environment; `None`
+    /// falls back to the process environment.
+    grok_cli: Option<grok_cli::RequestSettings>,
 }
 
 impl ProviderCredentials {
@@ -309,6 +312,7 @@ impl ProviderCredentials {
             api_key: Some(api_key.into()),
             headers: BTreeMap::new(),
             environment: BTreeMap::new(),
+            grok_cli: None,
         }
     }
 
@@ -342,7 +346,14 @@ impl ProviderCredentials {
             api_key: resolved.auth().api_key().map(str::to_owned),
             headers: resolved.effective_headers().clone(),
             environment: resolved.auth().environment().clone(),
+            grok_cli: None,
         }
+    }
+
+    /// Supplies the Grok CLI request settings (the version-pointer URL).
+    pub fn with_grok_cli_settings(mut self, settings: grok_cli::RequestSettings) -> Self {
+        self.grok_cli = Some(settings);
+        self
     }
 }
 
@@ -379,7 +390,10 @@ pub struct ProviderConfig {
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            max_retries: 2,
+            // pi's provider layer does not retry (`options.maxRetries ?? 0`);
+            // the turn policy one level up does. Retrying here as well turned
+            // one 429 into twelve requests.
+            max_retries: 0,
             retry_delay_limit: stream::RetryDelayLimit::Default,
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
@@ -781,6 +795,16 @@ impl ProviderResponderFactory {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
         }?;
+        let mut payload = payload;
+        if model.provider == grok_cli::PROVIDER_ID && protocol == ProviderProtocol::OpenAiResponses
+        {
+            grok_cli::prepare_payload(
+                &mut payload,
+                model,
+                &options.thinking_level,
+                &options.session_id,
+            );
+        }
         let anthropic_beta = (protocol == ProviderProtocol::AnthropicMessages)
             .then(|| anthropic_beta_features(model, context, &anthropic_shape).join(","))
             .filter(|features| !features.is_empty());
@@ -878,6 +902,20 @@ impl ProviderResponderFactory {
             anthropic_beta,
         )?;
         let body = serde_json::to_vec(payload)?;
+        // pi-grok-cli's proxyRetry.ts owns this provider's retry budget: the
+        // generic one would resend a conversation id the proxy just rejected.
+        let mut grok_attempt = (model.provider == grok_cli::PROVIDER_ID).then(|| {
+            let settings = credentials
+                .grok_cli
+                .clone()
+                .unwrap_or_else(grok_cli::RequestSettings::from_process_environment);
+            grok_cli::RequestAttempt::begin(&settings, &options.session_id)
+        });
+        let max_retries = if grok_attempt.is_some() {
+            0
+        } else {
+            self.config.max_retries
+        };
 
         let mut retry_index = 0;
         loop {
@@ -887,9 +925,17 @@ impl ProviderResponderFactory {
             let header_deadline = (protocol == ProviderProtocol::MistralConversations)
                 .then_some(self.config.mistral_response_header_timeout)
                 .flatten();
+            let mut attempt_headers = headers.clone();
+            if let Some(attempt) = grok_attempt.as_ref() {
+                for (name, value) in attempt.headers() {
+                    let value = HeaderValue::from_str(&value)
+                        .map_err(|_| ProviderAdapterError::InvalidHeaderValue(name.to_owned()))?;
+                    attempt_headers.insert(HeaderName::from_static(name), value);
+                }
+            }
             let sent = self.send_request(
                 endpoint.clone(),
-                headers.clone(),
+                attempt_headers,
                 body.clone(),
                 &options.cancellation,
                 header_deadline,
@@ -897,11 +943,19 @@ impl ProviderResponderFactory {
             match sent {
                 Ok(response) if response.status().is_success() => return Ok(response),
                 Ok(response) => {
-                    let error =
-                        provider_error_from_response(response, self.config.max_error_body_bytes);
-                    if !stream::is_retryable_provider_error(&error)
-                        || retry_index >= self.config.max_retries
+                    let error = provider_error_from_response(
+                        response,
+                        self.config.max_error_body_bytes,
+                        protocol,
+                    );
+                    // Nothing has streamed yet, so a gate or proxy rejection
+                    // can be retried without the caller seeing it.
+                    if let Some(attempt) = grok_attempt.as_mut()
+                        && attempt.retry_after(error.status)
                     {
+                        continue;
+                    }
+                    if !stream::is_retryable_provider_error(&error) || retry_index >= max_retries {
                         return Err(ProviderAdapterError::Provider(error));
                     }
                     wait_for_retry(
@@ -912,9 +966,7 @@ impl ProviderResponderFactory {
                     )?;
                 }
                 Err(ProviderAdapterError::Provider(error)) => {
-                    if !stream::is_retryable_provider_error(&error)
-                        || retry_index >= self.config.max_retries
-                    {
+                    if !stream::is_retryable_provider_error(&error) || retry_index >= max_retries {
                         return Err(ProviderAdapterError::Provider(error));
                     }
                     wait_for_retry(
@@ -998,12 +1050,33 @@ impl ProviderResponderFactory {
             let resolved = catalog
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
-            let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            let mut credentials = ProviderCredentials::from_resolved_model(&resolved);
+            if model.provider == grok_cli::PROVIDER_ID {
+                credentials = credentials.with_grok_cli_settings(
+                    grok_cli::RequestSettings::from_lookup(|name| catalog.environment_value(name)),
+                );
+                // A session that chose another saved account sends its token.
+                if let Some(token) = crate::grok_accounts::Accounts::new(&catalog)
+                    .request_token(&options.session_id)?
+                {
+                    credentials = credentials.with_api_key(token);
+                }
+            }
+            // A credential that names its own API base URL (Meta Muse) wins
+            // over the one the session's model copy was created with, so a
+            // re-minted key is always sent where Meta said to send it.
+            let model = match resolved.auth().base_url() {
+                Some(base_url) if base_url != model.base_url => Cow::Owned(llm::Model {
+                    base_url: base_url.to_owned(),
+                    ..model.clone()
+                }),
+                _ => Cow::Borrowed(model),
+            };
             // Native Aperture adaptation: a gateway-routed request carries the
             // provider-qualified model id and the provenance headers, and a
             // transient gateway restart is tagged so the retry classifier
             // recognizes it (cmd/goshcoder/aperture_session.go).
-            let routed = catalog.aperture_request_model(model, &options.session_id);
+            let routed = catalog.aperture_request_model(&model, &options.session_id);
             let gateway_routed = matches!(routed, Cow::Owned(_));
             let result = transport
                 .respond_with_credentials(&routed, context, options, credentials)
@@ -1098,13 +1171,25 @@ fn describe_body_read_error(error: io::Error) -> io::Error {
         .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
         .is_some_and(reqwest::Error::is_timeout);
     if timed_out {
-        io::Error::new(
+        return io::Error::new(
             io::ErrorKind::TimedOut,
             format!("provider stream timed out waiting for data: {error}"),
-        )
-    } else {
-        error
+        );
     }
+    // reqwest reports a connection dropped mid-body as a bare "request or
+    // response body error". pi sees undici's "terminated" there and retries;
+    // saying what happened also lets the turn policy recognise it.
+    let dropped = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        .is_some_and(|inner| inner.is_body() || inner.is_decode() || inner.is_request());
+    if dropped {
+        return io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "provider stream terminated: the connection was lost mid-response",
+        );
+    }
+    error
 }
 
 impl Read for CancellableBody {
@@ -1522,6 +1607,7 @@ fn extract_codex_account_id(token: &str) -> Result<String> {
 fn provider_error_from_response(
     mut response: Response,
     maximum_body_bytes: usize,
+    protocol: ProviderProtocol,
 ) -> stream::ProviderError {
     let status = response.status().as_u16();
     let headers = response
@@ -1550,17 +1636,103 @@ fn provider_error_from_response(
     } else {
         text.to_owned()
     };
-    let suffix = if body.is_empty() {
+    // The raw body stays on the error for callers that inspect it; the
+    // message carries only the provider's own sentence, and keeps the status
+    // so the retry classifier still sees it.
+    let detail = provider_error_detail(text).unwrap_or_else(|| body.clone());
+    let suffix = if detail.is_empty() {
         String::new()
     } else {
-        format!(": {body}")
+        format!(": {detail}")
     };
+    let message = match protocol {
+        ProviderProtocol::OpenAiCodexResponses => codex_usage_limit_message(status, text),
+        _ => None,
+    }
+    .unwrap_or_else(|| format!("provider request failed with status {status}{suffix}"));
     stream::ProviderError {
         status,
         headers,
         body,
-        message: format!("provider request failed with status {status}{suffix}"),
+        message,
     }
+}
+
+/// The human-readable sentence in a JSON error body, whichever of the usual
+/// shapes the provider uses.
+fn provider_error_detail(text: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    // Some gateways wrap the body in a one-element array.
+    let value = match value {
+        Value::Array(mut items) if items.len() == 1 => items.remove(0),
+        value => value,
+    };
+    let string = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+    };
+    let error = value.get("error");
+    string(error.and_then(|error| error.get("message")))
+        .or_else(|| string(value.get("message")))
+        .or_else(|| string(value.get("error_description")))
+        .or_else(|| string(value.get("detail")))
+        .or_else(|| string(error))
+        .map(|detail| truncate_error_text(&detail, MAX_PROVIDER_ERROR_BODY_CHARS))
+}
+
+/// pi's `parseErrorResponse` for Codex: a usage limit gets a sentence the
+/// user can act on, and since it carries no status code the turn policy does
+/// not retry a limit that will not lift for minutes or hours.
+fn codex_usage_limit_message(status: u16, text: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let error = value.get("error")?;
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let limited = [
+        "usage_limit_reached",
+        "usage_not_included",
+        "rate_limit_exceeded",
+    ]
+    .iter()
+    .any(|pattern| code.contains(pattern));
+    if !limited && status != 429 {
+        return None;
+    }
+    let plan = error
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(|plan| format!(" ({} plan)", plan.to_lowercase()))
+        .unwrap_or_default();
+    let when = error
+        .get("resets_at")
+        .and_then(Value::as_f64)
+        .map(|resets_at| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |elapsed| elapsed.as_secs_f64());
+            let minutes = ((resets_at - now) / 60.0).round().max(0.0);
+            // pi always says minutes; a weekly limit reads better in days.
+            if minutes >= 2.0 * 24.0 * 60.0 {
+                format!(
+                    " Try again in ~{:.0} days.",
+                    (minutes / (24.0 * 60.0)).round()
+                )
+            } else if minutes >= 90.0 {
+                format!(" Try again in ~{:.0} h.", (minutes / 60.0).round())
+            } else {
+                format!(" Try again in ~{minutes:.0} min.")
+            }
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "You have hit your ChatGPT usage limit{plan}.{when}"
+    ))
 }
 
 /// pi's `truncateErrorText`: keeps the first `max_chars` characters and says
@@ -2129,6 +2301,21 @@ fn compat_map(model: &llm::Model, name: &str) -> Map<String, Value> {
 fn requested_max_tokens(model: &llm::Model, context: &llm::Context) -> Option<u64> {
     (model.max_tokens != 0)
         .then(|| stream::clamp_max_tokens_to_context(model, context, model.max_tokens))
+}
+
+/// The effort a Responses request names when thinking is off. Leaving the
+/// field out lets the server apply its default effort, which still bills
+/// reasoning tokens, so pi sends the model's `off` mapping or `"none"`; an
+/// explicit `off: null` means the model cannot turn reasoning off.
+fn responses_off_effort(model: &llm::Model, requested: &str) -> Option<String> {
+    if !model.reasoning || stream::clamp_thinking_level(model, requested) != llm::THINKING_OFF {
+        return None;
+    }
+    match model.thinking_level_map.get(llm::THINKING_OFF) {
+        Some(None) => None,
+        Some(Some(mapped)) => Some(mapped.clone()),
+        None => Some("none".to_owned()),
+    }
 }
 
 fn mapped_thinking_level(model: &llm::Model, requested: &str) -> Option<String> {
@@ -3556,6 +3743,18 @@ fn build_openai_responses_request(
                 "reasoning.encrypted_content".to_owned(),
             )]),
         );
+    } else if model.provider != "github-copilot"
+        && let Some(effort) = responses_off_effort(model, &options.thinking_level)
+    {
+        body.insert("reasoning".to_owned(), json!({"effort": effort}));
+    }
+    if model.reasoning && model.provider == "xai" {
+        body.insert(
+            "include".to_owned(),
+            Value::Array(vec![Value::String(
+                "reasoning.encrypted_content".to_owned(),
+            )]),
+        );
     }
     if !options.session_id.is_empty() {
         body.insert(
@@ -3759,6 +3958,8 @@ fn build_openai_codex_responses_request(
             "reasoning".to_owned(),
             json!({"effort": effort, "summary": "auto"}),
         );
+    } else if let Some(effort) = responses_off_effort(model, &options.thinking_level) {
+        body.insert("reasoning".to_owned(), json!({"effort": effort}));
     }
     merge_sampling_params(&mut body, model);
     Ok(Value::Object(body))
@@ -4081,7 +4282,9 @@ fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<
         context,
         ResponsesInputOptions {
             include_system_prompt: true,
-            supports_developer_role: true,
+            // pi's `openai-responses.ts` reads this from compat (default
+            // true); Meta Muse rejects the developer role.
+            supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
             allowed_tool_call_providers: OPENAI_TOOL_CALL_PROVIDERS,
             grammar_tool_input_properties: &grammar_tool_input_properties,
             deferred_tools: &deferred_tools,
@@ -4219,6 +4422,14 @@ fn responses_input(
                                         .unwrap_or_else(|_| "{}".to_owned()),
                                 })
                             };
+                            // `json!` writes `None` as `null`, which the API
+                            // rejects as a non-string id; pi's JSON.stringify
+                            // drops the undefined field instead.
+                            if item.get("id").is_some_and(Value::is_null) {
+                                item.as_object_mut()
+                                    .expect("Responses tool call is an object")
+                                    .remove("id");
+                            }
                             if (same_model || deferred_tools.contains_key(&call.name))
                                 && !call.namespace.is_empty()
                             {
@@ -5582,6 +5793,11 @@ fn consume_openai_completions(
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
         {
+            // pi ends the open block whenever another kind of delta starts,
+            // so reasoning that precedes the answer is closed before it.
+            if let Some(index) = thinking_index.take() {
+                emitter.end_thinking(index)?;
+            }
             let index = match text_index {
                 Some(index) => index,
                 None => {
@@ -5602,6 +5818,9 @@ fn consume_openai_completions(
                     .map(|value| (*field, value))
             });
         if let Some((source, delta)) = reasoning {
+            if let Some(index) = text_index.take() {
+                emitter.end_text(index)?;
+            }
             let index = match thinking_index {
                 Some(index) => index,
                 None => {
@@ -5634,6 +5853,12 @@ fn consume_openai_completions(
                 .unwrap_or_default();
             let id = value_string(call, "id").unwrap_or_default();
             if let Entry::Vacant(entry) = tool_calls.entry(key) {
+                if let Some(index) = text_index.take() {
+                    emitter.end_text(index)?;
+                }
+                if let Some(index) = thinking_index.take() {
+                    emitter.end_thinking(index)?;
+                }
                 let content_index = emitter.start_tool(id, name)?;
                 entry.insert(OpenAiToolState {
                     content_index,
@@ -5723,6 +5948,25 @@ fn consume_google_generate_content(
             continue;
         }
         let chunk = serde_json::from_str::<Value>(data)?;
+        // Google sends a failure mid-stream as `{"error":{code,message,status}}`.
+        // Read past, it surfaced only as "ended without finishReason", which
+        // lost the reason and retried even a request that can never succeed.
+        if let Some(error) = chunk.get("error").filter(|error| !error.is_null()) {
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .map(|code| format!(" {code}"))
+                .unwrap_or_default();
+            let status = value_string(error, "status")
+                .map(|status| format!(" {status}"))
+                .unwrap_or_default();
+            let message = value_string(error, "message")
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            return Err(ProviderAdapterError::Protocol(format!(
+                "Google API error{code}{status}: {message}"
+            )));
+        }
         if emitter.message().response_id.is_empty()
             && let Some(response_id) =
                 value_string(&chunk, "responseId").filter(|response_id| !response_id.is_empty())
@@ -8861,6 +9105,96 @@ mod tests {
         assert_eq!(params["input"][3]["tools"][0]["defer_loading"], true);
     }
 
+    #[test]
+    fn responses_requests_turn_reasoning_off_explicitly() {
+        let context = llm::Context {
+            messages: vec![llm::Message::User(llm::UserMessage::text("hi", 0))],
+            ..llm::Context::default()
+        };
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.thinking_level = llm::THINKING_OFF.to_owned();
+        let mut reasoning = model(API_OPENAI_RESPONSES, "https://example.test".to_owned());
+        reasoning.reasoning = true;
+
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert_eq!(sent["reasoning"], json!({"effort": "none"}));
+        assert!(sent.get("include").is_none());
+
+        let mut codex = model(API_OPENAI_CODEX_RESPONSES, String::new());
+        codex.reasoning = true;
+        let sent = build_openai_codex_responses_request(
+            &codex,
+            &context,
+            &request_options,
+            &BTreeMap::new(),
+        )
+        .expect("codex body");
+        assert_eq!(sent["reasoning"], json!({"effort": "none"}));
+
+        // A model that maps off to its own value sends that; one that cannot
+        // turn reasoning off is clamped up to its lowest real effort.
+        reasoning
+            .thinking_level_map
+            .insert(llm::THINKING_OFF.to_owned(), Some("minimal".to_owned()));
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert_eq!(sent["reasoning"]["effort"], "minimal");
+        reasoning
+            .thinking_level_map
+            .insert(llm::THINKING_OFF.to_owned(), None);
+        let sent = build_openai_responses_request(&reasoning, &context, &request_options)
+            .expect("responses body");
+        assert!(
+            sent["reasoning"]["effort"]
+                .as_str()
+                .is_some_and(|effort| effort != "none"),
+            "{sent}"
+        );
+
+        // Negative control: a model without reasoning never gets the field.
+        let plain = model(API_OPENAI_RESPONSES, "https://example.test".to_owned());
+        let sent = build_openai_responses_request(&plain, &context, &request_options)
+            .expect("responses body");
+        assert!(sent.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn provider_errors_carry_the_providers_sentence_and_codex_limits_are_final() {
+        assert_eq!(
+            provider_error_detail(r#"{"error":{"message":"Invalid API key","type":"auth"}}"#)
+                .as_deref(),
+            Some("Invalid API key")
+        );
+        assert_eq!(
+            provider_error_detail(r#"[{"error":{"code":429,"message":"Quota\n exceeded"}}]"#)
+                .as_deref(),
+            Some("Quota exceeded")
+        );
+        assert_eq!(provider_error_detail("<html>Bad Gateway</html>"), None);
+
+        let limit = codex_usage_limit_message(
+            429,
+            r#"{"error":{"type":"usage_limit_reached","plan_type":"Plus"}}"#,
+        )
+        .expect("usage limit message");
+        assert_eq!(limit, "You have hit your ChatGPT usage limit (plus plan).");
+        let mut message = llm::AssistantMessage {
+            stop_reason: stream::STOP_ERROR.to_owned(),
+            error_message: limit,
+            ..llm::AssistantMessage::default()
+        };
+        assert!(
+            !stream::is_retryable_assistant_error(&message),
+            "a usage limit does not lift within the retry window"
+        );
+        message.error_message = "provider request failed with status 429: slow down".to_owned();
+        assert!(stream::is_retryable_assistant_error(&message));
+        assert!(
+            codex_usage_limit_message(400, r#"{"error":{"type":"invalid_request"}}"#).is_none()
+        );
+    }
+
     /// Streams a chunked response with pauses so idle and total deadlines can
     /// be told apart. The client may drop a stalled stream, so writes are
     /// allowed to fail.
@@ -9186,7 +9520,8 @@ mod tests {
             .iter()
             .find(|item| item["type"] == "function_call")
             .expect("function call item");
-        assert!(call["id"].is_null(), "{call}");
+        // Omitted, not `null`: the API rejects a null id.
+        assert!(call.get("id").is_none(), "{call}");
         assert_eq!(call["call_id"], "call_1");
         let message = items
             .iter()
@@ -9699,5 +10034,511 @@ mod tests {
         assert_eq!(response.usage.input, 6);
         assert_eq!(response.usage.output, 2);
         assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    /// pi-meta-muse-auth: a `meta-muse` login reaches Meta's Responses API
+    /// with the minted key as a bearer token, the Muse client identity, and
+    /// the system prompt in the `system` role Muse requires.
+    #[test]
+    fn meta_muse_requests_use_responses_bearer_auth_and_the_system_role() {
+        let body = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":6,\"total_tokens\":26}}}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let store = Arc::new(catalog::CredentialStore::in_memory());
+        let mut credential = catalog::Credential::oauth("muse-model-key", "identity", i64::MAX);
+        credential
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        store.put("meta-muse", credential).expect("store");
+        let catalog = catalog::Catalog::with_environment(Some(store), Arc::new(|_| None))
+            .expect("catalog")
+            .with_dynamic_paths(catalog::DynamicPaths::disabled());
+        let resolved = catalog
+            .resolve_model("meta-muse/muse-spark-1.3")
+            .expect("meta-muse model resolves");
+        assert_eq!(resolved.model.base_url, "https://api.meta.ai/v1");
+        // A loopback stand-in for api.meta.ai that keeps the /v1 path.
+        let mut request_model = resolved.model.clone();
+        request_model.base_url = format!("{base_url}/v1");
+
+        let response =
+            factory_with_credentials(0, ProviderCredentials::from_resolved_model(&resolved))
+                .respond(
+                    &request_model,
+                    &text_context(),
+                    options(agent::CancellationToken::default()),
+                )
+                .expect("Muse response");
+        let request = requests.recv().expect("captured Muse request");
+        server.join().expect("Muse test server finishes");
+
+        assert_eq!(request.target, "/v1/responses");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer muse-model-key")
+        );
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some("muse-build/pi-meta-muse-auth")
+        );
+        assert!(!request.headers.contains_key("x-api-key"));
+        let sent: Value = serde_json::from_slice(&request.body).expect("request JSON");
+        assert_eq!(sent["model"], "muse-spark-1.3");
+        assert_eq!(
+            sent["input"][0],
+            json!({"role": "system", "content": "be concise"})
+        );
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(sent["tools"][0]["strict"], false);
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+
+        // Control: without the compat flag a reasoning model keeps pi's
+        // default developer role.
+        let mut default_compat = request_model.clone();
+        default_compat.compat = None;
+        let input = openai_responses_input(&default_compat, &text_context()).expect("input");
+        assert_eq!(input[0]["role"], "developer");
+    }
+
+    // -- Grok CLI (pi-grok-cli) on the wire ------------------------------------
+
+    const GROK_OK_BODY: &str = concat!(
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_grok\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"grok says hi\"}\n\n",
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_grok\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"grok says hi\",\"annotations\":[]}]}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_grok\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n"
+    );
+
+    struct GrokWire {
+        catalog: Arc<catalog::Catalog>,
+        model: llm::Model,
+        requests: Receiver<CapturedRequest>,
+        server: JoinHandle<()>,
+        /// Held so the version server can report each lookup it served.
+        _version_requests: Receiver<CapturedRequest>,
+        version_server: JoinHandle<()>,
+    }
+
+    /// A catalog whose Grok CLI provider points at loopback servers: one for
+    /// the inference endpoint, one for the stable-version pointer.
+    fn grok_wire(model_id: &str, responses: Vec<Vec<u8>>, versions: Vec<&'static str>) -> GrokWire {
+        let (base_url, requests, server) = test_server(responses);
+        let (version_base, version_requests, version_server) = test_server(
+            versions
+                .into_iter()
+                .map(|version| http_response(200, version))
+                .collect(),
+        );
+        let environment = BTreeMap::from([
+            (grok_cli::TOKEN_ENV.to_owned(), "grok-env-token".to_owned()),
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base_url}/v1/")),
+            (
+                grok_cli::VERSION_URL_ENV.to_owned(),
+                format!("{version_base}/cli/stable"),
+            ),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                None,
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog"),
+        );
+        let model = catalog
+            .model(grok_cli::PROVIDER_ID, model_id)
+            .expect("grok-cli model");
+        GrokWire {
+            catalog,
+            model,
+            requests,
+            server,
+            _version_requests: version_requests,
+            version_server,
+        }
+    }
+
+    fn grok_options(session_id: &str) -> (agent::RequestOptions, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.session_id = session_id.to_owned();
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            log.lock().expect("event log").push(event.event_type);
+        }));
+        (request_options, events)
+    }
+
+    fn header<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str> {
+        request.headers.get(name).map(String::as_str)
+    }
+
+    #[test]
+    fn grok_cli_requests_carry_the_official_client_identity_and_a_sanitized_body() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![http_response(200, GROK_OK_BODY)],
+            vec!["1.2.3\n"],
+        );
+        assert_eq!(
+            wire.model.base_url,
+            wire.model.base_url.trim_end_matches('/')
+        );
+        let (request_options, events) = grok_options("grok-wire-identity");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let request = wire.requests.recv().expect("captured request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.content[0].plain_text(), Some("grok says hi"));
+        assert_eq!(request.target, "/v1/responses");
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer grok-env-token")
+        );
+        assert_eq!(
+            header(&request, "x-grok-client-identifier"),
+            Some("grok-shell")
+        );
+        assert_eq!(header(&request, "x-xai-token-auth"), Some("xai-grok-cli"));
+        assert_eq!(header(&request, "x-grok-model-override"), Some("grok-4.3"));
+        assert_eq!(
+            header(&request, "user-agent"),
+            Some("grok-shell/1.2.3 (macos; aarch64)")
+        );
+        assert_eq!(header(&request, "x-grok-client-version"), Some("1.2.3"));
+        assert_eq!(
+            header(&request, "x-grok-conv-id"),
+            Some("grok-wire-identity")
+        );
+
+        let sent: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(sent["model"], "grok-4.3");
+        assert_eq!(sent["instructions"], "be concise");
+        assert!(
+            sent["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .all(|item| !matches!(item["role"].as_str(), Some("developer" | "system"))),
+            "{sent}"
+        );
+        assert_eq!(sent["input"][0]["role"], "user");
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["prompt_cache_key"], "grok-wire-identity");
+        assert!(sent.get("prompt_cache_retention").is_none());
+        assert_eq!(sent["tools"][0]["name"], "weather");
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+    }
+
+    #[test]
+    fn grok_cli_effort_is_dropped_for_models_that_reject_it() {
+        let wire = grok_wire(
+            "grok-build",
+            vec![http_response(200, GROK_OK_BODY)],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-build");
+        factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let request = wire.requests.recv().expect("captured request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        let sent: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(sent["reasoning"], json!({"summary": "auto"}));
+        assert_eq!(
+            header(&request, "x-grok-model-override"),
+            Some("grok-build")
+        );
+    }
+
+    #[test]
+    fn grok_cli_426_refreshes_the_client_version_once_and_retries_unseen() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(426, "{\"error\":\"upgrade required\"}"),
+                http_response(200, GROK_OK_BODY),
+            ],
+            vec!["1.2.3", "1.2.4"],
+        );
+        let (request_options, events) = grok_options("grok-wire-426");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let first = wire.requests.recv().expect("rejected request");
+        let second = wire.requests.recv().expect("retried request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(header(&first, "x-grok-client-version"), Some("1.2.3"));
+        assert_eq!(header(&second, "x-grok-client-version"), Some("1.2.4"));
+        assert_eq!(
+            header(&second, "user-agent"),
+            Some("grok-shell/1.2.4 (macos; aarch64)")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+    }
+
+    #[test]
+    fn grok_cli_a_second_426_is_reported_rather_than_retried_again() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(426, "{\"error\":\"upgrade required\"}"),
+                http_response(426, "{\"error\":\"still too old\"}"),
+            ],
+            vec!["1.2.3", "1.2.4"],
+        );
+        let (request_options, _) = grok_options("grok-wire-426-twice");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(wire.requests.try_iter().count(), 2);
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(
+            response.error_message.contains("426"),
+            "{}",
+            response.error_message
+        );
+        assert!(
+            response.error_message.contains("still too old"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[test]
+    fn grok_cli_proxy_rejections_rotate_the_conversation_id_twice_at_most() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(502, "bad gateway"),
+                http_response(520, "unknown"),
+                http_response(200, GROK_OK_BODY),
+            ],
+            vec!["1.2.3"],
+        );
+        let (request_options, events) = grok_options("grok-wire-rotate");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        let conv_ids = wire
+            .requests
+            .try_iter()
+            .map(|request| header(&request, "x-grok-conv-id").map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conv_ids,
+            [
+                Some("grok-wire-rotate".to_owned()),
+                Some("grok-wire-rotate:1".to_owned()),
+                Some("grok-wire-rotate:2".to_owned()),
+            ]
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+        // The next turn keeps the rotated conversation.
+        assert_eq!(
+            grok_cli::conv_id("grok-wire-rotate").as_deref(),
+            Some("grok-wire-rotate:2")
+        );
+
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(401, "unauthorized"),
+                http_response(401, "unauthorized"),
+                http_response(401, "still unauthorized"),
+            ],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-rotate-exhausted");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(
+            wire.requests.try_iter().count(),
+            3,
+            "two rotations, then the error"
+        );
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(
+            response.error_message.contains("401"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[test]
+    fn grok_cli_disables_the_generic_retry_that_other_providers_keep() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![http_response(500, "server error")],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-no-retry");
+        let response = factory(2).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(wire.requests.try_iter().count(), 1);
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+
+        // Negative control: the same 500 is retried for another provider,
+        // which also sees none of the Grok CLI headers.
+        let (base_url, requests, server) = test_server(vec![
+            http_response(500, "server error"),
+            http_response(200, GROK_OK_BODY),
+        ]);
+        let response = factory(2)
+            .respond(
+                &model(API_OPENAI_RESPONSES, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("OpenAI response");
+        server.join().expect("server");
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(header(&captured[1], "x-grok-conv-id").is_none());
+        assert!(header(&captured[1], "x-grok-client-version").is_none());
+        let sent: Value = serde_json::from_slice(&captured[1].body).expect("JSON body");
+        // The system prompt stays in `input`; only Grok CLI moves it.
+        assert!(
+            matches!(
+                sent["input"][0]["role"].as_str(),
+                Some("developer" | "system")
+            ),
+            "{sent}"
+        );
+        assert!(sent.get("instructions").is_none());
+    }
+
+    #[test]
+    fn grok_cli_requests_carry_the_token_of_the_account_the_session_chose() {
+        let (base_url, requests, server) = test_server(vec![
+            http_response(200, GROK_OK_BODY),
+            http_response(200, GROK_OK_BODY),
+        ]);
+        let (version_base, _version_requests, version_server) =
+            test_server(vec![http_response(200, "1.2.3")]);
+        let agent_dir = std::env::temp_dir().join(format!(
+            "goshcoder-grok-wire-accounts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(catalog::CredentialStore::in_memory());
+        store
+            .put(
+                grok_cli::PROVIDER_ID,
+                catalog::Credential::oauth("account-one-token", "refresh", i64::MAX),
+            )
+            .expect("account 1 login");
+        let environment = BTreeMap::from([
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base_url}/v1")),
+            (
+                grok_cli::VERSION_URL_ENV.to_owned(),
+                format!("{version_base}/cli/stable"),
+            ),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                Some(store),
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog")
+            .with_dynamic_paths(catalog::DynamicPaths::for_agent_dir(&agent_dir)),
+        );
+        let accounts = crate::grok_accounts::Accounts::new(&catalog);
+        let work = accounts.add("Work").expect("add");
+        accounts
+            .store_login(
+                &work,
+                0,
+                catalog::Credential::oauth("work-token", "refresh", i64::MAX),
+            )
+            .expect("store");
+        crate::grok_accounts::choose_for_session("grok-wire-chooser", &work).expect("choose");
+        let model = catalog
+            .model(grok_cli::PROVIDER_ID, "grok-4.3")
+            .expect("model");
+        let responder = factory(0).catalog_assistant_responder(catalog.clone());
+        for session in ["grok-wire-chooser", "grok-wire-default"] {
+            let (request_options, _) = grok_options(session);
+            responder(&model, &text_context(), request_options).expect("response");
+        }
+        server.join().expect("server");
+        version_server.join().expect("version server");
+        let tokens = requests
+            .try_iter()
+            .map(|request| header(&request, "authorization").map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            [
+                Some("Bearer work-token".to_owned()),
+                Some("Bearer account-one-token".to_owned()),
+            ]
+        );
+        let _ = fs::remove_dir_all(agent_dir);
     }
 }

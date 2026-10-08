@@ -79,6 +79,13 @@ pub fn aperture_cache_path_in(agent_dir: &Path) -> PathBuf {
     agent_dir.join("extensions").join("aperture-cache.json")
 }
 
+/// The Meta Muse Code model list last fetched from Meta. pi keeps an
+/// extension's fetched models in its own models store; this sibling file
+/// plays that part, so the live list survives a restart and works offline.
+pub fn meta_muse_models_path_in(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("extensions").join("meta-muse-models.json")
+}
+
 pub fn mcp_config_path() -> PathBuf {
     agent_dir().join("mcp.json")
 }
@@ -213,7 +220,13 @@ fn read_default_model_from(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+/// Replaces `path` atomically with a file of the given mode, creating the
+/// parent directory when it is missing.
+pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    atomic_write(path, contents, mode)
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

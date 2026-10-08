@@ -319,7 +319,10 @@ impl Workspace {
             move |cancellation, _, parameters, _| {
                 workspace
                     .run_edit(&cancellation, &parameters)
-                    .map(agent::ToolResult::text)
+                    .map(|(text, first_changed_line)| agent::ToolResult {
+                        details: Some(json!({ "firstChangedLine": first_changed_line })),
+                        ..agent::ToolResult::text(text)
+                    })
                     .map_err(|error| error.to_string())
             },
         )
@@ -553,7 +556,7 @@ impl Workspace {
         &self,
         cancellation: &CancellationToken,
         parameters: &BTreeMap<String, Value>,
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
         check_cancelled(cancellation)?;
         let requested = required_string(parameters, "path")?;
         let old_text = required_string(parameters, "old_text")?;
@@ -621,7 +624,13 @@ impl Workspace {
         restored.push_str(bom);
         restored.push_str(&restore_line_endings(&updated, line_ending));
         self.write_file_atomic(&relative, restored.as_bytes(), cancellation)?;
-        Ok(format!("Edited {}", self.display(&relative)))
+        // pi reports where the change landed so an interface can show a hunk
+        // header; the model only sees the one-line text.
+        let first_changed_line = content[..index].matches('\n').count() + 1;
+        Ok((
+            format!("Edited {}", self.display(&relative)),
+            first_changed_line,
+        ))
     }
 
     fn run_list(
@@ -919,6 +928,15 @@ impl Workspace {
         } else {
             Ok(output)
         }
+    }
+
+    /// The absolute path of an existing file inside the workspace, refusing
+    /// one outside it or reached through a symlinked component, for
+    /// integrations that read a file the model names.
+    pub fn resolve_existing(&self, requested: &str) -> std::result::Result<PathBuf, String> {
+        let relative = self.resolve(requested).map_err(|error| error.to_string())?;
+        self.existing_path(&relative)
+            .map_err(|error| error.to_string())
     }
 
     /// Resolves a user supplied path to a normalized path relative to root.

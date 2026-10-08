@@ -49,7 +49,9 @@ GitHub Copilot explicitly not wanted.** Everything under that is done: Chinese
 providers are plain API-key providers on ported protocols (Kimi additionally
 has OAuth), Anthropic and Codex have PKCE/loopback and device-code logins with
 refresh, and `openai-codex-responses` is ported end to end. The same is true of
-xAI and Meta, added later.
+xAI and Meta, added later, and of Meta Muse Code (`meta-muse`, the
+`pi-meta-muse-auth` extension), which sits beside `meta` so pi's auth.json
+entries for both keep working.
 
 ## Layout
 
@@ -66,7 +68,9 @@ something goes wrong:
 | Session files (pi v3 JSONL) | `src/sessionlog.rs`, `src/session.rs` |
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
-| Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
+| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`, `src/grok_accounts.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
+| Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands), `src/tui_login.rs` (`/login` inside the interface) |
+| Line-mode chat | `src/line_editor.rs` (raw-mode prompt, Ctrl-C handling) |
 
 ## Starting without credentials
 
@@ -121,6 +125,11 @@ and size (`DynamicPaths`/`DynamicLayer` in `catalog.rs`):
 - The dedicated `aperture` provider serves the synchronized
   `extensions/aperture-cache.json`, so models load instantly even offline; a
   cache built for another gateway or selection is ignored.
+- `meta-muse` serves `extensions/meta-muse-models.json`, Meta's `/v1/models`
+  payload as last fetched, re-parsed on load; a missing or unusable file
+  leaves the five bundled models from `catalog_extra.json`. `auth login
+  meta-muse` writes it, and `PreparedSession::meta_muse_session_start`
+  revalidates it in the background whenever a `meta-muse` login is stored.
 - A provider routed through an Aperture proxy carries the gateway URL, API
   override and gateway model filter on every model, keeps bare ids in the
   picker, and resolves the `-` placeholder credential unless the gateway
@@ -162,6 +171,35 @@ is installed; the server is spawned lazily and closed with the session.
 - OAuth token endpoints and callback ports are the ones pi uses; xAI's
   discovered endpoints are pinned to the issuer host. `Auth` deliberately
   implements no `Debug` or `Display`.
+- A credential may carry its own API base URL (`Auth::base_url`, so far only
+  Meta Muse Code's `baseUrl`, validated to `https://api.meta.ai`).
+  `resolve_model` applies it to the resolved model and the catalog responder
+  re-applies it each turn, so a session's stored model copy never sends a
+  re-minted key to a stale URL. `meta-muse` refuses a key Meta does not mark
+  `is_subs_active`; keep that check, it is the provider's whole purpose.
+- The `openai-responses` builder honours `compat.supportsDeveloperRole`
+  (default true, as pi); Muse sets it false and gets a `system` message.
+- Grok CLI (`grok-cli`) is an `openai-responses` provider with three hooks
+  in the request path, all keyed on the provider id: `run_stream` passes the
+  body through `grok_cli::prepare_payload`, and `send_streaming_request`
+  adds the version and conversation headers per attempt and owns the retry
+  budget (`grok_cli::RequestAttempt`: 426 refreshes the version, 401/502/520
+  rotate the conversation, the generic retry is off). The conversation
+  generation lives in the session log; `runtime::prepare_session` registers
+  the session's `SessionCustomRecorder` under the agent's request session id,
+  and the store reads the newest `grok-cli-conv-id-v1` entry on the current
+  branch, so forks and resumes need no extra bookkeeping. Note that the
+  agent keeps the session id it was created with across `/new` and
+  `/resume`; the Grok CLI store follows the open session instead.
+- Grok CLI accounts: Account 1 is `auth.json`'s `grok-cli` login; further
+  accounts live in `<agent_dir>/grok-cli/accounts.json`, which exists only
+  when the catalog knows an agent directory (an injected test environment
+  without one sees Account 1 alone). `catalog_assistant_responder` swaps in
+  the token of the account the session chose (`grok_accounts::Accounts::
+  request_token`), and `resolve_auth` falls back to a saved account when
+  `auth.json` has no login. Exhaustion rotation is an agent subscription
+  that queues upstream's continuation as a follow-up on the failed turn;
+  `turns::finish_run` picks it up like any queued message.
 
 ## Sessions
 

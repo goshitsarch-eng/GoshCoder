@@ -103,8 +103,8 @@ impl MarkdownRenderer {
             }
 
             if is_table_row(raw) {
-                let (rows, next_index) = collect_table(&raw_lines, index);
-                self.push_table(&rows, &mut rendered);
+                let (rows, alignments, next_index) = collect_table(&raw_lines, index);
+                self.push_table(&rows, &alignments, &mut rendered);
                 reset_lists(&mut ordered_at, &mut hang_at);
                 in_quote = false;
                 index = next_index;
@@ -277,7 +277,7 @@ impl MarkdownRenderer {
     fn body_style(self) -> Style {
         match self.role {
             MarkdownRole::Assistant => Style::default().fg(TEXT),
-            MarkdownRole::Thinking => Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            MarkdownRole::Thinking => Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         }
     }
 
@@ -299,7 +299,12 @@ impl MarkdownRenderer {
         );
     }
 
-    fn push_table(self, rows: &[Vec<String>], rendered: &mut Vec<Line<'static>>) {
+    fn push_table(
+        self,
+        rows: &[Vec<String>],
+        alignments: &[Alignment],
+        rendered: &mut Vec<Line<'static>>,
+    ) {
         if rows.is_empty() {
             return;
         }
@@ -341,11 +346,19 @@ impl MarkdownRenderer {
                         .get(line_index)
                         .cloned()
                         .unwrap_or_default();
-                    let cell_width = fragments_width(&cell);
+                    let slack = width.saturating_sub(fragments_width(&cell));
+                    let before = match alignments.get(column).copied().unwrap_or_default() {
+                        Alignment::Left => 0,
+                        Alignment::Center => slack / 2,
+                        Alignment::Right => slack,
+                    };
+                    if before > 0 {
+                        fragments.push(Fragment::new(" ".repeat(before), Style::default()));
+                    }
                     append_fragments(&mut fragments, cell);
-                    if cell_width < *width {
+                    if slack > before {
                         fragments.push(Fragment::new(
-                            " ".repeat(*width - cell_width),
+                            " ".repeat(slack - before),
                             Style::default().fg(TEXT),
                         ));
                     }
@@ -833,17 +846,40 @@ fn is_table_row(line: &str) -> bool {
         .is_some_and(|rest| rest.contains('|'))
 }
 
-fn collect_table(lines: &[&str], start: usize) -> (Vec<Vec<String>>, usize) {
+/// A column's alignment from the divider row (`:---`, `:---:`, `---:`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Alignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+fn collect_table(lines: &[&str], start: usize) -> (Vec<Vec<String>>, Vec<Alignment>, usize) {
     let mut rows = Vec::new();
+    let mut alignments = Vec::new();
     let mut end = start;
     while end < lines.len() && is_table_row(lines[end]) {
         let cells = split_table_row(lines[end]);
-        if !is_divider_row(&cells) {
+        if is_divider_row(&cells) {
+            if alignments.is_empty() {
+                alignments = cells.iter().map(|cell| divider_alignment(cell)).collect();
+            }
+        } else {
             rows.push(cells);
         }
         end += 1;
     }
-    (rows, end)
+    (rows, alignments, end)
+}
+
+fn divider_alignment(cell: &str) -> Alignment {
+    let cell: String = cell.chars().filter(|c| !c.is_whitespace()).collect();
+    match (cell.starts_with(':'), cell.ends_with(':')) {
+        (true, true) => Alignment::Center,
+        (false, true) => Alignment::Right,
+        _ => Alignment::Left,
+    }
 }
 
 fn split_table_row(line: &str) -> Vec<String> {
@@ -867,48 +903,48 @@ fn is_divider_row(cells: &[String]) -> bool {
         })
 }
 
+/// Column widths that fit `width`. Space is taken from the widest column
+/// first and, while any column still has room above its longest word, no
+/// column is squeezed below its own: a proportional split used to break a
+/// short header such as "Name" across rows while a wide description column
+/// kept spare cells.
 fn table_widths(rows: &[Vec<Vec<Fragment>>], width: usize) -> Vec<usize> {
     let columns = rows.first().map_or(0, Vec::len);
     let mut desired = vec![1; columns];
+    let mut longest_word = vec![1; columns];
     for row in rows {
         for (column, cell) in row.iter().enumerate() {
             desired[column] = desired[column].max(fragments_width(cell).max(1));
+            let word = tokenize(cell)
+                .iter()
+                .filter(|token| !token.whitespace)
+                .map(|token| token.width)
+                .max()
+                .unwrap_or(1);
+            longest_word[column] = longest_word[column].max(word);
         }
     }
 
     let available = width.saturating_sub(columns.saturating_mul(3) + 1);
-    let desired_total: usize = desired.iter().sum();
-    if desired_total <= available {
-        return desired;
-    }
     if available < columns {
         return vec![1; columns];
     }
-
-    let extra_budget = available - columns;
-    let extra_needed: usize = desired.iter().map(|column| column - 1).sum();
-    if extra_needed == 0 {
-        return desired;
-    }
-
-    let mut widths = vec![1; columns];
-    let mut assigned = 0;
-    for (index, target) in desired.iter().enumerate() {
-        let share = (target - 1) * extra_budget / extra_needed;
-        widths[index] += share;
-        assigned += share;
-    }
-    while assigned < extra_budget {
-        let Some((index, _)) = desired
-            .iter()
-            .enumerate()
-            .filter(|(index, target)| widths[*index] < **target)
-            .max_by_key(|(index, target)| *target - widths[*index])
-        else {
+    let mut widths = desired;
+    let mut total: usize = widths.iter().sum();
+    while total > available {
+        let column = (0..columns)
+            .filter(|&column| widths[column] > longest_word[column])
+            .max_by_key(|&column| widths[column])
+            .or_else(|| {
+                (0..columns)
+                    .filter(|&column| widths[column] > 1)
+                    .max_by_key(|&column| widths[column])
+            });
+        let Some(column) = column else {
             break;
         };
-        widths[index] += 1;
-        assigned += 1;
+        widths[column] -= 1;
+        total -= 1;
     }
     widths
 }
@@ -1300,6 +1336,43 @@ func main() {}
                 .sum::<usize>();
             assert!(width <= 24, "table line exceeds width: {line:?}");
         }
+    }
+
+    #[test]
+    fn short_table_columns_keep_their_words_and_alignment_is_honoured() {
+        let source = "| Name | Type | Description |\n|------|:----:|------------:|\n| alpha | int | the first value |\n| beta | string | a much longer description that goes on |";
+        let rows = plain(&render_markdown(source, 50))
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for row in &rows {
+            assert!(UnicodeWidthStr::width(row.as_str()) <= 50, "{row}");
+        }
+        // Every short cell stays whole; only the long description wraps.
+        assert!(rows.iter().any(|row| row.contains("│ Name ")), "{rows:#?}");
+        assert!(rows.iter().any(|row| row.contains(" string ")), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("Nam ")), "{rows:#?}");
+        // `:----:` centres "int" under "string"; `---:` right-aligns.
+        assert!(
+            rows.iter().any(|row| row.contains("│  int   │")),
+            "{rows:#?}"
+        );
+        let first_value = rows
+            .iter()
+            .find(|row| row.contains("the first value"))
+            .expect("first data row");
+        assert!(first_value.contains("the first value │"), "{first_value}");
+        assert!(
+            !first_value.contains("│ the first value "),
+            "a right-aligned cell carries its slack on the left: {first_value}"
+        );
+
+        // A table without markers stays left-aligned.
+        let left = plain(&render_markdown(
+            "| a | b |\n| --- | --- |\n| x | long cell |",
+            40,
+        ));
+        assert!(left.contains("│ x │"), "{left}");
     }
 
     #[test]

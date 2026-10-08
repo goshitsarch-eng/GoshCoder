@@ -486,6 +486,12 @@ impl Tree {
         Ok(())
     }
 
+    /// Moves the write head before the first entry, so the next append
+    /// starts a new root (rewinding to before the very first message).
+    pub fn clear_leaf(&mut self) {
+        self.leaf_id = None;
+    }
+
     pub fn path(&self, leaf: Option<&str>) -> Vec<&Entry> {
         let Some(mut current) = leaf.or(self.leaf()) else {
             return Vec::new();
@@ -1299,6 +1305,10 @@ impl Writer {
 
     pub fn set_leaf(&mut self, id: impl Into<String>) -> Result<()> {
         self.tree.set_leaf(id)
+    }
+
+    pub fn clear_leaf(&mut self) {
+        self.tree.clear_leaf();
     }
 
     pub fn sync(&mut self) -> Result<()> {
