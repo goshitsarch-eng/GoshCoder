@@ -2236,7 +2236,10 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
             let method = match provider.id.as_str() {
                 "openai-codex" => "sign in with ChatGPT Plus/Pro",
                 "anthropic" => "sign in with Claude Pro/Max",
-                "grok-cli" | "xai" => "sign in with your Grok subscription",
+                // Grok CLI is the route a consumer subscription works on;
+                // xAI's own login reaches api.x.ai, which often refuses one.
+                "grok-cli" => "sign in with X Premium / SuperGrok",
+                "xai" => "sign in with your xAI account",
                 "meta" => "sign in with your Meta account",
                 "meta-muse" => "sign in with your Muse Code subscription",
                 "kimi-coding" => "sign in with Kimi",
@@ -4482,7 +4485,7 @@ mod tests {
             .expect("grok-cli row");
         assert!(
             grok.description
-                .ends_with("Grok CLI  ·  sign in with your Grok subscription"),
+                .ends_with("Grok CLI  ·  sign in with X Premium / SuperGrok"),
             "{}",
             grok.description
         );
