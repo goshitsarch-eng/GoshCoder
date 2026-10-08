@@ -65,6 +65,83 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::state::{Action, App, Message, MessageRole};
 
+const SESSION_FLAGS: &str = r#"Flags:
+  -m, -model <ref>      Model as provider/model, or a bare id when unambiguous
+  -s, -system <text>    System prompt
+  -thinking <level>     off, minimal, low, medium (default), high, xhigh, max
+  -tools[=false]        Built-in file and shell tools (on in chat)
+  -ralph[=false]        Long-running Ralph loops (on in chat)
+  -planner              Start in Planner review mode (-plan is an alias)
+  -C <dir>              Workspace directory for tools
+  -continue             Reopen the most recent session for this workspace
+  -resume               Choose a session to resume (chat only)
+  -session <ref>        Session id, id prefix, or path
+  -name <text>          Display name for the session
+  -no-session           Do not record this session
+  -read-only            Open a session without claiming it
+  -sessions-dir <dir>   Session storage root
+  -fullscreen[=false]   Full-screen interface (chat; default on a terminal)
+  -claude-tui[=false]   pi-claude-code-tui look in line mode (chat)
+  -quiet                Suppress session notices
+"#;
+
+/// `goshcoder <command> --help`. Commands with their own `help` keep it; the
+/// rest get their usage here instead of an "unknown flag" error.
+fn subcommand_help(args: &[String]) -> Option<String> {
+    let command = args.first()?.as_str();
+    let asks = |argument: &String| matches!(argument.as_str(), "-h" | "-help" | "--help");
+    let asked = args.iter().skip(1).any(asks)
+        || (args.get(1).is_some_and(|argument| argument == "help")
+            && matches!(command, "sessions" | "prompts" | "ralph" | "auth"));
+    // A bare `goshcoder -h` is the top-level usage, handled by `run`.
+    if !asked {
+        return None;
+    }
+    Some(match command {
+        "run" => format!(
+            "Usage: goshcoder run [flags] <prompt>\n\nRuns one prompt and exits; non-zero when the turn fails.\nRecords a session only with -continue, -session or -name.\n\n{SESSION_FLAGS}"
+        ),
+        "chat" => format!(
+            "Usage: goshcoder [chat] [flags]\n\nInteractive session. Type / inside chat for commands.\n\n{SESSION_FLAGS}"
+        ),
+        "sessions" => "Usage: goshcoder sessions <subcommand>
+
+  list [--all]                 Saved sessions for this workspace
+  show <id>                    Print a session
+  export <id> [--md] <path>    Save as HTML, Markdown (.md) or JSONL
+  import <path>                Adopt a session file
+  share <id> --yes             Upload as a secret GitHub gist (needs gh)
+  rm <id>                      Delete a session
+  gc --older-than 30d [--keep-named] [--yes]
+                               Delete old sessions (a dry run without --yes)
+"
+        .to_owned(),
+        "prompts" => "Usage: goshcoder prompts <subcommand>
+
+  list                 Saved prompt templates
+  backup [path]        Archive every template to a .tar.gz
+  restore <archive>    Restore templates from a backup
+"
+        .to_owned(),
+        "ralph" => "Usage: goshcoder ralph <subcommand>
+
+  start <name> <task>  Start a loop
+  list                 Loops in this workspace
+  status [name]        Progress of a loop
+  resume <name>        Resume a paused loop
+  stop <name>          Stop a loop
+  archive <name>       Archive a finished loop
+  delete <name>        Delete a loop
+"
+        .to_owned(),
+        "models" => "Usage: goshcoder models [provider]\n\nLists models for configured providers, or every model of one provider.\n".to_owned(),
+        "providers" => "Usage: goshcoder providers\n\nLists providers, whether each is configured, and how to set up the rest.\n".to_owned(),
+        "auth" => return None,
+        "omni" | "aperture" => return None,
+        _ => return None,
+    })
+}
+
 const USAGE: &str = r#"GoshCoder - a Rust coding agent
 
 Usage:
@@ -235,6 +312,10 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(help) = subcommand_help(&args) {
+        print!("{help}");
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
         Some("--version" | "-v" | "version") => {
             print_version();
@@ -248,6 +329,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("providers") => provider_cli::providers_command(),
         Some("models") => provider_cli::models_command(&args[1..]),
         Some("auth") => provider_cli::auth_command(&args[1..]),
+        // OmniRoute names its help `help`; accept the usual flags too.
+        Some("omni")
+            if args
+                .get(1)
+                .is_some_and(|flag| matches!(flag.as_str(), "-h" | "-help" | "--help")) =>
+        {
+            omni_cli::command(&["help".to_owned()])
+        }
         Some("omni") => omni_cli::command(&args[1..]),
         Some("aperture") => aperture_cli::command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
