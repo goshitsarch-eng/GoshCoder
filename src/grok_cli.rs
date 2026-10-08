@@ -125,6 +125,20 @@ pub fn is_valid_version(value: &str) -> bool {
         })
 }
 
+/// Whether a Grok CLI credential is at hand without touching the network:
+/// the environment token, or a stored login (which may still need a
+/// refresh when used).
+pub fn credential_present(catalog: &crate::catalog::Catalog) -> bool {
+    catalog.environment_value(TOKEN_ENV).is_some()
+        || catalog.credentials().is_some_and(|store| {
+            matches!(
+                store.read(PROVIDER_ID),
+                Ok(Some(credential))
+                    if credential.kind() == &crate::catalog::CredentialKind::OAuth
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Models
 

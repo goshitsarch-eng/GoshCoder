@@ -921,6 +921,15 @@ impl Workspace {
         }
     }
 
+    /// The absolute path of an existing file inside the workspace, refusing
+    /// one outside it or reached through a symlinked component, for
+    /// integrations that read a file the model names.
+    pub fn resolve_existing(&self, requested: &str) -> std::result::Result<PathBuf, String> {
+        let relative = self.resolve(requested).map_err(|error| error.to_string())?;
+        self.existing_path(&relative)
+            .map_err(|error| error.to_string())
+    }
+
     /// Resolves a user supplied path to a normalized path relative to root.
     fn resolve(&self, requested: &str) -> Result<PathBuf> {
         if requested.is_empty() {

@@ -13,6 +13,7 @@ pub mod config;
 pub mod export_html;
 pub mod google_auth;
 pub mod grok_cli;
+pub mod grok_imagine;
 pub mod llm;
 pub mod markdown;
 pub mod mistral;
@@ -1957,8 +1958,47 @@ fn dispatch_login_command<'a>(
     CommandDispatch::Suspended(Box::new(move || {
         run_self_subprocess(&["auth", subcommand, &provider_id])?;
         catalog.clear_oauth_refresh_failure(&provider_id);
+        // A Grok CLI login is what makes `image_gen` available.
+        prepared.sync_image_tool();
         Ok(after_login_message(prepared, catalog, &provider_id))
     }))
+}
+
+/// `/grok-cli-imagine:tool [on|off|status]`: the persisted `image_gen`
+/// switch. With no argument it toggles, as upstream does.
+fn image_tool_command(prepared: &runtime::PreparedSession, rest: &str) -> Result<String, String> {
+    let argument = rest.trim().to_ascii_lowercase();
+    if !matches!(argument.as_str(), "" | "on" | "off" | "status") {
+        return Err("Usage: /grok-cli-imagine:tool [on|off|status]".to_owned());
+    }
+    let path = prepared.imagine_config_path();
+    let loaded = grok_imagine::load_config(&path);
+    let mut lines = loaded.warning.into_iter().collect::<Vec<_>>();
+    let on_off = |value: bool| if value { "on" } else { "off" };
+    if argument == "status" {
+        lines.push(format!(
+            "image_gen persisted: {}; active: {}",
+            on_off(loaded.enabled),
+            on_off(prepared.image_tool_active())
+        ));
+        return Ok(lines.join("\n"));
+    }
+    let enabled = if argument.is_empty() {
+        !loaded.enabled
+    } else {
+        argument == "on"
+    };
+    grok_imagine::save_config(&path, enabled)
+        .map_err(|error| format!("Could not save image_gen setting: {error}"))?;
+    let active = prepared.sync_image_tool();
+    lines.push(format!("image_gen: {}", on_off(enabled)));
+    if enabled && !active {
+        lines.push(
+            "It becomes available once Grok CLI is signed in (/login grok-cli) and tools are on."
+                .to_owned(),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The in-chat command that configures a gateway provider; `/login` would
@@ -2206,7 +2246,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-conv [status|rotate]  Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-imagine <prompt> [--image <path>] [--aspect <r>] [--out <path>]  Generate or edit an image with Grok Imagine\n  /grok-cli-imagine:tool [on|off|status]  Offer the image_gen tool to the model, or not\n  /grok-cli-conv [status|rotate]  Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2688,6 +2728,29 @@ fn dispatch_runtime_slash_command<'a>(
             CommandDispatch::Handled
         }
         "/login" => dispatch_login_command(app, view, prepared, catalog, rest, fullscreen),
+        "/grok-cli-imagine" => {
+            if rest.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Usage: /grok-cli-imagine <prompt> [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]",
+                );
+                return CommandDispatch::Handled;
+            }
+            let context = prepared.imagine_context();
+            let arguments = rest.to_owned();
+            start_background_command(view, "/grok-cli-imagine", move || {
+                grok_imagine::run_command(&context, &arguments).map(|lines| lines.join("\n"))
+            });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-imagine:tool" => {
+            match image_tool_command(prepared, rest) {
+                Ok(message) => append_view_message(view, MessageRole::Command, message),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
         "/grok-cli-usage" => {
             let catalog = catalog.clone();
             let agent_dir = catalog

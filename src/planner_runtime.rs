@@ -673,6 +673,13 @@ impl PlannerRuntime {
         self.sync_agent();
     }
 
+    /// Drops tools from the ordinary set (an integration switched off) and
+    /// re-applies the current phase.
+    pub fn remove_normal_tools(&self, names: &[&str]) {
+        lock(&self.normal_tools).retain(|tool| !names.contains(&tool.name.as_str()));
+        self.sync_agent();
+    }
+
     /// A callback that performs [`PlannerRuntime::extend_normal_tools`] from
     /// a background thread that must not hold the session.
     #[must_use]

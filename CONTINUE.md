@@ -66,7 +66,7 @@ something goes wrong:
 | Session files (pi v3 JSONL) | `src/sessionlog.rs`, `src/session.rs` |
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
-| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`; its OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
+| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
 | Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
 
 ## Starting without credentials

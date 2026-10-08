@@ -191,7 +191,8 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | Package | Contents |
 | --- | --- |
 | `src/{llm,stream,providers,bedrock}` | Wire protocols, normalized messages, stream parsing, retries, and request adapters |
-| `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation |
+| `src/grok_cli.rs` | Grok CLI provider: identification headers, client version, conversation id, payload sanitisation, usage |
+| `src/grok_imagine.rs` | Grok Imagine image generation, `/grok-cli-imagine`, and the `image_gen` tool |
 | `src/catalog.rs` | Provider catalog, model data, credential store, and auth resolution |
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
@@ -438,6 +439,22 @@ is recorded in [`NOTICE`](NOTICE).
     answer is cached in `grok-cli/quota-cache.json` under the agent directory
     (0600, upstream's format; an entry older than 30 minutes counts as
     stale), and a failed refresh falls back to the cached figures.
+  - **Grok Imagine.** With a Grok CLI login, `/grok-cli-imagine <prompt>
+    [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]` generates
+    an image, or edits a PNG, JPEG or WebP of up to 400 KiB (typed by its
+    bytes, not its name), through `https://api.x.ai/v1/images/generations`
+    or `/edits` (`PI_GROK_CLI_IMAGINE_BASE_URL`, model
+    `grok-imagine-image-quality` or `PI_GROK_CLI_IMAGINE_MODEL`), with
+    upstream's 14 aspect ratios, three attempts on retryable failures and
+    its error messages. Images are numbered `N.jpg` in
+    `<session dir>/<session id>/images/`, or a temporary directory without a
+    session, and recorded as `grok-cli-imagine` session entries. The
+    `image_gen` tool gives the model the same ability; it is offered only
+    while coding tools are on, a Grok CLI credential exists and the switch in
+    `grok-cli/config.json` (`/grok-cli-imagine:tool [on|off|status]`) is on.
+    Its source image is read through the workspace confinement the other
+    file tools use, where upstream accepts any path. The interface shows the
+    saved path rather than drawing the image.
   - **Models.** Upstream's ten (Composer 2.5 Fast, Grok Build, Grok 4.3 to
     4.7, Grok 4.7 Fast and the three Grok 4.20 variants) with its context
     windows, prices and effort maps. `PI_GROK_CLI_MODELS` filters and reorders
@@ -446,9 +463,10 @@ is recorded in [`NOTICE`](NOTICE).
     `GOSHCODER_GROK_CLI_BASE_URL` move the endpoint.
 
   Not ported: the browser account dashboard, upstream's migrations from its
-  own earlier releases (there is nothing in GoshCoder to migrate from), and
-  the payload step that turns local image paths into data URIs (GoshCoder's
-  request builders only ever send data URIs).
+  own earlier releases (there is nothing in GoshCoder to migrate from), the
+  payload step that turns local image paths into data URIs (GoshCoder's
+  request builders only ever send data URIs), and Imagine's inline image
+  preview (GoshCoder has no terminal image renderer).
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,

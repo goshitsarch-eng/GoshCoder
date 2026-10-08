@@ -16,8 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, grok_cli, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
-    ralph_runtime,
+    computeruse, config, grok_cli, grok_imagine, llm, omni_cli, omniroute, planner_runtime,
+    plannotator, ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -130,9 +130,69 @@ pub struct PreparedSession {
     /// Keeps the Grok CLI conversation id answering from this session's log
     /// for as long as the session lives.
     grok_conv: Option<grok_cli::ConvRegistration>,
+    /// The absolute working directory, which Grok Imagine resolves paths in.
+    cwd: PathBuf,
 }
 
 impl PreparedSession {
+    /// What Grok Imagine needs from this session: credentials, the session
+    /// file its images are saved beside, and the workspace that confines
+    /// the tool's source images.
+    pub fn imagine_context(&self) -> Arc<grok_imagine::Context> {
+        Arc::new(grok_imagine::Context {
+            catalog: self.catalog.clone(),
+            recorder: self.runtime.custom_recorder(),
+            cwd: self.cwd.clone(),
+            workspace: self.workspace.clone(),
+            fallback_dir: grok_imagine::fallback_image_dir(),
+        })
+    }
+
+    pub fn imagine_config_path(&self) -> PathBuf {
+        grok_imagine::config_path(
+            &self
+                .catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir),
+        )
+    }
+
+    /// Whether `image_gen` is in the live tool set.
+    pub fn image_tool_active(&self) -> bool {
+        self.runtime
+            .agent()
+            .state()
+            .tools
+            .iter()
+            .any(|tool| tool.name == grok_imagine::TOOL_NAME)
+    }
+
+    /// Offers `image_gen` exactly when coding tools are on, the persisted
+    /// switch is on, and a Grok CLI credential exists; upstream re-applies
+    /// its switch on session start and model selection, GoshCoder at start,
+    /// after a login and after `/grok-cli-imagine:tool`.
+    pub fn sync_image_tool(&self) -> bool {
+        let wanted = self.config.enable_tools
+            && grok_imagine::load_config(&self.imagine_config_path()).enabled
+            && grok_cli::credential_present(&self.catalog);
+        let active = self.image_tool_active();
+        if wanted && !active {
+            self.register_tools(vec![grok_imagine::tool(self.imagine_context())]);
+        } else if !wanted && active {
+            match self.planner.as_ref() {
+                Some(planner) => planner.remove_normal_tools(&[grok_imagine::TOOL_NAME]),
+                None => {
+                    let mut tools = self.runtime.agent().state().tools;
+                    tools.retain(|tool| tool.name != grok_imagine::TOOL_NAME);
+                    self.runtime.agent().set_tools(tools);
+                }
+            }
+        }
+        self.image_tool_active()
+    }
+
     /// The session id this session's provider requests carry, which keys the
     /// Grok CLI conversation id. Empty without a session log.
     pub fn request_session_id(&self) -> &str {
@@ -736,9 +796,11 @@ pub fn prepare_session(
         catalog: catalog.clone(),
         desktop,
         grok_conv,
+        cwd: cwd.clone(),
     };
     prepared.aperture_session_start();
     prepared.omni_session_start();
+    prepared.sync_image_tool();
     Ok(prepared)
 }
 
@@ -1859,5 +1921,75 @@ mod tests {
         reopened.runtime.close().expect("close session");
         drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove workspace");
+    }
+
+    #[test]
+    fn image_gen_is_offered_only_with_a_grok_cli_credential_and_the_switch_on() {
+        let directory = std::env::temp_dir().join(format!(
+            "goshcoder-runtime-image-gen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let agent_dir = directory.join("agent");
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let catalog_with = |token: bool| {
+            Catalog::with_environment(
+                None,
+                Arc::new(move |name| match name {
+                    "OPENAI_API_KEY" => Some("test-key".to_owned()),
+                    grok_cli::TOKEN_ENV if token => Some("grok-token".to_owned()),
+                    _ => None,
+                }),
+            )
+            .expect("catalog")
+            .with_dynamic_paths(crate::catalog::DynamicPaths::for_agent_dir(&agent_dir))
+        };
+        let prepare = |catalog: &Catalog, tools: bool, planner: bool| {
+            let model_id = catalog
+                .provider("openai")
+                .and_then(|provider| provider.models().last().map(|model| model.id.clone()))
+                .expect("OpenAI model");
+            prepare_session(
+                catalog,
+                SessionConfig {
+                    model_ref: format!("openai/{model_id}"),
+                    workdir: workspace.clone(),
+                    enable_tools: tools,
+                    enable_planner: planner,
+                    no_session: true,
+                    ..SessionConfig::default()
+                },
+                None,
+                Vec::new(),
+            )
+            .expect("prepare session")
+        };
+
+        for planner in [false, true] {
+            let catalog = catalog_with(true);
+            let mut prepared = prepare(&catalog, true, planner);
+            assert!(prepared.image_tool_active(), "planner {planner}");
+            // Switching it off takes it away, through the planner's own set
+            // when one is attached, and switching back restores it.
+            grok_imagine::save_config(&prepared.imagine_config_path(), false).expect("save");
+            assert!(!prepared.sync_image_tool(), "planner {planner}");
+            assert!(!prepared.image_tool_active());
+            grok_imagine::save_config(&prepared.imagine_config_path(), true).expect("save");
+            assert!(prepared.sync_image_tool());
+            prepared.runtime.close().expect("close");
+        }
+
+        // No credential, or no coding tools: never offered.
+        let mut logged_out = prepare(&catalog_with(false), true, false);
+        assert!(!logged_out.image_tool_active());
+        logged_out.runtime.close().expect("close");
+        let mut read_only = prepare(&catalog_with(true), false, false);
+        assert!(!read_only.image_tool_active());
+        read_only.runtime.close().expect("close");
+        std::fs::remove_dir_all(directory).expect("remove");
     }
 }

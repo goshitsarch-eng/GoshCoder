@@ -762,6 +762,16 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/model", "Open the model picker", false),
         ("/login", "Open the provider picker and log in", false),
         (
+            "/grok-cli-imagine",
+            "Generate or edit an image with Grok Imagine",
+            false,
+        ),
+        (
+            "/grok-cli-imagine:tool",
+            "Turn the image_gen tool on or off",
+            false,
+        ),
+        (
             "/grok-cli-usage",
             "Show the Grok CLI subscription's usage",
             true,
