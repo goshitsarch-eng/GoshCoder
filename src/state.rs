@@ -177,7 +177,13 @@ impl App {
                 .dynamic_suggestions
                 .iter()
                 .filter(|suggestion| {
-                    query.is_empty() || suggestion.label.to_lowercase().contains(&query)
+                    // Descriptions carry the display names ("Claude", "API
+                    // key"), which are what people tend to type.
+                    query.is_empty()
+                        || query.split_whitespace().all(|word| {
+                            suggestion.label.to_lowercase().contains(word)
+                                || suggestion.description.to_lowercase().contains(word)
+                        })
                 })
                 .cloned()
                 .collect();

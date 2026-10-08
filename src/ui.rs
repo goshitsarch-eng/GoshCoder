@@ -176,18 +176,27 @@ fn render_suggestions(
         .saturating_sub(item_capacity)
         .min(suggestions.len().saturating_sub(item_capacity));
     let visible = &suggestions[first..suggestions.len().min(first + item_capacity)];
+    // One label column for the whole list, so it does not shift while
+    // scrolling, capped so a long id cannot squeeze out every description.
+    let label_width = suggestions
+        .iter()
+        .map(|suggestion| UnicodeWidthStr::width(suggestion.label.as_str()))
+        .max()
+        .unwrap_or(0)
+        .min((area.width / 2) as usize);
+    let description_width = (area.width as usize).saturating_sub(label_width + 7);
     let items: Vec<ListItem<'_>> = visible
         .iter()
         .map(|suggestion| {
-            let text = format!(
-                " {}  {}",
-                suggestion.label,
-                truncate(
-                    &suggestion.description,
-                    area.width.saturating_sub(6) as usize
-                )
-            );
-            ListItem::new(Line::from(text))
+            let label = truncate(&suggestion.label, label_width);
+            let padding = label_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            ListItem::new(Line::from(vec![
+                Span::raw(format!(" {label}{}  ", " ".repeat(padding))),
+                Span::styled(
+                    truncate(&suggestion.description, description_width),
+                    Style::default().fg(MUTED),
+                ),
+            ]))
         })
         .collect();
     let title = suggestion_title(&app.input);

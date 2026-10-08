@@ -19,6 +19,7 @@ use crate::{
 /// Executes `goshcoder providers`.
 pub fn providers_command() -> Result<(), Box<dyn Error>> {
     let catalog = Catalog::with_default_credentials()?;
+    let mut rows = Vec::new();
     for provider in catalog.providers() {
         let (status, detail) = match catalog.resolve_auth(&provider.id) {
             Ok(Some(authentication)) => {
@@ -35,10 +36,20 @@ pub fn providers_command() -> Result<(), Box<dyn Error>> {
             Err(error @ CatalogError::OAuthRefreshFailed { .. }) => ("!", error.to_string()),
             Err(error) => return Err(error.into()),
         };
-        println!(
-            "{status} {:<24} {:<22} {detail}",
-            provider.id, provider.name
-        );
+        rows.push((status, provider.id.clone(), provider.name.clone(), detail));
+    }
+    let id_width = rows
+        .iter()
+        .map(|row| row.1.chars().count())
+        .max()
+        .unwrap_or(0);
+    let name_width = rows
+        .iter()
+        .map(|row| row.2.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (status, id, name, detail) in rows {
+        println!("{status} {id:<id_width$}  {name:<name_width$}  {detail}");
     }
     if let Some(warning) = catalog.credential_store_warning() {
         eprintln!("warning: {warning}; stored credentials were ignored");
@@ -70,11 +81,25 @@ pub fn models_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+const AUTH_USAGE: &str = "usage: goshcoder auth <subcommand>
+
+  login <provider>   Sign in through the browser or a device code
+                     (anthropic, openai-codex, xai, meta, kimi-coding, openrouter)
+  set <provider>     Store an API key for any provider
+  list               Show stored credentials
+  logout <provider>  Remove a stored credential
+
+`goshcoder providers` shows which providers are configured and how to set up the rest.";
+
 /// Executes `goshcoder auth set|login|list|logout`.
 pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let Some(subcommand) = arguments.first().map(String::as_str) else {
-        return Err(command_error("usage: goshcoder auth set|login|list|logout"));
+        return Err(command_error(AUTH_USAGE));
     };
+    if matches!(subcommand, "help" | "-h" | "-help" | "--help") {
+        println!("{AUTH_USAGE}");
+        return Ok(());
+    }
     let store = CredentialStore::default_file();
     match subcommand {
         "list" => {
@@ -166,7 +191,7 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         _ => Err(command_error(format!(
-            "unknown auth subcommand {subcommand:?}"
+            "unknown auth subcommand {subcommand:?}\n\n{AUTH_USAGE}"
         ))),
     }
 }
@@ -190,11 +215,9 @@ impl oauth::OAuthInteraction for TerminalOAuthInteraction {
                 eprintln!("  {}. {} — {}", index + 1, option.label, option.description);
             }
         }
-        if prompt.placeholder.is_empty() {
-            eprint!("> ");
-        } else {
-            eprint!("{}: ", prompt.placeholder);
-        }
+        // The placeholder is an example of what to paste (the redirect URL),
+        // not a label; printed as one it reads like something to type.
+        eprint!("> ");
         io::stderr()
             .flush()
             .map_err(|error| oauth::OAuthError::Callback(format!("write prompt: {error}")))?;
@@ -278,14 +301,31 @@ fn cloudflare_credential_fields(provider_id: &str) -> &'static [(&'static str, &
 
 pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
     let environment = provider.env_keys.join(" or ");
-    if provider.supports_oauth {
-        if environment.is_empty() {
-            return format!("run: goshcoder auth login {}", provider.id);
-        }
-        return format!(
-            "run: goshcoder auth login {} (or set {environment})",
-            provider.id
-        );
+    // Some providers are marked OAuth-capable without a login GoshCoder can
+    // run; pointing at `auth login` there only leads to a refusal.
+    let login_available = provider.supports_oauth
+        && oauth::OAuthProviderId::parse(&provider.id).is_some_and(|id| {
+            oauth::metadata_for(id).flow_support == oauth::OAuthFlowSupport::Implemented
+        });
+    if login_available {
+        // Anthropic's key variables are resolved outside the catalog's
+        // `env_keys`, which only lists them for providers without OAuth.
+        let environment = match provider.id.as_str() {
+            "anthropic" => "ANTHROPIC_API_KEY".to_owned(),
+            _ => environment,
+        };
+        return match (environment.is_empty(), provider.id.as_str()) {
+            // A ChatGPT subscription has no API key; that is `openai`.
+            (_, "openai-codex") => format!("run: goshcoder auth login {}", provider.id),
+            (true, _) => format!(
+                "run: goshcoder auth login {id}, or goshcoder auth set {id} for an API key",
+                id = provider.id
+            ),
+            (false, _) => format!(
+                "run: goshcoder auth login {id}, or set {environment} / goshcoder auth set {id}",
+                id = provider.id
+            ),
+        };
     }
     if !environment.is_empty() {
         return format!(

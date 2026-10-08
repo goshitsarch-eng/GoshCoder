@@ -89,9 +89,130 @@ Usage:
 Tailscale Aperture. Type /help inside chat for the slash commands.
 "#;
 
+/// Set by [`run_self_subprocess`]: where a child reports why it failed, since
+/// the fullscreen interface redraws over whatever the child printed.
+const CHILD_ERROR_FILE_ENV: &str = "GOSHCODER_CHILD_ERROR_FILE";
+
+/// Ctrl-C while a child owns the terminal. With raw mode off the terminal
+/// turns it into SIGINT for the whole foreground process group, which would
+/// take the interface down with a login the user only meant to back out of.
+mod interrupt {
+    #[cfg(unix)]
+    mod sys {
+        use std::os::raw::c_int;
+
+        const SIGINT: c_int = 2;
+        const SIG_DFL: usize = 0;
+        const SIG_IGN: usize = 1;
+
+        unsafe extern "C" {
+            fn signal(signum: c_int, handler: usize) -> usize;
+        }
+
+        pub fn ignore() -> usize {
+            // SAFETY: installs a disposition constant, not a handler.
+            unsafe { signal(SIGINT, SIG_IGN) }
+        }
+
+        pub fn restore(previous: usize) {
+            // SAFETY: reinstates the disposition `ignore` returned.
+            unsafe {
+                signal(SIGINT, previous);
+            }
+        }
+
+        pub fn reset_default() {
+            // SAFETY: installs a disposition constant, not a handler.
+            unsafe {
+                signal(SIGINT, SIG_DFL);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod sys {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetConsoleCtrlHandler(handler: usize, add: i32) -> i32;
+        }
+
+        pub fn ignore() -> usize {
+            // SAFETY: a null handler toggles the process's Ctrl-C flag.
+            unsafe {
+                SetConsoleCtrlHandler(0, 1);
+            }
+            0
+        }
+
+        pub fn restore(_: usize) {
+            reset_default();
+        }
+
+        pub fn reset_default() {
+            // SAFETY: a null handler toggles the process's Ctrl-C flag.
+            unsafe {
+                SetConsoleCtrlHandler(0, 0);
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    mod sys {
+        pub fn ignore() -> usize {
+            0
+        }
+        pub fn restore(_: usize) {}
+        pub fn reset_default() {}
+    }
+
+    /// Ignores Ctrl-C in this process until the guard drops.
+    pub struct Ignored(usize);
+
+    pub fn ignore() -> Ignored {
+        Ignored(sys::ignore())
+    }
+
+    impl Drop for Ignored {
+        fn drop(&mut self) {
+            sys::restore(self.0);
+        }
+    }
+
+    /// An ignored disposition is inherited, so a child started by
+    /// [`super::run_self_subprocess`] takes Ctrl-C back for itself.
+    pub fn reset_default() {
+        sys::reset_default();
+    }
+}
+
+/// Whether a child ended because the user pressed Ctrl-C.
+fn interrupted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(2)
+    }
+    #[cfg(windows)]
+    {
+        // STATUS_CONTROL_C_EXIT
+        status.code() == Some(0xC000_013A_u32 as i32)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = status;
+        false
+    }
+}
+
 fn main() {
+    if std::env::var_os(CHILD_ERROR_FILE_ENV).is_some() {
+        interrupt::reset_default();
+    }
     if let Err(error) = run() {
         eprintln!("error: {error}");
+        if let Some(path) = std::env::var_os(CHILD_ERROR_FILE_ENV) {
+            let _ = std::fs::write(path, error.to_string());
+        }
         std::process::exit(1);
     }
 }
@@ -534,18 +655,41 @@ fn with_suspended_terminal<T>(
 fn run_self_subprocess(arguments: &[&str]) -> Result<(), String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("locate goshcoder: {error}"))?;
-    let status = std::process::Command::new(&executable)
-        .args(arguments)
-        .status()
-        .map_err(|error| format!("run goshcoder {}: {error}", arguments.join(" ")))?;
+    let error_file = std::env::temp_dir().join(format!(
+        "goshcoder-child-error-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let status = {
+        let _interrupt = interrupt::ignore();
+        std::process::Command::new(&executable)
+            .args(arguments)
+            .env(CHILD_ERROR_FILE_ENV, &error_file)
+            .status()
+            .map_err(|error| format!("run goshcoder {}: {error}", arguments.join(" ")))?
+    };
+    let reported = std::fs::read_to_string(&error_file).ok();
+    let _ = std::fs::remove_file(&error_file);
     if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "goshcoder {} exited with {status}",
-            arguments.join(" ")
-        ))
+        return Ok(());
     }
+    // Ctrl-C at a prompt is the user backing out, not a failure to dwell on.
+    if interrupted(&status) {
+        return Err(format!("goshcoder {} was cancelled", arguments.join(" ")));
+    }
+    let cancelled = reported
+        .as_deref()
+        .is_some_and(|message| message.contains("cancelled"));
+    if !cancelled {
+        eprint!("\nPress Enter to return to GoshCoder. ");
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+    }
+    Err(match reported {
+        Some(message) if !message.trim().is_empty() => message.trim().to_owned(),
+        _ => format!("goshcoder {} exited with {status}", arguments.join(" ")),
+    })
 }
 
 /// Runs a network-bound command off the terminal thread. Its output arrives
@@ -1760,16 +1904,20 @@ fn dispatch_login_command<'a>(
             view,
             MessageRole::Command,
             format!(
-                "Usage: /login <provider>\nOAuth subscriptions: {}\nOther providers prompt for an API key; existing provider credentials are preserved.",
+                "Usage: /login <provider> [key]\nBrowser or device sign-in: {}\nAdd `key` to store an API key instead; other providers always prompt for one. Existing credentials are preserved.",
                 oauth::implemented_provider_ids().join(", ")
             ),
         );
         return CommandDispatch::Handled;
     }
     let fields = rest.split_whitespace().collect::<Vec<_>>();
-    let [provider_id] = fields.as_slice() else {
-        append_view_message(view, MessageRole::Error, "usage: /login <provider>");
-        return CommandDispatch::Handled;
+    let (provider_id, use_key) = match fields.as_slice() {
+        [provider_id] => (provider_id, false),
+        [provider_id, "key" | "api-key" | "apikey"] => (provider_id, true),
+        _ => {
+            append_view_message(view, MessageRole::Error, "usage: /login <provider> [key]");
+            return CommandDispatch::Handled;
+        }
     };
     if catalog.provider(provider_id).is_none() {
         append_view_message(
@@ -1790,7 +1938,17 @@ fn dispatch_login_command<'a>(
         return CommandDispatch::Handled;
     }
     let provider_id = (*provider_id).to_owned();
-    let subcommand = if login_flow_available(&provider_id) {
+    if use_key && !api_key_login_available(&provider_id) {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!(
+                "{provider_id} has no API key; use /login {provider_id}, or /login openai key for the OpenAI API"
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
+    let subcommand = if login_flow_available(&provider_id) && !use_key {
         "login"
     } else {
         "set"
@@ -1847,6 +2005,101 @@ fn after_login_message(
             "Added {provider_id}, but {reference} could not be selected: {error}. Pick a model to start."
         ),
     }
+}
+
+/// Providers most people arrive with, listed first in the login picker; the
+/// rest follow alphabetically.
+const FEATURED_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai-codex",
+    "openai",
+    "google",
+    "xai",
+    "openrouter",
+    "deepseek",
+    "mistral",
+    "meta",
+    "kimi-coding",
+    "moonshotai",
+    "zai",
+    "groq",
+];
+
+/// The `/login` picker: one row per way in. A provider with a browser or
+/// device login and an API key gets a row for each, so a developer key is
+/// never hidden behind a subscription flow.
+fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
+    let mut providers = catalog
+        .providers()
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .models()
+                .iter()
+                .any(|model| providers::supports_api(&model.api))
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|provider| {
+        (
+            FEATURED_PROVIDERS
+                .iter()
+                .position(|featured| *featured == provider.id)
+                .unwrap_or(usize::MAX),
+            provider.id.clone(),
+        )
+    });
+    let mut choices = Vec::new();
+    for provider in providers {
+        let configured = if catalog.is_configured(&provider.id).unwrap_or(false) {
+            "✓ "
+        } else {
+            ""
+        };
+        if let Some(setup) = gateway_setup_command(&provider.id) {
+            choices.push(state::Suggestion {
+                description: format!(
+                    "{configured}{}  ·  gateway, set up with {setup}",
+                    provider.name
+                ),
+                value: format!("/login {}", provider.id),
+                label: provider.id,
+                execute: true,
+            });
+            continue;
+        }
+        if login_flow_available(&provider.id) {
+            let method = match provider.id.as_str() {
+                "openai-codex" => "sign in with ChatGPT Plus/Pro",
+                "anthropic" => "sign in with Claude Pro/Max",
+                "xai" => "sign in with your Grok subscription",
+                "meta" => "sign in with your Meta account",
+                "kimi-coding" => "sign in with Kimi",
+                _ => "sign in through the browser",
+            };
+            choices.push(state::Suggestion {
+                description: format!("{configured}{}  ·  {method}", provider.name),
+                value: format!("/login {}", provider.id),
+                label: provider.id.clone(),
+                execute: true,
+            });
+            if !api_key_login_available(&provider.id) {
+                continue;
+            }
+        }
+        choices.push(state::Suggestion {
+            description: format!("{configured}{}  ·  API key", provider.name),
+            value: format!("/login {} key", provider.id),
+            label: provider.id,
+            execute: true,
+        });
+    }
+    choices
+}
+
+/// Whether a provider with a login flow also takes an API key. A ChatGPT
+/// subscription has none; the `openai` provider is the API-key route.
+fn api_key_login_available(provider_id: &str) -> bool {
+    provider_id != "openai-codex"
 }
 
 fn login_flow_available(provider_id: &str) -> bool {
@@ -3149,30 +3402,7 @@ fn palette_suggestions(
             .clone();
     }
     view.login_choices
-        .get_or_insert_with(|| {
-            catalog
-                .providers()
-                .into_iter()
-                .filter(|provider| {
-                    provider
-                        .models()
-                        .iter()
-                        .any(|model| providers::supports_api(&model.api))
-                })
-                .map(|provider| state::Suggestion {
-                    description: if let Some(setup) = gateway_setup_command(&provider.id) {
-                        format!("{}  ·  gateway, see {setup}", provider.name)
-                    } else if login_flow_available(&provider.id) {
-                        format!("{}  ·  OAuth / subscription", provider.name)
-                    } else {
-                        format!("{}  ·  API key", provider.name)
-                    },
-                    value: format!("/login {}", provider.id),
-                    label: provider.id,
-                    execute: true,
-                })
-                .collect()
-        })
+        .get_or_insert_with(|| login_choices(catalog))
         .clone()
 }
 
