@@ -88,6 +88,7 @@ const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_CALLBACK_PORT: u16 = 53692;
 const ANTHROPIC_CALLBACK_PATH: &str = "/callback";
 const ANTHROPIC_REDIRECT_URI: &str = "http://localhost:53692/callback";
+const ANTHROPIC_COPY_CODE_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
 const ANTHROPIC_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 const ANTHROPIC_REFRESH_SKEW: Duration = Duration::from_secs(5 * 60);
 
@@ -2407,6 +2408,111 @@ impl OAuthClient {
         environment: &dyn OAuthEnvironment,
         cancellation: &CancellationToken,
     ) -> Result<Credential> {
+        let method = interaction.prompt(OAuthPrompt {
+            kind: OAuthPromptKind::Select,
+            message: "Select the Anthropic login method:".to_owned(),
+            placeholder: String::new(),
+            options: vec![
+                OAuthPromptOption {
+                    id: "browser".to_owned(),
+                    label: "Browser login (default)".to_owned(),
+                    description: String::new(),
+                },
+                OAuthPromptOption {
+                    id: "copy_code".to_owned(),
+                    label: "Copy code login (headless)".to_owned(),
+                    description: "for a machine whose browser cannot reach this one".to_owned(),
+                },
+            ],
+            cancellation: cancellation.clone(),
+        })?;
+        cancellation.check()?;
+        match method.as_str() {
+            "" | "browser" => self.login_anthropic_browser(interaction, environment, cancellation),
+            "copy_code" => self.login_anthropic_copy_code(interaction, cancellation),
+            _ => Err(OAuthError::InvalidConfiguration(format!(
+                "unknown Anthropic login method {method:?}"
+            ))),
+        }
+    }
+
+    /// pi's `loginAnthropicCopyCode`: Anthropic's own page shows the code,
+    /// so a login on a remote or headless machine needs no loopback at all.
+    fn login_anthropic_copy_code(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let pkce = generate_pkce();
+        interaction.notify(OAuthEvent {
+            instructions:
+                "Complete login in your browser, then copy the code Anthropic shows and paste it here."
+                    .to_owned(),
+            ..OAuthEvent::authorization_url(
+                &self.anthropic_authorization_url(&pkce, ANTHROPIC_COPY_CODE_REDIRECT_URI),
+            )
+        });
+        let _ = self
+            .browser
+            .open(&self.anthropic_authorization_url(&pkce, ANTHROPIC_COPY_CODE_REDIRECT_URI));
+        let input = interaction.prompt(OAuthPrompt {
+            kind: OAuthPromptKind::ManualCode,
+            message: "Paste the code Anthropic shows after you sign in:".to_owned(),
+            placeholder: "code#state".to_owned(),
+            options: Vec::new(),
+            cancellation: cancellation.clone(),
+        })?;
+        let parsed =
+            parse_authorization_input(&input).ok_or(OAuthError::InvalidAuthorizationInput)?;
+        if !parsed.state.is_empty() && !constant_time_eq(&parsed.state, pkce.verifier()) {
+            return Err(OAuthError::StateMismatch);
+        }
+        interaction.notify(OAuthEvent::progress(
+            "Exchanging the authorization code for tokens...",
+        ));
+        self.exchange_anthropic_code(
+            &parsed.code,
+            pkce.verifier(),
+            ANTHROPIC_COPY_CODE_REDIRECT_URI,
+            cancellation,
+        )
+    }
+
+    fn exchange_anthropic_code(
+        &self,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
+        let response = self.post_json(
+            &self.endpoints.anthropic_token_url,
+            json!({
+                "grant_type": "authorization_code",
+                "client_id": ANTHROPIC_CLIENT_ID,
+                "code": code,
+                "state": verifier,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+            }),
+            cancellation,
+        )?;
+        let token = self.successful_token(OAuthProviderId::Anthropic, "exchange", response)?;
+        credential_from_token(
+            OAuthProviderId::Anthropic.display_name(),
+            "exchange",
+            token,
+            self.clock.now_ms(),
+            ANTHROPIC_REFRESH_SKEW,
+        )
+    }
+
+    fn login_anthropic_browser(
+        &self,
+        interaction: Arc<dyn OAuthInteraction>,
+        environment: &dyn OAuthEnvironment,
+        cancellation: &CancellationToken,
+    ) -> Result<Credential> {
         let pkce = generate_pkce();
         let host = callback_host(environment);
         // pi's anthropic.ts: Anthropic accepts any loopback port, so a busy
@@ -2456,26 +2562,11 @@ impl OAuthClient {
             },
             server,
             |code| {
-                let response = self.post_json(
-                    &self.endpoints.anthropic_token_url,
-                    json!({
-                        "grant_type": "authorization_code",
-                        "client_id": ANTHROPIC_CLIENT_ID,
-                        "code": code,
-                        "state": pkce.verifier(),
-                        "redirect_uri": exchange_redirect_uri,
-                        "code_verifier": pkce.verifier(),
-                    }),
+                self.exchange_anthropic_code(
+                    &code,
+                    pkce.verifier(),
+                    &exchange_redirect_uri,
                     cancellation,
-                )?;
-                let token =
-                    self.successful_token(OAuthProviderId::Anthropic, "exchange", response)?;
-                credential_from_token(
-                    OAuthProviderId::Anthropic.display_name(),
-                    "exchange",
-                    token,
-                    self.clock.now_ms(),
-                    ANTHROPIC_REFRESH_SKEW,
                 )
             },
         )
@@ -4423,6 +4514,43 @@ mod tests {
                 .access(),
             "sk-or-v1-minted"
         );
+    }
+
+    #[test]
+    fn anthropic_copy_code_login_needs_no_loopback() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"access_token":"sk-ant-oat-new","refresh_token":"rt","expires_in":3600}"#.to_vec(),
+        )]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let interaction = Arc::new(PromptInteraction::answers(["copy_code", "pasted-code"]));
+        let credential = client
+            .login(
+                OAuthProviderId::Anthropic,
+                interaction.clone(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("copy-code login");
+        assert_eq!(credential.access(), "sk-ant-oat-new");
+
+        let shown = lock_unpoisoned(&interaction.events)
+            .iter()
+            .find_map(|event| event.authorization_url.clone())
+            .expect("authorization URL shown");
+        assert_eq!(
+            query_value(&Url::parse(&shown).expect("URL"), "redirect_uri"),
+            ANTHROPIC_COPY_CODE_REDIRECT_URI
+        );
+        let requests = transport.requests();
+        let body: Value = serde_json::from_slice(requests[0].body()).expect("JSON body");
+        assert_eq!(body["code"], "pasted-code");
+        assert_eq!(body["redirect_uri"], ANTHROPIC_COPY_CODE_REDIRECT_URI);
+        assert_eq!(body["state"], body["code_verifier"]);
     }
 
     #[test]
