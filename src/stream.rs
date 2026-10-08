@@ -1824,11 +1824,16 @@ const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS: &[&str] = &[
     "out of budget",
     "quota exceeded",
     "billing",
+    "subscription_sharing_usage_limit_exceeded",
     "chatgpt usage limit",
 ];
 
 const RETRYABLE_ASSISTANT_PATTERNS: &[&str] = &[
     "overloaded",
+    "server_busy",
+    "servers are currently busy",
+    "currently experiencing high demand",
+    "model is at capacity",
     "rate limit",
     "too many requests",
     "429",
@@ -1836,7 +1841,11 @@ const RETRYABLE_ASSISTANT_PATTERNS: &[&str] = &[
     "502",
     "503",
     "504",
+    "520",
     "524",
+    // Anthropic's overloaded status. Its body usually says "Overloaded", but a
+    // gateway in between may pass the status on with a body of its own.
+    "529",
     "service unavailable",
     "server error",
     "internal error",
@@ -1864,11 +1873,14 @@ const RETRYABLE_ASSISTANT_PATTERNS: &[&str] = &[
     "stream ended before message_stop",
     "stream ended before a terminal response event",
     "http2 request did not get a response",
+    "pending stream has been canceled",
     "retry delay",
     "you can retry your request",
     "try your request again",
     "please retry your request",
     "resourceexhausted",
+    "subscription_sharing_usage_unavailable",
+    "subscription_sharing_user_unavailable",
 ];
 
 /// Returns whether an assistant error looks transient enough for a new attempt.
