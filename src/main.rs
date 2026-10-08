@@ -1276,6 +1276,24 @@ fn event_loop(
             append_view_message(&mut view, MessageRole::Notice, banner);
         }
     }
+    if !quiet && prepared.config.no_session {
+        append_view_message(
+            &mut view,
+            MessageRole::Notice,
+            format!(
+                "-no-session: this conversation is kept in memory only and will not be written to {}.",
+                home_relative(
+                    &prepared
+                        .config
+                        .sessions_dir
+                        .clone()
+                        .unwrap_or_else(config::sessions_dir)
+                        .display()
+                        .to_string()
+                )
+            ),
+        );
+    }
     if !runtime::model_is_selected(&prepared.runtime.agent().state().model) {
         append_view_message(&mut view, MessageRole::Notice, NO_MODEL_WELCOME);
         app.set_input("/login ");
@@ -1575,6 +1593,9 @@ fn drain_interactive_events(
     let notices = prepared.runtime.drain_notices();
     if !notices.is_empty() {
         changed = true;
+        // Anchor them after whatever the agent added since the last frame
+        // (the prompt a retry notice is about, for one).
+        view.message_count = prepared.runtime.agent().state().messages.len();
     }
     for notice in notices {
         if notice.kind == "retry"
@@ -1595,6 +1616,10 @@ fn drain_interactive_events(
                 ),
             );
             view.retry = Some(retry);
+            // The failed attempt ended the agent run, but the turn is still
+            // going until the retry succeeds or gives up.
+            view.turn_pending = true;
+            view.activity_since.get_or_insert_with(Instant::now);
             continue;
         }
         append_view_message(
