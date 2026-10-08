@@ -686,7 +686,8 @@ pub struct Context {
     pub catalog: Catalog,
     /// The session id requests carry, which picks the account whose token
     /// pays for the image, as upstream resolves the session's route.
-    pub request_session: String,
+    /// The session the image request belongs to, which picks the account.
+    pub request_session: crate::agent::SessionId,
     pub recorder: SessionCustomRecorder,
     pub cwd: PathBuf,
     /// Confines the tool's source images; `None` without workspace tools.
@@ -697,7 +698,7 @@ pub struct Context {
 impl Context {
     fn token(&self) -> Result<String, String> {
         crate::grok_accounts::Accounts::new(&self.catalog)
-            .usage_route(&self.request_session)
+            .usage_route(&self.request_session.get())
             .ok()
             .map(|(_, token)| token)
             .filter(|token| !token.is_empty())
@@ -1325,7 +1326,7 @@ mod tests {
                 Arc::new(move |name| environment.get(name).cloned()),
             )
             .expect("catalog"),
-            request_session: String::new(),
+            request_session: crate::agent::SessionId::default(),
             recorder,
             cwd: cwd.to_path_buf(),
             workspace: Some(tools::Workspace::new(cwd).expect("workspace")),

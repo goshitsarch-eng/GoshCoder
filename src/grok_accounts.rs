@@ -977,7 +977,7 @@ struct Chain {
 pub fn rotation_subscription(
     agent: &agent::Agent,
     accounts: Accounts,
-    request_session: String,
+    request_session: agent::SessionId,
     notices: SessionNoticeSender,
 ) -> agent::Subscription {
     let queue = agent.weak_follow_up_queue();
@@ -1013,6 +1013,9 @@ pub fn rotation_subscription(
         let Ok(file) = accounts.vault.load() else {
             return;
         };
+        // Read now, not at subscription: a switch moves the session the
+        // failed request belonged to.
+        let request_session = request_session.get();
         let failed = request_account(&request_session)
             .or_else(|| accounts.selected(&file, session_choice(&request_session).as_deref()));
         let Some(failed) = failed else {
@@ -1640,8 +1643,12 @@ mod tests {
         let id = runtime.id().expect("recorded session");
         let registration =
             grok_cli::register_session_store(&id, Arc::new(runtime.custom_recorder()));
-        let subscription =
-            rotation_subscription(runtime.agent(), accounts, id, runtime.notice_sender());
+        let subscription = rotation_subscription(
+            runtime.agent(),
+            accounts,
+            runtime.agent().session_id_source(),
+            runtime.notice_sender(),
+        );
         Rotation {
             runtime,
             seen,

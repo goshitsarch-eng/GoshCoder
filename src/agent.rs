@@ -484,7 +484,29 @@ struct AgentInner {
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     tool_execution: ToolExecutionMode,
-    session_id: String,
+    /// The session requests belong to. It follows the session file the agent
+    /// is attached to, so a switch moves prompt-cache keys and session
+    /// headers along with it.
+    session_id: SessionId,
+}
+
+/// A shared, updatable session id. Listeners that outlive a session switch
+/// hold one of these rather than a copy of the id they started with.
+#[derive(Clone, Default)]
+pub struct SessionId(Arc<Mutex<String>>);
+
+impl SessionId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(Arc::new(Mutex::new(id.into())))
+    }
+
+    pub fn get(&self) -> String {
+        lock(&self.0).clone()
+    }
+
+    fn set(&self, id: impl Into<String>) {
+        *lock(&self.0) = id.into();
+    }
 }
 
 /// A message that has started but not yet joined the transcript.
@@ -611,7 +633,7 @@ impl Agent {
                 steering_mode: options.steering_mode,
                 follow_up_mode: options.follow_up_mode,
                 tool_execution: options.tool_execution,
-                session_id: options.session_id,
+                session_id: SessionId::new(options.session_id),
             }),
         }
     }
@@ -705,6 +727,23 @@ impl Agent {
     /// isolated, unrecorded helper turn without changing the live transcript.
     pub fn responder(&self) -> AssistantResponder {
         Arc::clone(&self.inner.responder)
+    }
+
+    /// The session id the next request carries.
+    pub fn session_id(&self) -> String {
+        self.inner.session_id.get()
+    }
+
+    /// A live view of the session id, for listeners that must follow a
+    /// session switch.
+    pub fn session_id_source(&self) -> SessionId {
+        self.inner.session_id.clone()
+    }
+
+    /// Moves later requests to another session, as a switch to another
+    /// session file does.
+    pub fn set_session_id(&self, id: impl Into<String>) {
+        self.inner.session_id.set(id);
     }
 
     /// Returns a queue handle that does not keep this agent alive.
@@ -1165,7 +1204,7 @@ impl Agent {
                     max_tokens: None,
                     tool_choice: None,
                     cache_retention: CacheRetention::Short,
-                    session_id: self.inner.session_id.clone(),
+                    session_id: self.inner.session_id.get(),
                     assistant_event_listener: Some(assistant_event_listener),
                 },
             )

@@ -134,7 +134,8 @@ pub struct PreparedSession {
     desktop: Option<computeruse::McpSession>,
     /// Keeps the Grok CLI conversation id answering from this session's log
     /// for as long as the session lives.
-    grok_conv: Option<grok_cli::SessionRegistration>,
+    /// Held for its drop, which unregisters the session's Grok CLI store.
+    _grok_conv: Option<grok_cli::SessionRegistration>,
     /// Moves the session to the next Grok CLI account when one runs dry.
     _grok_rotation: Option<agent::Subscription>,
     /// The absolute working directory, which Grok Imagine resolves paths in.
@@ -148,7 +149,7 @@ impl PreparedSession {
     pub fn imagine_context(&self) -> Arc<grok_imagine::Context> {
         Arc::new(grok_imagine::Context {
             catalog: self.catalog.clone(),
-            request_session: self.request_session_id().to_owned(),
+            request_session: self.runtime.agent().session_id_source(),
             recorder: self.runtime.custom_recorder(),
             cwd: self.cwd.clone(),
             workspace: self.workspace.clone(),
@@ -202,11 +203,10 @@ impl PreparedSession {
     }
 
     /// The session id this session's provider requests carry, which keys the
-    /// Grok CLI conversation id. Empty without a session log.
-    pub fn request_session_id(&self) -> &str {
-        self.grok_conv
-            .as_ref()
-            .map_or("", grok_cli::SessionRegistration::key)
+    /// Grok CLI conversation id. It follows `/resume`, `/fork` and `/import`;
+    /// empty without a session log.
+    pub fn request_session_id(&self) -> String {
+        self.runtime.agent().session_id()
     }
 
     /// Returns a consistent snapshot of the resources currently available to
@@ -790,17 +790,18 @@ pub fn prepare_session(
         .transpose()
         .map_err(|error| RuntimeError::Session(format!("initialize Ralph: {error}")))?;
 
-    // Requests carry the id the agent was created with; the store follows
-    // whichever session file is open behind the recorder.
+    // Registered under the id the session starts on; requests carry the
+    // agent's current id, which the registry also resolves through the store's
+    // open session after a switch.
     let grok_conv = runtime
         .id()
         .filter(|id| !id.is_empty())
         .map(|id| grok_cli::register_session_store(&id, Arc::new(runtime.custom_recorder())));
-    let grok_rotation = grok_conv.as_ref().map(|registration| {
+    let grok_rotation = grok_conv.as_ref().map(|_| {
         grok_accounts::rotation_subscription(
             runtime.agent(),
             grok_accounts::Accounts::new(catalog),
-            registration.key().to_owned(),
+            runtime.agent().session_id_source(),
             runtime.notice_sender(),
         )
     });
@@ -816,7 +817,7 @@ pub fn prepare_session(
         config,
         catalog: catalog.clone(),
         desktop,
-        grok_conv,
+        _grok_conv: grok_conv,
         _grok_rotation: grok_rotation,
         cwd: cwd.clone(),
     };
