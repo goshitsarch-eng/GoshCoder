@@ -352,6 +352,21 @@ struct ConvRegistry {
     memory: HashMap<String, u64>,
 }
 
+impl ConvRegistry {
+    /// The store for requests carrying `request_session`: the one registered
+    /// under that id, else the one whose open session it is. Requests carry
+    /// the agent's current session id, which moves on `/resume`, `/fork` or
+    /// `/import` while the registration keeps the id the session started on.
+    fn store(&self, request_session: &str) -> Option<Arc<dyn SessionStore>> {
+        self.stores.get(request_session).cloned().or_else(|| {
+            self.stores
+                .values()
+                .find(|store| store.session_id().as_deref() == Some(request_session))
+                .cloned()
+        })
+    }
+}
+
 fn conv_registry() -> &'static Mutex<ConvRegistry> {
     static REGISTRY: OnceLock<Mutex<ConvRegistry>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
@@ -385,12 +400,12 @@ pub fn register_session_store(key: &str, store: Arc<dyn SessionStore>) -> Sessio
 
 /// The store registered for requests carrying `request_session`.
 pub fn session_store(request_session: &str) -> Option<Arc<dyn SessionStore>> {
-    lock(conv_registry()).stores.get(request_session).cloned()
+    lock(conv_registry()).store(request_session)
 }
 
 /// The session id requests for `request_session` belong to now.
 pub fn effective_session_id(request_session: &str) -> String {
-    let store = lock(conv_registry()).stores.get(request_session).cloned();
+    let store = lock(conv_registry()).store(request_session);
     store
         .and_then(|store| store.session_id())
         .filter(|id| !id.is_empty())
@@ -400,7 +415,7 @@ pub fn effective_session_id(request_session: &str) -> String {
 fn current_generation(request_session: &str) -> (String, u64) {
     let (store, remembered) = {
         let registry = lock(conv_registry());
-        let store = registry.stores.get(request_session).cloned();
+        let store = registry.store(request_session);
         let effective = store
             .as_ref()
             .and_then(|store| store.session_id())
@@ -444,7 +459,7 @@ pub fn rotate_conv(request_session: &str) -> Result<String, String> {
     if request_session.is_empty() {
         return Err("no session is active".to_owned());
     }
-    let store = lock(conv_registry()).stores.get(request_session).cloned();
+    let store = lock(conv_registry()).store(request_session);
     let (session, generation) = current_generation(request_session);
     let next = generation.saturating_add(1);
     let recorded = match store {
@@ -1850,6 +1865,12 @@ mod tests {
             Ok("Grok CLI conversation ID: file-session:4".to_owned())
         );
         assert_eq!(effective_session_id("agent-session-a"), "file-session");
+        // After a switch the agent's requests carry the open session's id,
+        // which still finds the store registered under the starting id.
+        assert!(session_store("file-session").is_some());
+        assert_eq!(conv_id("file-session").as_deref(), Some("file-session:4"));
+        assert_eq!(effective_session_id("file-session"), "file-session");
+        assert!(session_store("some-other-session").is_none());
         assert_eq!(
             conv_command("agent-session-a", "bogus"),
             Err("Usage: /grok-cli-conv [status|rotate]".to_owned())

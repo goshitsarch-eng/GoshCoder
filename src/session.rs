@@ -951,6 +951,9 @@ impl SessionRuntime {
             path: writer.path().to_path_buf(),
             read_only: writer.read_only(),
         };
+        // Requests now belong to the adopted session: its id keys provider
+        // prompt caches and session headers, not the one the agent began on.
+        self.agent.set_session_id(handle.id.clone());
         let previous = self.recorder.swap(writer);
         if let Some(mut previous) = previous
             && let Err(error) = previous.close()
@@ -1875,7 +1878,14 @@ fn tree_title(tree: &Tree) -> Option<String> {
     if !tree.name().is_empty() {
         return Some(tree.name().to_owned());
     }
-    tree.path(tree.leaf()).iter().find_map(|entry| {
+    // `/clear` starts a new conversation in the same file; its title is the
+    // first message after the newest reset, as the session list counts it.
+    let path = tree.path(tree.leaf());
+    let start = path
+        .iter()
+        .rposition(|entry| entry.kind == sessionlog::TYPE_TRANSCRIPT_RESET)
+        .map_or(0, |index| index + 1);
+    path[start..].iter().find_map(|entry| {
         (entry.kind == sessionlog::TYPE_MESSAGE)
             .then_some(entry.message.as_ref())
             .flatten()
@@ -2098,11 +2108,17 @@ mod tests {
         first.agent().set_model(stored.clone());
         first.agent().set_thinking_level(llm::THINKING_HIGH);
         first.agent().prompt("before reset").expect("first prompt");
+        assert_eq!(first.title().as_deref(), Some("before reset"));
         first
             .agent()
             .reset_with_reason("/clear")
             .expect("record reset");
+        // A cleared conversation has no first message yet, so the title falls
+        // back to the id (the interface shows its placeholder) instead of
+        // naming a conversation that is gone.
+        assert_eq!(first.title(), first.id());
         first.agent().prompt("after reset").expect("second prompt");
+        assert_eq!(first.title().as_deref(), Some("after reset"));
         let first_id = first.id().expect("id");
         close(&mut first);
 
@@ -2112,6 +2128,7 @@ mod tests {
         let mut second = SessionRuntime::open(second_options).expect("resume");
         assert!(second.resumed());
         assert_eq!(second.id().as_deref(), Some(first_id.as_str()));
+        assert_eq!(second.title().as_deref(), Some("after reset"));
         assert_eq!(second.agent().state().model, stored);
         assert_eq!(second.agent().state().thinking_level, llm::THINKING_HIGH);
         let messages = second.agent().state().messages;
@@ -2430,6 +2447,45 @@ mod tests {
             !String::from_utf8_lossy(&fs::read(&original.path).expect("original log"))
                 .contains("only in target")
         );
+        close(&mut current);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Requests carry the session they belong to: its id keys every
+    /// provider's prompt cache and session headers, so a switch must move it.
+    #[test]
+    fn requests_follow_the_session_the_agent_is_attached_to() {
+        let root = temp_root("request-session");
+        let cwd = root.join("workspace");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let capture = seen.clone();
+        let mut current_options = options(&root, &cwd);
+        current_options.responder = Some(Arc::new(move |model, _, request| {
+            capture
+                .lock()
+                .expect("captured ids")
+                .push(request.session_id.clone());
+            Ok(assistant("answer", &model.provider, &model.id))
+        }));
+        let mut current = SessionRuntime::open(current_options).expect("open current");
+        current.agent().prompt("first").expect("prompt");
+        let original = current.id().expect("original id");
+
+        let mut target = SessionRuntime::open(options(&root, &cwd)).expect("open target");
+        target.agent().prompt("target question").expect("prompt");
+        let target_id = target.id().expect("target id");
+        close(&mut target);
+        current.switch_to(&target_id).expect("switch");
+        current.agent().prompt("after resume").expect("prompt");
+
+        let clone = current.clone_session().expect("clone");
+        current.agent().prompt("after clone").expect("prompt");
+
+        assert_eq!(
+            *seen.lock().expect("captured ids"),
+            [original, target_id, clone.id.clone()],
+        );
+        assert_eq!(current.agent().session_id(), clone.id);
         close(&mut current);
         let _ = fs::remove_dir_all(root);
     }

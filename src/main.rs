@@ -3256,7 +3256,7 @@ fn dispatch_runtime_slash_command<'a>(
                 .agent_dir
                 .clone()
                 .unwrap_or_else(config::agent_dir);
-            let session = prepared.request_session_id().to_owned();
+            let session = prepared.request_session_id();
             start_background_command(view, "/grok-cli-usage", move || {
                 Ok(grok_cli::usage_report(&catalog, &agent_dir, &session).join("\n\n"))
             });
@@ -3264,7 +3264,7 @@ fn dispatch_runtime_slash_command<'a>(
         }
         "/grok-cli-accounts" => {
             let accounts = grok_accounts::Accounts::new(catalog);
-            match grok_accounts::chat_command(&accounts, prepared.request_session_id(), rest) {
+            match grok_accounts::chat_command(&accounts, &prepared.request_session_id(), rest) {
                 Ok(grok_accounts::AccountsCommand::Done(message)) => {
                     append_view_message(view, MessageRole::Command, message);
                 }
@@ -3284,7 +3284,7 @@ fn dispatch_runtime_slash_command<'a>(
             CommandDispatch::Handled
         }
         "/grok-cli-conv" => {
-            match grok_cli::conv_command(prepared.request_session_id(), rest) {
+            match grok_cli::conv_command(&prepared.request_session_id(), rest) {
                 Ok(message) => append_view_message(view, MessageRole::Command, message),
                 Err(error) => append_view_message(view, MessageRole::Error, error),
             }
