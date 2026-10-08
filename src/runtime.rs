@@ -575,20 +575,33 @@ pub fn curated_model_reference(catalog: &Catalog, configured: &[String]) -> Opti
 }
 
 /// The model a session starts on when nothing was remembered: the curated
-/// defaults first, then the last model the first configured provider lists.
+/// defaults first, then a gateway's own router, then the last model the first
+/// configured provider lists.
 pub fn preferred_model_reference(catalog: &Catalog, configured: &[String]) -> Option<String> {
     if let Some(reference) = curated_model_reference(catalog, configured) {
         return Some(reference);
     }
     for provider_id in configured {
-        if let Some(provider) = catalog.provider(provider_id)
-            && let Some(model) = provider.models().last()
-        {
+        let Some(provider) = catalog.provider(provider_id) else {
+            continue;
+        };
+        let models = provider.models();
+        // OmniRoute's `auto` alias is the gateway choosing for you; the last
+        // synced model is whatever its upstream happened to sort last.
+        let router = GATEWAY_ROUTERS
+            .iter()
+            .find(|(gateway, _)| gateway == provider_id)
+            .and_then(|(_, router)| models.iter().find(|model| model.id == *router));
+        if let Some(model) = router.or_else(|| models.last()) {
             return Some(format!("{provider_id}/{}", model.id));
         }
     }
     None
 }
+
+/// Gateways whose catalog is synced at runtime (so they cannot be curated)
+/// but which carry a routing alias that is the sensible first model.
+const GATEWAY_ROUTERS: &[(&str, &str)] = &[("omni", "auto")];
 
 /// The model an interactive session runs on before any provider is
 /// authenticated. Its empty provider and id keep it out of the session log
@@ -1395,11 +1408,7 @@ pub fn absolute_workdir(workdir: &Path) -> Result<PathBuf> {
 }
 
 fn short_id(id: &str) -> &str {
-    let mut end = id.len().min(8);
-    while end > 0 && !id.is_char_boundary(end) {
-        end -= 1;
-    }
-    &id[..end]
+    crate::sessionlog::short_id(id)
 }
 
 /// Removes the old standalone-model file only when it is blank. This helper
@@ -1544,7 +1553,7 @@ mod tests {
 
     #[test]
     fn short_ids_do_not_split_utf8() {
-        assert_eq!(short_id("你好世界"), "你好");
+        assert_eq!(short_id("你好世界你好"), "你好世界");
         assert_eq!(short_id("abc"), "abc");
     }
 
@@ -1611,6 +1620,35 @@ mod tests {
     /// Guards the onboarding path for every provider: a curated default must
     /// exist in the catalog and speak a supported protocol, and a key alone
     /// must configure every provider except the ones that need more.
+    #[test]
+    fn an_omniroute_gateway_starts_on_its_router() {
+        let agent_dir =
+            std::env::temp_dir().join(format!("goshcoder-omni-default-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        crate::omniroute::Config {
+            server_url: "http://127.0.0.1:20999".to_owned(),
+            models: ["alpha", "zeta"]
+                .into_iter()
+                .map(|id| crate::omniroute::Model {
+                    id: id.to_owned(),
+                    ..crate::omniroute::Model::default()
+                })
+                .collect(),
+            ..crate::omniroute::Config::default()
+        }
+        .save(config::omni_route_path_in(&agent_dir))
+        .expect("write omniroute.json");
+        let catalog = Catalog::with_environment(None, Arc::new(|_| None))
+            .expect("catalog")
+            .with_dynamic_paths(crate::catalog::DynamicPaths::for_agent_dir(&agent_dir));
+        assert_eq!(
+            preferred_model_reference(&catalog, &["omni".to_owned()]).as_deref(),
+            Some("omni/auto"),
+            "not whichever synced model sorts last"
+        );
+        std::fs::remove_dir_all(agent_dir).ok();
+    }
+
     #[test]
     fn curated_defaults_exist_and_a_key_configures_every_plain_provider() {
         let store = Arc::new(crate::catalog::CredentialStore::in_memory());

@@ -167,32 +167,35 @@ fn choose_from_sessions<R: BufRead, W: Write>(
     )?;
     output.flush()?;
 
-    let mut choice = String::new();
-    if input.read_line(&mut choice)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "session picker input ended before a choice was made",
-        )
-        .into());
+    // A typo asks again rather than ending the program: the user was about
+    // to start chatting, not to see an error.
+    loop {
+        let mut choice = String::new();
+        if input.read_line(&mut choice)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "session picker input ended before a choice was made",
+            )
+            .into());
+        }
+        let choice = choice.trim();
+        if choice.is_empty() {
+            return Ok(None);
+        }
+        match choice.parse::<usize>() {
+            Ok(selected) if (1..=sessions.len()).contains(&selected) => {
+                return Ok(Some(sessions[selected - 1].clone()));
+            }
+            _ => {
+                writeln!(
+                    output,
+                    "choose a number between 1 and {}, or press Enter for a new session:",
+                    sessions.len()
+                )?;
+                output.flush()?;
+            }
+        }
     }
-    let choice = choice.trim();
-    if choice.is_empty() {
-        return Ok(None);
-    }
-    let selected = choice.parse::<usize>().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("choose a number between 1 and {}", sessions.len()),
-        )
-    })?;
-    if !(1..=sessions.len()).contains(&selected) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("choose a number between 1 and {}", sessions.len()),
-        )
-        .into());
-    }
-    Ok(Some(sessions[selected - 1].clone()))
 }
 
 fn format_modified(modified: SystemTime) -> String {
@@ -273,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_allows_a_new_session_or_rejects_bad_indexes() {
+    fn picker_allows_a_new_session_and_asks_again_after_a_bad_index() {
         let sessions = vec![session("aaaa1111-0000-7000-8000-000000000000", "", "", "")];
         let mut output = Vec::new();
         assert!(
@@ -281,9 +284,22 @@ mod tests {
                 .expect("new session choice")
                 .is_none()
         );
-        let error = choose_from_sessions(&sessions, &mut Cursor::new("0\n"), &mut Vec::new())
-            .expect_err("invalid index");
-        assert!(error.to_string().contains("between 1 and 1"));
+        // Out of range or not a number: asked again, not an error.
+        let mut output = Vec::new();
+        let selected =
+            choose_from_sessions(&sessions, &mut Cursor::new("0\nabc\n1\n"), &mut output)
+                .expect("a later valid choice")
+                .expect("a session");
+        assert_eq!(selected.id, sessions[0].id);
+        assert_eq!(
+            String::from_utf8(output)
+                .expect("utf-8")
+                .matches("choose a number between 1 and 1")
+                .count(),
+            2
+        );
+        // Input that ends without a choice is still an error.
+        assert!(choose_from_sessions(&sessions, &mut Cursor::new("0\n"), &mut Vec::new()).is_err());
     }
 
     #[test]

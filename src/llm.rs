@@ -4,7 +4,7 @@
 //! session files and provider payload adapters. Protocol-specific clients are
 //! layered on top of this module as they are migrated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
@@ -543,6 +543,74 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Which tool result answers which tool call, in a message history.
+///
+/// Call ids are only unique within one assistant message: several
+/// OpenAI-compatible servers number calls `call_0`, `call_1` on every turn,
+/// and a call the provider sent without an id has only its name. Keying a
+/// whole history by id would show one result under every call that shares
+/// it, so each result answers the oldest earlier call with the same id (or,
+/// without an id, the same name) that is still waiting for one.
+#[derive(Debug, Default)]
+pub struct ToolPairing {
+    /// (assistant message index, content block index) -> result message index.
+    calls: BTreeMap<(usize, usize), usize>,
+    answered: BTreeSet<usize>,
+}
+
+impl ToolPairing {
+    /// Pairs the tool calls and results of `messages`, whose positions are
+    /// the indices the lookups use; `None` holds the place of an entry that
+    /// is not a message (a compaction marker in an export).
+    pub fn new<'a>(messages: impl IntoIterator<Item = Option<&'a Message>>) -> Self {
+        let mut pairing = Self::default();
+        let mut waiting = BTreeMap::<(bool, String), VecDeque<(usize, usize)>>::new();
+        for (index, message) in messages.into_iter().enumerate() {
+            match message {
+                Some(Message::Assistant(assistant)) => {
+                    for (block, content) in assistant.content.iter().enumerate() {
+                        if let ContentBlock::ToolCall(call) = content {
+                            waiting
+                                .entry(Self::key(&call.id, &call.name))
+                                .or_default()
+                                .push_back((index, block));
+                        }
+                    }
+                }
+                Some(Message::ToolResult(result)) => {
+                    if let Some(call) = waiting
+                        .get_mut(&Self::key(&result.tool_call_id, &result.tool_name))
+                        .and_then(VecDeque::pop_front)
+                    {
+                        pairing.calls.insert(call, index);
+                        pairing.answered.insert(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        pairing
+    }
+
+    fn key(id: &str, name: &str) -> (bool, String) {
+        if id.is_empty() {
+            (false, name.to_owned())
+        } else {
+            (true, id.to_owned())
+        }
+    }
+
+    /// The index of the result answering block `block` of message `message`.
+    pub fn result_for(&self, message: usize, block: usize) -> Option<usize> {
+        self.calls.get(&(message, block)).copied()
+    }
+
+    /// Whether the result at `index` answers a call in the history.
+    pub fn is_answer(&self, index: usize) -> bool {
+        self.answered.contains(&index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +681,49 @@ mod tests {
 
         assert!(model.supports_images());
         assert_eq!(model.compat, Some(json!({"supportsReasoning": true})));
+    }
+
+    #[test]
+    fn tool_pairing_answers_the_oldest_waiting_call() {
+        let call = |id: &str, name: &str| {
+            ContentBlock::ToolCall(ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                ..ToolCall::default()
+            })
+        };
+        let assistant = |content| {
+            Message::Assistant(Box::new(AssistantMessage {
+                content,
+                ..AssistantMessage::default()
+            }))
+        };
+        let result = |id: &str, name: &str| {
+            Message::ToolResult(Box::new(ToolResultMessage {
+                tool_call_id: id.to_owned(),
+                tool_name: name.to_owned(),
+                ..ToolResultMessage::default()
+            }))
+        };
+        let messages = [
+            assistant(vec![call("a", "read"), call("", "ls")]),
+            result("a", "read"),
+            result("", "ls"),
+            assistant(vec![call("a", "read"), call("", "ls")]),
+            result("", "ls"),
+            result("a", "read"),
+            // Answers nothing: every call above already has its result.
+            result("a", "read"),
+        ];
+        let mut items = messages.iter().map(Some).collect::<Vec<_>>();
+        // A placeholder (an export's compaction marker) keeps the indices.
+        items.insert(3, None);
+        let pairing = ToolPairing::new(items);
+        assert_eq!(pairing.result_for(0, 0), Some(1));
+        assert_eq!(pairing.result_for(0, 1), Some(2));
+        assert_eq!(pairing.result_for(4, 0), Some(6));
+        assert_eq!(pairing.result_for(4, 1), Some(5));
+        assert!(pairing.is_answer(6));
+        assert!(!pairing.is_answer(7));
     }
 }

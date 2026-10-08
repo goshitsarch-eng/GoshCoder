@@ -11,10 +11,10 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, ThreadId},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Number, Value};
@@ -473,6 +473,8 @@ impl WeakFollowUpQueue {
 
 struct AgentInner {
     state: Mutex<InnerState>,
+    /// Bumped by every [`Agent::abort`].
+    aborts: AtomicU64,
     idle: Condvar,
     listeners: Mutex<BTreeMap<usize, Listener>>,
     next_listener_id: AtomicUsize,
@@ -607,6 +609,7 @@ impl Agent {
         });
         Self {
             inner: Arc::new(AgentInner {
+                aborts: AtomicU64::new(0),
                 state: Mutex::new(InnerState {
                     system_prompt: initial.system_prompt,
                     model: initial.model,
@@ -809,8 +812,30 @@ impl Agent {
     }
 
     pub fn abort(&self) {
+        // Counted even with nothing running: a caller waiting between runs
+        // (a retry's backoff) has no token to cancel but must still stop.
+        self.inner.aborts.fetch_add(1, Ordering::SeqCst);
         if let Some(cancellation) = lock(&self.inner.state).cancellation.clone() {
             cancellation.cancel();
+        }
+    }
+
+    /// How many times [`Agent::abort`] has been called; a change since an
+    /// earlier reading means the user asked to stop in between.
+    pub fn abort_count(&self) -> u64 {
+        self.inner.aborts.load(Ordering::SeqCst)
+    }
+
+    /// Sleeps for `delay`, returning early once [`Agent::abort`] is called.
+    pub fn pause(&self, delay: Duration) {
+        let since = self.abort_count();
+        let deadline = Instant::now() + delay;
+        while self.abort_count() == since {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            thread::sleep(left.min(Duration::from_millis(50)));
         }
     }
 

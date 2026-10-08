@@ -264,10 +264,20 @@ fn render_suggestions(
             ListItem::new(Line::from(text))
         })
         .collect();
-    let title = match app.prompt.as_ref() {
+    let mut title = match app.prompt.as_ref() {
         Some(prompt) => format!(" {} ", prompt.label.to_uppercase()),
         None => suggestion_title(&app.input).to_owned(),
     };
+    // A list longer than the box says so; otherwise the rows shown look
+    // like every choice there is.
+    if suggestions.len() > item_capacity {
+        title = format!(
+            "{} · {}/{} ",
+            title.trim_end(),
+            selected + 1,
+            suggestions.len()
+        );
+    }
     let list = List::new(items)
         .style(Style::default().fg(TEXT).bg(BACKGROUND))
         .block(
@@ -343,22 +353,34 @@ fn render_editor(frame: &mut Frame, area: Rect, app: &App, editor: &EditorWindow
     frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
-/// The key hints for what the keyboard does right now.
-fn status_hint(app: &App) -> &'static str {
+/// The key hints for what the keyboard does right now, longest first: the
+/// status bar shows the longest that fits beside the status, so an 80-column
+/// terminal keeps the essentials instead of losing every hint.
+fn status_hints(app: &App) -> &'static [&'static str] {
     if app
         .prompt
         .as_ref()
         .is_some_and(|prompt| !prompt.options.is_empty())
     {
-        "↑↓ select · enter choose · esc cancel"
+        &[
+            "↑↓ select · enter choose · esc cancel",
+            "enter choose · esc cancel",
+        ]
     } else if app.prompt.is_some() {
-        "enter submit · esc cancel"
+        &["enter submit · esc cancel"]
     } else if !app.suggestions().is_empty() {
-        "↑↓ select · enter choose · esc close"
+        &[
+            "↑↓ select · enter choose · esc close",
+            "enter choose · esc close",
+        ]
     } else if app.streaming {
-        "esc abort  ·  type to steer"
+        &["esc abort  ·  type to steer", "esc abort"]
     } else {
-        "enter send · ctrl+j newline · ctrl+l model · / commands"
+        &[
+            "enter send · ctrl+j newline · ctrl+l model · / commands",
+            "enter send · ctrl+j newline · / commands",
+            "enter send · / commands",
+        ]
     }
 }
 
@@ -375,15 +397,18 @@ fn status_lines(app: &App, width: u16, compact: bool) -> Vec<Line<'static>> {
     if compact && !app.context_hint.is_empty() {
         status = format!("{status}  ·  {}", app.context_hint);
     }
-    let hint = status_hint(app);
     let width = usize::from(width);
     let prefix = 4; // "  ● "
-    let hint_room = hint.width() + 2;
     // The hints keep their place while the status fits beside them, or can
     // wrap into a reasonable column there (as the mockup's two-row Ctrl-C
     // warning does); a narrow terminal gives the row to the status instead.
-    let beside = width.saturating_sub(prefix + hint_room);
-    let fits_hint = status.width() <= beside || beside >= 28;
+    let room_beside = |hint: &str| width.saturating_sub(prefix + hint.width() + 2);
+    let fits = |hint: &str| status.width() <= room_beside(hint) || room_beside(hint) >= 28;
+    let hints = status_hints(app);
+    let chosen = hints.iter().copied().find(|hint| fits(hint));
+    let fits_hint = chosen.is_some();
+    let hint = chosen.unwrap_or(hints[0]);
+    let beside = room_beside(hint);
     let status_room = if fits_hint {
         beside
     } else {
@@ -608,10 +633,15 @@ fn transcript_lines(
             }
             MessageRole::Tool => tool_card(&mut lines, message, full, tools_expanded),
             MessageRole::Error => {
-                lines.push(styled_line(
-                    "  Error".to_owned(),
-                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                ));
+                // Same "symbol label" header as notices, so the labels line
+                // up down the transcript; the label stays red to stand out.
+                lines.push(Line::from(vec![
+                    Span::styled("  × ", Style::default().fg(RED)),
+                    Span::styled(
+                        "Error",
+                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 lines.extend(message_lines(
                     &message.text,
                     Style::default().fg(RED),
@@ -756,8 +786,13 @@ fn notice_body(lines: &mut Vec<Line<'static>>, text: &str, inner: usize) {
         return;
     }
     for paragraph in text.split('\n') {
+        // Exactly four spaces before a single token mark a line to stand out
+        // (a sign-in URL, a device code). Deeper indentation is a column
+        // continuing, and an indented sentence is a report's detail line.
         if let Some(emphasis) = paragraph.strip_prefix("    ")
+            && !emphasis.starts_with(' ')
             && !emphasis.trim().is_empty()
+            && !emphasis.trim().contains(char::is_whitespace)
         {
             let emphasis = emphasis.trim();
             let style = if emphasis.starts_with("http://") || emphasis.starts_with("https://") {
@@ -772,10 +807,64 @@ fn notice_body(lines: &mut Vec<Line<'static>>, text: &str, inner: usize) {
             lines.push(Line::from(""));
             continue;
         }
-        for row in wrap_plain(paragraph, inner) {
+        for row in wrap_hanging(paragraph, inner) {
             lines.push(styled_line(format!("  {row}"), Style::default().fg(MUTED)));
         }
     }
+}
+
+/// Where the text of a list item ("12. text", "- text", "• text") starts,
+/// so its wrapped rows line up under the text instead of the marker.
+fn list_text_start(line: &str, content_start: usize) -> Option<usize> {
+    let content = &line[content_start..];
+    let digits = content.len()
+        - content
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .len();
+    let marker = if digits > 0 && content[digits..].starts_with(". ") {
+        digits + 1
+    } else if content.starts_with("- ") || content.starts_with("* ") || content.starts_with("• ")
+    {
+        content.chars().next().map_or(1, char::len_utf8)
+    } else {
+        return None;
+    };
+    let after = &content[marker..];
+    Some(content_start + marker + after.len() - after.trim_start().len())
+}
+
+/// Wraps one line of a notice so its continuation rows stay in its column:
+/// under the description of a two-column row ("/export [path]   Save…",
+/// "Ctrl-J      insert…"), or under the line's own indentation.
+fn wrap_hanging(line: &str, width: usize) -> Vec<String> {
+    if line.width() <= width {
+        return vec![line.to_owned()];
+    }
+    let content_start = line.len() - line.trim_start().len();
+    let column = line[content_start..]
+        .find("  ")
+        .map(|gap| {
+            let gap = content_start + gap;
+            gap + line[gap..].len() - line[gap..].trim_start().len()
+        })
+        .filter(|&column| column < line.len() && line[..column].width() <= (width / 2).min(32))
+        .or_else(|| list_text_start(line, content_start))
+        .unwrap_or(content_start);
+    let (lead, rest) = line.split_at(column);
+    let indent = lead.width();
+    if indent >= width {
+        return wrap_plain(line, width);
+    }
+    let mut rows = wrap_plain(rest, width - indent);
+    for (index, row) in rows.iter_mut().enumerate() {
+        let prefix = if index == 0 {
+            lead.to_owned()
+        } else {
+            " ".repeat(indent)
+        };
+        *row = format!("{prefix}{row}");
+    }
+    rows
 }
 
 /// Wraps plain text to `width` cells: words first, then a hard break inside
@@ -989,6 +1078,8 @@ fn suggestion_title(input: &str) -> &'static str {
         " THINKING LEVEL "
     } else if input.starts_with("/login ") {
         " ADD PROVIDER "
+    } else if input.starts_with("/resume ") {
+        " RESUME SESSION "
     } else if input.starts_with("/omni ") {
         " OMNIROUTE "
     } else if input.starts_with("/aperture ") {
@@ -1185,6 +1276,146 @@ mod tests {
         // Too narrow to share: the status gets the row, nothing collides.
         let screen = rows(&render(&app, 60, 20)).join("\n");
         assert!(screen.contains("Press Ctrl+C again to exit"), "{screen}");
+    }
+
+    #[test]
+    fn an_80_column_terminal_keeps_shorter_key_hints() {
+        // Without a sidebar the status carries the context use, which left
+        // no room for the full hints at the most common terminal width.
+        let mut app = quiet_app();
+        app.status = "Ready".to_owned();
+        app.context_hint = "0% context".to_owned();
+        let screen = rows(&render(&app, 80, 24));
+        let status = &screen[screen.len() - 1];
+        assert!(status.contains("Ready  ·  0% context"), "{status}");
+        assert!(status.contains("enter send"), "{status}");
+        assert!(status.contains("/ commands"), "{status}");
+    }
+
+    #[test]
+    fn card_headers_share_one_symbol_column() {
+        let lines = plain(&transcript_lines(
+            &[
+                message(MessageRole::Notice, "note"),
+                message(MessageRole::Command, "/x"),
+                message(MessageRole::Error, "broke"),
+            ],
+            80,
+            false,
+            false,
+        ));
+        for header in ["i Notice", "◇ Command", "× Error"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with(&format!("  {header}"))),
+                "{header}: {lines:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn notice_columns_keep_their_alignment_when_they_wrap() {
+        let text = "Slash commands:\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /planner-annotate <target>\n                        Annotate a file, folder, or URL\nSign in at:\n    https://example.com/device";
+        let lines = plain(&transcript_lines(
+            &[message(MessageRole::Notice, text)],
+            64,
+            false,
+            false,
+        ));
+        let body = lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>();
+        let export = body
+            .iter()
+            .position(|line| line.contains("/export"))
+            .expect("export row");
+        let column = body[export].find("Save").expect("description");
+        let continuation = body[export + 1];
+        assert!(
+            continuation.len() > column
+                && continuation[..column].trim().is_empty()
+                && !continuation[column..].starts_with(' '),
+            "a wrapped description stays under its column: {body:#?}"
+        );
+        // A continuation line is plain text in its column, not a callout
+        // between blank rows.
+        let annotate = body
+            .iter()
+            .position(|line| line.contains("Annotate a file"))
+            .expect("annotate row");
+        assert!(
+            body[annotate - 1].contains("/planner-annotate"),
+            "{body:#?}"
+        );
+        assert_eq!(
+            body[annotate],
+            "                          Annotate a file, folder, or URL"
+        );
+        // A numbered item wraps under its text, not its number.
+        let lines = plain(&transcript_lines(
+            &[message(
+                MessageRole::Notice,
+                " 3. Follow the deploy skill from a path that is far too long to fit",
+            )],
+            40,
+            false,
+            false,
+        ));
+        assert_eq!(lines[1], "   3. Follow the deploy skill from a");
+        assert!(lines[2].starts_with("      path"), "{lines:#?}");
+
+        // An indented sentence is a detail line, not a callout.
+        let lines = plain(&transcript_lines(
+            &[message(
+                MessageRole::Notice,
+                "  Usage:\n    no billing data available — run /login",
+            )],
+            80,
+            false,
+            false,
+        ));
+        assert_eq!(
+            lines[1..3],
+            ["    Usage:", "      no billing data available — run /login"],
+            "{lines:#?}"
+        );
+
+        // Four spaces before a single token still mark a line to stand out.
+        let url = body
+            .iter()
+            .position(|line| line.contains("https://example.com/device"))
+            .expect("url row");
+        assert!(
+            body[url - 1].is_empty() && body[url + 1].is_empty(),
+            "{body:#?}"
+        );
+    }
+
+    #[test]
+    fn a_palette_longer_than_its_box_shows_the_position() {
+        let mut app = quiet_app();
+        app.dynamic_suggestions = (0..20)
+            .map(|index| Suggestion {
+                label: format!("provider-{index}"),
+                description: "API key".to_owned(),
+                value: format!("/login provider-{index}"),
+                execute: true,
+            })
+            .collect();
+        app.set_input("/login ");
+        let screen = rows(&render(&app, 100, 40)).join("\n");
+        assert!(screen.contains("ADD PROVIDER · 1/20"), "{screen}");
+        app.selected_suggestion = 12;
+        let screen = rows(&render(&app, 100, 40)).join("\n");
+        assert!(screen.contains("ADD PROVIDER · 13/20"), "{screen}");
+
+        // A list that fits needs no counter.
+        app.dynamic_suggestions.truncate(3);
+        app.selected_suggestion = 0;
+        let screen = rows(&render(&app, 100, 40)).join("\n");
+        assert!(
+            screen.contains("ADD PROVIDER") && !screen.contains("1/3"),
+            "{screen}"
+        );
     }
 
     #[test]

@@ -317,6 +317,8 @@ pub enum SessionRuntimeError {
     Session(SessionError),
     Io(std::io::Error),
     InvalidOptions(String),
+    /// A `/fork` or `/label` point outside the session's branch points.
+    InvalidBranchPoint(String),
     NotRecording,
     Busy(String),
     AlreadyCurrentSession,
@@ -330,6 +332,7 @@ impl fmt::Display for SessionRuntimeError {
             Self::InvalidOptions(message) => {
                 write!(formatter, "invalid session options: {message}")
             }
+            Self::InvalidBranchPoint(message) => formatter.write_str(message),
             Self::NotRecording => formatter.write_str("this session is not being recorded"),
             Self::Busy(message) => formatter.write_str(message),
             Self::AlreadyCurrentSession => {
@@ -345,6 +348,7 @@ impl StdError for SessionRuntimeError {
             Self::Session(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::InvalidOptions(_)
+            | Self::InvalidBranchPoint(_)
             | Self::NotRecording
             | Self::Busy(_)
             | Self::AlreadyCurrentSession => None,
@@ -689,18 +693,13 @@ impl SessionRuntime {
         self.require_idle("wait for the current response to finish before rewinding")?;
         let points = self.branch_points();
         let target = points
-            .get(index.checked_sub(1).ok_or_else(|| {
-                SessionRuntimeError::InvalidOptions(
-                    "choose a branch point starting at 1".to_owned(),
-                )
-            })?)
+            .get(
+                index
+                    .checked_sub(1)
+                    .ok_or_else(|| branch_point_error(points.len()))?,
+            )
             .cloned()
-            .ok_or_else(|| {
-                SessionRuntimeError::InvalidOptions(format!(
-                    "choose a branch point between 1 and {}",
-                    points.len()
-                ))
-            })?;
+            .ok_or_else(|| branch_point_error(points.len()))?;
         let (abandoned, previous_leaf, new_leaf) = self
             .with_tree(|tree| {
                 let new_leaf = if target.on_path {
@@ -767,17 +766,12 @@ impl SessionRuntime {
         let label = label.into().trim().to_owned();
         let points = self.branch_points();
         let target = points
-            .get(index.checked_sub(1).ok_or_else(|| {
-                SessionRuntimeError::InvalidOptions(
-                    "choose a branch point starting at 1".to_owned(),
-                )
-            })?)
-            .ok_or_else(|| {
-                SessionRuntimeError::InvalidOptions(format!(
-                    "choose a branch point between 1 and {}",
-                    points.len()
-                ))
-            })?;
+            .get(
+                index
+                    .checked_sub(1)
+                    .ok_or_else(|| branch_point_error(points.len()))?,
+            )
+            .ok_or_else(|| branch_point_error(points.len()))?;
         self.recorder.append(Entry {
             kind: sessionlog::TYPE_LABEL.to_owned(),
             target_id: target.id.clone(),
@@ -811,7 +805,7 @@ impl SessionRuntime {
         let writer = self.store.fork(&source, leaf.as_deref(), &self.cwd)?;
         let handle = self.adopt_writer(
             writer,
-            "cloned session",
+            "cloned as",
             Some((state.model, state.thinking_level)),
         )?;
         if let Some(name) = name {
@@ -831,7 +825,7 @@ impl SessionRuntime {
             return Err(SessionRuntimeError::AlreadyCurrentSession);
         }
         let (writer, report) = self.store.attach(&info.path)?;
-        let handle = self.adopt_writer(writer, "switched session", None)?;
+        let handle = self.adopt_writer(writer, "switched to", None)?;
         for notice in report_notices(&report) {
             self.notices.push("Session", notice);
         }
@@ -849,7 +843,7 @@ impl SessionRuntime {
         }
         let source = self.store.resolve(&self.cwd, source)?;
         let writer = self.store.fork(&source, None, &self.cwd)?;
-        self.adopt_writer(writer, "imported session", None)
+        self.adopt_writer(writer, "imported as", None)
     }
 
     /// Returns the raw JSONL or a readable Markdown rendering of the current
@@ -975,8 +969,10 @@ impl SessionRuntime {
         for notice in model_notices {
             self.notices.push("Session", notice);
         }
-        self.notices
-            .push("Session", format!("{action} {}", handle.id));
+        self.notices.push(
+            "Session",
+            format!("{action} {}", sessionlog::short_id(&handle.id)),
+        );
         Ok(handle)
     }
 }
@@ -1966,6 +1962,15 @@ fn message_text(message: &llm::UserMessage) -> String {
     }
 }
 
+/// Why a branch point number was refused, in terms of what `/tree` lists.
+fn branch_point_error(count: usize) -> SessionRuntimeError {
+    SessionRuntimeError::InvalidBranchPoint(match count {
+        0 => "this session has no messages to go back to yet".to_owned(),
+        1 => "this session has one branch point: use 1 (see /tree)".to_owned(),
+        count => format!("choose a branch point between 1 and {count} (see /tree)"),
+    })
+}
+
 fn first_line(value: &str, limit: usize) -> String {
     let value = value.split(['\r', '\n']).next().unwrap_or_default().trim();
     let mut characters = value.chars();
@@ -1988,6 +1993,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_point_errors_speak_in_tree_terms() {
+        assert_eq!(
+            branch_point_error(0).to_string(),
+            "this session has no messages to go back to yet"
+        );
+        assert_eq!(
+            branch_point_error(3).to_string(),
+            "choose a branch point between 1 and 3 (see /tree)"
+        );
+        assert!(
+            !branch_point_error(1)
+                .to_string()
+                .contains("between 1 and 1")
+        );
+    }
     use std::{
         fs,
         sync::{

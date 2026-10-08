@@ -83,6 +83,9 @@ pub enum OmniRouteError {
         limit: usize,
     },
     InvalidModelsPayload(serde_json::Error),
+    /// The `/omni test` reply was not a chat completion; carries the start
+    /// of what came back, already made safe to print.
+    InvalidChatReply(String),
     Transport(HttpTransportError),
     HttpStatus {
         status: u16,
@@ -130,6 +133,10 @@ impl fmt::Display for OmniRouteError {
             Self::InvalidModelsPayload(error) => {
                 write!(formatter, "decode OmniRoute models: {error}")
             }
+            Self::InvalidChatReply(start) => write!(
+                formatter,
+                "OmniRoute's reply is not a JSON chat completion; it began: {start}"
+            ),
             Self::Transport(error) => write!(formatter, "OmniRoute transport: {error}"),
             Self::HttpStatus { status, body } => {
                 write!(formatter, "OmniRoute returned {status}: {body}")
@@ -1173,8 +1180,12 @@ impl<'a, T: HttpTransport + ?Sized> Client<'a, T> {
             "/chat/completions",
             Some(serde_json::to_vec(&body).map_err(OmniRouteError::ConfigEncode)?),
         )?;
-        let value: Value =
-            serde_json::from_slice(&payload).map_err(OmniRouteError::InvalidModelsPayload)?;
+        let value: Value = serde_json::from_slice(&payload).map_err(|_| {
+            OmniRouteError::InvalidChatReply(sanitize_gateway_text(&truncate(
+                String::from_utf8_lossy(&payload).trim(),
+                200,
+            )))
+        })?;
         let content = value
             .get("choices")
             .and_then(Value::as_array)
@@ -1591,7 +1602,16 @@ impl ModelsReport {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        let mut lines = vec![format!("OmniRoute models ({})", self.models.len())];
+        let mut lines = vec![if query.is_empty() {
+            format!("OmniRoute models ({})", self.models.len())
+        } else {
+            format!(
+                "OmniRoute models matching {:?} ({} of {})",
+                self.query,
+                filtered.len(),
+                self.models.len()
+            )
+        }];
         if let ModelsSource::Cached { error } = &self.source {
             lines.push(format!(
                 "(showing the last synchronized list; the gateway did not answer: {error})"
@@ -2330,6 +2350,22 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_test_that_gets_no_json_reports_what_came_back() {
+        let config = Config::new("http://gw.example").expect("config");
+        let transport = ScriptedTransport::new([
+            Ok((200, "data: {\"choices\":[]}\n\n")),
+            Ok((200, r#"{"choices":[{"message":{"content":" ok "}}]}"#)),
+        ]);
+        let client = Client::new(config, "", &transport);
+        let error = client.test_chat("m").expect_err("streamed reply");
+        let message = error.to_string();
+        assert!(message.contains("not a JSON chat completion"), "{message}");
+        assert!(message.contains("data: "), "{message}");
+        assert!(!message.contains("models"), "{message}");
+        assert_eq!(client.test_chat("m").expect("json reply"), "ok");
+    }
+
+    #[test]
     fn routing_aliases_precede_synced_models_and_keep_gateway_metadata() {
         let mut config = Config::new("http://gw.example").expect("config");
         config.models = parse_models_payload(MODELS_PAYLOAD.as_bytes()).expect("payload");
@@ -2541,6 +2577,10 @@ mod tests {
             .expect("filtered listing")
             .render();
         assert!(filtered.contains("openai/gpt-x") && !filtered.contains("local-llm"));
+        assert!(
+            filtered.starts_with("OmniRoute models matching \"GPT\" (1 of 9)"),
+            "the count describes what is listed: {filtered}"
+        );
         assert!(
             models_command(&path, None, "", &models_transport(), "nothing-matches")
                 .expect("listing")

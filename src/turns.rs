@@ -10,7 +10,7 @@
 //! the run going. The agent loop itself knows nothing of this, exactly as
 //! pi's `Agent` does not: the policy lives one layer up.
 
-use std::{thread, time::Duration};
+use std::time::Duration;
 
 use crate::{agent, compaction, llm, session::SessionNoticeSender, stream};
 
@@ -61,7 +61,7 @@ pub fn run_prompt(
     policy: &RetryPolicy,
     notices: Option<&SessionNoticeSender>,
 ) -> Result<TurnReport, String> {
-    run_prompt_with_sleep(agent, prompt, policy, notices, thread::sleep)
+    run_prompt_with_sleep(agent, prompt, policy, notices, |delay| agent.pause(delay))
 }
 
 fn run_prompt_with_sleep(
@@ -118,10 +118,17 @@ fn finish_run(
                         error_summary(last)
                     ),
                 );
+                let aborts = agent.abort_count();
+                sleep(delay);
+                if agent.abort_count() != aborts {
+                    // Esc during the wait: the error stays as the turn's
+                    // last word instead of a retry nobody wants.
+                    notify(notices, "retry", "cancelled");
+                    break;
+                }
                 // The failed message stays in the session file but leaves the
                 // context the retry sees.
                 drop_last_assistant(agent, &state);
-                sleep(delay);
                 agent.continue_run().map_err(|error| error.to_string())?;
                 report.retries = report.retries.max(attempt);
                 continue;
@@ -130,7 +137,12 @@ fn finish_run(
                 notices,
                 "retry",
                 format!(
-                    "giving up after {attempt} attempt(s): {}",
+                    "giving up after {}: {}",
+                    if attempt == 1 {
+                        "one retry".to_owned()
+                    } else {
+                        format!("{attempt} retries")
+                    },
                     error_summary(last)
                 ),
             );
@@ -428,6 +440,46 @@ mod tests {
             ..AgentOptions::default()
         });
         (agent, calls)
+    }
+
+    #[test]
+    fn an_abort_during_the_backoff_stops_the_retry() {
+        let (agent, calls) = scripted_agent(vec![
+            assistant("error", "", "503 service unavailable"),
+            assistant("stop", "never requested", ""),
+        ]);
+        let waiting = agent.clone();
+        let report = run_prompt_with_sleep(
+            &agent,
+            "hello",
+            &RetryPolicy::default(),
+            None,
+            // The user presses Esc while the retry waits.
+            move |_| waiting.abort(),
+        )
+        .expect("an abort is not a failure");
+        assert_eq!(*calls.lock().expect("calls"), 1, "no retry request");
+        assert_eq!(report.retries, 0);
+        let messages = agent.state().messages;
+        assert_eq!(
+            last_assistant(&messages).map(|message| message.stop_reason.as_str()),
+            Some("error"),
+            "the error stays as the turn's last word"
+        );
+    }
+
+    #[test]
+    fn pause_returns_as_soon_as_the_agent_is_aborted() {
+        let (agent, _) = scripted_agent(Vec::new());
+        let aborter = agent.clone();
+        let started = std::time::Instant::now();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            aborter.abort();
+        });
+        agent.pause(Duration::from_secs(30));
+        thread.join().expect("aborter");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

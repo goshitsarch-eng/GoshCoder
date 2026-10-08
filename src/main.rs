@@ -47,7 +47,7 @@ mod ui;
 pub mod webaccess;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     error::Error,
     io::{self, BufRead, IsTerminal, Write},
     sync::{
@@ -114,7 +114,8 @@ fn subcommand_help(args: &[String]) -> Option<String> {
 
   list [--all]                 Saved sessions for this workspace
   show <id>                    Print a session
-  export <id> [--md] <path>    Save as HTML, Markdown (.md) or JSONL
+  export <id> [--md] [path]    Save as HTML, Markdown (.md) or JSONL;
+                               without a path, JSONL goes to stdout
   import <path>                Adopt a session file
   share <id> --yes             Upload as a secret GitHub gist (needs gh)
   rm <id>                      Delete a session
@@ -177,6 +178,101 @@ Tailscale Aperture. Type /help inside chat for the slash commands.
 /// Set by [`run_self_subprocess`]: where a child reports why it failed, since
 /// the fullscreen interface redraws over whatever the child printed.
 const CHILD_ERROR_FILE_ENV: &str = "GOSHCODER_CHILD_ERROR_FILE";
+
+/// SIGTERM and SIGHUP while chat owns the terminal. Their default action
+/// kills the process on the spot, which leaves the user's shell on the
+/// alternate screen in raw mode with mouse reporting on, and leaves the
+/// session file claimed. The handler only records the signal; the interface
+/// loops notice it within one poll and leave the way `/exit` does.
+pub mod termination {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static RECEIVED: AtomicI32 = AtomicI32::new(0);
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+
+    static HOOKS: std::sync::Mutex<Vec<Box<dyn Fn() + Send>>> = std::sync::Mutex::new(Vec::new());
+
+    /// How long an orderly exit may take before the process ends anyway.
+    /// After a hangup crossterm can spin forever reading the dead terminal
+    /// inside its own poll, where the interface loop never gets to look at
+    /// the request; this keeps that from outliving the terminal. The
+    /// terminal is certainly gone after a hangup, so it waits less there.
+    #[cfg(unix)]
+    fn grace(signal: i32) -> std::time::Duration {
+        std::time::Duration::from_millis(if signal == 1 { 500 } else { 5000 })
+    }
+
+    /// Routes SIGTERM and SIGHUP to [`requested`]. A no-op off Unix.
+    pub fn install() {
+        INSTALLED.call_once(install_handlers);
+    }
+
+    /// Runs `hook` off the interface thread as soon as a signal arrives, so
+    /// work that must not depend on that thread (aborting a reply, which
+    /// then records itself) happens even when it is stuck.
+    pub fn on_request(hook: impl Fn() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Box::new(hook));
+    }
+
+    fn install_handlers() {
+        #[cfg(unix)]
+        {
+            use std::os::raw::c_int;
+            const SIGHUP: c_int = 1;
+            const SIGTERM: c_int = 15;
+            unsafe extern "C" {
+                // The handler as an address, as every other declaration of
+                // this symbol in the crate has it.
+                fn signal(signum: c_int, handler: usize) -> usize;
+            }
+            extern "C" fn record(signum: c_int) {
+                // An atomic store is async-signal-safe.
+                RECEIVED.store(signum, Ordering::SeqCst);
+            }
+            // SAFETY: installs a handler that only stores to an atomic.
+            unsafe {
+                signal(SIGTERM, record as extern "C" fn(c_int) as usize);
+                signal(SIGHUP, record as extern "C" fn(c_int) as usize);
+            }
+            std::thread::spawn(|| {
+                let signal = loop {
+                    if let Some(signal) = requested() {
+                        break signal;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                };
+                for hook in HOOKS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                {
+                    hook();
+                }
+                std::thread::sleep(grace(signal));
+                exit_if_requested();
+            });
+        }
+    }
+
+    /// The signal that asked chat to end, if one has.
+    pub fn requested() -> Option<i32> {
+        match RECEIVED.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// Ends the process the way the signal would have, once cleanup is done:
+    /// the shell sees the usual 128 + signal status.
+    pub fn exit_if_requested() {
+        if let Some(signal) = requested() {
+            std::process::exit(128 + signal);
+        }
+    }
+}
 
 /// Ctrl-C while a child owns the terminal. With raw mode off the terminal
 /// turns it into SIGINT for the whole foreground process group, which would
@@ -515,7 +611,11 @@ fn render_run_event<Out: Write, Err: Write>(
                         }
                     }
                 }
-                if !message.error_message.is_empty() {
+                if message.stop_reason == stream::STOP_ABORTED {
+                    // Asked for, so not an error; the fullscreen interface
+                    // says the same with its "Interrupted" line.
+                    writeln!(stderr, "\n{}", dim("(interrupted)", color))?;
+                } else if !message.error_message.is_empty() {
                     writeln!(stderr, "{} {}", dim("error:", color), message.error_message)?;
                 }
             }
@@ -702,6 +802,11 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         previous_hook(info);
     }));
 
+    termination::install();
+    termination::on_request({
+        let agent = agent.clone();
+        move || agent.abort()
+    });
     if let Err(error) = enter_terminal_modes() {
         restore_terminal_modes();
         return Err(error.into());
@@ -737,6 +842,9 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .iter()
             .any(|message| matches!(message, llm::Message::Assistant(_)));
     let session_cleanup = prepared.runtime.close();
+    // After a hangup the terminal is gone: writing to it would fail, so
+    // nothing more is said once the session is safely closed.
+    termination::exit_if_requested();
     terminal_cleanup?;
     session_cleanup?;
     if result.is_ok() && resumable {
@@ -941,6 +1049,7 @@ fn run_line_interactive(invocation: runtime::Invocation) -> Result<(), Box<dyn E
 
     let result = line_interactive_loop(&prepared, catalog.as_ref(), quiet);
     let close_result = prepared.runtime.close();
+    termination::exit_if_requested();
     result?;
     close_result?;
     Ok(())
@@ -992,11 +1101,19 @@ fn line_interactive_loop(
         // Ctrl-C during a reply aborts the turn instead of killing chat; at
         // the prompt it is a key the editor handles (twice to exit).
         line_editor::install_interrupt_handler();
+        termination::install();
         let agent = prepared.runtime.agent().clone();
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_millis(50));
-                if line_editor::take_interrupts() > 0 && agent.state().is_streaming {
+                // Not only while streaming: a retry's backoff is part of the
+                // turn too, and the prompt reads keys in raw mode, so a
+                // SIGINT here always means "stop the response".
+                if termination::requested().is_some() {
+                    let _ = agent.take_queued_messages();
+                    agent.abort();
+                }
+                if line_editor::take_interrupts() > 0 {
                     eprintln!("\n^C aborting the response");
                     let _ = agent.take_queued_messages();
                     agent.abort();
@@ -1175,6 +1292,8 @@ struct InteractiveView {
     /// Palette entries cached while `/model ` or `/login ` is being typed.
     model_choices: Option<Vec<state::Suggestion>>,
     login_choices: Option<Vec<state::Suggestion>>,
+    /// Saved sessions, cached while `/resume ` is being typed.
+    resume_choices: Option<Vec<state::Suggestion>>,
     /// A `/login` running inside the interface.
     login: Option<tui_login::LoginFlow>,
 }
@@ -1243,6 +1362,7 @@ impl Default for InteractiveView {
             background: None,
             model_choices: None,
             login_choices: None,
+            resume_choices: None,
             login: None,
         }
     }
@@ -1304,6 +1424,16 @@ fn event_loop(
     // not on every poll timeout of an idle session.
     let mut dirty = true;
     loop {
+        if termination::requested().is_some() {
+            leave_chat(prepared, &view, &turn_results);
+            return Ok(());
+        }
+        if app.expire_quit_arm() {
+            if view.activity.starts_with("Press Ctrl+C again") {
+                view.activity = "Ready".to_owned();
+            }
+            dirty = true;
+        }
         if drain_interactive_events(&mut view, prepared, &agent_events, &turn_results)
             | drain_login_events(&mut app, &mut view, prepared, catalog)
         {
@@ -1357,13 +1487,7 @@ fn event_loop(
                 }
                 Action::CancelPrompt => cancel_composer_prompt(&mut app, &mut view),
                 Action::Quit => {
-                    if let Some(thread) = view.pending_btw_thread.as_deref() {
-                        let _ = prepared.btw.cancel(thread);
-                    }
-                    prepared.runtime.agent().abort();
-                    if let Some(planner) = prepared.planner.as_ref() {
-                        planner.abort_review();
-                    }
+                    leave_chat(prepared, &view, &turn_results);
                     return Ok(());
                 }
                 Action::Abort if view.login.is_some() && !view.turn_pending => {
@@ -1414,7 +1538,7 @@ fn event_loop(
                         follow_up,
                     ) {
                         CommandDispatch::Quit => {
-                            prepared.runtime.agent().abort();
+                            leave_chat(prepared, &view, &turn_results);
                             return Ok(());
                         }
                         CommandDispatch::Suspended(run) => {
@@ -1448,6 +1572,51 @@ fn event_loop(
                 break;
             }
         }
+    }
+}
+
+/// `/queue`: what will run after the active response, in order.
+fn queue_report(queued: &[String]) -> String {
+    if queued.is_empty() {
+        return "Nothing is queued. While a response runs, Enter steers it and Alt-Enter queues a follow-up.".to_owned();
+    }
+    let mut report = format!("{} queued:", plural(queued.len(), "message", "messages"));
+    for (index, text) in queued.iter().enumerate() {
+        report.push_str(&format!("\n{:>3}. {}", index + 1, first_line(text)));
+    }
+    report
+}
+
+/// Puts `text` on the clipboard through the terminal (OSC 52), which works
+/// over SSH and needs no clipboard tool; a terminal that does not support
+/// it ignores the sequence. Written between frames, so the screen is left
+/// as it was.
+fn copy_to_terminal_clipboard(text: &str) {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stderr = io::stderr();
+    let _ = write!(stderr, "\x1b]52;c;{encoded}\x07");
+    let _ = stderr.flush();
+}
+
+/// Stops everything still running before the interface closes the session.
+/// An interrupted turn gets a moment to record its partial reply: closing
+/// first would find no assistant message and discard the session, taking
+/// the user's prompt with it.
+fn leave_chat(
+    prepared: &runtime::PreparedSession,
+    view: &InteractiveView,
+    turn_results: &Receiver<Result<(), String>>,
+) {
+    if let Some(thread) = view.pending_btw_thread.as_deref() {
+        let _ = prepared.btw.cancel(thread);
+    }
+    prepared.runtime.agent().abort();
+    if let Some(planner) = prepared.planner.as_ref() {
+        planner.abort_review();
+    }
+    if view.turn_pending {
+        let _ = turn_results.recv_timeout(Duration::from_secs(3));
     }
 }
 
@@ -1746,7 +1915,15 @@ fn drain_login_events(
                     }
                     _ => {}
                 }
-                if let Some(notice) = tui_login::event_notice(&provider, &event) {
+                if let Some(mut notice) = tui_login::event_notice(&provider, &event) {
+                    if let Some(text) = tui_login::clipboard_text(&event) {
+                        copy_to_terminal_clipboard(text);
+                        notice.push_str(if event.kind == oauth::OAuthEventKind::DeviceCode {
+                            "\nThe code is also on your clipboard, where the terminal allows it."
+                        } else {
+                            "\nThe address is also on your clipboard, where the terminal allows it."
+                        });
+                    }
                     append_view_message(view, MessageRole::Notice, notice);
                 }
             }
@@ -1926,23 +2103,10 @@ fn submit_interactive_input<'a>(
         );
     }
 
-    if let Some(flow) = view.login.as_ref() {
-        append_view_message(
-            view,
-            MessageRole::Error,
-            format!(
-                "Finish the {} login first, or press Esc to cancel it.",
-                flow.provider()
-            ),
-        );
+    if !ready_for_prompt(app, view, prepared) {
         return CommandDispatch::Handled;
     }
     let agent = prepared.runtime.agent().clone();
-    if !runtime::model_is_selected(&agent.state().model) {
-        append_view_message(view, MessageRole::Error, NO_MODEL_PROMPT_REFUSED);
-        app.set_input("/login ");
-        return CommandDispatch::Handled;
-    }
     if follow_up {
         agent.follow_up(llm::Message::User(llm::UserMessage::text(
             input,
@@ -1960,13 +2124,49 @@ fn submit_interactive_input<'a>(
         return CommandDispatch::Handled;
     }
 
+    start_interactive_prompt(view, prepared, turn_sender, input)
+}
+
+/// Whether a prompt may start: no login is waiting for an answer and a
+/// model is selected. Says why not in the transcript.
+fn ready_for_prompt(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+) -> bool {
+    if let Some(flow) = view.login.as_ref() {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!(
+                "Finish the {} login first, or press Esc to cancel it.",
+                flow.provider()
+            ),
+        );
+        return false;
+    }
+    if !runtime::model_is_selected(&prepared.runtime.agent().state().model) {
+        append_view_message(view, MessageRole::Error, NO_MODEL_PROMPT_REFUSED);
+        app.set_input("/login ");
+        return false;
+    }
+    true
+}
+
+/// Starts a turn for `input` on an idle agent.
+fn start_interactive_prompt<'a>(
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    turn_sender: Sender<Result<(), String>>,
+    input: String,
+) -> CommandDispatch<'a> {
     if let Err(error) = prepared.sync_extensions() {
         append_view_message(view, MessageRole::Error, error.to_string());
         return CommandDispatch::Handled;
     }
     begin_interactive_turn(
         view,
-        agent,
+        prepared.runtime.agent().clone(),
         prepared.runtime.notice_sender(),
         turn_sender,
         input,
@@ -1991,7 +2191,7 @@ fn hotkeys_text(fullscreen: bool) -> String {
         "Ctrl-J      insert a newline (Shift-Enter needs a terminal with the kitty keyboard protocol)"
     };
     format!(
-        "Enter       send or accept selection; steer while a response is active\nAlt-Enter   queue a follow-up\n{newline}\nUp/Down     navigate palette, editor lines, or history\nAlt-←/→     move by word; Home/End move within a line\nTab         complete the selected command; Shift-Tab cycle thinking\nCtrl-L      open model selector; Ctrl-P cycle models; Ctrl-O expand tools\nCtrl-T      toggle displayed thinking\nPgUp/PgDn   scroll the transcript; Ctrl-Home/Ctrl-End jump to top/bottom\nEsc         close the palette, clear input, or abort a response\nCtrl-C      abort, or quit (asks twice when the session is not saved)\nCtrl-D      quit when the editor is empty"
+        "Enter       send or accept selection; steer while a response is active\nAlt-Enter   queue a follow-up\n{newline}\nUp/Down     navigate palette, editor lines, or history\nAlt-←/→     move by word; Home/End or Ctrl-A/Ctrl-E move within a line\nCtrl-U/K/W  delete to the line's start, to its end, or the previous word\nTab         complete the selected command; Shift-Tab cycle thinking\nCtrl-L      open model selector; Ctrl-P cycle models; Ctrl-O expand tools\nCtrl-T      toggle displayed thinking\nPgUp/PgDn   scroll the transcript; Ctrl-Home/Ctrl-End jump to top/bottom\nEsc         close the palette, clear input (Up brings it back), or abort a response\nCtrl-C      abort, or quit (asks twice when the session is not saved)\nCtrl-D      quit when the editor is empty"
     )
 }
 
@@ -2213,7 +2413,22 @@ fn dispatch_btw_slash_command<'a>(
                             .bring_to_main(thread_id, scope)
                             .map_err(|error| error.to_string())
                     }) {
-                    Ok(output) => append_view_message(view, MessageRole::Command, output.text),
+                    // "Bring to main" means into the main conversation: the
+                    // context goes into the composer to edit and send, as
+                    // the original extension does.
+                    Ok(output) => {
+                        app.set_input(&output.text);
+                        append_view_message(
+                            view,
+                            MessageRole::Notice,
+                            format!(
+                                "Brought {} from {} (about {} tokens) into the editor. Edit it, then press Enter to send it to the main conversation.",
+                                plural(output.segments.len(), "message", "messages"),
+                                output.thread_id,
+                                output.estimated_tokens
+                            ),
+                        );
+                    }
                     Err(error) => append_view_message(view, MessageRole::Error, error),
                 }
             }
@@ -2239,17 +2454,30 @@ fn dispatch_btw_slash_command<'a>(
 }
 
 fn list_btw_threads(prepared: &runtime::PreparedSession) -> String {
+    // Threads are saved as session entries, so only an unrecorded session
+    // loses them on exit.
+    let storage = if prepared.runtime.recording() {
+        "saved with this session"
+    } else {
+        "kept in memory only; this session is not recorded"
+    };
     let mut lines = vec![
-        "BTW side threads (in memory only):".to_owned(),
-        "  /btw <question>                  start a fresh side thread".to_owned(),
-        "  /btw resume <id> <question>      continue one".to_owned(),
-        "  /btw bring <id> [latest|all|from:N]  show side context".to_owned(),
-        "  /btw settings [level|remember]   view/change preferences".to_owned(),
+        format!("BTW side threads ({storage}):"),
+        "  /btw <question>                       start a fresh side thread".to_owned(),
+        "  /btw resume <id> <question>           continue one".to_owned(),
+        "  /btw bring <id> [latest|all|from:N]   show side context".to_owned(),
+        "  /btw settings [level|remember]        view/change preferences".to_owned(),
     ];
-    for summary in prepared.btw.list_threads() {
+    let threads = prepared.btw.list_threads();
+    if threads.is_empty() {
+        lines.push("No side threads yet.".to_owned());
+    }
+    for summary in threads {
         lines.push(format!(
-            "  {}  {} question(s)  {}",
-            summary.id, summary.questions, summary.title
+            "  {}  {}  {}",
+            summary.id,
+            plural(summary.questions, "question", "questions"),
+            summary.title
         ));
     }
     lines.join("\n")
@@ -2699,11 +2927,19 @@ fn dispatch_aperture_command<'a>(
     let label = format!("/aperture {rest}").trim_end().to_owned();
     let catalog = catalog.clone();
     start_background_command(view, &label, move || {
-        let output = aperture_cli::execute(&arguments, false).map_err(|error| error.to_string());
+        let output = aperture_cli::execute(&arguments, false)
+            .map(|text| in_chat_terms(&text))
+            .map_err(|error| in_chat_terms(&error.to_string()));
         catalog.refresh_dynamic();
         output
     });
     CommandDispatch::Handled
+}
+
+/// The Aperture module's text names its shell commands; inside chat the
+/// same command is a slash command away, so that is what it should say.
+fn in_chat_terms(text: &str) -> String {
+    text.replace("`goshcoder aperture ", "`/aperture ")
 }
 
 fn dispatch_runtime_slash_command<'a>(
@@ -2895,17 +3131,36 @@ fn dispatch_runtime_slash_command<'a>(
             CommandDispatch::Handled
         }
         "/queue" => {
-            let agent = prepared.runtime.agent();
-            append_view_message(
-                view,
-                MessageRole::Command,
-                format!("{} message(s) queued.", agent.queued_message_count()),
-            );
+            let queued = prepared
+                .runtime
+                .agent()
+                .queued_messages()
+                .iter()
+                .filter_map(|message| match message {
+                    llm::Message::User(user) => Some(user_message_text(user)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            append_view_message(view, MessageRole::Command, queue_report(&queued));
             CommandDispatch::Handled
         }
         "/steer" if rest.is_empty() => {
             append_view_message(view, MessageRole::Error, "usage: /steer <text>");
             CommandDispatch::Handled
+        }
+        // With nothing running there is nothing to steer or follow: the
+        // text is simply the next prompt, instead of waiting in a queue
+        // that the next prompt (or a compaction) would surprise.
+        "/steer" | "/followup"
+            if !rest.is_empty()
+                && !app.streaming
+                && !view.turn_pending
+                && !prepared.runtime.agent().state().is_streaming =>
+        {
+            if !ready_for_prompt(app, view, prepared) {
+                return CommandDispatch::Handled;
+            }
+            start_interactive_prompt(view, prepared, turn_sender, rest.to_owned())
         }
         "/steer" => {
             prepared
@@ -3029,7 +3284,7 @@ fn dispatch_runtime_slash_command<'a>(
         "/clone" => {
             match prepared.runtime.clone_session() {
                 Ok(handle) => {
-                    // The runtime reports "cloned session <id>" itself.
+                    // The runtime reports "cloned as <id>" itself.
                     view.activity = format!("Cloned session {}", short_id(&handle.id));
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
@@ -3084,7 +3339,7 @@ fn dispatch_runtime_slash_command<'a>(
             match prepared.runtime.switch_to(rest) {
                 Ok(handle) => {
                     // The previous session's notices stay with it; the
-                    // runtime's own "switched session" notice is the one
+                    // runtime's own "switched to" notice is the one
                     // line this needs.
                     reset_view_transcript(view, prepared);
                     app.scroll_to_bottom();
@@ -3375,8 +3630,10 @@ fn prompt_list(prepared: &runtime::PreparedSession) -> Result<String, String> {
             } else {
                 format!("  {}", template.description)
             };
+            // Two spaces, not four: four mark a line to stand out (a
+            // sign-in URL), which a template's path is not.
             format!(
-                "/{}{}\n    {}",
+                "/{}{}\n  {}",
                 template.name,
                 description,
                 template.path.display()
@@ -3789,7 +4046,7 @@ fn dispatch_import_command<'a>(
                 MessageRole::Notice,
                 format!(
                     "Session imported from {source} as {} and switched to it.",
-                    handle.id
+                    short_id(&handle.id)
                 ),
             );
         }
@@ -3812,6 +4069,10 @@ fn dispatch_share_command<'a>(
             return CommandDispatch::Handled;
         }
     };
+    if let Some(refusal) = sessions::share_refusal(&info) {
+        append_view_message(view, MessageRole::Error, refusal);
+        return CommandDispatch::Handled;
+    }
     match rest.trim().to_ascii_lowercase().as_str() {
         "" => append_view_message(
             view,
@@ -3849,6 +4110,41 @@ fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<Stri
         &sessions,
         prepared.runtime.id().as_deref(),
     ))
+}
+
+/// The `/resume ` palette: this workspace's other saved sessions, newest
+/// first, so a session can be picked instead of its id remembered.
+fn resume_choices(prepared: &runtime::PreparedSession) -> Vec<state::Suggestion> {
+    let Ok(cwd) = runtime::absolute_workdir(&prepared.config.workdir) else {
+        return Vec::new();
+    };
+    let store = sessionlog::Store::new(
+        prepared
+            .config
+            .sessions_dir
+            .clone()
+            .unwrap_or_else(config::sessions_dir),
+    );
+    let Ok(sessions) = session_picker::list_sessions_for_picker(&store, &cwd) else {
+        return Vec::new();
+    };
+    let current = prepared.runtime.id();
+    let labels = sessionlog::short_ids(&sessions);
+    sessions
+        .iter()
+        .zip(labels)
+        .filter(|(session, _)| current.as_deref() != Some(session.id.as_str()))
+        .map(|(session, label)| {
+            let (label, description) =
+                session_picker::describe_session(session, &label, false, false);
+            state::Suggestion {
+                value: format!("/resume {label}"),
+                label,
+                description,
+                execute: true,
+            }
+        })
+        .collect()
 }
 
 fn render_interactive_session_list(
@@ -4003,7 +4299,7 @@ fn refresh_runtime_app(
 ) {
     let state = prepared.runtime.agent().state();
     view.message_count = state.messages.len();
-    app.dynamic_suggestions = palette_suggestions(app, catalog, &state, view);
+    app.dynamic_suggestions = palette_suggestions(app, prepared, catalog, &state, view);
     // Cloning the resource set is not free; only the slash palette needs it.
     app.command_suggestions = if app.input.starts_with('/') {
         resource_command_suggestions(prepared)
@@ -4126,6 +4422,7 @@ fn resource_command_suggestions(prepared: &runtime::PreparedSession) -> Vec<stat
 /// palette opening and reused until the composer leaves the command.
 fn palette_suggestions(
     app: &App,
+    prepared: &runtime::PreparedSession,
     catalog: &catalog::Catalog,
     state: &agent::State,
     view: &mut InteractiveView,
@@ -4137,8 +4434,17 @@ fn palette_suggestions(
     if !input.starts_with("/login ") {
         view.login_choices = None;
     }
+    if !input.starts_with("/resume ") {
+        view.resume_choices = None;
+    }
     if state::dynamic_palette_argument(input).is_none() {
         return Vec::new();
+    }
+    if input.starts_with("/resume ") {
+        return view
+            .resume_choices
+            .get_or_insert_with(|| resume_choices(prepared))
+            .clone();
     }
     if input.starts_with("/thinking ") {
         return stream::supported_thinking_levels(&state.model)
@@ -4459,23 +4765,7 @@ fn live_activity(view: &InteractiveView, state: &agent::State) -> String {
 }
 
 fn agent_messages(messages: &[llm::Message]) -> Vec<(usize, Message)> {
-    let mut tool_results = BTreeMap::<String, &llm::ToolResultMessage>::new();
-    let mut unnamed_results = BTreeMap::<String, Vec<&llm::ToolResultMessage>>::new();
-    for message in messages {
-        if let llm::Message::ToolResult(result) = message {
-            if result.tool_call_id.is_empty() {
-                unnamed_results
-                    .entry(result.tool_name.clone())
-                    .or_default()
-                    .push(result);
-            } else {
-                tool_results.insert(result.tool_call_id.clone(), result);
-            }
-        }
-    }
-
-    let mut matched_results = BTreeSet::new();
-    let mut unnamed_positions = BTreeMap::<String, usize>::new();
+    let pairing = llm::ToolPairing::new(messages.iter().map(Some));
     let mut result = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         let mut push = |message: Message| result.push((index, message));
@@ -4545,32 +4835,22 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<(usize, Message)> {
                         ..Message::default()
                     });
                 }
-                for content in &assistant.content {
+                for (block, content) in assistant.content.iter().enumerate() {
                     let llm::ContentBlock::ToolCall(call) = content else {
                         continue;
                     };
-                    let matched = if call.id.is_empty() {
-                        let position = unnamed_positions.entry(call.name.clone()).or_default();
-                        let selected = unnamed_results
-                            .get(&call.name)
-                            .and_then(|results| results.get(*position).copied());
-                        if selected.is_some() {
-                            *position += 1;
-                        }
-                        selected
-                    } else {
-                        tool_results.get(&call.id).copied()
-                    };
-                    if let Some(tool_result) = matched {
-                        matched_results.insert(tool_result.tool_call_id.clone());
-                    }
+                    let matched =
+                        pairing.result_for(index, block).and_then(|answer| {
+                            match &messages[answer] {
+                                llm::Message::ToolResult(result) => Some(result.as_ref()),
+                                _ => None,
+                            }
+                        });
                     push(tool_view_message(call, matched));
                 }
             }
             llm::Message::ToolResult(tool_result) => {
-                if !tool_result.tool_call_id.is_empty()
-                    && matched_results.contains(&tool_result.tool_call_id)
-                {
+                if pairing.is_answer(index) {
                     continue;
                 }
                 push(unmatched_tool_view_message(tool_result));
@@ -4817,17 +5097,9 @@ struct ActivitySummary {
 
 fn activity_summary(messages: &[llm::Message]) -> ActivitySummary {
     let mut summary = ActivitySummary::default();
-    let failed_ids = messages
-        .iter()
-        .filter_map(|message| match message {
-            llm::Message::ToolResult(result) if result.is_error => {
-                Some(result.tool_call_id.clone())
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let pairing = llm::ToolPairing::new(messages.iter().map(Some));
     let mut seen_paths = BTreeSet::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
         match message {
             llm::Message::User(user) => {
                 if !compaction::is_summary_message(message)
@@ -4837,13 +5109,15 @@ fn activity_summary(messages: &[llm::Message]) -> ActivitySummary {
                 }
             }
             llm::Message::Assistant(assistant) => {
-                for content in &assistant.content {
+                for (block, content) in assistant.content.iter().enumerate() {
                     let llm::ContentBlock::ToolCall(call) = content else {
                         continue;
                     };
                     summary.tools += 1;
                     summary.last_tool = Some(tool_title(call));
-                    let failed = failed_ids.contains(&call.id);
+                    let failed = pairing.result_for(index, block).is_some_and(|answer| {
+                        matches!(&messages[answer], llm::Message::ToolResult(result) if result.is_error)
+                    });
                     if failed {
                         summary.failed += 1;
                     }
@@ -5258,12 +5532,8 @@ fn compact_number(value: u64) -> String {
     }
 }
 
-fn short_id(value: &str) -> &str {
-    let mut end = value.len().min(8);
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
+fn short_id(id: &str) -> &str {
+    sessionlog::short_id(id)
 }
 
 fn now_millis() -> i64 {
@@ -5542,6 +5812,22 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr");
         assert!(stderr.contains("reasoning"));
         assert!(stderr.contains("tokens: 12 in / 4 out  cost: $0.0123"));
+
+        // A reply the user stopped is an interruption, not an error.
+        let mut aborted = event(agent::EventKind::MessageEnd);
+        aborted.message = Some(llm::Message::Assistant(Box::new(llm::AssistantMessage {
+            stop_reason: stream::STOP_ABORTED.to_owned(),
+            error_message: "request aborted".to_owned(),
+            ..llm::AssistantMessage::default()
+        })));
+        aborted.assistant_was_streamed = true;
+        let mut stderr = Vec::new();
+        render_run_event(&aborted, &mut Vec::new(), &mut stderr, false).expect("render abort");
+        let stderr = String::from_utf8(stderr).expect("stderr");
+        assert!(
+            stderr.contains("(interrupted)") && !stderr.contains("error"),
+            "{stderr}"
+        );
     }
 
     fn notice(anchor: usize, text: &str) -> AnchoredNotice {
@@ -5780,6 +6066,68 @@ mod tests {
             ]
         );
         assert_eq!(summary.last_tool.as_deref(), Some("edit src/broken.rs"));
+    }
+
+    #[test]
+    fn queue_report_lists_what_will_run_next() {
+        assert!(queue_report(&[]).starts_with("Nothing is queued."));
+        assert_eq!(
+            queue_report(&[
+                "fix the test\nand rerun".to_owned(),
+                "then commit".to_owned()
+            ]),
+            "2 messages queued:\n  1. fix the test ...\n  2. then commit"
+        );
+    }
+
+    #[test]
+    fn tool_cards_pair_results_by_turn_when_a_server_reuses_call_ids() {
+        // Some OpenAI-compatible servers number calls per message, so the
+        // same id comes back every turn; each card must keep its own output.
+        let turn = |command: &str| {
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                content: vec![llm::ContentBlock::ToolCall(llm::ToolCall {
+                    id: "call_0".to_owned(),
+                    name: "bash".to_owned(),
+                    arguments: BTreeMap::from([("command".to_owned(), serde_json::json!(command))]),
+                    ..llm::ToolCall::default()
+                })],
+                ..llm::AssistantMessage::default()
+            }))
+        };
+        let result = |output: &str, is_error: bool| {
+            llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: "call_0".to_owned(),
+                tool_name: "bash".to_owned(),
+                content: vec![llm::ContentBlock::Text(llm::TextContent {
+                    text: output.to_owned(),
+                    ..llm::TextContent::default()
+                })],
+                is_error,
+                ..llm::ToolResultMessage::default()
+            }))
+        };
+        let messages = vec![
+            llm::Message::User(llm::UserMessage::text("one", 1)),
+            turn("echo first"),
+            result("first output", false),
+            llm::Message::User(llm::UserMessage::text("two", 2)),
+            turn("false"),
+            result("second failure", true),
+        ];
+        let cards = agent_messages(&messages)
+            .into_iter()
+            .map(|(_, message)| message)
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 2, "no result may render as an orphan");
+        assert!(cards[0].detail.contains("first output"), "{:?}", cards[0]);
+        assert!(!cards[0].is_error);
+        assert!(cards[1].detail.contains("second failure"), "{:?}", cards[1]);
+        assert!(cards[1].is_error);
+
+        let summary = activity_summary(&messages);
+        assert_eq!((summary.tools, summary.failed), (2, 1));
     }
 
     #[test]

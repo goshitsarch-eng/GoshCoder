@@ -174,7 +174,7 @@ Session flags (`-claude-tui` and `-fullscreen` affect interactive chat only):
 | `-claude-tui` | Use the native `pi-claude-code-tui` appearance in line mode |
 | `-fullscreen` | Use the full-screen alternate-screen TUI (default true on an interactive terminal) |
 | `-C` | Workspace directory for tools |
-| `-continue` | Reopen the most recent session for this workspace |
+| `-continue` | Reopen the most recent session for this workspace (one with a conversation in it) |
 | `-resume` | Choose a session to resume (chat only) |
 | `-session` | Session id, id prefix, or path |
 | `-name` | Display name for the session |
@@ -293,17 +293,17 @@ is recorded in [`NOTICE`](NOTICE).
 - [`@narumitw/pi-btw`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-btw)
   by narumiruna — **BTW** (native adaptation of version 0.50.0): `/btw <question>` opens a
   context-aware side thread without adding the question or answer to the main
-  transcript. The fullscreen side UI supports follow-ups, queued Steering,
-  resume, independent model/thinking settings in `pi-btw.json`,
-  Shift+Tab thinking changes, scrolling, cancellation, and Ctrl+R to bring the
-  latest Q&A into the editable main composer. GoshCoder requires the main agent
-  to be idle before opening BTW rather than rendering both agents concurrently.
-  `/btw` lists retained threads;
-  `/btw resume <id> <question>` resumes one. Unlike the original, threads are
-  saved with the session (as `goshcoder.btw` custom entries, the newest 50)
-  and come back with `-continue` or `/resume`. The original's exact character/
-  line range selector and nested bring-preview menus are not ported; native
-  line mode offers deterministic `latest`, `all`, and `from:N` export instead.
+  transcript. Answers appear as cards in the interface; `/btw` lists retained
+  threads, `/btw resume <id> <question>` continues one, `/btw settings` shows
+  or changes the independent model/thinking settings in `pi-btw.json`, and
+  `/btw bring <id> [latest|all|from:N]` puts a thread's exchange into the main
+  composer to edit and send. Esc cancels a side question in flight. GoshCoder
+  requires the main agent to be idle before opening BTW rather than running
+  both agents concurrently. Unlike the original, threads are saved with the
+  session (as `goshcoder.btw` custom entries, the newest 50) and come back with
+  `-continue` or `/resume`. The original's side panel, its exact character/line
+  range selector and nested bring-preview menus are not ported; the `latest`,
+  `all`, and `from:N` selections replace them.
 - [`@tmustier/pi-ralph-wiggum`](https://github.com/tmustier/pi-extensions) by Thomas
   Mustier — **Ralph** (native adaptation): persistent iterative loops and
   completion tools.
@@ -532,13 +532,41 @@ The visual extensions are implemented by GoshCoder's Ratatui terminal UI rather
 than pi's TypeScript runtime. Type `/` to open the command
 palette; arrows select an item, Tab completes it, and Enter accepts it. `/model`
 opens a searchable picker containing models from authenticated providers, while
-`/thinking` contains only levels supported by the active model. The composer
-supports up to three visible lines (`Shift+Enter`/`Ctrl+J` inserts a newline),
-word navigation, and line-aware Home/End. Tool calls render as compact cards;
-`Ctrl+O` expands their output and `Ctrl+T` toggles thinking. `/compact [focus]`
-creates a Pi-style structured summary while retaining recent turns; the same
-compaction runs automatically near the active model's context limit. Transient
-429/5xx provider failures are retried automatically.
+`/thinking` contains only levels supported by the active model, and
+`/resume ` lists this workspace's saved sessions to pick from. A palette longer
+than its box shows its position (`3/45`) in the title. The composer grows to
+eight visible lines (`Shift+Enter`/`Ctrl+J` inserts a newline) and edits by
+grapheme, so an emoji or accented letter is never split. Tool calls render as
+compact cards; `Ctrl+O` expands their output and `Ctrl+T` toggles thinking.
+`/compact [focus]` creates a Pi-style structured summary while retaining recent
+turns; the same compaction runs automatically near the active model's context
+limit. Transient 429/5xx provider failures are retried automatically, with the
+countdown in the status bar; Esc cancels the wait. During a browser or device
+login the sign-in address (or the device code) is also put on the clipboard
+through the terminal (OSC 52), because a long address wraps over several rows
+of the fullscreen interface and cannot be selected as one piece.
+
+**Keyboard** (`/hotkeys` shows the same list inside chat):
+
+| Key | Action |
+| --- | --- |
+| Enter | Send, or accept the palette selection; while a reply streams, steer it |
+| Alt+Enter | Queue a follow-up for after the current reply |
+| Ctrl+J, Shift+Enter | Insert a newline (Shift+Enter needs the kitty keyboard protocol) |
+| Up / Down | Move in the palette, between editor lines, or through history |
+| Alt+← / Alt+→, Home / End, Ctrl+A / Ctrl+E | Move by word; to the line's start or end |
+| Ctrl+U / Ctrl+K / Ctrl+W | Delete to the line's start, to its end, or the previous word |
+| Tab / Shift+Tab | Complete the palette selection / cycle thinking levels |
+| Ctrl+L, Ctrl+P | Open the model picker; cycle models (Ctrl+Shift+P backwards) |
+| Ctrl+O, Ctrl+T | Expand tool output; collapse thinking |
+| PgUp / PgDn, Ctrl+Home / Ctrl+End, mouse wheel | Scroll the transcript; jump to top or bottom |
+| Esc | Close the palette, clear the draft (Up brings it back), or abort a reply |
+| Ctrl+C | Clear the draft, abort a reply, or quit (twice when the session is not saved) |
+| Ctrl+D | Quit when the editor is empty |
+
+Chat ends cleanly on SIGTERM or a closed terminal as it does on `/exit`: the
+terminal is restored, an interrupted reply is saved, and the exit status is
+128 plus the signal number.
 
 ## Local resources
 
