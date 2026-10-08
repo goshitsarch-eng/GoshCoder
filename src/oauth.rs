@@ -771,6 +771,22 @@ pub fn parse_authorization_input(input: &str) -> Option<AuthorizationResponse> {
     })
 }
 
+/// The provider's reason when a pasted redirect URL carries `error=` rather
+/// than a code.
+fn redirect_error(input: &str) -> Option<String> {
+    let url = Url::parse(input.trim()).ok()?;
+    let error = query_value(&url, "error");
+    if error.is_empty() {
+        return None;
+    }
+    let description = query_value(&url, "error_description");
+    Some(if description.is_empty() {
+        error
+    } else {
+        description
+    })
+}
+
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1367,6 +1383,7 @@ pub fn run_loopback_login_with_server<T>(
         cancellation: manual_cancellation,
     };
     let (manual_sender, manual_receiver) = mpsc::sync_channel(1);
+    let mut manual_receiver = Some(manual_receiver);
     let prompter = interaction.clone();
     thread::Builder::new()
         .name("oauth-manual-code".to_owned())
@@ -1405,21 +1422,45 @@ pub fn run_loopback_login_with_server<T>(
             }
             None => {}
         }
-        match manual_receiver.try_recv() {
-            Ok(result) => {
-                let parsed = parse_authorization_input(&result?)
-                    .ok_or(OAuthError::InvalidAuthorizationInput)?;
-                if !parsed.state.is_empty()
-                    && !request.expected_state.is_empty()
-                    && !constant_time_eq(&parsed.state, &request.expected_state)
-                {
-                    return Err(OAuthError::StateMismatch);
+        let manual = match manual_receiver.as_ref().map(mpsc::Receiver::try_recv) {
+            None | Some(Err(TryRecvError::Empty)) => None,
+            Some(Ok(result)) => Some(result?),
+            Some(Err(TryRecvError::Disconnected)) => {
+                if server.is_none() {
+                    return Err(OAuthError::Cancelled);
                 }
-                break parsed.code;
+                manual_receiver = None;
+                None
             }
-            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
-            Err(TryRecvError::Disconnected) => return Err(OAuthError::Cancelled),
+        };
+        let Some(input) = manual else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        // An empty line, or a stdin that is not a terminal, must not abandon
+        // a browser sign-in that is still on its way back.
+        if input.trim().is_empty() && server.is_some() {
+            manual_receiver = None;
+            interaction.notify(OAuthEvent::info(
+                "Still waiting for the browser sign-in; press Ctrl-C to cancel.",
+            ));
+            continue;
         }
+        if let Some(reason) = redirect_error(&input) {
+            return Err(OAuthError::Callback(format!(
+                "{} sign-in was not authorized in the browser: {reason}",
+                request.provider_name
+            )));
+        }
+        let parsed =
+            parse_authorization_input(&input).ok_or(OAuthError::InvalidAuthorizationInput)?;
+        if !parsed.state.is_empty()
+            && !request.expected_state.is_empty()
+            && !constant_time_eq(&parsed.state, &request.expected_state)
+        {
+            return Err(OAuthError::StateMismatch);
+        }
+        break parsed.code;
     };
     interaction.notify(OAuthEvent::progress(
         "Exchanging the authorization code for tokens...",
@@ -1651,14 +1692,6 @@ struct TokenResponse {
     refresh_token: String,
     #[serde(default)]
     expires_in: i64,
-    #[serde(default)]
-    error: String,
-    #[serde(default)]
-    error_description: String,
-}
-
-fn parse_token_response(body: &[u8]) -> Option<TokenResponse> {
-    serde_json::from_slice(body).ok()
 }
 
 fn token_error(
@@ -1666,17 +1699,14 @@ fn token_error(
     operation: &'static str,
     response: &OAuthResponse,
 ) -> OAuthError {
-    let parsed = parse_token_response(&response.body);
-    let detail = parsed
-        .as_ref()
-        .map(|response| response.error_description.trim().to_owned())
-        .filter(|detail| !detail.is_empty())
-        .unwrap_or_else(|| truncate_response(&response.body, 500));
+    let detail = truncate_response(&response.body, 500);
+    let code = error_code(&response.body);
     if response.status == 401
         || response.status == 403
-        || parsed
-            .as_ref()
-            .is_some_and(|response| response.error == "invalid_grant")
+        || matches!(
+            code.as_deref(),
+            Some("invalid_grant" | "invalid_refresh_token" | "token_expired")
+        )
     {
         OAuthError::Unauthorized {
             provider,
@@ -1693,8 +1723,44 @@ fn token_error(
     }
 }
 
+/// The human-readable part of an error body. Providers disagree on the
+/// shape (`error_description`, `{"error":{"message"}}`, `message`, a bare
+/// `error` string), so they are tried in the order pi's `errorDetail` uses,
+/// and anything else falls back to the raw text.
+fn error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    text(value.get("error_description"))
+        .or_else(|| text(value.get("error").and_then(|error| error.get("message"))))
+        .or_else(|| text(value.get("message")))
+        .or_else(|| text(value.get("error")))
+}
+
+/// The machine-readable error code, top-level or nested under `error`.
+fn error_code(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let error = value.get("error")?;
+    error
+        .as_str()
+        .or_else(|| error.get("code").and_then(Value::as_str))
+        .or_else(|| error.get("type").and_then(Value::as_str))
+        .map(str::to_owned)
+}
+
 fn truncate_response(body: &[u8], limit: usize) -> String {
-    let body = String::from_utf8_lossy(body);
+    let detail = error_detail(body);
+    let body = match &detail {
+        Some(detail) => detail.clone(),
+        None => String::from_utf8_lossy(body).into_owned(),
+    };
+    // A multi-line HTML or JSON dump reads as noise on one terminal line.
+    let body = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut text = body.trim().chars();
     let truncated: String = text.by_ref().take(limit).collect();
     if text.next().is_some() {
@@ -2218,14 +2284,14 @@ fn meta_client_id(environment: &dyn OAuthEnvironment) -> String {
 
 impl OAuthClient {
     /// Builds Anthropic's registered PKCE authorization URL.
-    pub fn anthropic_authorization_url(&self, pkce: &PkcePair) -> Url {
+    pub fn anthropic_authorization_url(&self, pkce: &PkcePair, redirect_uri: &str) -> Url {
         append_query(
             &self.endpoints.anthropic_authorize_url,
             &[
                 ("code", "true"),
                 ("client_id", ANTHROPIC_CLIENT_ID),
                 ("response_type", "code"),
-                ("redirect_uri", ANTHROPIC_REDIRECT_URI),
+                ("redirect_uri", redirect_uri),
                 ("scope", ANTHROPIC_SCOPES),
                 ("code_challenge", pkce.challenge()),
                 ("code_challenge_method", "S256"),
@@ -2243,20 +2309,53 @@ impl OAuthClient {
         cancellation: &CancellationToken,
     ) -> Result<Credential> {
         let pkce = generate_pkce();
-        let authorization_url = self.anthropic_authorization_url(&pkce);
-        run_loopback_login(
+        let host = callback_host(environment);
+        // pi's anthropic.ts: Anthropic accepts any loopback port, so a busy
+        // 53692 falls back to a free one rather than sending the browser's
+        // code to whatever holds the port.
+        let server = LoopbackCallbackServer::bind(
+            &host,
+            ANTHROPIC_CALLBACK_PORT,
+            ANTHROPIC_CALLBACK_PATH,
+            pkce.verifier(),
+        )
+        .or_else(|_| {
+            LoopbackCallbackServer::bind(&host, 0, ANTHROPIC_CALLBACK_PATH, pkce.verifier())
+        });
+        let redirect_uri = match server.as_ref().map(LoopbackCallbackServer::local_addr) {
+            Ok(Ok(address)) if address.port() != ANTHROPIC_CALLBACK_PORT => {
+                format!(
+                    "http://localhost:{}{ANTHROPIC_CALLBACK_PATH}",
+                    address.port()
+                )
+            }
+            _ => ANTHROPIC_REDIRECT_URI.to_owned(),
+        };
+        let server = match server {
+            Ok(server) => Some(server),
+            Err(error) => {
+                interaction.notify(OAuthEvent::info(format!(
+                    "Could not listen for the browser callback ({error}). Complete login in the browser and paste the redirect URL below."
+                )));
+                None
+            }
+        };
+        let authorization_url = self.anthropic_authorization_url(&pkce, &redirect_uri);
+        let exchange_redirect_uri = redirect_uri.clone();
+        run_loopback_login_with_server(
             interaction,
             self.browser.clone(),
             cancellation,
             LoopbackLoginRequest {
                 provider_name: OAuthProviderId::Anthropic.display_name(),
                 authorization_url,
-                redirect_uri: ANTHROPIC_REDIRECT_URI.to_owned(),
+                redirect_uri,
                 expected_state: pkce.verifier().to_owned(),
-                callback_host: callback_host(environment),
+                callback_host: host,
                 callback_port: ANTHROPIC_CALLBACK_PORT,
                 callback_path: ANTHROPIC_CALLBACK_PATH.to_owned(),
             },
+            server,
             |code| {
                 let response = self.post_json(
                     &self.endpoints.anthropic_token_url,
@@ -2265,7 +2364,7 @@ impl OAuthClient {
                         "client_id": ANTHROPIC_CLIENT_ID,
                         "code": code,
                         "state": pkce.verifier(),
-                        "redirect_uri": ANTHROPIC_REDIRECT_URI,
+                        "redirect_uri": exchange_redirect_uri,
                         "code_verifier": pkce.verifier(),
                     }),
                     cancellation,
@@ -3948,7 +4047,7 @@ mod tests {
         let client = test_client(transport, clock, OAuthEndpoints::default());
         let pkce = generate_pkce();
 
-        let anthropic = client.anthropic_authorization_url(&pkce);
+        let anthropic = client.anthropic_authorization_url(&pkce, ANTHROPIC_REDIRECT_URI);
         assert_eq!(query_value(&anthropic, "client_id"), ANTHROPIC_CLIENT_ID);
         assert_eq!(
             query_value(&anthropic, "redirect_uri"),
@@ -4211,6 +4310,46 @@ mod tests {
                 .expect("refresh")
                 .access(),
             "sk-or-v1-minted"
+        );
+    }
+
+    #[test]
+    fn error_bodies_are_reduced_to_their_message() {
+        let nested = br#"{
+  "error": {
+    "message": "Could not validate your token.",
+    "type": "invalid_request_error",
+    "code": "token_expired"
+  }
+}"#;
+        assert_eq!(
+            truncate_response(nested, 500),
+            "Could not validate your token."
+        );
+        assert_eq!(error_code(nested).as_deref(), Some("token_expired"));
+        assert!(
+            token_error("Example", "refresh", &response(400, nested.to_vec())).is_unauthorized(),
+            "an expired token code means log in again, whatever the status"
+        );
+        assert_eq!(
+            truncate_response(
+                br#"{"error":"invalid_grant","error_description":"Bad code"}"#,
+                500
+            ),
+            "Bad code"
+        );
+        assert_eq!(
+            truncate_response(b"<html>\n  <b>oops</b>\n</html>", 500),
+            "<html> <b>oops</b> </html>"
+        );
+        // A transient failure stays retryable.
+        assert!(
+            !token_error(
+                "Example",
+                "refresh",
+                &response(400, br#"{"error":"invalid_request"}"#.to_vec())
+            )
+            .is_unauthorized()
         );
     }
 

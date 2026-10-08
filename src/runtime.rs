@@ -968,14 +968,21 @@ fn desktop_mcp_tool(
     }
     let agent_dir = catalog.dynamic_paths().agent_dir.clone()?;
     let Some(binary) = computeruse::find_binary() else {
-        // The extension warns on session_start when the binary is missing.
-        notices.push((
-            computeruse::PACKAGE_NAME,
-            format!(
-                "computer-use-linux binary not found. {}",
-                computeruse::INSTALL_HINT
-            ),
-        ));
+        // The extension warns on every session_start when the binary is
+        // missing. Desktop control is an optional add-on most people never
+        // install, so the hint is shown once per agent directory instead of
+        // greeting every launch.
+        let marker = agent_dir.join("computer-use-linux.hint-shown");
+        if !quiet && !marker.exists() {
+            let _ = std::fs::write(&marker, b"");
+            notices.push((
+                computeruse::PACKAGE_NAME,
+                format!(
+                    "Desktop control is available once computer-use-linux is installed (this hint is shown once). {}",
+                    computeruse::INSTALL_HINT
+                ),
+            ));
+        }
         return None;
     };
     // Keep the pi-mcp-adapter-compatible mcp.json entry registered, exactly

@@ -1058,7 +1058,11 @@ fn event_loop(
         for notice in runtime::drain_session_notices(&prepared.runtime) {
             append_view_message(&mut view, MessageRole::Notice, notice);
         }
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
+        // The sidebar already says a new session is recording; only a
+        // resumed one is worth a line in the transcript.
+        if prepared.runtime.resumed()
+            && let Some(banner) = runtime::session_banner(&prepared.runtime)
+        {
             append_view_message(&mut view, MessageRole::Notice, banner);
         }
     }
