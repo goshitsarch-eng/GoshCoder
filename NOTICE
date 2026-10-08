@@ -83,6 +83,13 @@ omniroute-agent-extension — OmniRoute
   upstream npm package, crates.io, or its release binaries, under its own
   licence.
 
+pi-meta-muse-auth — Meta Muse Code subscription provider
+  Sadik Saifi — https://github.com/sadiksaifi/pi-meta-muse-auth
+  Copyright (c) 2026 pi-meta-muse-auth contributors — MIT License
+  Adapted from version 0.1.2. Meta, Muse Code and Muse Spark are Meta's; the
+  adaptation talks to Meta's public endpoints with the user's own
+  subscription and bundles nothing of Meta's.
+
 
 Third-party Rust crates
 -----------------------

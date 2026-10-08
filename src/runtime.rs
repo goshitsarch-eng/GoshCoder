@@ -16,8 +16,8 @@ use std::{
 use crate::{
     agent, aperture, aperture_cli, aperture_mcp, aperture_tools, btw_runtime,
     catalog::Catalog,
-    computeruse, config, llm, omni_cli, omniroute, planner_runtime, plannotator, ralph,
-    ralph_runtime,
+    computeruse, config, llm, meta_muse, oauth, omni_cli, omniroute, planner_runtime, plannotator,
+    ralph, ralph_runtime,
     resources::{self, ResourcePaths, ResourceSet},
     session::{SessionNoticeSender, SessionOptions, SessionRuntime, SessionSelection},
     stream,
@@ -464,6 +464,7 @@ pub const CURATED_MODELS: &[(&str, &str)] = &[
     ("deepseek", "deepseek-v4-pro"),
     ("xai", "grok-build-0.1"),
     ("meta", "muse-spark-1.2"),
+    ("meta-muse", "muse-spark-1.3"),
     ("google", "gemini-3.6-flash"),
     ("google-vertex", "gemini-3.6-flash"),
     ("zai", "glm-5.2"),
@@ -720,6 +721,7 @@ pub fn prepare_session(
     };
     prepared.aperture_session_start();
     prepared.omni_session_start();
+    prepared.meta_muse_session_start();
     Ok(prepared)
 }
 
@@ -806,6 +808,32 @@ impl PreparedSession {
                             configuration.server_url
                         ),
                     );
+                }
+            })
+            .ok();
+    }
+
+    /// Revalidates the Meta Muse Code model list in the background, as the
+    /// extension's `fetchModels` does whenever pi refreshes its catalog. The
+    /// cached or bundled list serves the picker meanwhile, and a failure
+    /// (offline, an expired subscription) leaves it in place silently: the
+    /// request path reports a credential problem when it matters.
+    fn meta_muse_session_start(&self) {
+        let catalog = self.catalog.clone();
+        let stored_login = catalog
+            .credentials()
+            .and_then(|store| store.read_raw(meta_muse::PROVIDER_ID).ok().flatten())
+            .is_some();
+        if !stored_login || catalog.dynamic_paths().meta_muse_models.is_none() {
+            return;
+        }
+        thread::Builder::new()
+            .name("meta-muse-models".to_owned())
+            .spawn(move || {
+                let cancellation =
+                    oauth::CancellationToken::with_timeout(meta_muse::REQUEST_TIMEOUT);
+                if let Ok(transport) = meta_muse::models_transport() {
+                    let _ = meta_muse::refresh_model_cache(&catalog, &transport, &cancellation);
                 }
             })
             .ok();
@@ -1524,14 +1552,15 @@ mod tests {
             }
         }
         // Cloudflare needs an account (and gateway) id, which `auth set`
-        // prompts for; Aperture is configured by its gateway; Codex is OAuth
-        // only.
+        // prompts for; Aperture is configured by its gateway; Codex and Meta
+        // Muse Code are subscription logins only.
         assert_eq!(
             unconfigured,
             [
                 "aperture",
                 "cloudflare-ai-gateway",
                 "cloudflare-workers-ai",
+                "meta-muse",
                 "openai-codex"
             ]
         );

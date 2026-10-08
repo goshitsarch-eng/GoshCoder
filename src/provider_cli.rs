@@ -13,7 +13,7 @@ use crossterm::{
 
 use crate::{
     catalog::{Catalog, CatalogError, Credential, CredentialStore, Provider},
-    config, oauth,
+    config, meta_muse, oauth,
 };
 
 /// Executes `goshcoder providers`.
@@ -84,7 +84,8 @@ pub fn models_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 const AUTH_USAGE: &str = "usage: goshcoder auth <subcommand>
 
   login <provider>   Sign in through the browser or a device code
-                     (anthropic, openai-codex, xai, meta, kimi-coding, openrouter)
+                     (anthropic, openai-codex, xai, meta, meta-muse, kimi-coding,
+                     openrouter)
   set <provider>     Store an API key for any provider
   list               Show stored credentials
   logout <provider>  Remove a stored credential
@@ -180,6 +181,9 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 "Logged in to {provider_id} with OAuth; credentials are stored in {}",
                 config::auth_path().display()
             );
+            if provider == oauth::OAuthProviderId::MetaMuse {
+                refresh_muse_models(&catalog);
+            }
             Ok(())
         }
         "logout" => {
@@ -262,6 +266,22 @@ impl oauth::OAuthInteraction for TerminalOAuthInteraction {
     }
 }
 
+/// Loads Meta's live Muse Spark list right after login, as pi fetches an
+/// extension's models once it has a credential. A failure only costs the live
+/// list; the bundled models stay selectable.
+fn refresh_muse_models(catalog: &Catalog) {
+    let cancellation = oauth::CancellationToken::with_timeout(meta_muse::REQUEST_TIMEOUT);
+    let refreshed = meta_muse::models_transport()
+        .and_then(|transport| meta_muse::refresh_model_cache(catalog, &transport, &cancellation));
+    match refreshed {
+        Ok(Some(count)) => println!("Meta lists {count} Muse Spark models for this subscription."),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "warning: could not load Meta's Muse Spark model list ({error}); the bundled models remain available"
+        ),
+    }
+}
+
 fn select_oauth_option(input: &str, options: &[oauth::OAuthPromptOption]) -> String {
     if let Ok(index) = input.parse::<usize>()
         && let Some(option) = index.checked_sub(1).and_then(|index| options.get(index))
@@ -315,8 +335,11 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
             _ => environment,
         };
         return match (environment.is_empty(), provider.id.as_str()) {
-            // A ChatGPT subscription has no API key; that is `openai`.
-            (_, "openai-codex") => format!("run: goshcoder auth login {}", provider.id),
+            // A ChatGPT subscription has no API key; that is `openai`. Meta
+            // Muse Code refuses keys outright; that is `meta`.
+            (_, "openai-codex" | "meta-muse") => {
+                format!("run: goshcoder auth login {}", provider.id)
+            }
             (true, _) => format!(
                 "run: goshcoder auth login {id}, or goshcoder auth set {id} for an API key",
                 id = provider.id
@@ -438,6 +461,15 @@ mod tests {
         assert!(
             provider_setup_hint(&catalog.provider("amazon-bedrock").expect("Bedrock"))
                 .contains("AWS_ACCESS_KEY_ID")
+        );
+        // A subscription-only provider must not suggest `auth set`.
+        assert_eq!(
+            provider_setup_hint(&catalog.provider("meta-muse").expect("Meta Muse")),
+            "run: goshcoder auth login meta-muse"
+        );
+        assert!(
+            provider_setup_hint(&catalog.provider("meta").expect("Meta"))
+                .contains("goshcoder auth set meta")
         );
     }
 

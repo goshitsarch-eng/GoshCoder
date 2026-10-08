@@ -34,7 +34,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeErr
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{aperture, config, llm, oauth, omniroute};
+use crate::{aperture, config, llm, meta_muse, oauth, omniroute};
 
 const CATALOG_JSON: &str = include_str!("../data/catalog.json");
 const CATALOG_EXTRA_JSON: &str = include_str!("../data/catalog_extra.json");
@@ -435,6 +435,17 @@ const PROVIDER_DEFINITIONS: &[ProviderDefinition] = &[
         key_name: "Meta Model API key",
         env_keys: &["META_API_KEY"],
         auth_kind: AuthKind::MetaBearer,
+        supports_oauth: true,
+    },
+    // pi-meta-muse-auth: a Muse Code subscription login, never an API key,
+    // so a pay-as-you-go key cannot be configured here by accident.
+    ProviderDefinition {
+        id: "meta-muse",
+        name: "Meta Muse Code",
+        base_url: meta_muse::DEFAULT_API_BASE_URL,
+        key_name: "",
+        env_keys: &[],
+        auth_kind: AuthKind::OAuthOnly,
         supports_oauth: true,
     },
     ProviderDefinition {
@@ -2001,6 +2012,8 @@ pub struct Auth {
     environment: BTreeMap<String, String>,
     headers: AuthHeaders,
     source: String,
+    /// Replaces the model's base URL when the credential names its own.
+    base_url: Option<String>,
 }
 
 impl Auth {
@@ -2015,6 +2028,7 @@ impl Auth {
             environment,
             headers,
             source: source.into(),
+            base_url: None,
         }
     }
 
@@ -2028,6 +2042,7 @@ impl Auth {
             environment,
             headers,
             source: source.into(),
+            base_url: None,
         }
     }
 
@@ -2069,6 +2084,13 @@ impl Auth {
 
     pub fn is_ambient(&self) -> bool {
         self.api_key.as_deref() == Some(AUTHENTICATED_SENTINEL)
+    }
+
+    /// The API base URL the stored credential carries, which requests use
+    /// instead of the model's. Meta returns one with every Muse Code key, so
+    /// it travels with the key rather than living in the catalog.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 }
 
@@ -2312,12 +2334,15 @@ impl Catalog {
     fn provider_with_layer(&self, layer: &DynamicLayer, id: &str) -> Option<Provider> {
         let definition = provider_definition(id)?;
         let mut base_url = definition.base_url.to_owned();
-        let mut models: Vec<llm::Model> = self
-            .data
-            .models
-            .get(id)
-            .map(|models| models.values().cloned().collect())
-            .unwrap_or_default();
+        let mut models: Vec<llm::Model> = match layer.live_models(id) {
+            Some(models) => models.clone(),
+            None => self
+                .data
+                .models
+                .get(id)
+                .map(|models| models.values().cloned().collect())
+                .unwrap_or_default(),
+        };
         if id == omniroute::OMNI_PROVIDER_ID {
             if let Some(omni) = &layer.omni {
                 base_url = omni.base_url.clone();
@@ -2392,7 +2417,10 @@ impl Catalog {
                 .find(|model| model.id == model_id)
                 .cloned();
         }
-        let model = self.data.models.get(provider_id)?.get(model_id)?;
+        let model = match layer.live_models(provider_id) {
+            Some(models) => models.iter().find(|model| model.id == model_id)?,
+            None => self.data.models.get(provider_id)?.get(model_id)?,
+        };
         match layer.aperture.routes.get(provider_id) {
             Some(route) => aperture::apply_proxy_route(model, route),
             None => Some(model.clone()),
@@ -2574,11 +2602,13 @@ impl Catalog {
         {
             Ok(Some(auth)) => {
                 self.clear_oauth_refresh_failure(provider_id);
+                let base_url = auth.base_url().map(str::to_owned);
                 let (api_key, headers, source) = auth.into_parts();
-                let auth = match api_key {
+                let mut auth = match api_key {
                     Some(api_key) => Auth::with_api_key(api_key, BTreeMap::new(), headers, source),
                     None => Auth::without_api_key(BTreeMap::new(), headers, source),
                 };
+                auth.base_url = base_url;
                 Ok(Some(auth))
             }
             Ok(None) => {
@@ -3007,7 +3037,10 @@ impl Catalog {
         }
     }
 
-    fn resolved_model(&self, model: llm::Model, auth: Auth) -> ResolvedModel {
+    fn resolved_model(&self, mut model: llm::Model, auth: Auth) -> ResolvedModel {
+        if let Some(base_url) = auth.base_url() {
+            model.base_url = base_url.to_owned();
+        }
         let mut effective_headers: AuthHeaders =
             resolve_headers(&model.headers, auth.environment(), &self.environment)
                 .into_iter()
@@ -3048,6 +3081,9 @@ pub struct DynamicPaths {
     pub omniroute_url: Option<String>,
     pub aperture: Option<PathBuf>,
     pub aperture_cache: Option<PathBuf>,
+    /// Meta Muse Code's last fetched model list, which replaces the bundled
+    /// `meta-muse` models while it parses.
+    pub meta_muse_models: Option<PathBuf>,
 }
 
 impl DynamicPaths {
@@ -3064,6 +3100,7 @@ impl DynamicPaths {
             omniroute_url: None,
             aperture: Some(config::aperture_path_in(agent_dir)),
             aperture_cache: Some(config::aperture_cache_path_in(agent_dir)),
+            meta_muse_models: Some(config::meta_muse_models_path_in(agent_dir)),
         }
     }
 
@@ -3091,10 +3128,15 @@ impl DynamicPaths {
 
     fn fingerprint(&self) -> DynamicFingerprint {
         DynamicFingerprint(
-            [&self.omniroute, &self.aperture, &self.aperture_cache]
-                .into_iter()
-                .map(|path| file_fingerprint(path.as_deref()))
-                .collect(),
+            [
+                &self.omniroute,
+                &self.aperture,
+                &self.aperture_cache,
+                &self.meta_muse_models,
+            ]
+            .into_iter()
+            .map(|path| file_fingerprint(path.as_deref()))
+            .collect(),
         )
     }
 }
@@ -3124,6 +3166,17 @@ struct DynamicLayer {
     omni: Option<GatewayModels>,
     dedicated: Option<GatewayModels>,
     aperture: aperture::ApertureState,
+    meta_muse: Option<Vec<llm::Model>>,
+}
+
+impl DynamicLayer {
+    /// The live model list for a provider whose catalog is fetched rather
+    /// than bundled, when one has been fetched.
+    fn live_models(&self, provider_id: &str) -> Option<&Vec<llm::Model>> {
+        (provider_id == meta_muse::PROVIDER_ID)
+            .then_some(self.meta_muse.as_ref())
+            .flatten()
+    }
 }
 
 fn build_dynamic_layer(
@@ -3166,11 +3219,18 @@ fn build_dynamic_layer(
             base_url: aperture::provider_base_url(&aperture.resolved.base_url),
             models: aperture.dedicated_models.clone(),
         });
+    // A missing or unusable cache keeps the bundled models, as the
+    // extension falls back to its own list.
+    let meta_muse = paths
+        .meta_muse_models
+        .as_deref()
+        .and_then(meta_muse::load_cache);
     DynamicLayer {
         fingerprint,
         omni,
         dedicated,
         aperture,
+        meta_muse,
     }
 }
 
@@ -4443,5 +4503,142 @@ mod tests {
                 .is_none()
         );
         fs::remove_dir_all(directory).expect("remove temp directory");
+    }
+
+    fn muse_credential(base_url: &str) -> Credential {
+        let mut credential = Credential::oauth("muse-model-key", "identity", i64::MAX);
+        credential
+            .set_extra("baseUrl", json!(base_url))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        credential
+    }
+
+    fn muse_catalog(store: Arc<CredentialStore>, agent_dir: &Path) -> Catalog {
+        Catalog::with_environment_and_file_exists(
+            Some(store),
+            test_environment(&[]),
+            Arc::new(|_| false),
+        )
+        .expect("catalog")
+        .with_dynamic_paths(DynamicPaths::for_agent_dir(agent_dir))
+    }
+
+    fn muse_model_ids(catalog: &Catalog) -> Vec<String> {
+        catalog
+            .provider(meta_muse::PROVIDER_ID)
+            .expect("meta-muse provider")
+            .models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect()
+    }
+
+    #[test]
+    fn meta_muse_requests_use_the_credentials_base_url_and_the_cached_live_models() {
+        let agent_dir = test_directory("meta-muse");
+        let store = Arc::new(CredentialStore::in_memory());
+        store
+            .put("meta-muse", muse_credential("https://api.meta.ai/v2/"))
+            .expect("store");
+        let catalog = muse_catalog(store, &agent_dir);
+
+        // Nothing fetched yet: the bundled list.
+        assert_eq!(
+            muse_model_ids(&catalog),
+            [
+                "muse-spark-1.1",
+                "muse-spark-1.2",
+                "muse-spark-1.2-contributor",
+                "muse-spark-1.3",
+                "muse-spark-1.3-contributor"
+            ]
+        );
+        let resolved = catalog
+            .resolve_model("meta-muse/muse-spark-1.3")
+            .expect("resolves");
+        // The stored URL wins over the provider default, sanitised again.
+        assert_eq!(resolved.model.base_url, "https://api.meta.ai/v2");
+        assert_eq!(resolved.auth().api_key(), Some("muse-model-key"));
+        assert_eq!(resolved.auth().base_url(), Some("https://api.meta.ai/v2"));
+        assert_eq!(
+            resolved.effective_headers().get("User-Agent"),
+            Some(&Some(meta_muse::MUSE_USER_AGENT.to_owned()))
+        );
+
+        // A fetched catalog replaces the bundled models.
+        let cache = config::meta_muse_models_path_in(&agent_dir);
+        fs::create_dir_all(cache.parent().expect("extensions dir")).expect("create dir");
+        fs::write(
+            &cache,
+            r#"{"data":[{"id":"muse-spark-2.0"},{"id":"muse-voice-1"}]}"#,
+        )
+        .expect("write cache");
+        catalog.refresh_dynamic();
+        assert_eq!(muse_model_ids(&catalog), ["muse-spark-2.0"]);
+        assert!(catalog.model("meta-muse", "muse-spark-1.3").is_none());
+        let live = catalog
+            .resolve_model("meta-muse/muse-spark-2.0")
+            .expect("live model resolves");
+        assert_eq!(live.model.base_url, "https://api.meta.ai/v2");
+        // Other providers keep their own data.
+        assert!(catalog.model("meta", "muse-spark-1.2").is_some());
+
+        // An unusable cache falls back to the bundled list.
+        fs::write(&cache, r#"{"data":[]}"#).expect("rewrite cache");
+        catalog.refresh_dynamic();
+        assert_eq!(muse_model_ids(&catalog).len(), 5);
+        let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    #[test]
+    fn meta_muse_is_configured_only_by_a_complete_subscription_login() {
+        let agent_dir = test_directory("meta-muse-auth");
+        let store = Arc::new(CredentialStore::in_memory());
+        let catalog = muse_catalog(store.clone(), &agent_dir);
+        assert!(!catalog.is_configured("meta-muse").expect("status"));
+
+        // An API key never configures the subscription provider.
+        store
+            .put("meta-muse", Credential::api_key("paygo-key"))
+            .expect("store");
+        assert!(
+            catalog
+                .resolve_auth("meta-muse")
+                .expect("resolve")
+                .is_none()
+        );
+
+        // An entry without the subscription fields needs a new login.
+        store
+            .put(
+                "meta-muse",
+                Credential::oauth("muse-model-key", "identity", i64::MAX),
+            )
+            .expect("store");
+        assert!(matches!(
+            catalog.resolve_auth("meta-muse"),
+            Err(CatalogError::OAuthRefreshFailed {
+                unauthorized: true,
+                ..
+            })
+        ));
+        assert!(!catalog.is_configured("meta-muse").expect("status"));
+
+        // A stored URL off api.meta.ai is never used.
+        store
+            .put("meta-muse", muse_credential("https://example.com/v1"))
+            .expect("store");
+        assert!(catalog.resolve_auth("meta-muse").is_err());
+
+        store
+            .put("meta-muse", muse_credential("https://api.meta.ai/v1"))
+            .expect("store");
+        assert!(catalog.is_configured("meta-muse").expect("status"));
+        // The `meta` provider is unaffected by a `meta-muse` login.
+        assert!(!catalog.is_configured("meta").expect("status"));
+        let _ = fs::remove_dir_all(agent_dir);
     }
 }

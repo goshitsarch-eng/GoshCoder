@@ -49,7 +49,9 @@ GitHub Copilot explicitly not wanted.** Everything under that is done: Chinese
 providers are plain API-key providers on ported protocols (Kimi additionally
 has OAuth), Anthropic and Codex have PKCE/loopback and device-code logins with
 refresh, and `openai-codex-responses` is ported end to end. The same is true of
-xAI and Meta, added later.
+xAI and Meta, added later, and of Meta Muse Code (`meta-muse`, the
+`pi-meta-muse-auth` extension), which sits beside `meta` so pi's auth.json
+entries for both keep working.
 
 ## Layout
 
@@ -121,6 +123,11 @@ and size (`DynamicPaths`/`DynamicLayer` in `catalog.rs`):
 - The dedicated `aperture` provider serves the synchronized
   `extensions/aperture-cache.json`, so models load instantly even offline; a
   cache built for another gateway or selection is ignored.
+- `meta-muse` serves `extensions/meta-muse-models.json`, Meta's `/v1/models`
+  payload as last fetched, re-parsed on load; a missing or unusable file
+  leaves the five bundled models from `catalog_extra.json`. `auth login
+  meta-muse` writes it, and `PreparedSession::meta_muse_session_start`
+  revalidates it in the background whenever a `meta-muse` login is stored.
 - A provider routed through an Aperture proxy carries the gateway URL, API
   override and gateway model filter on every model, keeps bare ids in the
   picker, and resolves the `-` placeholder credential unless the gateway
@@ -162,6 +169,14 @@ is installed; the server is spawned lazily and closed with the session.
 - OAuth token endpoints and callback ports are the ones pi uses; xAI's
   discovered endpoints are pinned to the issuer host. `Auth` deliberately
   implements no `Debug` or `Display`.
+- A credential may carry its own API base URL (`Auth::base_url`, so far only
+  Meta Muse Code's `baseUrl`, validated to `https://api.meta.ai`).
+  `resolve_model` applies it to the resolved model and the catalog responder
+  re-applies it each turn, so a session's stored model copy never sends a
+  re-minted key to a stale URL. `meta-muse` refuses a key Meta does not mark
+  `is_subs_active`; keep that check, it is the provider's whole purpose.
+- The `openai-responses` builder honours `compat.supportsDeveloperRole`
+  (default true, as pi); Muse sets it false and gets a `system` message.
 
 ## Sessions
 

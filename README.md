@@ -142,6 +142,7 @@ goshcoder auth login openai-codex
 goshcoder auth login kimi-coding
 goshcoder auth login xai      # Grok subscription; device code or browser
 goshcoder auth login meta     # Meta account; mints a Model API key
+goshcoder auth login meta-muse  # Muse Code subscription; then meta-muse/muse-spark-1.3
 
 # The same providers by API key, for a developer account
 goshcoder auth set xai        # then select xai/grok-4.6 or grok-build-0.1
@@ -194,6 +195,7 @@ directory with pi's exact encoding and written in pi's v3 JSONL format, so
 | `src/agent.rs` | Agent turns, tool execution, hooks, steering, follow-up queues, and compaction events |
 | `src/tools.rs` | Pi-compatible built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) |
 | `src/webaccess.rs` | Native cited web search (OpenAI/Codex, Exa, and Kagi) |
+| `src/meta_muse.rs` | Meta Muse Code subscription login, key mint, and live Muse Spark model list |
 | `src/{omniroute,omni_cli}.rs` | OmniRoute setup, catalog synchronization, and command adapter |
 | `src/{aperture,aperture_mcp}.rs` | Tailscale Aperture core, routing, cache, and connector MCP client |
 | `src/computeruse.rs` | computer-use-linux discovery, mcp.json upkeep, stdio MCP client, and `mcp` tool |
@@ -384,6 +386,28 @@ is recorded in [`NOTICE`](NOTICE).
   install it with `npm install -g @agent-sh/computer-use-linux` or `cargo
   install computer-use-linux` and check readiness with
   `computer-use-linux doctor`.
+- [`pi-meta-muse-auth`](https://github.com/sadiksaifi/pi-meta-muse-auth) by
+  Sadik Saifi — **Meta Muse Code** (native adaptation of version 0.1.2): a
+  `meta-muse` provider for a Muse Code subscription, beside the existing
+  `meta` provider rather than replacing it, so pi's `auth.json` entries for
+  both keep working. `goshcoder auth login meta-muse` (or `/login`, "sign in
+  with your Muse Code subscription") runs the auth.meta.com device flow,
+  accepting a verification page only on `https://auth.meta.com`, and then
+  mints a Model API key at `api.meta.ai/muse-code/key`. A key Meta does not
+  confirm as subscription-backed is refused rather than stored, so a login
+  can never fall back to pay-as-you-go billing; for the same reason the
+  provider takes no API key (`meta` is the API-key route). The key is
+  re-minted from the stored identity token every twelve hours, and the base
+  URL Meta returns with it is honoured only on `https://api.meta.ai`. Requests
+  use OpenAI Responses with the Muse client identity and a `system`-role
+  prompt. Five Muse Spark models (1.1 to 1.3, plus the Contributor variants)
+  are bundled; the live list from `/v1/models`, with Meta's names, limits and
+  reasoning levels, replaces them after login and is revalidated in the
+  background at session start, cached in `extensions/meta-muse-models.json`
+  so it loads offline. Not ported: pi's own models store (the sibling cache
+  file stands in for it) and the extension's npm packaging; a reported poll
+  interval under a second is treated as five seconds by the shared device
+  poller.
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,
@@ -492,8 +516,9 @@ Documented at the top of each ported file. The notable ones:
 - **No SDKs.** Provider requests are hand-rolled blocking HTTP plus an SSE reader
   rather than the OpenAI, Anthropic, Google, and AWS SDKs.
 - **OAuth.** Login and refresh are ported for Anthropic, OpenAI Codex, Kimi
-  Code, xAI, and Meta. Every one of them also accepts an API key, so a
-  developer account never has to go through a subscription login.
+  Code, xAI, Meta, and Meta Muse Code. Every one of them except Codex and Meta
+  Muse Code also accepts an API key, so a developer account never has to go
+  through a subscription login; their API-key routes are `openai` and `meta`.
   - **xAI (Grok)** uses xAI's own OIDC server at `auth.x.ai`: PKCE S256 over a
     loopback callback, or RFC 8628 device code for a headless session, against
     the public desktop client. Discovered endpoints are pinned to the issuer's
@@ -507,10 +532,17 @@ Documented at the top of each ported file. The notable ones:
     Meta re-mints it about once a day, which the stored expiry accounts for.
     Meta's Model API speaks the Anthropic Messages shape but authenticates with
     `Authorization`, so the key travels as a header and never as `x-api-key`.
+  - **Meta Muse Code** (`meta-muse`, from the `pi-meta-muse-auth` extension)
+    uses the same device sign-in but mints the key with the Muse Code
+    subscription request and stores it only when Meta confirms an active
+    subscription. Its requests are OpenAI Responses calls to the base URL Meta
+    returned with the key (always `https://api.meta.ai`), and it takes no API
+    key at all; see [Extensions](#extensions).
   - The client ids both flows use are public desktop clients with no secret --
     PKCE and the device flow replace one. `GOSHCODER_XAI_OAUTH_CLIENT_ID` and
     `GOSHCODER_META_OAUTH_CLIENT_ID` override them for an account registered
-    against a different application.
+    against a different application. Meta Muse Code always uses the Muse Code
+    launcher's client, as the extension does.
 - **Interface.** Interactive chat uses a Ratatui alternate-screen TUI with a
   command palette, model-aware thinking picker, live activity, fixed transcript,
   multiline editor, compact tool cards, and responsive OpenCode-style sidebar.
@@ -585,6 +617,7 @@ It is a derivative work of [pi](https://github.com/earendil-works/pi),
 Copyright (c) 2025 Mario Zechner, used under the MIT License.
 [`NOTICE`](NOTICE) reproduces that copyright and credits every other project
 adapted here — `pi-web-access`, Plannotator, `pi-ralph-wiggum`,
-`pi-claude-code-tui`, OmniRoute and `pi-btw` — with its author, repository and
+`pi-claude-code-tui`, OmniRoute, `pi-btw` and `pi-meta-muse-auth`, among
+others — with its author, repository and
 licence. If you redistribute GoshCoder or a build of it, carry `NOTICE` with
 it: that is the condition every one of those licences attaches.
