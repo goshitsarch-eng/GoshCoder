@@ -126,8 +126,8 @@ pub fn is_valid_version(value: &str) -> bool {
 }
 
 /// Whether a Grok CLI credential is at hand without touching the network:
-/// the environment token, or a stored login (which may still need a
-/// refresh when used).
+/// the environment token, the `auth.json` login, or a saved account (any
+/// of which may still need a refresh when used).
 pub fn credential_present(catalog: &crate::catalog::Catalog) -> bool {
     catalog.environment_value(TOKEN_ENV).is_some()
         || catalog.credentials().is_some_and(|store| {
@@ -137,6 +137,7 @@ pub fn credential_present(catalog: &crate::catalog::Catalog) -> bool {
                     if credential.kind() == &crate::catalog::CredentialKind::OAuth
             )
         })
+        || crate::grok_accounts::Accounts::new(catalog).has_saved_login()
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +587,15 @@ pub fn prepare_payload(
         body.insert("reasoning".to_owned(), json!({ "effort": effort }));
     }
     let session = (!request_session.is_empty()).then(|| effective_session_id(request_session));
+    // The shared builder keyed the cache on the id the agent was created
+    // with; the conversation header names the session open now, and the
+    // two must agree, as they do upstream.
+    if let (Some(body), Some(session)) = (payload.as_object_mut(), session.as_deref()) {
+        body.insert(
+            "prompt_cache_key".to_owned(),
+            Value::String(session.chars().take(64).collect()),
+        );
+    }
     sanitize_payload(payload, model, session.as_deref());
 }
 
@@ -2202,5 +2212,33 @@ mod tests {
             assert!(load_quota_cache(&path).is_empty(), "{unreadable}");
         }
         let _ = fs::remove_dir_all(agent_dir);
+    }
+
+    #[test]
+    fn the_cache_key_and_conversation_id_name_the_same_open_session() {
+        let store = Arc::new(FakeStore {
+            session: "resumed-session".to_owned(),
+            recording: true,
+            recorded: Mutex::new(Vec::new()),
+        });
+        let _registration = register_session_store("agent-session-c", store);
+        // The shared builder used the agent's original id.
+        let mut payload = json!({"input": "x", "prompt_cache_key": "agent-session-c"});
+        prepare_payload(
+            &mut payload,
+            &model("grok-build"),
+            "high",
+            "agent-session-c",
+        );
+        assert_eq!(payload["prompt_cache_key"], "resumed-session");
+        assert_eq!(
+            conv_id("agent-session-c").as_deref(),
+            Some("resumed-session")
+        );
+
+        // Without a session nothing is invented.
+        let mut payload = json!({"input": "x"});
+        prepare_payload(&mut payload, &model("grok-build"), "high", "");
+        assert!(payload.get("prompt_cache_key").is_none());
     }
 }

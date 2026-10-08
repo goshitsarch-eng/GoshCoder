@@ -4682,4 +4682,37 @@ mod tests {
                 .is_none()
         );
     }
+
+    /// CONTINUE.md promises these two checks: an extra model pi has since
+    /// shipped must be deleted rather than silently shadowed, and an
+    /// override must still correct something.
+    #[test]
+    fn extras_and_overrides_never_restate_the_generated_catalog() {
+        let generated = parse_raw_catalog(CATALOG_JSON, "catalog.json").expect("generated");
+        let extras = parse_raw_catalog(CATALOG_EXTRA_JSON, "catalog_extra.json").expect("extras");
+        for (provider_id, models) in &extras {
+            for model_id in models.keys() {
+                assert!(
+                    generated
+                        .get(provider_id)
+                        .is_none_or(|generated| !generated.contains_key(model_id)),
+                    "catalog_extra.json duplicates generated model {provider_id}/{model_id}; delete the extra"
+                );
+            }
+        }
+        let overrides =
+            parse_raw_catalog(CATALOG_OVERRIDES_JSON, "catalog_overrides.json").expect("overrides");
+        for (provider_id, models) in &overrides {
+            for (model_id, patch) in models {
+                let model = &generated[provider_id][model_id];
+                for (field, value) in patch {
+                    assert_ne!(
+                        model.get(field),
+                        Some(value),
+                        "catalog_overrides.json restates {provider_id}/{model_id}.{field}"
+                    );
+                }
+            }
+        }
+    }
 }

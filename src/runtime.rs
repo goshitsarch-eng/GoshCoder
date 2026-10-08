@@ -143,6 +143,7 @@ impl PreparedSession {
     pub fn imagine_context(&self) -> Arc<grok_imagine::Context> {
         Arc::new(grok_imagine::Context {
             catalog: self.catalog.clone(),
+            request_session: self.request_session_id().to_owned(),
             recorder: self.runtime.custom_recorder(),
             cwd: self.cwd.clone(),
             workspace: self.workspace.clone(),

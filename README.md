@@ -483,11 +483,13 @@ is recorded in [`NOTICE`](NOTICE).
     `GOSHCODER_GROK_CLI_BASE_URL` move the endpoint.
 
   Not ported: the browser account dashboard (accounts are managed with the
-  subcommands above), upstream's migrations from its
-  own earlier releases (there is nothing in GoshCoder to migrate from), the
-  payload step that turns local image paths into data URIs (GoshCoder's
-  request builders only ever send data URIs), and Imagine's inline image
-  preview (GoshCoder has no terminal image renderer).
+  subcommands above), upstream's migrations from its own earlier releases
+  (there is nothing in GoshCoder to migrate from), the payload step that
+  turns local image paths into data URIs (GoshCoder's request builders only
+  ever send data URIs), and Imagine's inline image preview (GoshCoder has no
+  terminal image renderer). One deliberate difference: the base URL comes
+  from the environment on every request, where upstream pins the one a login
+  recorded; the recorded `baseUrl` is kept in the credential for reference.
 - [`pi-claude-code-tui`](https://pi.dev/packages/pi-claude-code-tui) by Phoobobo
   — startup card, half-open rounded chat prompt, and an
   OpenCode-inspired right sidebar with model, context usage, cost, messages,

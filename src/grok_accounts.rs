@@ -475,6 +475,15 @@ impl Accounts {
         outcome
     }
 
+    /// Whether any account after the first is signed in.
+    pub fn has_saved_login(&self) -> bool {
+        self.vault.load().is_ok_and(|file| {
+            file.accounts
+                .iter()
+                .any(|account| account.credential.is_some())
+        })
+    }
+
     /// A token from the first logged-in vault account, for when `auth.json`
     /// holds no Grok CLI login: upstream keeps the provider usable as long
     /// as any account is signed in.

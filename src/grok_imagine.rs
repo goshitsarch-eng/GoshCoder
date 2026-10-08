@@ -684,6 +684,9 @@ pub fn save_image(
 #[derive(Clone)]
 pub struct Context {
     pub catalog: Catalog,
+    /// The session id requests carry, which picks the account whose token
+    /// pays for the image, as upstream resolves the session's route.
+    pub request_session: String,
     pub recorder: SessionCustomRecorder,
     pub cwd: PathBuf,
     /// Confines the tool's source images; `None` without workspace tools.
@@ -693,14 +696,12 @@ pub struct Context {
 
 impl Context {
     fn token(&self) -> Result<String, String> {
-        match self.catalog.resolve_auth(grok_cli::PROVIDER_ID) {
-            Ok(Some(auth)) => auth
-                .api_key()
-                .filter(|token| !token.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| AUTH_ERROR.to_owned()),
-            _ => Err(AUTH_ERROR.to_owned()),
-        }
+        crate::grok_accounts::Accounts::new(&self.catalog)
+            .usage_route(&self.request_session)
+            .ok()
+            .map(|(_, token)| token)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| AUTH_ERROR.to_owned())
     }
 
     fn settings(&self) -> Settings {
@@ -1324,6 +1325,7 @@ mod tests {
                 Arc::new(move |name| environment.get(name).cloned()),
             )
             .expect("catalog"),
+            request_session: String::new(),
             recorder,
             cwd: cwd.to_path_buf(),
             workspace: Some(tools::Workspace::new(cwd).expect("workspace")),
