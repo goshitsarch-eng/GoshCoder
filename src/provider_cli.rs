@@ -260,7 +260,9 @@ fn print_models(provider: &Provider) {
 
 /// The values a Cloudflare provider needs beside its API key, with the prompt
 /// `auth set` shows for each.
-fn cloudflare_credential_fields(provider_id: &str) -> &'static [(&'static str, &'static str)] {
+pub(crate) fn cloudflare_credential_fields(
+    provider_id: &str,
+) -> &'static [(&'static str, &'static str)] {
     match provider_id {
         "cloudflare-workers-ai" => {
             &[("CLOUDFLARE_ACCOUNT_ID", "Enter the Cloudflare account ID: ")]

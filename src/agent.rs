@@ -752,6 +752,18 @@ impl Agent {
         !state.steering.is_empty() || !state.follow_ups.is_empty()
     }
 
+    /// Copies both queues, steering first, without emptying them: an
+    /// interface shows what is waiting (pi's pending-messages strip).
+    pub fn queued_messages(&self) -> Vec<llm::Message> {
+        let state = lock(&self.inner.state);
+        state
+            .steering
+            .iter()
+            .chain(state.follow_ups.iter())
+            .cloned()
+            .collect()
+    }
+
     pub fn queued_message_count(&self) -> usize {
         let state = lock(&self.inner.state);
         state.steering.len() + state.follow_ups.len()

@@ -7,7 +7,7 @@
 //! Callers provide models and callbacks through [`SessionOptions`].
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error as StdError,
     fmt, fs,
     path::{Path, PathBuf},
@@ -185,16 +185,25 @@ pub struct SessionHandle {
     pub read_only: bool,
 }
 
-/// A selectable user-message boundary on the current tree path.
+/// A selectable user message anywhere in the session tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BranchPoint {
     /// One-based position used by chat commands and UI pickers.
     pub index: usize,
     pub id: String,
+    /// The first line, shortened for listings.
     pub text: String,
+    /// The whole message, which a rewind hands back to the editor.
+    pub prompt: String,
     pub label: Option<String>,
     pub children: usize,
+    /// The last user message on the current path.
     pub current: bool,
+    /// Whether the point is on the current path rather than an abandoned
+    /// branch.
+    pub on_path: bool,
+    /// Nesting under the forks above it, for an indented tree listing.
+    pub depth: usize,
 }
 
 /// Metadata stored in a pi-compatible compaction entry.
@@ -623,8 +632,15 @@ impl SessionRuntime {
             .unwrap_or_default()
     }
 
-    /// Rewinds the write head to a user-message branch point while preserving
-    /// the abandoned path in the JSONL file.
+    /// Moves the write head to a branch point while preserving the path being
+    /// left in the JSONL file.
+    ///
+    /// A point on the current path rewinds to just before that message, as
+    /// pi's tree navigation does for a user message: the message is not
+    /// kept as a dangling turn without a reply, and its text is returned in
+    /// [`BranchPoint::prompt`] for the editor. A point on an abandoned branch
+    /// resumes that branch at its newest entry, which is how a rewind is
+    /// undone.
     pub fn fork_to(&self, index: usize) -> Result<BranchPoint> {
         self.require_recording()?;
         self.require_idle("wait for the current response to finish before rewinding")?;
@@ -642,19 +658,37 @@ impl SessionRuntime {
                     points.len()
                 ))
             })?;
-        let (abandoned, previous_leaf) = self
+        let (abandoned, previous_leaf, new_leaf) = self
             .with_tree(|tree| {
-                let old_path_len = tree.path(tree.leaf()).len();
-                let target_path_len = tree.path(Some(&target.id)).len();
+                let new_leaf = if target.on_path {
+                    tree.entry(&target.id)
+                        .and_then(|entry| entry.parent_id.clone())
+                } else {
+                    Some(latest_tip(tree, &target.id))
+                };
+                let old_path = tree.path(tree.leaf());
+                let new_path = match new_leaf.as_deref() {
+                    Some(leaf) => tree.path(Some(leaf)),
+                    None => Vec::new(),
+                };
+                let shared = old_path
+                    .iter()
+                    .zip(&new_path)
+                    .take_while(|(old, new)| old.id == new.id)
+                    .count();
                 (
-                    old_path_len.saturating_sub(target_path_len),
+                    old_path.len().saturating_sub(shared),
                     tree.leaf().map(str::to_owned),
+                    new_leaf,
                 )
             })
             .ok_or(SessionRuntimeError::NotRecording)?;
 
         self.recorder.mutate(|writer| {
-            writer.set_leaf(target.id.clone())?;
+            match new_leaf.clone() {
+                Some(leaf) => writer.set_leaf(leaf)?,
+                None => writer.clear_leaf(),
+            }
             if abandoned > 0 {
                 writer.append(Entry {
                     kind: sessionlog::TYPE_BRANCH_SUMMARY.to_owned(),
@@ -662,10 +696,17 @@ impl SessionRuntime {
                     // is what lets a tree view find the abandoned branch; the
                     // entry's parent already says where the rewind landed.
                     from_id: previous_leaf.unwrap_or_else(|| "root".to_owned()),
-                    summary: format!(
-                        "branched from {:?}, leaving {abandoned} entries on the previous path",
-                        target.text
-                    ),
+                    summary: if target.on_path {
+                        format!(
+                            "rewound to before {:?}, leaving {abandoned} entries on the previous path",
+                            target.text
+                        )
+                    } else {
+                        format!(
+                            "returned to the branch at {:?}, leaving {abandoned} entries on the previous path",
+                            target.text
+                        )
+                    },
                     ..Entry::default()
                 })?;
             }
@@ -718,8 +759,22 @@ impl SessionRuntime {
             .store
             .resolve(&self.cwd, current.path.to_string_lossy().as_ref())?;
         let leaf = self.recorder.leaf();
+        // A clone is the same conversation continued elsewhere: it keeps the
+        // model and name it had. Resolving the model from the copied entries
+        // instead fell back to the configured default for a gateway model,
+        // and the session name lives outside the copied branch.
+        let name = self.name();
+        let state = self.agent.state();
         let writer = self.store.fork(&source, leaf.as_deref(), &self.cwd)?;
-        self.adopt_writer(writer, "cloned session")
+        let handle = self.adopt_writer(
+            writer,
+            "cloned session",
+            Some((state.model, state.thinking_level)),
+        )?;
+        if let Some(name) = name {
+            self.set_name(name)?;
+        }
+        Ok(handle)
     }
 
     /// Attaches another writable v3 session without closing the current log
@@ -733,7 +788,7 @@ impl SessionRuntime {
             return Err(SessionRuntimeError::AlreadyCurrentSession);
         }
         let (writer, report) = self.store.attach(&info.path)?;
-        let handle = self.adopt_writer(writer, "switched session")?;
+        let handle = self.adopt_writer(writer, "switched session", None)?;
         for notice in report_notices(&report) {
             self.notices.push("Session", notice);
         }
@@ -751,7 +806,7 @@ impl SessionRuntime {
         }
         let source = self.store.resolve(&self.cwd, source)?;
         let writer = self.store.fork(&source, None, &self.cwd)?;
-        self.adopt_writer(writer, "imported session")
+        self.adopt_writer(writer, "imported session", None)
     }
 
     /// Returns the raw JSONL or a readable Markdown rendering of the current
@@ -819,16 +874,29 @@ impl SessionRuntime {
         });
     }
 
-    fn adopt_writer(&self, writer: Writer, action: &str) -> Result<SessionHandle> {
+    /// `keep` carries a model and thinking level to continue with instead of
+    /// the ones the adopted entries record.
+    fn adopt_writer(
+        &self,
+        writer: Writer,
+        action: &str,
+        keep: Option<(llm::Model, String)>,
+    ) -> Result<SessionHandle> {
         let restored = restore_from_tree(&writer.snapshot(), writer.leaf());
         let mut model_notices = Vec::new();
-        let model = self
-            .model_selection
-            .resolve(&restored, false, &mut model_notices);
-        let thinking_level = if restored.thinking_level.is_empty() {
-            self.agent.state().thinking_level
-        } else {
-            restored.thinking_level.clone()
+        let (model, thinking_level) = match keep {
+            Some(kept) => kept,
+            None => {
+                let model = self
+                    .model_selection
+                    .resolve(&restored, false, &mut model_notices);
+                let thinking_level = if restored.thinking_level.is_empty() {
+                    self.agent.state().thinking_level
+                } else {
+                    restored.thinking_level.clone()
+                };
+                (model, thinking_level)
+            }
         };
 
         // Set the transcript before the swap. `set_context` is intentionally
@@ -975,6 +1043,19 @@ pub fn restore_from_tree(tree: &Tree, leaf: Option<&str>) -> RestoredSession {
 const BRANCH_SUMMARY_PREFIX: &str =
     "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+
+/// The summary inside a restored branch-summary message, or `None` for text
+/// the user actually wrote. Interfaces show it as a compact note, as pi's
+/// `BranchSummaryMessageComponent` does, rather than as a user turn.
+pub fn branch_summary_text(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix(BRANCH_SUMMARY_PREFIX)?;
+    Some(
+        inner
+            .strip_suffix(BRANCH_SUMMARY_SUFFIX)
+            .unwrap_or(inner)
+            .trim(),
+    )
+}
 
 #[derive(Clone)]
 struct ModelSelection {
@@ -1556,35 +1637,114 @@ fn retained_tail_id(tree: &Tree, retained: &[llm::Message]) -> Option<String> {
     Some(tail[0].id.clone())
 }
 
+/// The text of a user-message entry, or `None` for any other entry.
+fn user_entry_text(entry: &Entry) -> Option<String> {
+    if entry.kind != sessionlog::TYPE_MESSAGE {
+        return None;
+    }
+    let message = entry.message.as_ref()?;
+    match serde_json::from_value::<llm::Message>(message.clone()).ok()? {
+        llm::Message::User(message) => Some(message_text(&message)),
+        _ => None,
+    }
+}
+
+/// Every user message in the tree, abandoned branches included, in the
+/// order a tree view lists them: depth-first, each fork's branches indented
+/// one level under the point they split from. pi's `/tree` shows the whole
+/// tree for the same reason: a rewound branch is not gone, and the user
+/// needs a way back to it.
 fn branch_points(tree: &Tree, leaf: Option<&str>) -> Vec<BranchPoint> {
-    let children = tree.child_counts();
-    let mut points = tree
+    let entries = tree.all();
+    let mut children: HashMap<Option<&str>, Vec<&Entry>> = HashMap::new();
+    for entry in &entries {
+        children
+            .entry(entry.parent_id.as_deref())
+            .or_default()
+            .push(entry);
+    }
+    // Entries are stored parents first, so one reverse pass knows which
+    // subtrees hold a user message; only those count as branches.
+    let mut holds_user: HashMap<&str, bool> = HashMap::new();
+    for entry in entries.iter().rev() {
+        let below = children
+            .get(&Some(entry.id.as_str()))
+            .is_some_and(|kids| kids.iter().any(|kid| holds_user[kid.id.as_str()]));
+        holds_user.insert(entry.id.as_str(), below || user_entry_text(entry).is_some());
+    }
+    let on_path = tree
         .path(leaf)
         .into_iter()
-        .filter(|entry| entry.kind == sessionlog::TYPE_MESSAGE)
-        .filter_map(|entry| {
-            let message = entry.message.as_ref()?;
-            let decoded = serde_json::from_value::<llm::Message>(message.clone()).ok()?;
-            let llm::Message::User(message) = decoded else {
-                return None;
-            };
-            Some(BranchPoint {
-                index: 0,
-                id: entry.id.clone(),
-                text: first_line(&message_text(&message), 120),
-                label: tree.label(&entry.id).map(str::to_owned),
-                children: children.get(entry.id.as_str()).copied().unwrap_or(0),
-                current: false,
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    let counts = tree.child_counts();
+
+    fn push_children<'a>(
+        stack: &mut Vec<(&'a Entry, usize)>,
+        children: &HashMap<Option<&'a str>, Vec<&'a Entry>>,
+        holds_user: &HashMap<&'a str, bool>,
+        parent: Option<&'a str>,
+        depth: usize,
+    ) {
+        let branches = children
+            .get(&parent)
+            .map(|kids| {
+                kids.iter()
+                    .filter(|kid| holds_user[kid.id.as_str()])
+                    .copied()
+                    .collect::<Vec<_>>()
             })
-        })
-        .collect::<Vec<_>>();
-    for (index, point) in points.iter_mut().enumerate() {
-        point.index = index + 1;
+            .unwrap_or_default();
+        let depth = if branches.len() > 1 { depth + 1 } else { depth };
+        for kid in branches.into_iter().rev() {
+            stack.push((kid, depth));
+        }
     }
-    if let Some(point) = points.last_mut() {
+
+    let mut points = Vec::new();
+    let mut stack: Vec<(&Entry, usize)> = Vec::new();
+    push_children(&mut stack, &children, &holds_user, None, 0);
+    while let Some((entry, depth)) = stack.pop() {
+        if let Some(text) = user_entry_text(entry) {
+            points.push(BranchPoint {
+                index: points.len() + 1,
+                id: entry.id.clone(),
+                text: first_line(&text, 120),
+                prompt: text,
+                label: tree.label(&entry.id).map(str::to_owned),
+                children: counts.get(entry.id.as_str()).copied().unwrap_or(0),
+                current: false,
+                on_path: on_path.contains(entry.id.as_str()),
+                depth,
+            });
+        }
+        push_children(
+            &mut stack,
+            &children,
+            &holds_user,
+            Some(entry.id.as_str()),
+            depth,
+        );
+    }
+    if let Some(point) = points.iter_mut().rev().find(|point| point.on_path) {
         point.current = true;
     }
     points
+}
+
+/// The newest tip under `id`, following the most recently written child.
+fn latest_tip(tree: &Tree, id: &str) -> String {
+    let mut current = id.to_owned();
+    loop {
+        let next = tree
+            .children(Some(&current))
+            .last()
+            .map(|entry| entry.id.clone());
+        match next {
+            Some(next) => current = next,
+            None => return current,
+        }
+    }
 }
 
 fn assistant_model(value: &Value) -> Option<(String, String)> {
@@ -1834,6 +1994,36 @@ mod tests {
 
     fn close(runtime: &mut SessionRuntime) {
         runtime.close().expect("close session");
+    }
+
+    #[test]
+    fn a_clone_keeps_the_model_thinking_level_and_name_of_its_source() {
+        let root = temp_root("clone-keeps");
+        let cwd = root.join("workspace");
+        let mut runtime = SessionRuntime::open(options(&root, &cwd)).expect("open");
+        runtime.agent().prompt("first").expect("first");
+        // A model the session's resolver does not know, like a gateway model
+        // synchronized at runtime: resolving it again would fall back.
+        runtime.agent().set_model(model("omni", "gateway-only"));
+        runtime.agent().set_thinking_level("high");
+        runtime.set_name("Port the lock fix").expect("name");
+        let original = runtime.handle().expect("original");
+
+        let clone = runtime.clone_session().expect("clone");
+        assert_ne!(clone.id, original.id);
+        let state = runtime.agent().state();
+        assert_eq!(
+            (state.model.provider.as_str(), state.model.id.as_str()),
+            ("omni", "gateway-only")
+        );
+        assert_eq!(state.thinking_level, "high");
+        assert_eq!(runtime.name().as_deref(), Some("Port the lock fix"));
+        assert_eq!(runtime.title().as_deref(), Some("Port the lock fix"));
+        // The name is written into the clone's own file.
+        let written = fs::read_to_string(&clone.path).expect("clone file");
+        assert!(written.contains("Port the lock fix"));
+        close(&mut runtime);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2216,20 +2406,69 @@ mod tests {
         );
 
         let original = runtime.handle().expect("original");
-        runtime.fork_to(2).expect("rewind");
-        // The rewound context ends with pi's branch summary of what was left.
+        let target = runtime.fork_to(2).expect("rewind");
+        // Rewinding to a message lands just before it, as pi does: the
+        // message comes back for the editor instead of staying behind as a
+        // turn without a reply, and the context ends with pi's branch
+        // summary of what was left.
+        assert_eq!(target.prompt, "second question");
         let messages = runtime.agent().state().messages;
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[2].text_preview(), "second question");
+        assert_eq!(messages.len(), 3, "{messages:#?}");
+        assert_eq!(messages[0].text_preview(), "first question");
         assert!(
-            messages[3]
+            messages[2]
                 .text_preview()
                 .contains("summary of a branch that this conversation came back from")
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.text_preview() == "second question")
         );
         runtime
             .agent()
             .prompt("different direction")
             .expect("branch prompt");
+
+        // The abandoned branch is still listed, indented beside the new one,
+        // and choosing it resumes it at its newest entry.
+        let points = runtime.branch_points();
+        let texts = points
+            .iter()
+            .map(|point| (point.text.as_str(), point.depth, point.on_path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                ("first question", 0, true),
+                ("second question", 1, false),
+                ("third question", 1, false),
+                ("different direction", 1, true),
+            ]
+        );
+        assert!(points[3].current);
+        let resumed = runtime.fork_to(3).expect("return to the old branch");
+        assert!(!resumed.on_path);
+        let messages = runtime.agent().state().messages;
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text_preview() == "third question"),
+            "{messages:#?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.text_preview() == "different direction")
+        );
+        let target = runtime
+            .branch_points()
+            .into_iter()
+            .find(|point| point.text == "different direction")
+            .expect("new branch listed");
+        runtime
+            .fork_to(target.index)
+            .expect("back to the new branch");
         let original_bytes = fs::read(&original.path).expect("read original");
 
         let clone = runtime.clone_session().expect("clone");
@@ -2413,7 +2652,7 @@ mod tests {
             .flatten()
             .expect("leaf");
 
-        let target = runtime.fork_to(1).expect("rewind");
+        let target = runtime.fork_to(2).expect("rewind");
         let summary = runtime
             .with_tree(|tree| {
                 tree.path(tree.leaf())
@@ -2424,10 +2663,34 @@ mod tests {
             .flatten()
             .expect("branch summary");
         assert_eq!(summary.from_id, abandoned_tip);
-        assert_eq!(summary.parent_id.as_deref(), Some(target.id.as_str()));
-        // The rewound point now has the abandoned reply and the summary
-        // beneath it, which a branch listing counts without a per-point scan.
-        assert_eq!(runtime.branch_points()[0].children, 2);
+        // The rewind lands on the message before the chosen one (the first
+        // reply), so the abandoned "second" and the summary both hang from
+        // it, which a branch listing counts without a per-point scan.
+        let target_parent = runtime
+            .with_tree(|tree| {
+                tree.entry(&target.id)
+                    .and_then(|entry| entry.parent_id.clone())
+            })
+            .flatten()
+            .expect("target parent");
+        assert_eq!(summary.parent_id.as_deref(), Some(target_parent.as_str()));
+        let siblings = runtime
+            .with_tree(|tree| tree.children(Some(&target_parent)).len())
+            .expect("tree");
+        assert_eq!(siblings, 2);
+
+        // Rewinding to the very first message empties the context instead
+        // of failing for want of a parent message.
+        let first = runtime.fork_to(1).expect("rewind to the start");
+        assert_eq!(first.prompt, "first");
+        assert!(
+            runtime
+                .agent()
+                .state()
+                .messages
+                .iter()
+                .all(|message| message.text_preview() != "first")
+        );
         close(&mut runtime);
         let _ = fs::remove_dir_all(root);
     }

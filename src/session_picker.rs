@@ -20,7 +20,7 @@ use crate::sessionlog::{self, ListOptions, SessionInfo, Store};
 pub const PICKER_LIMIT: usize = 50;
 
 const PICKER_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
-    format_description!("[month repr:short] [day padding:none] [hour padding:zero]:[minute]");
+    format_description!("[month repr:short] [day padding:zero] [hour padding:zero]:[minute]");
 
 /// Lists the sessions suitable for `chat -resume`.
 ///
@@ -97,12 +97,21 @@ pub fn matches_session(info: &SessionInfo, terms: &[String]) -> bool {
 }
 
 /// Returns the readable label and metadata shown for one session.
-pub fn describe_session(info: &SessionInfo, label: &str, show_cwd: bool) -> (String, String) {
+/// `current` marks the session this process has open: its lock is ours, so
+/// calling it "open elsewhere" would be wrong.
+pub fn describe_session(
+    info: &SessionInfo,
+    label: &str,
+    show_cwd: bool,
+    current: bool,
+) -> (String, String) {
     let mut parts = vec![format_modified(info.modified)];
     if info.messages > 0 {
         parts.push(format!("{} msg", info.messages));
     }
-    if info.locked {
+    if current {
+        parts.push("current".to_owned());
+    } else if info.locked {
         parts.push("open elsewhere".to_owned());
     }
     if show_cwd {
@@ -149,7 +158,7 @@ fn choose_from_sessions<R: BufRead, W: Write>(
     writeln!(output, "saved sessions for this workspace:")?;
     let labels = sessionlog::short_ids(sessions);
     for (index, (session, label)) in sessions.iter().zip(labels).enumerate() {
-        let (label, description) = describe_session(session, &label, false);
+        let (label, description) = describe_session(session, &label, false, false);
         writeln!(output, "{:>3}  {label}  {description}", index + 1)?;
     }
     writeln!(
@@ -281,11 +290,17 @@ mod tests {
     fn session_description_includes_state_and_title() {
         let mut info = session("aaaa1111-0000-7000-8000-000000000000", "SSE fix", "", "");
         info.locked = true;
-        let (label, description) = describe_session(&info, "aaaa1111", false);
+        let (label, description) = describe_session(&info, "aaaa1111", false, false);
 
         assert_eq!(label, "aaaa1111");
         for expected in ["SSE fix", "4 msg", "open elsewhere"] {
             assert!(description.contains(expected), "{description}");
         }
+
+        // Our own session is locked by us: it is the current one, not one
+        // open in another window.
+        let (_, ours) = describe_session(&info, "aaaa1111", false, true);
+        assert!(ours.contains("current"), "{ours}");
+        assert!(!ours.contains("open elsewhere"), "{ours}");
     }
 }

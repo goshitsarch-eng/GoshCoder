@@ -12,6 +12,7 @@ pub mod computeruse;
 pub mod config;
 pub mod export_html;
 pub mod google_auth;
+mod line_editor;
 pub mod llm;
 pub mod markdown;
 pub mod mistral;
@@ -36,6 +37,7 @@ pub mod sessions;
 mod state;
 pub mod stream;
 pub mod tools;
+mod tui_login;
 pub mod turns;
 mod ui;
 pub mod webaccess;
@@ -55,7 +57,8 @@ use std::{
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind, MouseEventKind,
+        Event, KeyEventKind, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -288,10 +291,12 @@ fn render_run_event<Out: Write, Err: Write>(
         }
         agent::EventKind::ToolExecutionEnd => {
             let status = if event.is_error { "✗" } else { "✓" };
+            // Named, because several calls in a row would otherwise print
+            // results nobody can match to their call.
             writeln!(
                 stderr,
                 "{} {}",
-                dim(status, color),
+                dim(&format!("{status} {}:", event.tool_name), color),
                 dim(&first_line(&tool_result_text(event.result.as_ref())), color)
             )?;
         }
@@ -481,9 +486,22 @@ fn run_interactive(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     restore_terminal_modes();
     let terminal_cleanup = terminal.show_cursor();
+    // A session without a reply is discarded on close, so only one with an
+    // answer in it is worth pointing back to.
+    let resumable = prepared.runtime.recording()
+        && prepared
+            .runtime
+            .agent()
+            .state()
+            .messages
+            .iter()
+            .any(|message| matches!(message, llm::Message::Assistant(_)));
     let session_cleanup = prepared.runtime.close();
     terminal_cleanup?;
     session_cleanup?;
+    if result.is_ok() && resumable {
+        eprintln!("Resume with: goshcoder chat -continue");
+    }
     result
 }
 
@@ -497,12 +515,29 @@ fn enter_terminal_modes() -> io::Result<()> {
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableBracketedPaste
-    )
+    )?;
+    // The kitty keyboard protocol's first level reports Shift-Enter as
+    // itself instead of a bare Enter, which is what makes "Shift-Enter
+    // inserts a newline" true. Terminals without it are left alone, and
+    // Ctrl-J keeps working everywhere.
+    if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            io::stderr(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    {
+        KEYBOARD_ENHANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Undoes [`enter_terminal_modes`]. Safe to call more than once and from a
 /// panic hook: every step is best effort.
 fn restore_terminal_modes() {
+    if KEYBOARD_ENHANCED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = execute!(io::stderr(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stderr(),
@@ -689,17 +724,37 @@ fn line_interactive_loop(
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut raw = String::new();
+    let mut history: Vec<String> = Vec::new();
+    if interactive {
+        // Ctrl-C during a reply aborts the turn instead of killing chat; at
+        // the prompt it is a key the editor handles (twice to exit).
+        line_editor::install_interrupt_handler();
+        let agent = prepared.runtime.agent().clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(50));
+                if line_editor::take_interrupts() > 0 && agent.state().is_streaming {
+                    eprintln!("\n^C aborting the response");
+                    let _ = agent.take_queued_messages();
+                    agent.abort();
+                }
+            }
+        });
+    }
     loop {
         raw.clear();
         if interactive {
-            let mut stderr = io::stderr().lock();
-            write!(stderr, "\n> ")?;
-            stderr.flush()?;
-        }
-        if reader.read_line(&mut raw)? == 0 {
-            if interactive {
-                eprintln!();
+            eprintln!();
+            match line_editor::read_line("> ", &history)? {
+                line_editor::LineInput::Line(line) => {
+                    if !line.trim().is_empty() && history.last() != Some(&line) {
+                        history.push(line.clone());
+                    }
+                    raw = line;
+                }
+                line_editor::LineInput::Exit | line_editor::LineInput::Eof => break,
             }
+        } else if reader.read_line(&mut raw)? == 0 {
             break;
         }
 
@@ -814,14 +869,17 @@ fn line_interactive_loop(
 fn render_line_view(view: &mut InteractiveView) {
     let notices = std::mem::take(&mut view.notices);
     let had_notices = !notices.is_empty();
-    for message in notices {
+    for AnchoredNotice { message, .. } in notices {
         match message.role {
             MessageRole::Error => eprintln!("error: {}", message.text),
-            MessageRole::Command | MessageRole::Notice => eprintln!("{}", message.text),
+            // Line mode already shows what was typed at its own prompt.
+            MessageRole::Command => {}
+            MessageRole::Notice => eprintln!("{}", message.text),
             MessageRole::User
             | MessageRole::Assistant
             | MessageRole::Thinking
-            | MessageRole::Tool => {
+            | MessageRole::Tool
+            | MessageRole::Summary => {
                 eprintln!("{}", message.text)
             }
         }
@@ -832,7 +890,17 @@ fn render_line_view(view: &mut InteractiveView) {
 }
 
 struct InteractiveView {
-    notices: Vec<Message>,
+    /// Command output and notices, each anchored to the number of agent
+    /// messages that existed when it was added. The transcript splices them
+    /// in at that point, so a reply that arrives later renders below an
+    /// older `/help` instead of above it.
+    notices: Vec<AnchoredNotice>,
+    /// Agent messages at the last refresh: the anchor for a new notice.
+    message_count: usize,
+    /// A provider retry being waited out: when it fires, and which attempt.
+    retry: Option<RetryWait>,
+    /// Steering and follow-up messages waiting, at the last refresh.
+    queued_count: usize,
     activity: String,
     recent_tool: String,
     activity_since: Option<Instant>,
@@ -844,6 +912,8 @@ struct InteractiveView {
     /// Palette entries cached while `/model ` or `/login ` is being typed.
     model_choices: Option<Vec<state::Suggestion>>,
     login_choices: Option<Vec<state::Suggestion>>,
+    /// A `/login` running inside the interface.
+    login: Option<tui_login::LoginFlow>,
 }
 
 /// Reports a worker's outcome exactly once, including when the worker
@@ -875,6 +945,19 @@ impl Drop for TurnCompletion {
     }
 }
 
+/// A transcript notice and the agent message count it follows.
+struct AnchoredNotice {
+    anchor: usize,
+    message: Message,
+}
+
+/// The retry `turns::run_prompt` announced and is sleeping before.
+struct RetryWait {
+    attempt: u32,
+    attempts: u32,
+    fires_at: Instant,
+}
+
 /// A command whose result is still on its way from a worker thread.
 struct BackgroundCommand {
     label: String,
@@ -885,6 +968,9 @@ impl Default for InteractiveView {
     fn default() -> Self {
         Self {
             notices: Vec::new(),
+            message_count: 0,
+            retry: None,
+            queued_count: 0,
             activity: "Ready".to_owned(),
             recent_tool: String::new(),
             activity_since: None,
@@ -894,6 +980,7 @@ impl Default for InteractiveView {
             background: None,
             model_choices: None,
             login_choices: None,
+            login: None,
         }
     }
 }
@@ -909,12 +996,20 @@ fn event_loop(
 ) -> Result<(), Box<dyn Error>> {
     let mut app = App::new();
     app.replace_messages(Vec::new());
-    let mut view = InteractiveView::default();
+    // A resumed transcript is already there; startup notices follow it.
+    let mut view = InteractiveView {
+        message_count: prepared.runtime.agent().state().messages.len(),
+        ..InteractiveView::default()
+    };
     if !quiet {
         for notice in runtime::drain_session_notices(&prepared.runtime) {
             append_view_message(&mut view, MessageRole::Notice, notice);
         }
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
+        // The sidebar already says a new session is recording; only a
+        // resumed one is worth a line in the transcript.
+        if prepared.runtime.resumed()
+            && let Some(banner) = runtime::session_banner(&prepared.runtime)
+        {
             append_view_message(&mut view, MessageRole::Notice, banner);
         }
     }
@@ -928,7 +1023,9 @@ fn event_loop(
     // not on every poll timeout of an idle session.
     let mut dirty = true;
     loop {
-        if drain_interactive_events(&mut view, prepared, &agent_events, &turn_results) {
+        if drain_interactive_events(&mut view, prepared, &agent_events, &turn_results)
+            | drain_login_events(&mut app, &mut view, prepared, catalog)
+        {
             dirty = true;
         }
         let animating = app.streaming || view.turn_pending || view.background.is_some();
@@ -974,6 +1071,10 @@ fn event_loop(
             };
             match action {
                 Action::None => {}
+                Action::Answer(answer) => {
+                    answer_composer_prompt(&mut app, &mut view, prepared, catalog, answer)
+                }
+                Action::CancelPrompt => cancel_composer_prompt(&mut app, &mut view),
                 Action::Quit => {
                     if let Some(thread) = view.pending_btw_thread.as_deref() {
                         let _ = prepared.btw.cancel(thread);
@@ -983,6 +1084,9 @@ fn event_loop(
                         planner.abort_review();
                     }
                     return Ok(());
+                }
+                Action::Abort if view.login.is_some() && !view.turn_pending => {
+                    cancel_composer_prompt(&mut app, &mut view);
                 }
                 Action::Abort => {
                     if let Some(thread) = view.pending_btw_thread.as_deref() {
@@ -1084,16 +1188,38 @@ fn drain_interactive_events(
         changed = true;
         match event.kind {
             agent::EventKind::AgentStart => {
+                view.retry = None;
                 view.turn_pending = true;
                 view.activity = "Composing response".to_owned();
                 view.activity_since = Some(Instant::now());
             }
             agent::EventKind::MessageUpdate => {
+                view.retry = None;
                 view.activity = "Composing response".to_owned();
                 view.activity_since.get_or_insert_with(Instant::now);
             }
             agent::EventKind::ToolExecutionStart => {
-                view.activity = format!("Running {}", event.tool_name);
+                // "Running bash · cargo test": the tool and what it was
+                // asked to do, as its card title says it.
+                let call = llm::ToolCall {
+                    name: event.tool_name.clone(),
+                    arguments: event.arguments.clone(),
+                    ..llm::ToolCall::default()
+                };
+                let title = tool_title(&call);
+                let detail = title
+                    .strip_prefix(event.tool_name.as_str())
+                    .map(str::trim)
+                    .unwrap_or_default();
+                view.activity = if detail.is_empty() {
+                    format!("Running {}", event.tool_name)
+                } else {
+                    format!(
+                        "Running {} · {}",
+                        event.tool_name,
+                        clip_characters(&first_line(detail), 48)
+                    )
+                };
                 view.recent_tool = format!("● {} running", event.tool_name);
                 view.activity_since.get_or_insert_with(Instant::now);
             }
@@ -1107,6 +1233,7 @@ fn drain_interactive_events(
                 }
             }
             agent::EventKind::AgentEnd => {
+                view.retry = None;
                 view.turn_pending = false;
                 view.activity = "Ready".to_owned();
                 view.activity_since = None;
@@ -1136,6 +1263,7 @@ fn drain_interactive_events(
         }
     }
     while let Ok(result) = turn_results.try_recv() {
+        view.retry = None;
         changed = true;
         if view.pending_btw_thread.is_some() {
             let _ = finish_pending_btw(view, prepared, result);
@@ -1186,6 +1314,26 @@ fn drain_interactive_events(
         changed = true;
     }
     for notice in notices {
+        if notice.kind == "retry"
+            && let Some((retry, summary)) = parse_retry_notice(&notice.text)
+        {
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "{summary}. Retrying in {}s (attempt {} of {}).",
+                    retry
+                        .fires_at
+                        .saturating_duration_since(Instant::now())
+                        .as_secs_f64()
+                        .round(),
+                    retry.attempt,
+                    retry.attempts
+                ),
+            );
+            view.retry = Some(retry);
+            continue;
+        }
         append_view_message(
             view,
             MessageRole::Notice,
@@ -1193,6 +1341,27 @@ fn drain_interactive_events(
         );
     }
     changed
+}
+
+/// Reads `turns`' retry notice ("attempt 1 of 3 in 2s: <error>") into the
+/// countdown the status bar shows. `turns` numbers retries; the interface
+/// numbers attempts, the first request being attempt 1.
+fn parse_retry_notice(text: &str) -> Option<(RetryWait, String)> {
+    let rest = text.strip_prefix("attempt ")?;
+    let (retry, rest) = rest.split_once(" of ")?;
+    let (retries, rest) = rest.split_once(" in ")?;
+    let (seconds, summary) = rest.split_once("s: ")?;
+    let retry = retry.trim().parse::<u32>().ok()?;
+    let retries = retries.trim().parse::<u32>().ok()?;
+    let seconds = seconds.trim().parse::<f64>().ok()?;
+    Some((
+        RetryWait {
+            attempt: retry + 1,
+            attempts: retries + 1,
+            fires_at: Instant::now() + Duration::from_secs_f64(seconds.max(0.0)),
+        },
+        summary.trim().trim_end_matches('.').to_owned(),
+    ))
 }
 
 /// Turns a completed asynchronous side-thread request into a visible
@@ -1261,6 +1430,149 @@ fn finish_pending_btw(
     true
 }
 
+/// Applies whatever an in-interface login reported since the last frame.
+fn drain_login_events(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+) -> bool {
+    let mut changed = false;
+    while let Some(flow) = view.login.as_mut() {
+        let Some(event) = flow.poll() else {
+            break;
+        };
+        changed = true;
+        let provider = flow.provider().to_owned();
+        match event {
+            tui_login::LoginEvent::Notify(event) => {
+                match event.kind {
+                    oauth::OAuthEventKind::DeviceCode => {
+                        view.activity = format!("Waiting for {provider} approval");
+                    }
+                    oauth::OAuthEventKind::AuthorizationUrl => {
+                        view.activity = format!("Waiting for {provider} sign-in");
+                    }
+                    oauth::OAuthEventKind::Progress if !event.message.is_empty() => {
+                        view.activity = first_line(&event.message);
+                    }
+                    _ => {}
+                }
+                if let Some(notice) = tui_login::event_notice(&provider, &event) {
+                    append_view_message(view, MessageRole::Notice, notice);
+                }
+            }
+            tui_login::LoginEvent::Prompt { prompt, .. } => {
+                append_view_message(view, MessageRole::Notice, tui_login::prompt_notice(&prompt));
+                app.prompt = Some(state::ComposerPrompt {
+                    label: if prompt.select {
+                        "Choose an option".to_owned()
+                    } else {
+                        format!("{provider} login")
+                    },
+                    secret: false,
+                });
+                view.activity = format!("Waiting for your answer · {provider} login");
+            }
+            tui_login::LoginEvent::Finished(result) => {
+                finish_login(app, view, prepared, catalog, &provider, result, true);
+            }
+        }
+    }
+    changed
+}
+
+/// Reports a finished login and puts the new provider to use.
+fn finish_login(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    provider: &str,
+    result: Result<(), String>,
+    oauth: bool,
+) {
+    view.login = None;
+    app.prompt = None;
+    view.activity = "Ready".to_owned();
+    view.activity_since = None;
+    match result {
+        Ok(()) => {
+            catalog.clear_oauth_refresh_failure(provider);
+            let saved = home_relative(&config::auth_path().display().to_string());
+            let first = if oauth {
+                format!("Logged in to {provider}. Credentials saved to {saved} (mode 0600).")
+            } else {
+                format!("Stored an API key for {provider} in {saved} (mode 0600).")
+            };
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "{first}\n{}",
+                    after_login_message(prepared, catalog, provider)
+                ),
+            );
+            if !runtime::model_is_selected(&prepared.runtime.agent().state().model)
+                && interactive_models(catalog).is_ok_and(|models| !models.is_empty())
+            {
+                app.set_input("/model ");
+            }
+        }
+        Err(error) if error.contains("cancelled") => {
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!("{provider} login cancelled."),
+            );
+        }
+        Err(error) => append_view_message(view, MessageRole::Error, error),
+    }
+}
+
+/// Enter while the composer is asking a login question.
+fn answer_composer_prompt(
+    app: &mut App,
+    view: &mut InteractiveView,
+    prepared: &runtime::PreparedSession,
+    catalog: &catalog::Catalog,
+    answer: String,
+) {
+    let Some(flow) = view.login.as_mut() else {
+        app.prompt = None;
+        return;
+    };
+    let provider = flow.provider().to_owned();
+    let oauth = flow.started().is_some();
+    match flow.answer(answer) {
+        Some(result) => finish_login(app, view, prepared, catalog, &provider, result, oauth),
+        None => {
+            app.prompt = flow
+                .api_key_question()
+                .map(|(label, secret)| state::ComposerPrompt { label, secret });
+            if oauth {
+                view.activity = format!("Signing in to {provider}");
+            }
+        }
+    }
+}
+
+/// Esc while a login is running or asking.
+fn cancel_composer_prompt(app: &mut App, view: &mut InteractiveView) {
+    app.prompt = None;
+    if let Some(mut flow) = view.login.take() {
+        let provider = flow.provider().to_owned();
+        flow.cancel();
+        append_view_message(
+            view,
+            MessageRole::Notice,
+            format!("{provider} login cancelled."),
+        );
+    }
+    view.activity = "Ready".to_owned();
+    view.activity_since = None;
+}
+
 fn submit_interactive_input<'a>(
     app: &mut App,
     view: &mut InteractiveView,
@@ -1271,6 +1583,12 @@ fn submit_interactive_input<'a>(
     follow_up: bool,
 ) -> CommandDispatch<'a> {
     app.record_submission(&input);
+    // The last command's "Model set to …" or "Transcript cleared" is not
+    // what is happening any more once something new starts.
+    if !app.streaming && !view.turn_pending && view.background.is_none() && view.login.is_none() {
+        view.activity = "Ready".to_owned();
+    }
+    let typed = input.clone();
     let input = match prepared.expand_resource_input(&input) {
         Ok(Some(expanded)) => expanded,
         Ok(None) => input,
@@ -1280,6 +1598,9 @@ fn submit_interactive_input<'a>(
         }
     };
     if input.starts_with('/') {
+        if echoes_command(&input) {
+            echo_command(view, &typed);
+        }
         return dispatch_runtime_slash_command(
             app,
             view,
@@ -1291,6 +1612,17 @@ fn submit_interactive_input<'a>(
         );
     }
 
+    if let Some(flow) = view.login.as_ref() {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!(
+                "Finish the {} login first, or press Esc to cancel it.",
+                flow.provider()
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
     let agent = prepared.runtime.agent().clone();
     if !runtime::model_is_selected(&agent.state().model) {
         append_view_message(view, MessageRole::Error, NO_MODEL_PROMPT_REFUSED);
@@ -1327,6 +1659,38 @@ fn submit_interactive_input<'a>(
         "Starting response",
     );
     CommandDispatch::NotCommand
+}
+
+/// Set once the terminal accepted the kitty keyboard protocol flags, which
+/// is what lets Shift-Enter arrive as something other than Enter.
+static KEYBOARD_ENHANCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `/hotkeys` for the interface in use: line mode has none of the editor.
+fn hotkeys_text(fullscreen: bool) -> String {
+    if !fullscreen {
+        return "Enter       send the line\nCtrl-C      abort the active response; press twice at the prompt to exit\nCtrl-D      exit at an empty prompt\nLine editing is your terminal's own; -fullscreen (the default) has the full editor."
+            .to_owned();
+    }
+    let newline = if KEYBOARD_ENHANCED.load(std::sync::atomic::Ordering::Relaxed) {
+        "Ctrl-J      insert a newline (Shift-Enter also works in this terminal)"
+    } else {
+        "Ctrl-J      insert a newline (Shift-Enter needs a terminal with the kitty keyboard protocol)"
+    };
+    format!(
+        "Enter       send or accept selection; steer while a response is active\nAlt-Enter   queue a follow-up\n{newline}\nUp/Down     navigate palette, editor lines, or history\nAlt-←/→     move by word; Home/End move within a line\nTab         complete the selected command; Shift-Tab cycle thinking\nCtrl-L      open model selector; Ctrl-P cycle models; Ctrl-O expand tools\nCtrl-T      toggle displayed thinking\nPgUp/PgDn   scroll the transcript; Ctrl-Home/Ctrl-End jump to top/bottom\nEsc         close the palette, clear input, or abort a response\nCtrl-C      abort, or quit (asks twice when the session is not saved)\nCtrl-D      quit when the editor is empty"
+    )
+}
+
+/// Whether a typed command is echoed as a "◇ Command" card. Pickers and
+/// their selections (`/model x`, `/thinking high`) announce their result in
+/// a notice instead, and `/clear` and `/new` empty the screen anyway.
+fn echoes_command(input: &str) -> bool {
+    let (command, rest) = input.split_once(' ').unwrap_or((input, ""));
+    match command {
+        "/model" | "/thinking" | "/clear" | "/new" | "/exit" | "/quit" => false,
+        "/login" => !rest.trim().is_empty(),
+        _ => true,
+    }
 }
 
 /// A command the fullscreen interface must step aside for: it talks to the
@@ -1767,9 +2131,13 @@ fn dispatch_login_command<'a>(
         return CommandDispatch::Handled;
     }
     let fields = rest.split_whitespace().collect::<Vec<_>>();
-    let [provider_id] = fields.as_slice() else {
-        append_view_message(view, MessageRole::Error, "usage: /login <provider>");
-        return CommandDispatch::Handled;
+    let (provider_id, use_key) = match fields.as_slice() {
+        [provider_id] => (provider_id, false),
+        [provider_id, "key" | "api-key" | "apikey"] => (provider_id, true),
+        _ => {
+            append_view_message(view, MessageRole::Error, "usage: /login <provider> [key]");
+            return CommandDispatch::Handled;
+        }
     };
     if catalog.provider(provider_id).is_none() {
         append_view_message(
@@ -1790,11 +2158,60 @@ fn dispatch_login_command<'a>(
         return CommandDispatch::Handled;
     }
     let provider_id = (*provider_id).to_owned();
-    let subcommand = if login_flow_available(&provider_id) {
-        "login"
-    } else {
-        "set"
-    };
+    if use_key && !api_key_login_available(&provider_id) {
+        append_view_message(
+            view,
+            MessageRole::Error,
+            format!(
+                "{provider_id} has no API key; use /login {provider_id}, or /login openai key for the OpenAI API"
+            ),
+        );
+        return CommandDispatch::Handled;
+    }
+    let oauth = login_flow_available(&provider_id) && !use_key;
+    if fullscreen {
+        if view.login.is_some() {
+            append_view_message(
+                view,
+                MessageRole::Error,
+                "A login is already in progress; finish it or press Esc to cancel it.",
+            );
+            return CommandDispatch::Handled;
+        }
+        // The login runs inside the interface: notices in the transcript,
+        // questions in the composer, nothing printed over the screen.
+        let store = catalog::CredentialStore::default_file();
+        if oauth {
+            match tui_login::LoginFlow::start_oauth(&provider_id, store) {
+                Ok(flow) => {
+                    view.activity = format!("{provider_id} login");
+                    view.activity_since = Some(Instant::now());
+                    view.login = Some(flow);
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+        } else {
+            let flow = tui_login::LoginFlow::start_api_key(
+                &provider_id,
+                provider_cli::cloudflare_credential_fields(&provider_id),
+                store,
+            );
+            append_view_message(
+                view,
+                MessageRole::Notice,
+                format!(
+                    "Paste the API key for {provider_id} and press Enter; Esc cancels. It is stored in {} (mode 0600) and not shown on screen.",
+                    home_relative(&config::auth_path().display().to_string())
+                ),
+            );
+            app.prompt = flow
+                .api_key_question()
+                .map(|(label, secret)| state::ComposerPrompt { label, secret });
+            view.login = Some(flow);
+        }
+        return CommandDispatch::Handled;
+    }
+    let subcommand = if oauth { "login" } else { "set" };
     CommandDispatch::Suspended(Box::new(move || {
         run_self_subprocess(&["auth", subcommand, &provider_id])?;
         catalog.clear_oauth_refresh_failure(&provider_id);
@@ -1832,20 +2249,18 @@ fn after_login_message(
         );
     }
     if runtime::model_is_selected(&prepared.runtime.agent().state().model) {
-        return format!("Added {provider_id}. Use /model to switch providers.");
+        return "Use /model or ctrl+l to switch to one of its models.".to_owned();
     }
     let Some(reference) = runtime::curated_model_reference(catalog, &[provider_id.to_owned()])
     else {
-        return format!("Added {provider_id}. Pick one of its models to start.");
+        return format!("Pick one of the {provider_id} models to start.");
     };
     match runtime::set_model(&prepared.runtime, catalog, &reference) {
         Ok(model) => format!(
-            "Added {provider_id}. Using {}/{}; /model switches to another model.",
+            "Model set to {}/{}. Use /model or ctrl+l to switch.",
             model.provider, model.id
         ),
-        Err(error) => format!(
-            "Added {provider_id}, but {reference} could not be selected: {error}. Pick a model to start."
-        ),
+        Err(error) => format!("{reference} could not be selected: {error}. Pick a model to start."),
     }
 }
 
@@ -1950,18 +2365,13 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>\n                        Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
         }
         "/hotkeys" => {
-            append_view_message(
-                view,
-                MessageRole::Command,
-                "Enter       send or accept selection; steer while a response is active\nAlt-Enter   queue a follow-up\nShift-Enter insert a newline\nUp/Down     navigate palette, editor lines, or history\nAlt-←/→     move by word; Home/End move within a line\nTab         complete the selected command; Shift-Tab cycle thinking\nCtrl-L      open model selector; Ctrl-P cycle models; Ctrl-O expand tools\nCtrl-T      toggle displayed thinking; PgUp/PgDn scroll transcript\nEsc         clear input or abort a response; Ctrl-C abort or quit\nCtrl-D      quit when the editor is empty"
-                    .to_owned(),
-            );
+            append_view_message(view, MessageRole::Command, hotkeys_text(fullscreen));
             CommandDispatch::Handled
         }
         "/clear" | "/new" => {
@@ -1974,13 +2384,12 @@ fn dispatch_runtime_slash_command<'a>(
                     "clear"
                 }) {
                 Ok(()) => {
-                    app.scroll = 0;
-                    view.activity = "Transcript cleared".to_owned();
-                    append_view_message(
-                        view,
-                        MessageRole::Notice,
-                        "Transcript reset and recorded in the active session.",
-                    );
+                    // The old conversation's notices go with it, so the
+                    // screen really is empty apart from this line.
+                    reset_view_transcript(view, prepared);
+                    app.scroll_to_bottom();
+                    view.activity = "Ready".to_owned();
+                    append_view_message(view, MessageRole::Notice, "Started a fresh conversation.");
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
@@ -2044,10 +2453,20 @@ fn dispatch_runtime_slash_command<'a>(
         "/model" => {
             match runtime::set_model(&prepared.runtime, catalog, rest) {
                 Ok(model) => {
-                    view.activity = format!("Model set to {}/{}", model.provider, model.id)
+                    view.activity = format!("Model set to {}/{}", model.provider, model.id);
+                    append_view_message(
+                        view,
+                        MessageRole::Notice,
+                        format!("Model set to {}/{}.", model.provider, model.id),
+                    );
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
+            CommandDispatch::Handled
+        }
+        "/thinking" if rest.is_empty() && fullscreen => {
+            // Like `/model`, the bare command opens its picker.
+            app.set_input("/thinking ");
             CommandDispatch::Handled
         }
         "/thinking" if rest.is_empty() => {
@@ -2167,25 +2586,7 @@ fn dispatch_runtime_slash_command<'a>(
                 if points.is_empty() {
                     "No session rewind points are available.".to_owned()
                 } else {
-                    points
-                        .iter()
-                        .map(|point| {
-                            let label = point
-                                .label
-                                .as_deref()
-                                .map(|label| format!(" [{label}]"))
-                                .unwrap_or_default();
-                            let current = if point.current { " *" } else { "" };
-                            format!(
-                                "{}. {}{}{}",
-                                point.index,
-                                first_line(&point.text),
-                                label,
-                                current
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    render_session_tree(&points)
                 },
             );
             CommandDispatch::Handled
@@ -2198,8 +2599,33 @@ fn dispatch_runtime_slash_command<'a>(
                     .map_err(|error| error.to_string())
             }) {
                 Ok(point) => {
-                    view.activity = format!("Rewound to {}", first_line(&point.text));
-                    app.scroll = 0;
+                    reset_view_transcript(view, prepared);
+                    app.scroll_to_bottom();
+                    if point.on_path {
+                        // pi hands the rewound message back for editing
+                        // rather than leaving it as a turn without a reply.
+                        if fullscreen {
+                            app.set_input(&point.prompt);
+                        }
+                        view.activity = format!("Rewound to before {}", first_line(&point.text));
+                        append_view_message(
+                            view,
+                            MessageRole::Notice,
+                            if fullscreen {
+                                "Rewound. The message is back in the editor: edit it and press Enter to take the conversation another way. /tree lists every branch."
+                            } else {
+                                "Rewound. Send the message again (or a new one) to take the conversation another way. /tree lists every branch."
+                            },
+                        );
+                    } else {
+                        view.activity =
+                            format!("Back on the branch at {}", first_line(&point.text));
+                        append_view_message(
+                            view,
+                            MessageRole::Notice,
+                            format!("Returned to the branch at \"{}\".", first_line(&point.text)),
+                        );
+                    }
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error),
             }
@@ -2230,12 +2656,8 @@ fn dispatch_runtime_slash_command<'a>(
         "/clone" => {
             match prepared.runtime.clone_session() {
                 Ok(handle) => {
+                    // The runtime reports "cloned session <id>" itself.
                     view.activity = format!("Cloned session {}", short_id(&handle.id));
-                    append_view_message(
-                        view,
-                        MessageRole::Notice,
-                        format!("Created session {}.", handle.id),
-                    );
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
@@ -2288,13 +2710,12 @@ fn dispatch_runtime_slash_command<'a>(
         "/resume" => {
             match prepared.runtime.switch_to(rest) {
                 Ok(handle) => {
-                    app.scroll = 0;
+                    // The previous session's notices stay with it; the
+                    // runtime's own "switched session" notice is the one
+                    // line this needs.
+                    reset_view_transcript(view, prepared);
+                    app.scroll_to_bottom();
                     view.activity = format!("Resumed session {}", short_id(&handle.id));
-                    append_view_message(
-                        view,
-                        MessageRole::Notice,
-                        format!("Switched to session {}.", handle.id),
-                    );
                 }
                 Err(error) => append_view_message(view, MessageRole::Error, error.to_string()),
             }
@@ -2918,7 +3339,8 @@ fn dispatch_import_command<'a>(
     });
     match outcome {
         Ok(handle) => {
-            app.scroll = 0;
+            reset_view_transcript(view, prepared);
+            app.scroll_to_bottom();
             view.activity = format!("Imported session {}", short_id(&handle.id));
             append_view_message(
                 view,
@@ -2981,10 +3403,16 @@ fn list_interactive_sessions(prepared: &runtime::PreparedSession) -> Result<Stri
     );
     let sessions = session_picker::list_sessions_for_picker(&store, &cwd)
         .map_err(|error| error.to_string())?;
-    Ok(render_interactive_session_list(&sessions))
+    Ok(render_interactive_session_list(
+        &sessions,
+        prepared.runtime.id().as_deref(),
+    ))
 }
 
-fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> String {
+fn render_interactive_session_list(
+    sessions: &[sessionlog::SessionInfo],
+    current: Option<&str>,
+) -> String {
     if sessions.is_empty() {
         return "No saved sessions for this workspace.".to_owned();
     }
@@ -2999,7 +3427,9 @@ fn render_interactive_session_list(sessions: &[sessionlog::SessionInfo]) -> Stri
             ));
             break;
         }
-        let (label, description) = session_picker::describe_session(session, &label, false);
+        let is_current = current == Some(session.id.as_str());
+        let (label, description) =
+            session_picker::describe_session(session, &label, false, is_current);
         lines.push(format!("{label}  {description}"));
     }
     lines.join("\n")
@@ -3053,17 +3483,74 @@ where
     CommandDispatch::Handled
 }
 
+/// Adds command output or a notice at the current end of the transcript.
+/// Command output shows as a notice: the "◇ Command" card is the echo of
+/// what was typed ([`echo_command`]).
 fn append_view_message(view: &mut InteractiveView, role: MessageRole, text: impl Into<String>) {
-    view.notices.push(Message {
-        role,
-        text: text.into(),
-        is_error: role == MessageRole::Error,
-        ..Message::default()
+    let role = match role {
+        MessageRole::Command => MessageRole::Notice,
+        role => role,
+    };
+    push_notice(
+        view,
+        Message {
+            role,
+            text: text.into(),
+            is_error: role == MessageRole::Error,
+            ..Message::default()
+        },
+    );
+}
+
+/// Shows a typed slash command as a "◇ Command" card, so its output below it
+/// reads as an answer to something.
+fn echo_command(view: &mut InteractiveView, input: &str) {
+    push_notice(
+        view,
+        Message {
+            role: MessageRole::Command,
+            text: input.to_owned(),
+            ..Message::default()
+        },
+    );
+}
+
+fn push_notice(view: &mut InteractiveView, message: Message) {
+    view.notices.push(AnchoredNotice {
+        anchor: view.message_count,
+        message,
     });
-    const MAX_NOTICES: usize = 20;
+    // Bounded so a long session of commands does not grow without limit;
+    // the oldest are the ones furthest up the transcript.
+    const MAX_NOTICES: usize = 200;
     if view.notices.len() > MAX_NOTICES {
         view.notices.drain(..view.notices.len() - MAX_NOTICES);
     }
+}
+
+/// Forgets the notices of the conversation being left (`/clear`, `/new`,
+/// `/resume`, `/fork`), so they do not trail into the next one.
+fn reset_view_transcript(view: &mut InteractiveView, prepared: &runtime::PreparedSession) {
+    view.notices.clear();
+    view.retry = None;
+    view.recent_tool.clear();
+    view.message_count = prepared.runtime.agent().state().messages.len();
+}
+
+/// Interleaves agent messages and anchored notices in the order they
+/// happened. A notice anchored past the end (the transcript was compacted or
+/// rewound underneath it) stays at the end.
+fn splice_transcript(agent: Vec<(usize, Message)>, notices: &[AnchoredNotice]) -> Vec<Message> {
+    let mut result = Vec::with_capacity(agent.len() + notices.len());
+    let mut pending = notices.iter().peekable();
+    for (index, message) in agent {
+        while let Some(notice) = pending.next_if(|notice| notice.anchor <= index) {
+            result.push(notice.message.clone());
+        }
+        result.push(message);
+    }
+    result.extend(pending.map(|notice| notice.message.clone()));
+    result
 }
 
 fn refresh_runtime_app(
@@ -3073,18 +3560,121 @@ fn refresh_runtime_app(
     view: &mut InteractiveView,
 ) {
     let state = prepared.runtime.agent().state();
+    view.message_count = state.messages.len();
     app.dynamic_suggestions = palette_suggestions(app, catalog, &state, view);
+    // Cloning the resource set is not free; only the slash palette needs it.
+    app.command_suggestions = if app.input.starts_with('/') {
+        resource_command_suggestions(prepared)
+    } else {
+        Vec::new()
+    };
     let mut messages = agent_messages(&state.messages);
     if let Some(message) = state.streaming_message.as_ref() {
-        messages.extend(agent_messages(std::slice::from_ref(message)));
+        let index = state.messages.len();
+        messages.extend(
+            agent_messages(std::slice::from_ref(message))
+                .into_iter()
+                .map(|(_, mut message)| {
+                    message.streaming = message.role == MessageRole::Assistant;
+                    (index, message)
+                }),
+        );
     }
-    messages.extend(view.notices.clone());
+    let mut messages = splice_transcript(messages, &view.notices);
+    for message in &mut messages {
+        if message.role == MessageRole::User {
+            message.text = summarize_large_pastes(&message.text, &app.pasted_blocks);
+        }
+    }
     app.replace_messages(messages);
-    app.streaming = state.is_streaming || view.turn_pending;
+    // A browser or device login is waited on like a reply: spinner, Esc
+    // to abort.
+    app.streaming = state.is_streaming
+        || view.turn_pending
+        || view
+            .login
+            .as_ref()
+            .is_some_and(|flow| flow.started().is_some());
     app.set_recording_active(prepared.runtime.recording());
-    app.title = format!("v{}  ·  {}", ui_version(), model_label(&state.model));
-    app.status = interactive_status(view, app.streaming || view.background.is_some());
-    app.sidebar = runtime_sidebar(prepared, &state, view);
+    app.title = session_title(prepared).unwrap_or_else(|| "interactive session".to_owned());
+    app.queued = prepared
+        .runtime
+        .agent()
+        .queued_messages()
+        .iter()
+        .filter_map(|message| match message {
+            llm::Message::User(user) => Some(user_message_text(user)),
+            _ => None,
+        })
+        .collect();
+    view.queued_count = app.queued.len();
+    app.status = interactive_status(view, &state, app.streaming || view.background.is_some());
+    let context = context_usage(&state);
+    app.context_hint = format!("{}% context", context.percent);
+    app.sidebar = runtime_sidebar(prepared, &state, view, &context);
+}
+
+/// The session's name, else its first message. The runtime's title falls
+/// back to the session id, which says nothing to a person, so that case is
+/// left to the caller's placeholder.
+fn session_title(prepared: &runtime::PreparedSession) -> Option<String> {
+    let id = prepared.runtime.id();
+    prepared
+        .runtime
+        .name()
+        .or_else(|| prepared.runtime.title())
+        .filter(|title| Some(title) != id.as_ref())
+        .map(|title| first_line(&title))
+}
+
+/// Replaces a large pasted block with a one-line marker for display; the
+/// message itself, as the model received it, is unchanged.
+fn summarize_large_pastes(text: &str, pasted: &[String]) -> String {
+    let mut text = text.to_owned();
+    for block in pasted {
+        let trimmed = block.trim();
+        if !trimmed.is_empty() && text.contains(trimmed) {
+            let marker = format!("[pasted {} lines]", trimmed.lines().count());
+            text = text.replacen(trimmed, &marker, 1);
+        }
+    }
+    text
+}
+
+/// Prompt templates and invocable skills as slash-palette entries.
+fn resource_command_suggestions(prepared: &runtime::PreparedSession) -> Vec<state::Suggestion> {
+    let resources = prepared.resources();
+    let templates = resources.templates.iter().map(|template| {
+        let description = if template.description.is_empty() {
+            "Prompt template".to_owned()
+        } else {
+            template.description.clone()
+        };
+        let description = if template.argument_hint.is_empty() {
+            description
+        } else {
+            format!("{description} · {}", template.argument_hint)
+        };
+        state::Suggestion {
+            label: format!("/{}", template.name),
+            description,
+            value: format!("/{} ", template.name),
+            execute: false,
+        }
+    });
+    // A skill hidden from the model (`disable-model-invocation`) is still
+    // the user's to run, so every skill is listed.
+    let skills = resources.skills.iter().map(|skill| state::Suggestion {
+        label: format!("/skill:{}", skill.name),
+        description: if skill.description.is_empty() {
+            "Skill".to_owned()
+        } else {
+            format!("Skill · {}", skill.description)
+        },
+        value: format!("/skill:{} ", skill.name),
+        execute: false,
+    });
+    templates.chain(skills).collect()
 }
 
 /// Fills the argument palette for `/model `, `/thinking `, and `/login `.
@@ -3111,11 +3701,17 @@ fn palette_suggestions(
     if input.starts_with("/thinking ") {
         return stream::supported_thinking_levels(&state.model)
             .into_iter()
-            .map(|level| state::Suggestion {
-                value: format!("/thinking {level}"),
-                label: level,
-                description: String::new(),
-                execute: true,
+            .map(|level| {
+                let mut description = thinking_level_description(&level).to_owned();
+                if level == effective_thinking_level(state) {
+                    description.push_str(" · current");
+                }
+                state::Suggestion {
+                    value: format!("/thinking {level}"),
+                    label: level,
+                    description,
+                    execute: true,
+                }
             })
             .collect();
     }
@@ -3126,11 +3722,15 @@ fn palette_suggestions(
                 let choices = interactive_models(catalog)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|model| state::Suggestion {
-                        label: format!("{}/{}", model.provider, model.id),
-                        description: model.name,
-                        value: format!("/model {}/{}", model.provider, model.id),
-                        execute: true,
+                    .map(|model| {
+                        let current =
+                            model.provider == state.model.provider && model.id == state.model.id;
+                        state::Suggestion {
+                            label: format!("{}/{}", model.provider, model.id),
+                            description: model_picker_description(&model, current),
+                            value: format!("/model {}/{}", model.provider, model.id),
+                            execute: true,
+                        }
                     })
                     .collect::<Vec<_>>();
                 if choices.is_empty() {
@@ -3149,52 +3749,273 @@ fn palette_suggestions(
             .clone();
     }
     view.login_choices
-        .get_or_insert_with(|| {
-            catalog
-                .providers()
-                .into_iter()
-                .filter(|provider| {
-                    provider
-                        .models()
-                        .iter()
-                        .any(|model| providers::supports_api(&model.api))
-                })
-                .map(|provider| state::Suggestion {
-                    description: if let Some(setup) = gateway_setup_command(&provider.id) {
-                        format!("{}  ·  gateway, see {setup}", provider.name)
-                    } else if login_flow_available(&provider.id) {
-                        format!("{}  ·  OAuth / subscription", provider.name)
-                    } else {
-                        format!("{}  ·  API key", provider.name)
-                    },
-                    value: format!("/login {}", provider.id),
-                    label: provider.id,
-                    execute: true,
-                })
-                .collect()
-        })
+        .get_or_insert_with(|| login_choices(catalog))
         .clone()
 }
 
-fn interactive_status(view: &InteractiveView, busy: bool) -> String {
+/// What each reasoning level means, for the `/thinking` picker.
+fn thinking_level_description(level: &str) -> &'static str {
+    match level {
+        "off" => "No extended reasoning",
+        "minimal" => "Barely any reasoning",
+        "low" => "Short reasoning budget",
+        "medium" => "Balanced",
+        "high" => "Larger budget for hard problems",
+        "xhigh" => "Very large budget",
+        "max" => "Largest budget this model accepts",
+        _ => "",
+    }
+}
+
+/// The level requests actually use: a model without reasoning runs with
+/// thinking off whatever level the session last chose.
+fn effective_thinking_level(state: &agent::State) -> String {
+    let levels = stream::supported_thinking_levels(&state.model);
+    if runtime::model_is_selected(&state.model) && levels.contains(&state.thinking_level) {
+        state.thinking_level.clone()
+    } else {
+        llm::THINKING_OFF.to_owned()
+    }
+}
+
+/// "Claude Sonnet 5 · 1M ctx · current"; gateway models say which gateway.
+fn model_picker_description(model: &llm::Model, current: bool) -> String {
+    let mut parts = Vec::new();
+    match model.provider.as_str() {
+        "omni" => parts.push("via OmniRoute".to_owned()),
+        "aperture" => parts.push("via Aperture gateway".to_owned()),
+        _ => {
+            if !model.name.is_empty() && model.name != model.id {
+                parts.push(model.name.clone());
+            }
+            if model.context_window > 0 {
+                parts.push(format!("{} ctx", short_token_count(model.context_window)));
+            }
+        }
+    }
+    if current {
+        parts.push("current".to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// 1M, 200k, 1.5M: a context window as people say it.
+fn short_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        if tokens.is_multiple_of(1_000_000) {
+            format!("{}M", tokens / 1_000_000)
+        } else {
+            format!("{:.1}M", tokens as f64 / 1_000_000.0)
+        }
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Providers most people arrive with, listed first in the login picker; the
+/// rest follow alphabetically.
+const FEATURED_PROVIDERS: &[&str] = &[
+    "anthropic",
+    "openai-codex",
+    "xai",
+    "meta",
+    "kimi-coding",
+    "openai",
+    "google",
+    "mistral",
+    "omni",
+    "openrouter",
+    "deepseek",
+    "moonshotai",
+    "zai",
+    "groq",
+];
+
+/// The `/login` picker: one row per way in. A provider with a browser or
+/// device login and an API key gets a second, key row further down, so a
+/// developer key is never hidden behind a subscription flow.
+fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
+    let mut providers = catalog
+        .providers()
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .models()
+                .iter()
+                .any(|model| providers::supports_api(&model.api))
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|provider| {
+        (
+            FEATURED_PROVIDERS
+                .iter()
+                .position(|featured| *featured == provider.id)
+                .unwrap_or(usize::MAX),
+            provider.id.clone(),
+        )
+    });
+    let mut primary = Vec::new();
+    let mut key_rows = Vec::new();
+    for provider in providers {
+        let configured = catalog.is_configured(&provider.id).unwrap_or(false);
+        let mark = |description: String| {
+            if configured {
+                format!("{description} · ✓ configured")
+            } else {
+                description
+            }
+        };
+        let api_key = provider
+            .env_keys
+            .first()
+            .map(|key| format!("API key · {key}"))
+            .unwrap_or_else(|| "API key".to_owned());
+        if let Some(setup) = gateway_setup_command(&provider.id) {
+            primary.push(state::Suggestion {
+                description: mark(format!("{} gateway · {setup}", gateway_name(&provider))),
+                value: format!("/login {}", provider.id),
+                label: provider.id,
+                execute: true,
+            });
+            continue;
+        }
+        if login_flow_available(&provider.id) {
+            primary.push(state::Suggestion {
+                description: mark(oauth_login_description(&provider.id, &provider.name)),
+                value: format!("/login {}", provider.id),
+                label: provider.id.clone(),
+                execute: true,
+            });
+            if api_key_login_available(&provider.id) {
+                let api_key = match provider.id.as_str() {
+                    "anthropic" => "API key · ANTHROPIC_API_KEY".to_owned(),
+                    _ => api_key,
+                };
+                key_rows.push(state::Suggestion {
+                    description: mark(api_key),
+                    value: format!("/login {} key", provider.id),
+                    label: provider.id,
+                    execute: true,
+                });
+            }
+            continue;
+        }
+        primary.push(state::Suggestion {
+            description: mark(api_key),
+            value: format!("/login {}", provider.id),
+            label: provider.id,
+            execute: true,
+        });
+    }
+    primary.extend(key_rows);
+    primary
+}
+
+fn gateway_name(provider: &catalog::Provider) -> String {
+    match provider.id.as_str() {
+        "omni" => "OmniRoute".to_owned(),
+        "aperture" => "Tailscale Aperture".to_owned(),
+        _ => provider.name.clone(),
+    }
+}
+
+/// How a browser or device login signs in, in the picker's words. Unknown
+/// providers (new logins added later) fall back to their display name.
+fn oauth_login_description(id: &str, name: &str) -> String {
+    match id {
+        "anthropic" => "Claude Pro / Max subscription · OAuth".to_owned(),
+        "openai-codex" => "ChatGPT Plus / Pro · OAuth".to_owned(),
+        "xai" => "Grok subscription · device code or browser".to_owned(),
+        "meta" => "Meta account · mints a Model API key".to_owned(),
+        "kimi-coding" => "Kimi Code · OAuth".to_owned(),
+        _ if name.is_empty() => "Browser sign-in · OAuth".to_owned(),
+        _ => format!("{} · OAuth", name),
+    }
+}
+
+/// Whether a provider with a login flow also takes an API key. A ChatGPT
+/// subscription has none; the `openai` provider is the API-key route.
+fn api_key_login_available(provider_id: &str) -> bool {
+    provider_id != "openai-codex"
+}
+
+const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// "12s" under a minute, "1:05" after.
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// The status bar's left side: what is happening and for how long, such as
+/// "⠦ Running bash · cargo test · 12s" or "⠸ Retrying in 4s · attempt 2/4".
+fn interactive_status(view: &InteractiveView, state: &agent::State, busy: bool) -> String {
     if !busy {
         return view.activity.clone();
     }
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
     let elapsed = view
         .activity_since
         .map(|started| started.elapsed())
         .unwrap_or_default();
-    let index = (elapsed.as_millis() / 120) as usize % spinner.len();
-    format!(
-        "{}  {}  {:.1}s",
-        spinner[index],
-        view.activity,
-        elapsed.as_secs_f32()
-    )
+    let spinner = SPINNER[(elapsed.as_millis() / 120) as usize % SPINNER.len()];
+    if let Some(retry) = view.retry.as_ref() {
+        let remaining = retry.fires_at.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            return format!(
+                "{spinner} Retrying in {}s · attempt {}/{}",
+                remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0),
+                retry.attempt,
+                retry.attempts
+            );
+        }
+    }
+    let activity = live_activity(view, state);
+    let queued = state_queue_suffix(view);
+    format!("{spinner} {activity}{queued} · {}", format_elapsed(elapsed))
 }
 
-fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
+/// "· 1 queued" while steering or follow-up messages wait.
+fn state_queue_suffix(view: &InteractiveView) -> String {
+    if view.queued_count == 0 {
+        String::new()
+    } else {
+        format!(" · {} queued", view.queued_count)
+    }
+}
+
+/// The current step in words. A streaming reply reads "Thinking" until its
+/// first visible text and "Responding" after.
+fn live_activity(view: &InteractiveView, state: &agent::State) -> String {
+    if view.activity == "Composing response"
+        && let Some(llm::Message::Assistant(message)) = state.streaming_message.as_ref()
+    {
+        let has_text = message
+            .content
+            .iter()
+            .any(|block| matches!(block, llm::ContentBlock::Text(text) if !text.text.is_empty()));
+        let has_thinking = message
+            .content
+            .iter()
+            .any(|block| matches!(block, llm::ContentBlock::Thinking(_)));
+        return if has_text || !has_thinking {
+            "Responding".to_owned()
+        } else {
+            "Thinking".to_owned()
+        };
+    }
+    if view.activity == "Composing response" {
+        return "Waiting for the model".to_owned();
+    }
+    view.activity.clone()
+}
+
+fn agent_messages(messages: &[llm::Message]) -> Vec<(usize, Message)> {
     let mut tool_results = BTreeMap::<String, &llm::ToolResultMessage>::new();
     let mut unnamed_results = BTreeMap::<String, Vec<&llm::ToolResultMessage>>::new();
     for message in messages {
@@ -3213,15 +4034,28 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
     let mut matched_results = BTreeSet::new();
     let mut unnamed_positions = BTreeMap::<String, usize>::new();
     let mut result = Vec::new();
-    for message in messages {
+    for (index, message) in messages.iter().enumerate() {
+        let mut push = |message: Message| result.push((index, message));
         match message {
             llm::Message::User(user) => {
                 if compaction::is_summary_message(message) {
                     continue;
                 }
-                result.push(Message {
+                let text = user_message_text(user);
+                // pi renders a branch summary as its own compact entry, not
+                // as something the user said.
+                if let Some(summary) = session::branch_summary_text(&text) {
+                    push(Message {
+                        role: MessageRole::Summary,
+                        title: "branch summary".to_owned(),
+                        text: summary.to_owned(),
+                        ..Message::default()
+                    });
+                    continue;
+                }
+                push(Message {
                     role: MessageRole::User,
-                    text: user_message_text(user),
+                    text,
                     ..Message::default()
                 });
             }
@@ -3238,21 +4072,30 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
                     }
                 }
                 if !thinking.is_empty() {
-                    result.push(Message {
+                    push(Message {
                         role: MessageRole::Thinking,
                         text: thinking,
                         ..Message::default()
                     });
                 }
                 if !text.is_empty() {
-                    result.push(Message {
+                    push(Message {
                         role: MessageRole::Assistant,
                         text,
                         ..Message::default()
                     });
                 }
-                if !assistant.error_message.is_empty() {
-                    result.push(Message {
+                if assistant.stop_reason == stream::STOP_ABORTED {
+                    // The user stopped it; that is not an error to alarm
+                    // anyone with.
+                    push(Message {
+                        role: MessageRole::Summary,
+                        title: "Interrupted".to_owned(),
+                        text: "stopped before the reply finished".to_owned(),
+                        ..Message::default()
+                    });
+                } else if !assistant.error_message.is_empty() {
+                    push(Message {
                         role: MessageRole::Error,
                         text: assistant.error_message.clone(),
                         is_error: true,
@@ -3278,7 +4121,7 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
                     if let Some(tool_result) = matched {
                         matched_results.insert(tool_result.tool_call_id.clone());
                     }
-                    result.push(tool_view_message(call, matched));
+                    push(tool_view_message(call, matched));
                 }
             }
             llm::Message::ToolResult(tool_result) => {
@@ -3287,7 +4130,7 @@ fn agent_messages(messages: &[llm::Message]) -> Vec<Message> {
                 {
                     continue;
                 }
-                result.push(unmatched_tool_view_message(tool_result));
+                push(unmatched_tool_view_message(tool_result));
             }
         }
     }
@@ -3341,13 +4184,36 @@ fn content_text(content: &[llm::ContentBlock]) -> String {
 fn tool_view_message(call: &llm::ToolCall, result: Option<&llm::ToolResultMessage>) -> Message {
     let detail = result.map_or_else(String::new, |result| content_text(&result.content));
     let is_error = result.is_some_and(|result| result.is_error);
+    // A successful edit shows the change itself, as pi's edit renderer does,
+    // rather than the one-line "Edited path" the model receives.
+    if call.name == "edit"
+        && !is_error
+        && let Some(result) = result
+        && let Some(diff) = edit_diff(call, result)
+    {
+        return Message {
+            role: MessageRole::Tool,
+            title: tool_title(call),
+            text: diff.lines().take(3).collect::<Vec<_>>().join("\n"),
+            detail: diff,
+            is_error,
+            ..Message::default()
+        };
+    }
     let text = match result {
         None => "running…".to_owned(),
         Some(_) if is_error => first_line(&detail),
         Some(_)
             if matches!(
                 call.name.as_str(),
-                "bash" | "grep" | "find" | "ls" | "list" | "planner_submit_plan" | "web_search"
+                "bash"
+                    | "read"
+                    | "grep"
+                    | "find"
+                    | "ls"
+                    | "list"
+                    | "planner_submit_plan"
+                    | "web_search"
             ) =>
         {
             detail.lines().take(3).collect::<Vec<_>>().join("\n")
@@ -3360,7 +4226,50 @@ fn tool_view_message(call: &llm::ToolCall, result: Option<&llm::ToolResultMessag
         text,
         detail,
         is_error,
+        ..Message::default()
     }
+}
+
+/// A unified-style diff of an edit call: a hunk header when the tool
+/// reported where the change landed (`firstChangedLine`, as in pi's edit
+/// details), then the removed and added lines with the unchanged lines at
+/// either end left out.
+fn edit_diff(call: &llm::ToolCall, result: &llm::ToolResultMessage) -> Option<String> {
+    let text = |name: &str| call.arguments.get(name).and_then(serde_json::Value::as_str);
+    let old_text = text("old_text").or_else(|| text("oldText"))?;
+    let new_text = text("new_text").or_else(|| text("newText"))?;
+    let old_lines = old_text.lines().collect::<Vec<_>>();
+    let new_lines = new_text.lines().collect::<Vec<_>>();
+    let prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let suffix = old_lines[prefix..]
+        .iter()
+        .rev()
+        .zip(new_lines[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let removed = &old_lines[prefix..old_lines.len() - suffix];
+    let added = &new_lines[prefix..new_lines.len() - suffix];
+    let mut diff = Vec::new();
+    if let Some(first) = result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("firstChangedLine"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        let start = first as usize + prefix;
+        diff.push(format!(
+            "@@ -{start},{} +{start},{} @@",
+            removed.len(),
+            added.len()
+        ));
+    }
+    diff.extend(removed.iter().map(|line| format!("-{line}")));
+    diff.extend(added.iter().map(|line| format!("+{line}")));
+    (!diff.is_empty()).then(|| diff.join("\n"))
 }
 
 fn unmatched_tool_view_message(result: &llm::ToolResultMessage) -> Message {
@@ -3371,6 +4280,7 @@ fn unmatched_tool_view_message(result: &llm::ToolResultMessage) -> Message {
         text: first_line(&detail),
         detail,
         is_error: result.is_error,
+        ..Message::default()
     }
 }
 
@@ -3417,37 +4327,158 @@ fn tool_title(call: &llm::ToolCall) -> String {
     }
 }
 
-fn runtime_sidebar(
-    prepared: &runtime::PreparedSession,
-    state: &agent::State,
-    view: &InteractiveView,
-) -> Vec<state::SidebarLine> {
+/// Estimated context use of the next request, against the model's window.
+struct ContextUsage {
+    tokens: u64,
+    limit: u64,
+    percent: u8,
+    cost: f64,
+}
+
+fn context_usage(state: &agent::State) -> ContextUsage {
     let context = llm::Context {
         system_prompt: state.system_prompt.clone(),
         messages: state.messages.clone(),
         tools: state.tools.iter().map(agent::Tool::llm_tool).collect(),
     };
-    let estimate = stream::estimate_context_tokens(&context);
+    // Before the first message nothing has been sent; the system prompt
+    // alone is not "context used" to anyone reading the bar.
+    let tokens = if state.messages.is_empty() {
+        0
+    } else {
+        stream::estimate_context_tokens(&context).tokens
+    };
     let limit = state.model.context_window;
     let percent = if limit == 0 {
         0
     } else {
-        estimate
-            .tokens
-            .saturating_mul(100)
-            .saturating_div(limit)
-            .min(100) as u8
+        tokens.saturating_mul(100).saturating_div(limit).min(100) as u8
     };
-    let cost = compaction::conversation_cost(&state.messages, &state.compactions);
-    let name = prepared
-        .runtime
-        .name()
-        .or_else(|| prepared.runtime.title())
-        .unwrap_or_else(|| "New Session".to_owned());
+    ContextUsage {
+        tokens,
+        limit,
+        percent,
+        cost: compaction::conversation_cost(&state.messages, &state.compactions),
+    }
+}
+
+/// What the session has done so far, for the sidebar's Activity section.
+#[derive(Default)]
+struct ActivitySummary {
+    turns: usize,
+    tools: usize,
+    failed: usize,
+    last_tool: Option<String>,
+    files: Vec<(String, state::FileStatus)>,
+}
+
+fn activity_summary(messages: &[llm::Message]) -> ActivitySummary {
+    let mut summary = ActivitySummary::default();
+    let failed_ids = messages
+        .iter()
+        .filter_map(|message| match message {
+            llm::Message::ToolResult(result) if result.is_error => {
+                Some(result.tool_call_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen_paths = BTreeSet::new();
+    for message in messages {
+        match message {
+            llm::Message::User(user) => {
+                if !compaction::is_summary_message(message)
+                    && session::branch_summary_text(&user_message_text(user)).is_none()
+                {
+                    summary.turns += 1;
+                }
+            }
+            llm::Message::Assistant(assistant) => {
+                for content in &assistant.content {
+                    let llm::ContentBlock::ToolCall(call) = content else {
+                        continue;
+                    };
+                    summary.tools += 1;
+                    summary.last_tool = Some(tool_title(call));
+                    let failed = failed_ids.contains(&call.id);
+                    if failed {
+                        summary.failed += 1;
+                    }
+                    let path = call
+                        .arguments
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let known = !seen_paths.insert(path.clone());
+                    if failed || !matches!(call.name.as_str(), "edit" | "write") {
+                        continue;
+                    }
+                    // A write to a path the session never touched before is
+                    // most likely a new file; anything else is a change.
+                    let status = if call.name == "write" && !known {
+                        state::FileStatus::Added
+                    } else {
+                        state::FileStatus::Modified
+                    };
+                    match summary.files.iter_mut().find(|(file, _)| *file == path) {
+                        Some(_) => {}
+                        None => summary.files.push((path, status)),
+                    }
+                }
+            }
+            llm::Message::ToolResult(_) => {}
+        }
+    }
+    summary
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// 12,480: a token count as the sidebar prints it.
+fn grouped_number(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// A path with the home directory written as `~`.
+fn home_relative(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            let rest = &path[home.len()..];
+            if rest.is_empty() || rest.starts_with('/') {
+                format!("~{rest}")
+            } else {
+                path.to_owned()
+            }
+        }
+        _ => path.to_owned(),
+    }
+}
+
+fn runtime_sidebar(
+    prepared: &runtime::PreparedSession,
+    state: &agent::State,
+    view: &InteractiveView,
+    context: &ContextUsage,
+) -> Vec<state::SidebarLine> {
+    let name = session_title(prepared).unwrap_or_else(|| "New Session".to_owned());
     let storage = if prepared.runtime.recording() {
         prepared.runtime.id().map_or_else(
             || "recording".to_owned(),
-            |id| format!("recording {}", short_id(&id)),
+            |id| format!("recording · {}", short_id(&id)),
         )
     } else if prepared.runtime.read_only() {
         "read-only session".to_owned()
@@ -3459,57 +4490,120 @@ fn runtime_sidebar(
         .as_ref()
         .map(|workspace| workspace.root().display().to_string())
         .unwrap_or_else(|| prepared.config.workdir.display().to_string());
-    let mode = prepared.planner.as_ref().map_or_else(
-        || "normal".to_owned(),
-        planner_runtime::PlannerRuntime::status_line,
-    );
+    let planner_state = prepared
+        .planner
+        .as_ref()
+        .map(|planner| planner.manager().state());
+    let mode = match planner_state.as_ref().map(|state| &state.phase) {
+        Some(plannotator::Phase::Planning | plannotator::Phase::Executing) => "planner",
+        _ => "normal",
+    };
+    let model = if runtime::model_is_selected(&state.model) {
+        model_label(&state.model)
+    } else {
+        "no model".to_owned()
+    };
     let mut lines = vec![
         state::SidebarLine::title(name),
-        state::SidebarLine::accent(model_label(&state.model)),
-        state::SidebarLine::meta(format!("{} thinking · {mode}", state.thinking_level)),
+        state::SidebarLine::accent(model),
+        state::SidebarLine::meta(format!(
+            "{} thinking · {mode}",
+            effective_thinking_level(state)
+        )),
         state::SidebarLine::meta(storage),
         state::SidebarLine::blank(),
         state::SidebarLine::section("Context"),
-        state::SidebarLine::progress(percent),
-        state::SidebarLine::meta(if limit == 0 {
-            format!("{} tokens", compact_number(estimate.tokens))
-        } else {
-            format!(
-                "{} / {} tokens",
-                compact_number(estimate.tokens),
-                compact_number(limit)
-            )
-        }),
-        state::SidebarLine::meta(format!("{percent}% used · ${cost:.4} spent")),
+        state::SidebarLine::progress(context.percent),
+        state::SidebarLine::meta(format!(
+            "{} / {} tokens",
+            grouped_number(context.tokens),
+            grouped_number(context.limit)
+        )),
+        state::SidebarLine::meta(format!(
+            "{}% used · ${:.4} spent",
+            context.percent, context.cost
+        )),
     ];
-    if state.is_streaming || view.turn_pending || !state.pending_tool_calls.is_empty() {
+
+    let busy = state.is_streaming || view.turn_pending || view.background.is_some();
+    let mut transcript = state.messages.clone();
+    if let Some(message) = state.streaming_message.as_ref() {
+        transcript.push(message.clone());
+    }
+    let summary = activity_summary(&transcript);
+    if busy || summary.tools > 0 {
         lines.extend([
             state::SidebarLine::blank(),
             state::SidebarLine::section("Activity"),
-            state::SidebarLine {
-                kind: state::SidebarKind::Active,
-                value: view.activity.clone(),
-            },
         ]);
-        if !state.pending_tool_calls.is_empty() {
+        if busy {
+            let activity = if view.retry.is_some() {
+                "Retrying".to_owned()
+            } else {
+                live_activity(view, state)
+            };
+            lines.push(state::SidebarLine {
+                kind: state::SidebarKind::Active,
+                value: activity,
+            });
+        }
+        let mut counts = vec![if busy {
+            format!("turn {}", summary.turns.max(1))
+        } else {
+            plural(summary.turns, "turn", "turns")
+        }];
+        counts.push(plural(summary.tools, "tool", "tools"));
+        if !summary.files.is_empty() {
+            counts.push(format!(
+                "{} changed",
+                plural(summary.files.len(), "file", "files")
+            ));
+        }
+        if summary.failed > 0 {
+            counts.push(format!("{} failed", summary.failed));
+        }
+        lines.push(state::SidebarLine::meta(counts.join(" · ")));
+        if view.queued_count > 0 {
             lines.push(state::SidebarLine::meta(format!(
-                "{} tool{} running",
-                state.pending_tool_calls.len(),
-                if state.pending_tool_calls.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                "follow-up queued: {}",
+                view.queued_count
             )));
         }
-        if !view.recent_tool.is_empty() {
-            lines.push(state::SidebarLine::meta(view.recent_tool.clone()));
+        if let Some(tool) = summary.last_tool {
+            lines.push(state::SidebarLine::meta(first_line(&tool)));
         }
+        const SHOWN_FILES: usize = 6;
+        for (path, status) in summary.files.iter().rev().take(SHOWN_FILES) {
+            lines.push(state::SidebarLine {
+                kind: state::SidebarKind::File { status: *status },
+                value: path.clone(),
+            });
+        }
+        if summary.files.len() > SHOWN_FILES {
+            lines.push(state::SidebarLine::meta(format!(
+                "… {} more",
+                summary.files.len() - SHOWN_FILES
+            )));
+        }
+    }
+    if let Some(planner_state) = planner_state
+        && !planner_state.items.is_empty()
+    {
+        lines.extend([
+            state::SidebarLine::blank(),
+            state::SidebarLine::section("Plan"),
+        ]);
+        lines.extend(planner_state.items.iter().map(|item| state::SidebarLine {
+            kind: state::SidebarKind::Todo {
+                complete: item.completed,
+            },
+            value: item.text.clone(),
+        }));
     }
     lines.extend([
         state::SidebarLine::blank(),
         state::SidebarLine::section("Workspace"),
-        state::SidebarLine::path(cwd),
+        state::SidebarLine::path(home_relative(&cwd)),
         state::SidebarLine::blank(),
         state::SidebarLine::brand(format!("● GoshCoder v{}", ui_version())),
     ]);
@@ -3569,7 +4663,7 @@ fn session_status(prepared: &runtime::PreparedSession, activity: &str) -> String
 }
 
 /// First-run guidance shown when chat opens without an authenticated provider.
-const NO_MODEL_WELCOME: &str = "Welcome to GoshCoder. No provider is authenticated yet.\nPick one from the list below and press Enter to log in (OAuth providers open a browser; the rest ask for an API key).\nAfterwards /model switches models, and Ctrl-L opens the model picker.";
+const NO_MODEL_WELCOME: &str = "No provider is authenticated yet. Choose one and press Enter; the OAuth or API-key flow runs here, and the first login selects that provider's default model.";
 
 const NO_MODEL_PROMPT_REFUSED: &str = "No model is selected yet. Choose a provider with /login first; the first login also selects a model.";
 
@@ -3664,6 +4758,40 @@ fn cycle_interactive_thinking(runtime: &session::SessionRuntime) -> Option<Strin
     let next = levels[(current + 1) % levels.len()].clone();
     runtime.agent().set_thinking_level(next.clone());
     Some(next)
+}
+
+/// `/tree`: every user message, branches indented under the point they
+/// split from, the current path marked, abandoned branches dimmed by a
+/// trailing note.
+fn render_session_tree(points: &[session::BranchPoint]) -> String {
+    let mut lines = points
+        .iter()
+        .map(|point| {
+            let label = point
+                .label
+                .as_deref()
+                .map(|label| format!(" [{label}]"))
+                .unwrap_or_default();
+            let marker = if point.current {
+                "  ← current"
+            } else if point.on_path {
+                ""
+            } else {
+                "  (other branch)"
+            };
+            format!(
+                "{}{:>2}. {}{label}{marker}",
+                "  ".repeat(point.depth),
+                point.index,
+                first_line(&point.text),
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.push(
+        "/fork N rewinds to before message N on this branch, or returns to another branch."
+            .to_owned(),
+    );
+    lines.join("\n")
 }
 
 fn parse_branch_index(value: &str) -> Result<usize, String> {
@@ -3855,7 +4983,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let rendered = render_interactive_session_list(&sessions);
+        let rendered = render_interactive_session_list(&sessions, None);
 
         assert!(rendered.contains("session 0"));
         assert!(rendered.contains("… 2 more · goshcoder sessions list"));
@@ -3941,6 +5069,312 @@ mod tests {
         let stderr = String::from_utf8(stderr).expect("stderr");
         assert!(stderr.contains("reasoning"));
         assert!(stderr.contains("tokens: 12 in / 4 out  cost: $0.0123"));
+    }
+
+    fn notice(anchor: usize, text: &str) -> AnchoredNotice {
+        AnchoredNotice {
+            anchor,
+            message: Message {
+                role: MessageRole::Notice,
+                text: text.to_owned(),
+                ..Message::default()
+            },
+        }
+    }
+
+    #[test]
+    fn notices_interleave_with_the_transcript_in_the_order_they_happened() {
+        let agent = vec![
+            (
+                0,
+                Message {
+                    role: MessageRole::User,
+                    text: "first".to_owned(),
+                    ..Message::default()
+                },
+            ),
+            (
+                1,
+                Message {
+                    text: "first reply".to_owned(),
+                    ..Message::default()
+                },
+            ),
+            (
+                2,
+                Message {
+                    role: MessageRole::User,
+                    text: "second".to_owned(),
+                    ..Message::default()
+                },
+            ),
+            (
+                3,
+                Message {
+                    text: "second reply".to_owned(),
+                    ..Message::default()
+                },
+            ),
+        ];
+        let notices = [
+            notice(0, "startup"),
+            notice(2, "/help output"),
+            notice(9, "anchored past a rewind"),
+        ];
+        let order = splice_transcript(agent, &notices)
+            .into_iter()
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "startup",
+                "first",
+                "first reply",
+                // /help ran after the first exchange: the later reply comes
+                // below it, not above.
+                "/help output",
+                "second",
+                "second reply",
+                "anchored past a rewind",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_output_is_a_notice_and_the_typed_command_its_own_card() {
+        let mut view = InteractiveView {
+            message_count: 4,
+            ..InteractiveView::default()
+        };
+        echo_command(&mut view, "/hotkeys");
+        append_view_message(&mut view, MessageRole::Command, "Enter send");
+        append_view_message(&mut view, MessageRole::Error, "boom");
+        let roles = view
+            .notices
+            .iter()
+            .map(|notice| (notice.anchor, notice.message.role))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                (4, MessageRole::Command),
+                (4, MessageRole::Notice),
+                (4, MessageRole::Error)
+            ]
+        );
+        assert!(echoes_command("/help"));
+        assert!(echoes_command("/login xai"));
+        assert!(!echoes_command("/login"));
+        assert!(!echoes_command("/model omni/auto"));
+        assert!(!echoes_command("/clear"));
+    }
+
+    #[test]
+    fn retry_notices_become_a_countdown_with_attempt_numbers() {
+        let (retry, summary) =
+            parse_retry_notice("attempt 1 of 3 in 2s: anthropic returned 529 overloaded")
+                .expect("parsed");
+        assert_eq!((retry.attempt, retry.attempts), (2, 4));
+        assert_eq!(summary, "anthropic returned 529 overloaded");
+        let remaining = retry.fires_at.saturating_duration_since(Instant::now());
+        assert!(remaining <= Duration::from_secs(2) && remaining > Duration::from_secs(1));
+        assert!(parse_retry_notice("giving up after 3 attempt(s): boom").is_none());
+    }
+
+    #[test]
+    fn edits_render_as_a_diff_with_the_reported_line() {
+        let call = llm::ToolCall {
+            name: "edit".to_owned(),
+            arguments: BTreeMap::from([
+                ("path".to_owned(), serde_json::json!("src/session.rs")),
+                (
+                    "old_text".to_owned(),
+                    serde_json::json!("fn a() {\n    old();\n}"),
+                ),
+                (
+                    "new_text".to_owned(),
+                    serde_json::json!("fn a() {\n    new();\n    more();\n}"),
+                ),
+            ]),
+            ..llm::ToolCall::default()
+        };
+        let result = llm::ToolResultMessage {
+            details: Some(serde_json::json!({ "firstChangedLine": 410 })),
+            content: vec![llm::ContentBlock::text("Edited src/session.rs")],
+            ..llm::ToolResultMessage::default()
+        };
+        let card = tool_view_message(&call, Some(&result));
+        assert_eq!(
+            card.detail,
+            "@@ -411,1 +411,2 @@\n-    old();\n+    new();\n+    more();"
+        );
+        assert_eq!(card.title, "edit src/session.rs");
+        // Without the line the diff still shows; a failed edit shows its error.
+        let plain = llm::ToolResultMessage {
+            details: None,
+            ..result.clone()
+        };
+        assert!(
+            tool_view_message(&call, Some(&plain))
+                .detail
+                .starts_with("-    old();")
+        );
+        let failed = llm::ToolResultMessage {
+            is_error: true,
+            content: vec![llm::ContentBlock::text("old_text was not found")],
+            ..result
+        };
+        assert_eq!(
+            tool_view_message(&call, Some(&failed)).detail,
+            "old_text was not found"
+        );
+    }
+
+    #[test]
+    fn branch_summaries_and_aborts_are_not_shown_as_turns_or_errors() {
+        let summary = "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nrewound to before \"x\"</summary>";
+        let aborted = llm::AssistantMessage {
+            stop_reason: stream::STOP_ABORTED.to_owned(),
+            error_message: "request aborted".to_owned(),
+            ..llm::AssistantMessage::default()
+        };
+        let failed = llm::AssistantMessage {
+            stop_reason: stream::STOP_ERROR.to_owned(),
+            error_message: "529 overloaded".to_owned(),
+            ..llm::AssistantMessage::default()
+        };
+        let view = agent_messages(&[
+            llm::Message::User(llm::UserMessage::text(summary, 1)),
+            llm::Message::Assistant(Box::new(aborted)),
+            llm::Message::Assistant(Box::new(failed)),
+        ]);
+        let shown = view
+            .iter()
+            .map(|(index, message)| (*index, message.role, message.title.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                (0, MessageRole::Summary, "branch summary"),
+                (1, MessageRole::Summary, "Interrupted"),
+                (2, MessageRole::Error, ""),
+            ]
+        );
+        assert_eq!(view[0].1.text, "rewound to before \"x\"");
+    }
+
+    #[test]
+    fn activity_summary_counts_turns_tools_failures_and_changed_files() {
+        let call = |id: &str, name: &str, path: &str| {
+            llm::ContentBlock::ToolCall(llm::ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: BTreeMap::from([("path".to_owned(), serde_json::json!(path))]),
+                ..llm::ToolCall::default()
+            })
+        };
+        let result = |id: &str, is_error: bool| {
+            llm::Message::ToolResult(Box::new(llm::ToolResultMessage {
+                tool_call_id: id.to_owned(),
+                is_error,
+                ..llm::ToolResultMessage::default()
+            }))
+        };
+        let messages = vec![
+            llm::Message::User(llm::UserMessage::text("go", 1)),
+            llm::Message::Assistant(Box::new(llm::AssistantMessage {
+                content: vec![
+                    call("1", "read", "src/a.rs"),
+                    call("2", "edit", "src/a.rs"),
+                    call("3", "write", "src/new.rs"),
+                    call("4", "edit", "src/broken.rs"),
+                ],
+                ..llm::AssistantMessage::default()
+            })),
+            result("1", false),
+            result("2", false),
+            result("3", false),
+            result("4", true),
+        ];
+        let summary = activity_summary(&messages);
+        assert_eq!((summary.turns, summary.tools, summary.failed), (1, 4, 1));
+        assert_eq!(
+            summary.files,
+            [
+                ("src/a.rs".to_owned(), state::FileStatus::Modified),
+                ("src/new.rs".to_owned(), state::FileStatus::Added),
+            ]
+        );
+        assert_eq!(summary.last_tool.as_deref(), Some("edit src/broken.rs"));
+    }
+
+    #[test]
+    fn session_tree_indents_branches_and_marks_the_current_path() {
+        let point = |index, text: &str, depth, on_path, current| session::BranchPoint {
+            index,
+            id: format!("id{index}"),
+            text: text.to_owned(),
+            prompt: text.to_owned(),
+            label: None,
+            children: 0,
+            current,
+            on_path,
+            depth,
+        };
+        let rendered = render_session_tree(&[
+            point(1, "first", 0, true, false),
+            point(2, "abandoned", 1, false, false),
+            point(3, "new direction", 1, true, true),
+        ]);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], " 1. first");
+        assert_eq!(lines[1], "   2. abandoned  (other branch)");
+        assert_eq!(lines[2], "   3. new direction  ← current");
+        assert!(lines[3].starts_with("/fork N"));
+    }
+
+    #[test]
+    fn line_mode_hotkeys_list_only_line_mode_keys() {
+        let line = hotkeys_text(false);
+        assert!(line.contains("Ctrl-C"));
+        assert!(!line.contains("Ctrl-L"));
+        assert!(!line.contains("Shift-Tab"));
+        let fullscreen = hotkeys_text(true);
+        assert!(fullscreen.contains("Ctrl-J"));
+        assert!(fullscreen.contains("Ctrl-Home/Ctrl-End"));
+        assert!(
+            !fullscreen.contains("Shift-Enter insert"),
+            "Shift-Enter is only promised where the terminal reports it"
+        );
+    }
+
+    #[test]
+    fn numbers_and_durations_read_as_in_the_sidebar() {
+        assert_eq!(grouped_number(0), "0");
+        assert_eq!(grouped_number(12_480), "12,480");
+        assert_eq!(grouped_number(1_000_000), "1,000,000");
+        assert_eq!(format_elapsed(Duration::from_secs(12)), "12s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1:05");
+        assert_eq!(short_token_count(1_000_000), "1M");
+        assert_eq!(short_token_count(200_000), "200k");
+        assert_eq!(
+            summarize_large_pastes("see\nA\nB\nend", &["A\nB".to_owned()]),
+            "see\n[pasted 2 lines]\nend"
+        );
+    }
+
+    #[test]
+    fn unknown_providers_get_a_generic_login_description() {
+        assert_eq!(
+            oauth_login_description("anthropic", "Anthropic"),
+            "Claude Pro / Max subscription · OAuth"
+        );
+        assert_eq!(
+            oauth_login_description("meta-muse", "Meta Muse"),
+            "Meta Muse · OAuth"
+        );
+        assert_eq!(thinking_level_description("medium"), "Balanced");
     }
 
     #[test]

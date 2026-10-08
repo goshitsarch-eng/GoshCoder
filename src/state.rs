@@ -5,6 +5,12 @@ use std::{
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+/// Width, tools expanded, thinking hidden: what the transcript rows depend on.
+pub type TranscriptLayout = (u16, bool, bool);
+
+/// A paste longer than this is summarized in the transcript.
+pub const LARGE_PASTE_LINES: usize = 20;
+
 /// A transcript item rendered by the terminal interface.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Message {
@@ -13,6 +19,8 @@ pub struct Message {
     pub text: String,
     pub detail: String,
     pub is_error: bool,
+    /// The reply still arriving; the renderer ends it with a cursor block.
+    pub streaming: bool,
 }
 
 // These variants are the stable view-model contract for runtime modules that
@@ -28,6 +36,9 @@ pub enum MessageRole {
     Error,
     Notice,
     Command,
+    /// Context the session carries for the model but the user did not type,
+    /// such as pi's branch summary; shown as one dim line, not a bubble.
+    Summary,
 }
 
 /// A completion item in the command palette.
@@ -54,6 +65,19 @@ pub enum Action {
     },
     /// Ask the runtime to advance through levels supported by the active model.
     CycleThinking,
+    /// The composer's answer to an open [`ComposerPrompt`].
+    Answer(String),
+    /// Esc or Ctrl-C while a [`ComposerPrompt`] is open.
+    CancelPrompt,
+}
+
+/// A question the runtime asked through the composer (an OAuth paste, an API
+/// key). Enter answers it instead of sending a message, and a secret answer
+/// is masked on screen and kept out of the editor history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComposerPrompt {
+    pub label: String,
+    pub secret: bool,
 }
 
 /// State shared by the Ratatui renderer and terminal event loop.
@@ -75,6 +99,7 @@ pub struct App {
     /// can exit immediately on Ctrl-C; an in-memory transcript retains the
     /// two-press safeguard from the previous fullscreen interface.
     pub recording_active: bool,
+    /// Rows the user scrolled above the newest content.
     pub scroll: u16,
     pub selected_suggestion: usize,
     pub tools_expanded: bool,
@@ -83,10 +108,36 @@ pub struct App {
     /// Suggestions the runtime supplies for an argument palette (`/model `,
     /// `/thinking `, `/login `); the static command list covers the rest.
     pub dynamic_suggestions: Vec<Suggestion>,
+    /// Prompt templates and invocable skills, offered beside the built-in
+    /// commands in the slash palette.
+    pub command_suggestions: Vec<Suggestion>,
+    /// Steering and follow-up texts waiting for the agent, shown above the
+    /// composer so a queued message is not invisible until it runs.
+    pub queued: Vec<String>,
+    /// A question the composer is answering instead of composing a message.
+    pub prompt: Option<ComposerPrompt>,
+    /// Context use for the status line when the sidebar is hidden.
+    pub context_hint: String,
+    /// Large pastes, which the transcript shows as "[pasted N lines]"
+    /// although the whole text is sent.
+    pub pasted_blocks: Vec<String>,
     /// The largest useful scroll offset at the last draw. The renderer
     /// writes it so key handling can clamp instead of letting the offset
     /// run past the top of the transcript.
     pub last_max_scroll: Cell<u16>,
+    /// Rows that arrived below the viewport while it was scrolled up. The
+    /// offset is measured from the bottom, so without this the view would
+    /// drift down with every streamed line; the renderer adds the growth so
+    /// the same content stays on screen.
+    pub scroll_growth: Cell<usize>,
+    /// Whether new rows arrived below a scrolled-up viewport.
+    pub unseen_output: Cell<bool>,
+    /// Transcript row count at the last draw and the layout it was measured
+    /// under (width, tools expanded, thinking hidden): growth only counts
+    /// when the layout is unchanged, so expanding cards is not "new output".
+    pub last_transcript_rows: Cell<Option<(usize, TranscriptLayout)>>,
+    /// Transcript viewport height at the last draw, for page scrolling.
+    pub last_transcript_height: Cell<u16>,
     history_index: Option<usize>,
     draft: String,
     quit_armed_at: Option<Instant>,
@@ -163,7 +214,16 @@ impl App {
             hide_thinking: false,
             history: Vec::new(),
             dynamic_suggestions: Vec::new(),
+            command_suggestions: Vec::new(),
+            queued: Vec::new(),
+            prompt: None,
+            context_hint: String::new(),
+            pasted_blocks: Vec::new(),
             last_max_scroll: Cell::new(0),
+            scroll_growth: Cell::new(0),
+            unseen_output: Cell::new(false),
+            last_transcript_rows: Cell::new(None),
+            last_transcript_height: Cell::new(0),
             history_index: None,
             draft: String::new(),
             quit_armed_at: None,
@@ -171,31 +231,77 @@ impl App {
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
+        if self.prompt.is_some() {
+            return Vec::new();
+        }
         if let Some(argument) = dynamic_palette_argument(&self.input) {
             let query = argument.to_lowercase();
             return self
                 .dynamic_suggestions
                 .iter()
                 .filter(|suggestion| {
-                    query.is_empty() || suggestion.label.to_lowercase().contains(&query)
+                    // Descriptions carry the display names ("Claude", "API
+                    // key"), which are what people tend to type.
+                    query.is_empty()
+                        || query.split_whitespace().all(|word| {
+                            suggestion.label.to_lowercase().contains(word)
+                                || suggestion.description.to_lowercase().contains(word)
+                        })
                 })
                 .cloned()
                 .collect();
         }
-        suggestions_for(&self.input)
+        let mut suggestions = suggestions_for(&self.input);
+        if self.input.starts_with('/') && !self.input.contains(char::is_whitespace) {
+            let query = self.input.to_lowercase();
+            suggestions.extend(
+                self.command_suggestions
+                    .iter()
+                    .filter(|suggestion| suggestion.label.to_lowercase().starts_with(&query))
+                    .cloned(),
+            );
+        }
+        suggestions
+    }
+
+    /// The rows above the bottom the renderer shows: the user's own offset
+    /// plus whatever arrived below it since.
+    pub fn scroll_offset(&self) -> usize {
+        if self.scroll == 0 {
+            0
+        } else {
+            usize::from(self.scroll) + self.scroll_growth.get()
+        }
     }
 
     /// Scrolls the transcript towards older content, never past its top.
     pub fn scroll_up(&mut self, rows: u16) {
-        self.scroll = self
-            .scroll
-            .saturating_add(rows)
-            .min(self.last_max_scroll.get());
+        let offset = self.scroll_offset().saturating_add(usize::from(rows));
+        self.set_scroll(offset.min(usize::from(self.last_max_scroll.get())));
     }
 
     /// Scrolls the transcript towards the newest content.
     pub fn scroll_down(&mut self, rows: u16) {
-        self.scroll = self.scroll.saturating_sub(rows);
+        self.set_scroll(self.scroll_offset().saturating_sub(usize::from(rows)));
+    }
+
+    /// Follows the newest content again.
+    pub fn scroll_to_bottom(&mut self) {
+        self.set_scroll(0);
+    }
+
+    fn set_scroll(&mut self, offset: usize) {
+        self.scroll = offset.min(usize::from(u16::MAX)) as u16;
+        self.scroll_growth.set(0);
+        if self.scroll == 0 {
+            self.unseen_output.set(false);
+        }
+    }
+
+    /// One transcript page, less two rows of overlap so the reader keeps
+    /// their place.
+    fn page_rows(&self) -> u16 {
+        self.last_transcript_height.get().saturating_sub(2).max(1)
     }
 
     /// Clears the composer and remembers a submitted value without adding
@@ -208,6 +314,8 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.selected_suggestion = 0;
+        // Whoever sends something wants to see what it starts.
+        self.scroll_to_bottom();
     }
 
     /// Retains an externally generated transcript while keeping editor history
@@ -230,7 +338,44 @@ impl App {
             self.clear_quit_arm();
         }
 
+        if self.prompt.is_some() {
+            match (key.code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.clear_input();
+                    return Action::CancelPrompt;
+                }
+                (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.clear_input();
+                    return Action::CancelPrompt;
+                }
+                (KeyCode::Enter, modifiers)
+                    if !modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    let answer = std::mem::take(&mut self.input);
+                    self.cursor = 0;
+                    return Action::Answer(answer.trim().to_owned());
+                }
+                _ => {}
+            }
+        }
+
         match (key.code, modifiers) {
+            // pi's fullscreen bindings: Ctrl-Home and Ctrl-End scroll to the
+            // top and bottom without taking Home/End from the editor.
+            (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_to_bottom();
+                Action::None
+            }
+            (KeyCode::Home, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_up(u16::MAX);
+                Action::None
+            }
+            // End has nothing to do in an empty composer, so it jumps to the
+            // newest output there as well.
+            (KeyCode::End, _) if self.input.is_empty() && self.scroll > 0 => {
+                self.scroll_to_bottom();
+                Action::None
+            }
             (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.handle_ctrl_c()
             }
@@ -248,7 +393,11 @@ impl App {
                 }
             }
             (KeyCode::Esc, _) => {
-                if self.streaming {
+                if !self.suggestions().is_empty() {
+                    // The palette's "esc close" comes before aborting a turn.
+                    self.clear_input();
+                    Action::None
+                } else if self.streaming {
                     self.status = "Aborting".to_owned();
                     Action::Abort
                 } else if !self.input.is_empty() {
@@ -355,11 +504,11 @@ impl App {
                 Action::None
             }
             (KeyCode::PageUp, _) => {
-                self.scroll_up(10);
+                self.scroll_up(self.page_rows());
                 Action::None
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_down(10);
+                self.scroll_down(self.page_rows());
                 Action::None
             }
             (KeyCode::Enter, modifiers)
@@ -413,14 +562,19 @@ impl App {
     pub fn paste(&mut self, text: &str) {
         // Terminals deliver pasted line breaks as CR; keep them as newlines
         // instead of filtering them out with the other control characters.
-        let text = text
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\t', "    ");
+        // Tabs stay tabs: they are part of what the model should see (a
+        // Makefile, a TSV), and only the editor's rendering expands them.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let sanitized: String = crate::markdown::sanitize_terminal_text(&text)
             .chars()
-            .filter(|character| !character.is_control() || *character == '\n')
+            .filter(|character| !character.is_control() || matches!(*character, '\n' | '\t'))
             .collect();
+        if sanitized.lines().count() > LARGE_PASTE_LINES {
+            self.pasted_blocks.push(sanitized.clone());
+            if self.pasted_blocks.len() > 16 {
+                self.pasted_blocks.remove(0);
+            }
+        }
         self.insert(&sanitized);
     }
 
@@ -480,9 +634,17 @@ impl App {
     fn handle_enter(&mut self) -> Action {
         let suggestions = self.suggestions();
         if let Some(item) = suggestions.get(self.clamped_suggestion(suggestions.len())) {
-            self.set_input(&item.value);
-            if !item.execute {
-                return Action::None;
+            // A command typed out in full runs on Enter when its argument
+            // is optional (`/compact`, `/export`); only a required argument
+            // makes Enter complete the name and wait. Tab still completes.
+            let typed_in_full = self.input.trim() == item.label
+                && item.value.trim_end() == item.label
+                && !REQUIRES_ARGUMENT.contains(&item.label.as_str());
+            if !typed_in_full {
+                self.set_input(&item.value);
+                if !item.execute {
+                    return Action::None;
+                }
             }
         }
         self.request_submission(false)
@@ -507,7 +669,6 @@ impl App {
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
-        self.scroll = 0;
         self.selected_suggestion = 0;
     }
 
@@ -750,6 +911,17 @@ pub fn dynamic_palette_argument(input: &str) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Commands that do nothing useful without an argument, so Enter on the bare
+/// name completes it instead of running it.
+const REQUIRES_ARGUMENT: &[&str] = &[
+    "/fork",
+    "/label",
+    "/import",
+    "/steer",
+    "/followup",
+    "/planner-annotate",
+];
+
 fn suggestions_for(input: &str) -> Vec<Suggestion> {
     const COMMANDS: &[(&str, &str, bool)] = &[
         ("/help", "Show all commands", true),
@@ -859,6 +1031,18 @@ fn subcommand_suggestions(input: &str) -> Option<Vec<Suggestion>> {
                 ("help", "Show the Aperture commands", true),
             ],
         ),
+        (
+            "/ralph ",
+            &[
+                ("status", "Show loop progress and iteration count", true),
+                ("resume", "Continue a stopped loop", false),
+                ("list", "Loops in .ralph/", true),
+                ("stop", "End the loop", true),
+                ("start", "Start a loop: <name> <task>", false),
+                ("archive", "Move a finished loop out of the list", false),
+                ("delete", "Remove a loop and its state", false),
+            ],
+        ),
     ];
     let lowered = input.to_lowercase();
     let (prefix, words) = GATEWAYS
@@ -919,20 +1103,190 @@ mod tests {
     }
 
     #[test]
-    fn paste_keeps_carriage_return_line_breaks() {
+    fn paste_keeps_carriage_return_line_breaks_and_tabs() {
         let mut app = App::new();
         app.paste("a\r\nb\rc\td\x1b[2Je");
-        assert_eq!(app.input, "a\nb\nc    de");
+        // The tab is what the model should receive; only the editor's
+        // rendering expands it.
+        assert_eq!(app.input, "a\nb\nc\tde");
+        assert!(app.pasted_blocks.is_empty());
+    }
+
+    #[test]
+    fn a_large_paste_is_remembered_for_the_transcript_marker() {
+        let mut app = App::new();
+        let text = (1..=30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.paste(&text);
+        assert_eq!(app.input, text);
+        assert_eq!(app.pasted_blocks, [text]);
     }
 
     #[test]
     fn scrolling_is_clamped_to_the_last_rendered_extent() {
         let mut app = App::new();
         app.last_max_scroll.set(4);
+        app.last_transcript_height.set(12);
         app.handle_key(key(KeyCode::PageUp));
         assert_eq!(app.scroll, 4);
         app.scroll_down(10);
         assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn page_keys_move_a_page_less_two_rows() {
+        let mut app = App::new();
+        app.last_max_scroll.set(100);
+        app.last_transcript_height.set(20);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 18);
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.scroll, 36);
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.scroll, 18);
+    }
+
+    #[test]
+    fn submitting_or_ctrl_end_returns_to_the_newest_output() {
+        let mut app = App::new();
+        app.last_max_scroll.set(50);
+        app.scroll_up(20);
+        app.scroll_growth.set(7);
+        app.unseen_output.set(true);
+        assert_eq!(app.scroll_offset(), 27);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert_eq!(app.scroll_offset(), 0);
+        assert!(!app.unseen_output.get());
+
+        // End in an empty composer jumps too; with text it is the editor's.
+        app.scroll_up(5);
+        app.set_input("abc");
+        app.cursor = 0;
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.scroll, 5);
+        app.set_input("");
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.scroll, 0);
+
+        app.scroll_up(9);
+        app.set_input("next prompt");
+        app.record_submission("next prompt");
+        assert_eq!(app.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scrolling_further_keeps_the_rows_that_arrived_below() {
+        let mut app = App::new();
+        app.last_max_scroll.set(100);
+        app.scroll_up(10);
+        // The renderer measured 6 new rows below the viewport.
+        app.scroll_growth.set(6);
+        app.scroll_up(3);
+        assert_eq!(app.scroll_offset(), 19);
+        app.scroll_down(19);
+        assert_eq!(app.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn enter_runs_a_command_whose_argument_is_optional() {
+        for command in ["/compact", "/export", "/prompt", "/ralph"] {
+            let mut app = App::new();
+            app.set_input(command);
+            assert_eq!(
+                app.handle_key(key(KeyCode::Enter)),
+                Action::Submit(command.to_owned()),
+                "{command}"
+            );
+        }
+        // Tab still completes, and a partial name still completes on Enter.
+        let mut app = App::new();
+        app.set_input("/compact");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/compact ");
+        let mut app = App::new();
+        app.set_input("/comp");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.input, "/compact ");
+        // A required argument keeps Enter as completion.
+        let mut app = App::new();
+        app.set_input("/fork");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(app.input, "/fork ");
+    }
+
+    #[test]
+    fn prompt_templates_and_skills_join_the_slash_palette() {
+        let mut app = App::new();
+        app.command_suggestions = vec![
+            Suggestion {
+                label: "/review".to_owned(),
+                description: "Prompt template".to_owned(),
+                value: "/review ".to_owned(),
+                execute: false,
+            },
+            Suggestion {
+                label: "/skill:deploy".to_owned(),
+                description: "Skill".to_owned(),
+                value: "/skill:deploy ".to_owned(),
+                execute: false,
+            },
+        ];
+        app.set_input("/rev");
+        let labels = app
+            .suggestions()
+            .into_iter()
+            .map(|suggestion| suggestion.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["/review"]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::None,
+            "a partial name completes first"
+        );
+        assert_eq!(app.input, "/review ");
+        app.set_input("/review");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Submit("/review".to_owned())
+        );
+        app.set_input("/sk");
+        assert_eq!(app.suggestions()[0].label, "/skill:deploy");
+        app.set_input("/zzz");
+        assert!(app.suggestions().is_empty());
+    }
+
+    #[test]
+    fn a_composer_prompt_takes_enter_and_escape() {
+        let mut app = App::new();
+        app.prompt = Some(ComposerPrompt {
+            label: "API key for openai".to_owned(),
+            secret: true,
+        });
+        app.set_input("/model");
+        assert!(app.suggestions().is_empty(), "no palette while answering");
+        app.set_input("sk-test");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Action::Answer("sk-test".to_owned())
+        );
+        assert!(app.input.is_empty());
+        assert!(app.history.is_empty(), "a secret never enters the history");
+        app.set_input("half");
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::CancelPrompt);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn escape_closes_the_palette_before_aborting_a_turn() {
+        let mut app = App::new();
+        app.streaming = true;
+        app.set_input("/he");
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.input.is_empty());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::Abort);
     }
 
     #[test]
