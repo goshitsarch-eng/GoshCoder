@@ -12,6 +12,9 @@ pub mod computeruse;
 pub mod config;
 pub mod export_html;
 pub mod google_auth;
+pub mod grok_accounts;
+pub mod grok_cli;
+pub mod grok_imagine;
 pub mod llm;
 pub mod markdown;
 pub mod meta_muse;
@@ -154,6 +157,7 @@ Usage:
   goshcoder auth <subcommand>        Manage credentials
   goshcoder omni <subcommand>        Manage an OmniRoute gateway
   goshcoder aperture <subcommand>    Manage Tailscale Aperture
+  goshcoder grok-cli <subcommand>    Grok CLI usage and accounts
   goshcoder ralph <subcommand>       Manage Ralph loops
   goshcoder sessions [subcommand]    List, inspect, export, import, or remove sessions
   goshcoder prompts <subcommand>     Manage prompt templates
@@ -339,6 +343,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         Some("omni") => omni_cli::command(&args[1..]),
         Some("aperture") => aperture_cli::command(&args[1..]),
+        Some("grok-cli") => provider_cli::grok_cli_command(&args[1..]),
         Some("sessions") => sessions::command(&args[1..]),
         Some("prompts") => prompts::command(&args[1..]),
         Some("ralph") => ralph_cli::command(&args[1..]),
@@ -360,6 +365,7 @@ fn unknown_command_message(command: &str) -> String {
         "auth",
         "omni",
         "aperture",
+        "grok-cli",
         "ralph",
         "sessions",
         "prompts",
@@ -2074,8 +2080,47 @@ fn dispatch_login_command<'a>(
     CommandDispatch::Suspended(Box::new(move || {
         run_self_subprocess(&["auth", subcommand, &provider_id])?;
         catalog.clear_oauth_refresh_failure(&provider_id);
+        // A Grok CLI login is what makes `image_gen` available.
+        prepared.sync_image_tool();
         Ok(after_login_message(prepared, catalog, &provider_id))
     }))
+}
+
+/// `/grok-cli-imagine:tool [on|off|status]`: the persisted `image_gen`
+/// switch. With no argument it toggles, as upstream does.
+fn image_tool_command(prepared: &runtime::PreparedSession, rest: &str) -> Result<String, String> {
+    let argument = rest.trim().to_ascii_lowercase();
+    if !matches!(argument.as_str(), "" | "on" | "off" | "status") {
+        return Err("Usage: /grok-cli-imagine:tool [on|off|status]".to_owned());
+    }
+    let path = prepared.imagine_config_path();
+    let loaded = grok_imagine::load_config(&path);
+    let mut lines = loaded.warning.into_iter().collect::<Vec<_>>();
+    let on_off = |value: bool| if value { "on" } else { "off" };
+    if argument == "status" {
+        lines.push(format!(
+            "image_gen persisted: {}; active: {}",
+            on_off(loaded.enabled),
+            on_off(prepared.image_tool_active())
+        ));
+        return Ok(lines.join("\n"));
+    }
+    let enabled = if argument.is_empty() {
+        !loaded.enabled
+    } else {
+        argument == "on"
+    };
+    grok_imagine::save_config(&path, enabled)
+        .map_err(|error| format!("Could not save image_gen setting: {error}"))?;
+    let active = prepared.sync_image_tool();
+    lines.push(format!("image_gen: {}", on_off(enabled)));
+    if enabled && !active {
+        lines.push(
+            "It becomes available once Grok CLI is signed in (/login grok-cli) and tools are on."
+                .to_owned(),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 /// The in-chat command that configures a gateway provider; `/login` would
@@ -2132,6 +2177,7 @@ const FEATURED_PROVIDERS: &[&str] = &[
     "openai-codex",
     "openai",
     "google",
+    "grok-cli",
     "xai",
     "openrouter",
     "deepseek",
@@ -2190,7 +2236,7 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
             let method = match provider.id.as_str() {
                 "openai-codex" => "sign in with ChatGPT Plus/Pro",
                 "anthropic" => "sign in with Claude Pro/Max",
-                "xai" => "sign in with your Grok subscription",
+                "grok-cli" | "xai" => "sign in with your Grok subscription",
                 "meta" => "sign in with your Meta account",
                 "meta-muse" => "sign in with your Muse Code subscription",
                 "kimi-coding" => "sign in with Kimi",
@@ -2217,8 +2263,8 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
 }
 
 /// Whether a provider with a login flow also takes an API key. Subscription
-/// providers (a ChatGPT plan, Meta Muse Code, which refuses any key Meta does
-/// not confirm as subscription-backed) have none.
+/// providers (a ChatGPT plan, Grok CLI, Meta Muse Code, which refuses any key
+/// Meta does not confirm as subscription-backed) have none.
 fn api_key_login_available(catalog: &catalog::Catalog, provider_id: &str) -> bool {
     catalog
         .provider(provider_id)
@@ -2230,6 +2276,7 @@ fn api_key_login_available(catalog: &catalog::Catalog, provider_id: &str) -> boo
 fn api_key_alternative(provider_id: &str) -> (&'static str, &'static str) {
     match provider_id {
         "meta-muse" => ("meta", "Meta Model API"),
+        "grok-cli" => ("xai", "xAI API"),
         _ => ("openai", "OpenAI API"),
     }
 }
@@ -2335,7 +2382,7 @@ fn dispatch_runtime_slash_command<'a>(
             append_view_message(
                 view,
                 MessageRole::Command,
-                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
+                "Slash commands:\n  /help                 Show this help\n  /model [ref]          Open the model picker, or switch to provider/model\n  /thinking [level]     List or choose reasoning effort\n  /tools                List active tools\n  /status, /session     Show live session information\n  /messages             Show transcript summary\n  /queue                Show queued steering/follow-up messages\n  /steer <text>         Guide an active response\n  /followup <text>      Queue the next turn\n  /clear, /new          Reset this transcript\n  /compact [focus]      Summarize older context and keep recent turns\n  /name <text>          Set the persisted session name\n  /sessions             List saved sessions\n  /resume <id>          Switch to a saved session\n  /tree, /fork, /label  Inspect or rewind saved-session branches\n  /clone                Duplicate the current saved session\n  /export [path]        Save this session as HTML (.md or .jsonl by extension)\n  /import <path>        Adopt a session file and switch to it\n  /share [confirm]      Upload this session as a secret GitHub gist\n  /prompt <action>      List, save, edit, remove, back up, or restore prompts\n  /reload               Reload local context, prompts, and skills\n  /resources            Show loaded context, prompts, and skills\n  /ralph <subcommand>   Manage Ralph loops\n  /planner              Toggle planning mode\n  /planner-review [URL] Review local changes or a GitHub PR\n  /planner-annotate <target>  Annotate a file, folder, or URL\n  /planner-last         Annotate the latest assistant response\n  /login [provider]     Open the provider picker, or log in to one (keeps existing logins)\n  /grok-cli-usage       Show the Grok CLI subscription's weekly usage\n  /grok-cli-imagine <prompt> [--image <path>] [--aspect <r>] [--out <path>]  Generate or edit an image with Grok Imagine\n  /grok-cli-imagine:tool [on|off|status]  Offer the image_gen tool to the model, or not\n  /grok-cli-accounts [list|use|add|login|logout|rename|remove]  Manage several Grok CLI accounts\n  /grok-cli-conv [status|rotate]  Show or rotate the Grok CLI conversation ID\n  /omni [command]       Set up, sync, or inspect an OmniRoute gateway\n  /aperture [command]   Manage a Tailscale Aperture gateway\n  /btw <question>       Ask a side question without touching the transcript\n  /hotkeys              Show keyboard shortcuts\n  /exit                 Leave chat"
                     .to_owned(),
             );
             CommandDispatch::Handled
@@ -2817,6 +2864,70 @@ fn dispatch_runtime_slash_command<'a>(
             CommandDispatch::Handled
         }
         "/login" => dispatch_login_command(app, view, prepared, catalog, rest, fullscreen),
+        "/grok-cli-imagine" => {
+            if rest.is_empty() {
+                append_view_message(
+                    view,
+                    MessageRole::Error,
+                    "Usage: /grok-cli-imagine <prompt> [--image|--edit <path>] [--aspect <ratio>] [--out|-o <path>]",
+                );
+                return CommandDispatch::Handled;
+            }
+            let context = prepared.imagine_context();
+            let arguments = rest.to_owned();
+            start_background_command(view, "/grok-cli-imagine", move || {
+                grok_imagine::run_command(&context, &arguments).map(|lines| lines.join("\n"))
+            });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-imagine:tool" => {
+            match image_tool_command(prepared, rest) {
+                Ok(message) => append_view_message(view, MessageRole::Command, message),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/grok-cli-usage" => {
+            let catalog = catalog.clone();
+            let agent_dir = catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir);
+            let session = prepared.request_session_id().to_owned();
+            start_background_command(view, "/grok-cli-usage", move || {
+                Ok(grok_cli::usage_report(&catalog, &agent_dir, &session).join("\n\n"))
+            });
+            CommandDispatch::Handled
+        }
+        "/grok-cli-accounts" => {
+            let accounts = grok_accounts::Accounts::new(catalog);
+            match grok_accounts::chat_command(&accounts, prepared.request_session_id(), rest) {
+                Ok(grok_accounts::AccountsCommand::Done(message)) => {
+                    append_view_message(view, MessageRole::Command, message);
+                }
+                Ok(grok_accounts::AccountsCommand::Terminal(arguments)) => {
+                    // The OAuth login owns the terminal, as /login's does.
+                    return CommandDispatch::Suspended(Box::new(move || {
+                        let mut child = vec!["grok-cli"];
+                        child.extend(arguments.iter().map(String::as_str));
+                        run_self_subprocess(&child)?;
+                        catalog.clear_oauth_refresh_failure(grok_cli::PROVIDER_ID);
+                        prepared.sync_image_tool();
+                        Ok("Grok CLI accounts updated; /grok-cli-accounts lists them.".to_owned())
+                    }));
+                }
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
+        "/grok-cli-conv" => {
+            match grok_cli::conv_command(prepared.request_session_id(), rest) {
+                Ok(message) => append_view_message(view, MessageRole::Command, message),
+                Err(error) => append_view_message(view, MessageRole::Error, error),
+            }
+            CommandDispatch::Handled
+        }
         "/omni" => dispatch_omni_command(view, catalog, rest),
         "/aperture" => dispatch_aperture_command(view, catalog, rest),
         _ if command.starts_with('/') => {
@@ -3121,6 +3232,11 @@ fn reserved_prompt_names(resources: &resources::ResourceSet) -> Vec<String> {
         "aperture",
         "aperture:onboarding",
         "aperture:settings",
+        "grok-cli-accounts",
+        "grok-cli-conv",
+        "grok-cli-imagine",
+        "grok-cli-imagine:tool",
+        "grok-cli-usage",
         "btw",
         "thinking",
         "system",
@@ -4349,5 +4465,31 @@ mod tests {
         assert!(summary.starts_with("a=\"value\" z=\""));
         assert!(summary.ends_with("..."));
         assert!(summary.len() <= "a=\"value\" z=".len() + 63);
+    }
+
+    #[test]
+    fn the_login_picker_offers_grok_cli_as_a_subscription_without_a_key_row() {
+        let catalog =
+            catalog::Catalog::with_environment(None, Arc::new(|_| None)).expect("catalog");
+        let choices = login_choices(&catalog);
+        let values = choices
+            .iter()
+            .map(|choice| choice.value.as_str())
+            .collect::<Vec<_>>();
+        let grok = choices
+            .iter()
+            .find(|choice| choice.value == "/login grok-cli")
+            .expect("grok-cli row");
+        assert!(
+            grok.description
+                .ends_with("Grok CLI  ·  sign in with your Grok subscription"),
+            "{}",
+            grok.description
+        );
+        assert!(!values.contains(&"/login grok-cli key"));
+        // xAI keeps both of its ways in, and Grok CLI is listed before it.
+        assert!(values.contains(&"/login xai key"));
+        let position = |value: &str| values.iter().position(|candidate| *candidate == value);
+        assert!(position("/login grok-cli") < position("/login xai"));
     }
 }

@@ -68,6 +68,7 @@ something goes wrong:
 | Session files (pi v3 JSONL) | `src/sessionlog.rs`, `src/session.rs` |
 | Tools and workspace confinement | `src/tools.rs` |
 | Gateways | `src/omniroute.rs`, `src/aperture*.rs`, session start in `src/runtime.rs` |
+| Grok CLI provider (pi-grok-cli) | `src/grok_cli.rs`, `src/grok_imagine.rs`, `src/grok_accounts.rs`; OAuth deltas in `src/oauth.rs`, request hooks in `providers.rs` |
 | Fullscreen interface | `src/state.rs` (editor/palette), `src/ui.rs` (rendering), `src/main.rs` (event loop, slash commands) |
 
 ## Starting without credentials
@@ -177,6 +178,27 @@ is installed; the server is spawned lazily and closed with the session.
   `is_subs_active`; keep that check, it is the provider's whole purpose.
 - The `openai-responses` builder honours `compat.supportsDeveloperRole`
   (default true, as pi); Muse sets it false and gets a `system` message.
+- Grok CLI (`grok-cli`) is an `openai-responses` provider with three hooks
+  in the request path, all keyed on the provider id: `run_stream` passes the
+  body through `grok_cli::prepare_payload`, and `send_streaming_request`
+  adds the version and conversation headers per attempt and owns the retry
+  budget (`grok_cli::RequestAttempt`: 426 refreshes the version, 401/502/520
+  rotate the conversation, the generic retry is off). The conversation
+  generation lives in the session log; `runtime::prepare_session` registers
+  the session's `SessionCustomRecorder` under the agent's request session id,
+  and the store reads the newest `grok-cli-conv-id-v1` entry on the current
+  branch, so forks and resumes need no extra bookkeeping. Note that the
+  agent keeps the session id it was created with across `/new` and
+  `/resume`; the Grok CLI store follows the open session instead.
+- Grok CLI accounts: Account 1 is `auth.json`'s `grok-cli` login; further
+  accounts live in `<agent_dir>/grok-cli/accounts.json`, which exists only
+  when the catalog knows an agent directory (an injected test environment
+  without one sees Account 1 alone). `catalog_assistant_responder` swaps in
+  the token of the account the session chose (`grok_accounts::Accounts::
+  request_token`), and `resolve_auth` falls back to a saved account when
+  `auth.json` has no login. Exhaustion rotation is an agent subscription
+  that queues upstream's continuation as a follow-up on the failed turn;
+  `turns::finish_run` picks it up like any queued message.
 
 ## Sessions
 

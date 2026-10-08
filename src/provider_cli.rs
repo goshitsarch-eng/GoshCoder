@@ -15,7 +15,7 @@ use crate::{
     catalog::{
         AuthKind, Catalog, CatalogError, Credential, CredentialKind, CredentialStore, Provider,
     },
-    config, meta_muse, oauth,
+    config, grok_accounts, grok_cli, meta_muse, oauth,
 };
 
 /// Executes `goshcoder providers`.
@@ -86,7 +86,7 @@ pub fn models_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 const AUTH_USAGE: &str = "usage: goshcoder auth <subcommand>
 
   login <provider>   Sign in through the browser or a device code
-                     (anthropic, openai-codex, xai, meta, meta-muse, kimi-coding,
+                     (anthropic, openai-codex, grok-cli, xai, meta, meta-muse, kimi-coding,
                      openrouter)
   set <provider>     Store an API key for any provider
   list               Show stored credentials
@@ -271,6 +271,61 @@ pub fn auth_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 }
 
+const GROK_CLI_USAGE: &str = "usage: goshcoder grok-cli <subcommand>
+
+  usage                        Show the subscription's weekly usage
+  accounts                     List the saved Grok CLI accounts
+  accounts add [label]         Add an account and sign in to it
+  accounts login <n>           Sign in to an account again
+  accounts logout <n>          Sign out of an account
+  accounts rename <n> <label>  Rename an account
+  accounts remove <n>          Remove an account (Account 1 stays)
+  accounts use <n>             Make an account the default for new sessions
+
+Accounts are named by their number in the list, their label, or their id.";
+
+/// Executes `goshcoder grok-cli usage|accounts`.
+pub fn grok_cli_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let words = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let catalog = Catalog::with_default_credentials()?;
+    match words.as_slice() {
+        ["usage"] => {
+            let agent_dir = catalog
+                .dynamic_paths()
+                .agent_dir
+                .clone()
+                .unwrap_or_else(config::agent_dir);
+            println!(
+                "{}",
+                grok_cli::usage_report(&catalog, &agent_dir, "").join("\n\n")
+            );
+            Ok(())
+        }
+        ["accounts", rest @ ..] => {
+            config::ensure_agent_dir()?;
+            let accounts = grok_accounts::Accounts::new(&catalog);
+            let output = grok_accounts::cli_command(&accounts, rest, &|client| {
+                client
+                    .login(
+                        oauth::OAuthProviderId::GrokCli,
+                        Arc::new(TerminalOAuthInteraction),
+                        &oauth::ProcessEnvironment,
+                        &oauth::CancellationToken::new(),
+                    )
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(command_error)?;
+            println!("{output}");
+            Ok(())
+        }
+        ["help" | "-h" | "--help"] => {
+            println!("{GROK_CLI_USAGE}");
+            Ok(())
+        }
+        _ => Err(command_error(GROK_CLI_USAGE)),
+    }
+}
+
 /// Blocking CLI presentation for the provider-neutral OAuth flow.
 ///
 /// Browser and device authorization remain owned by `oauth`; this adapter only
@@ -411,6 +466,12 @@ pub(crate) fn provider_setup_hint(provider: &Provider) -> String {
             (_, "openai-codex" | "meta-muse") => {
                 format!("run: goshcoder auth login {}", provider.id)
             }
+            // Grok CLI takes a login or a bearer token, never a stored key.
+            (_, "grok-cli") => format!(
+                "run: goshcoder auth login {}, or set {}",
+                provider.id,
+                grok_cli::TOKEN_ENV
+            ),
             (true, _) => format!(
                 "run: goshcoder auth login {id}, or goshcoder auth set {id} for an API key",
                 id = provider.id

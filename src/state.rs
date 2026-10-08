@@ -761,6 +761,31 @@ fn suggestions_for(input: &str) -> Vec<Suggestion> {
         ("/help", "Show all commands", true),
         ("/model", "Open the model picker", false),
         ("/login", "Open the provider picker and log in", false),
+        (
+            "/grok-cli-imagine",
+            "Generate or edit an image with Grok Imagine",
+            false,
+        ),
+        (
+            "/grok-cli-imagine:tool",
+            "Turn the image_gen tool on or off",
+            false,
+        ),
+        (
+            "/grok-cli-usage",
+            "Show the Grok CLI subscription's usage",
+            true,
+        ),
+        (
+            "/grok-cli-accounts",
+            "List, add, or switch Grok CLI accounts",
+            false,
+        ),
+        (
+            "/grok-cli-conv",
+            "Show or rotate the Grok CLI conversation ID",
+            false,
+        ),
         ("/omni", "Manage an OmniRoute gateway", false),
         (
             "/aperture",

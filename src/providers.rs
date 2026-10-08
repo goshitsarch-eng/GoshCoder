@@ -47,8 +47,8 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::{
-    agent, aperture, bedrock, catalog, google_auth, llm, mistral, oauth, omni_prompt_tools,
-    omniroute, stream,
+    agent, aperture, bedrock, catalog, google_auth, grok_cli, llm, mistral, oauth,
+    omni_prompt_tools, omniroute, stream,
 };
 
 pub const API_OPENAI_COMPLETIONS: &str = "openai-completions";
@@ -301,6 +301,9 @@ pub struct ProviderCredentials {
     api_key: Option<String>,
     headers: BTreeMap<String, Option<String>>,
     environment: BTreeMap<String, String>,
+    /// Grok CLI request settings from the catalog's environment; `None`
+    /// falls back to the process environment.
+    grok_cli: Option<grok_cli::RequestSettings>,
 }
 
 impl ProviderCredentials {
@@ -309,6 +312,7 @@ impl ProviderCredentials {
             api_key: Some(api_key.into()),
             headers: BTreeMap::new(),
             environment: BTreeMap::new(),
+            grok_cli: None,
         }
     }
 
@@ -342,7 +346,14 @@ impl ProviderCredentials {
             api_key: resolved.auth().api_key().map(str::to_owned),
             headers: resolved.effective_headers().clone(),
             environment: resolved.auth().environment().clone(),
+            grok_cli: None,
         }
+    }
+
+    /// Supplies the Grok CLI request settings (the version-pointer URL).
+    pub fn with_grok_cli_settings(mut self, settings: grok_cli::RequestSettings) -> Self {
+        self.grok_cli = Some(settings);
+        self
     }
 }
 
@@ -784,6 +795,16 @@ impl ProviderResponderFactory {
                 unreachable!("Bedrock is dispatched before the generic HTTP adapter")
             }
         }?;
+        let mut payload = payload;
+        if model.provider == grok_cli::PROVIDER_ID && protocol == ProviderProtocol::OpenAiResponses
+        {
+            grok_cli::prepare_payload(
+                &mut payload,
+                model,
+                &options.thinking_level,
+                &options.session_id,
+            );
+        }
         let anthropic_beta = (protocol == ProviderProtocol::AnthropicMessages)
             .then(|| anthropic_beta_features(model, context, &anthropic_shape).join(","))
             .filter(|features| !features.is_empty());
@@ -881,6 +902,20 @@ impl ProviderResponderFactory {
             anthropic_beta,
         )?;
         let body = serde_json::to_vec(payload)?;
+        // pi-grok-cli's proxyRetry.ts owns this provider's retry budget: the
+        // generic one would resend a conversation id the proxy just rejected.
+        let mut grok_attempt = (model.provider == grok_cli::PROVIDER_ID).then(|| {
+            let settings = credentials
+                .grok_cli
+                .clone()
+                .unwrap_or_else(grok_cli::RequestSettings::from_process_environment);
+            grok_cli::RequestAttempt::begin(&settings, &options.session_id)
+        });
+        let max_retries = if grok_attempt.is_some() {
+            0
+        } else {
+            self.config.max_retries
+        };
 
         let mut retry_index = 0;
         loop {
@@ -890,9 +925,17 @@ impl ProviderResponderFactory {
             let header_deadline = (protocol == ProviderProtocol::MistralConversations)
                 .then_some(self.config.mistral_response_header_timeout)
                 .flatten();
+            let mut attempt_headers = headers.clone();
+            if let Some(attempt) = grok_attempt.as_ref() {
+                for (name, value) in attempt.headers() {
+                    let value = HeaderValue::from_str(&value)
+                        .map_err(|_| ProviderAdapterError::InvalidHeaderValue(name.to_owned()))?;
+                    attempt_headers.insert(HeaderName::from_static(name), value);
+                }
+            }
             let sent = self.send_request(
                 endpoint.clone(),
-                headers.clone(),
+                attempt_headers,
                 body.clone(),
                 &options.cancellation,
                 header_deadline,
@@ -905,9 +948,14 @@ impl ProviderResponderFactory {
                         self.config.max_error_body_bytes,
                         protocol,
                     );
-                    if !stream::is_retryable_provider_error(&error)
-                        || retry_index >= self.config.max_retries
+                    // Nothing has streamed yet, so a gate or proxy rejection
+                    // can be retried without the caller seeing it.
+                    if let Some(attempt) = grok_attempt.as_mut()
+                        && attempt.retry_after(error.status)
                     {
+                        continue;
+                    }
+                    if !stream::is_retryable_provider_error(&error) || retry_index >= max_retries {
                         return Err(ProviderAdapterError::Provider(error));
                     }
                     wait_for_retry(
@@ -918,9 +966,7 @@ impl ProviderResponderFactory {
                     )?;
                 }
                 Err(ProviderAdapterError::Provider(error)) => {
-                    if !stream::is_retryable_provider_error(&error)
-                        || retry_index >= self.config.max_retries
-                    {
+                    if !stream::is_retryable_provider_error(&error) || retry_index >= max_retries {
                         return Err(ProviderAdapterError::Provider(error));
                     }
                     wait_for_retry(
@@ -1004,7 +1050,18 @@ impl ProviderResponderFactory {
             let resolved = catalog
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
-            let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            let mut credentials = ProviderCredentials::from_resolved_model(&resolved);
+            if model.provider == grok_cli::PROVIDER_ID {
+                credentials = credentials.with_grok_cli_settings(
+                    grok_cli::RequestSettings::from_lookup(|name| catalog.environment_value(name)),
+                );
+                // A session that chose another saved account sends its token.
+                if let Some(token) = crate::grok_accounts::Accounts::new(&catalog)
+                    .request_token(&options.session_id)?
+                {
+                    credentials = credentials.with_api_key(token);
+                }
+            }
             // A credential that names its own API base URL (Meta Muse) wins
             // over the one the session's model copy was created with, so a
             // re-minted key is always sent where Meta said to send it.
@@ -10048,5 +10105,440 @@ mod tests {
         default_compat.compat = None;
         let input = openai_responses_input(&default_compat, &text_context()).expect("input");
         assert_eq!(input[0]["role"], "developer");
+    }
+
+    // -- Grok CLI (pi-grok-cli) on the wire ------------------------------------
+
+    const GROK_OK_BODY: &str = concat!(
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_grok\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"grok says hi\"}\n\n",
+        "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_grok\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"grok says hi\",\"annotations\":[]}]}}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_grok\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n"
+    );
+
+    struct GrokWire {
+        catalog: Arc<catalog::Catalog>,
+        model: llm::Model,
+        requests: Receiver<CapturedRequest>,
+        server: JoinHandle<()>,
+        /// Held so the version server can report each lookup it served.
+        _version_requests: Receiver<CapturedRequest>,
+        version_server: JoinHandle<()>,
+    }
+
+    /// A catalog whose Grok CLI provider points at loopback servers: one for
+    /// the inference endpoint, one for the stable-version pointer.
+    fn grok_wire(model_id: &str, responses: Vec<Vec<u8>>, versions: Vec<&'static str>) -> GrokWire {
+        let (base_url, requests, server) = test_server(responses);
+        let (version_base, version_requests, version_server) = test_server(
+            versions
+                .into_iter()
+                .map(|version| http_response(200, version))
+                .collect(),
+        );
+        let environment = BTreeMap::from([
+            (grok_cli::TOKEN_ENV.to_owned(), "grok-env-token".to_owned()),
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base_url}/v1/")),
+            (
+                grok_cli::VERSION_URL_ENV.to_owned(),
+                format!("{version_base}/cli/stable"),
+            ),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                None,
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog"),
+        );
+        let model = catalog
+            .model(grok_cli::PROVIDER_ID, model_id)
+            .expect("grok-cli model");
+        GrokWire {
+            catalog,
+            model,
+            requests,
+            server,
+            _version_requests: version_requests,
+            version_server,
+        }
+    }
+
+    fn grok_options(session_id: &str) -> (agent::RequestOptions, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&events);
+        let mut request_options = options(agent::CancellationToken::default());
+        request_options.session_id = session_id.to_owned();
+        request_options.assistant_event_listener = Some(Arc::new(move |event| {
+            log.lock().expect("event log").push(event.event_type);
+        }));
+        (request_options, events)
+    }
+
+    fn header<'a>(request: &'a CapturedRequest, name: &str) -> Option<&'a str> {
+        request.headers.get(name).map(String::as_str)
+    }
+
+    #[test]
+    fn grok_cli_requests_carry_the_official_client_identity_and_a_sanitized_body() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![http_response(200, GROK_OK_BODY)],
+            vec!["1.2.3\n"],
+        );
+        assert_eq!(
+            wire.model.base_url,
+            wire.model.base_url.trim_end_matches('/')
+        );
+        let (request_options, events) = grok_options("grok-wire-identity");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let request = wire.requests.recv().expect("captured request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert_eq!(response.content[0].plain_text(), Some("grok says hi"));
+        assert_eq!(request.target, "/v1/responses");
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer grok-env-token")
+        );
+        assert_eq!(
+            header(&request, "x-grok-client-identifier"),
+            Some("grok-shell")
+        );
+        assert_eq!(header(&request, "x-xai-token-auth"), Some("xai-grok-cli"));
+        assert_eq!(header(&request, "x-grok-model-override"), Some("grok-4.3"));
+        assert_eq!(
+            header(&request, "user-agent"),
+            Some("grok-shell/1.2.3 (macos; aarch64)")
+        );
+        assert_eq!(header(&request, "x-grok-client-version"), Some("1.2.3"));
+        assert_eq!(
+            header(&request, "x-grok-conv-id"),
+            Some("grok-wire-identity")
+        );
+
+        let sent: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(sent["model"], "grok-4.3");
+        assert_eq!(sent["instructions"], "be concise");
+        assert!(
+            sent["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .all(|item| !matches!(item["role"].as_str(), Some("developer" | "system"))),
+            "{sent}"
+        );
+        assert_eq!(sent["input"][0]["role"], "user");
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(sent["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(sent["prompt_cache_key"], "grok-wire-identity");
+        assert!(sent.get("prompt_cache_retention").is_none());
+        assert_eq!(sent["tools"][0]["name"], "weather");
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+    }
+
+    #[test]
+    fn grok_cli_effort_is_dropped_for_models_that_reject_it() {
+        let wire = grok_wire(
+            "grok-build",
+            vec![http_response(200, GROK_OK_BODY)],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-build");
+        factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let request = wire.requests.recv().expect("captured request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        let sent: Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(sent["reasoning"], json!({"summary": "auto"}));
+        assert_eq!(
+            header(&request, "x-grok-model-override"),
+            Some("grok-build")
+        );
+    }
+
+    #[test]
+    fn grok_cli_426_refreshes_the_client_version_once_and_retries_unseen() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(426, "{\"error\":\"upgrade required\"}"),
+                http_response(200, GROK_OK_BODY),
+            ],
+            vec!["1.2.3", "1.2.4"],
+        );
+        let (request_options, events) = grok_options("grok-wire-426");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        let first = wire.requests.recv().expect("rejected request");
+        let second = wire.requests.recv().expect("retried request");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(header(&first, "x-grok-client-version"), Some("1.2.3"));
+        assert_eq!(header(&second, "x-grok-client-version"), Some("1.2.4"));
+        assert_eq!(
+            header(&second, "user-agent"),
+            Some("grok-shell/1.2.4 (macos; aarch64)")
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+    }
+
+    #[test]
+    fn grok_cli_a_second_426_is_reported_rather_than_retried_again() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(426, "{\"error\":\"upgrade required\"}"),
+                http_response(426, "{\"error\":\"still too old\"}"),
+            ],
+            vec!["1.2.3", "1.2.4"],
+        );
+        let (request_options, _) = grok_options("grok-wire-426-twice");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(wire.requests.try_iter().count(), 2);
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(
+            response.error_message.contains("426"),
+            "{}",
+            response.error_message
+        );
+        assert!(
+            response.error_message.contains("still too old"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[test]
+    fn grok_cli_proxy_rejections_rotate_the_conversation_id_twice_at_most() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(502, "bad gateway"),
+                http_response(520, "unknown"),
+                http_response(200, GROK_OK_BODY),
+            ],
+            vec!["1.2.3"],
+        );
+        let (request_options, events) = grok_options("grok-wire-rotate");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("grok-cli response");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        let conv_ids = wire
+            .requests
+            .try_iter()
+            .map(|request| header(&request, "x-grok-conv-id").map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conv_ids,
+            [
+                Some("grok-wire-rotate".to_owned()),
+                Some("grok-wire-rotate:1".to_owned()),
+                Some("grok-wire-rotate:2".to_owned()),
+            ]
+        );
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(
+            !events
+                .lock()
+                .expect("events")
+                .contains(&stream::EVENT_ERROR.to_owned())
+        );
+        // The next turn keeps the rotated conversation.
+        assert_eq!(
+            grok_cli::conv_id("grok-wire-rotate").as_deref(),
+            Some("grok-wire-rotate:2")
+        );
+
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![
+                http_response(401, "unauthorized"),
+                http_response(401, "unauthorized"),
+                http_response(401, "still unauthorized"),
+            ],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-rotate-exhausted");
+        let response = factory(0).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(
+            wire.requests.try_iter().count(),
+            3,
+            "two rotations, then the error"
+        );
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+        assert!(
+            response.error_message.contains("401"),
+            "{}",
+            response.error_message
+        );
+    }
+
+    #[test]
+    fn grok_cli_disables_the_generic_retry_that_other_providers_keep() {
+        let wire = grok_wire(
+            "grok-4.3",
+            vec![http_response(500, "server error")],
+            vec!["1.2.3"],
+        );
+        let (request_options, _) = grok_options("grok-wire-no-retry");
+        let response = factory(2).catalog_assistant_responder(wire.catalog.clone())(
+            &wire.model,
+            &text_context(),
+            request_options,
+        )
+        .expect("normalized error message");
+        wire.server.join().expect("server");
+        wire.version_server.join().expect("version server");
+        assert_eq!(wire.requests.try_iter().count(), 1);
+        assert_eq!(response.stop_reason, stream::STOP_ERROR);
+
+        // Negative control: the same 500 is retried for another provider,
+        // which also sees none of the Grok CLI headers.
+        let (base_url, requests, server) = test_server(vec![
+            http_response(500, "server error"),
+            http_response(200, GROK_OK_BODY),
+        ]);
+        let response = factory(2)
+            .respond(
+                &model(API_OPENAI_RESPONSES, base_url),
+                &text_context(),
+                options(agent::CancellationToken::default()),
+            )
+            .expect("OpenAI response");
+        server.join().expect("server");
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(response.stop_reason, stream::STOP_STOP);
+        assert!(header(&captured[1], "x-grok-conv-id").is_none());
+        assert!(header(&captured[1], "x-grok-client-version").is_none());
+        let sent: Value = serde_json::from_slice(&captured[1].body).expect("JSON body");
+        // The system prompt stays in `input`; only Grok CLI moves it.
+        assert!(
+            matches!(
+                sent["input"][0]["role"].as_str(),
+                Some("developer" | "system")
+            ),
+            "{sent}"
+        );
+        assert!(sent.get("instructions").is_none());
+    }
+
+    #[test]
+    fn grok_cli_requests_carry_the_token_of_the_account_the_session_chose() {
+        let (base_url, requests, server) = test_server(vec![
+            http_response(200, GROK_OK_BODY),
+            http_response(200, GROK_OK_BODY),
+        ]);
+        let (version_base, _version_requests, version_server) =
+            test_server(vec![http_response(200, "1.2.3")]);
+        let agent_dir = std::env::temp_dir().join(format!(
+            "goshcoder-grok-wire-accounts-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = Arc::new(catalog::CredentialStore::in_memory());
+        store
+            .put(
+                grok_cli::PROVIDER_ID,
+                catalog::Credential::oauth("account-one-token", "refresh", i64::MAX),
+            )
+            .expect("account 1 login");
+        let environment = BTreeMap::from([
+            ("PI_GROK_CLI_BASE_URL".to_owned(), format!("{base_url}/v1")),
+            (
+                grok_cli::VERSION_URL_ENV.to_owned(),
+                format!("{version_base}/cli/stable"),
+            ),
+        ]);
+        let catalog = Arc::new(
+            catalog::Catalog::with_environment(
+                Some(store),
+                Arc::new(move |name| environment.get(name).cloned()),
+            )
+            .expect("catalog")
+            .with_dynamic_paths(catalog::DynamicPaths::for_agent_dir(&agent_dir)),
+        );
+        let accounts = crate::grok_accounts::Accounts::new(&catalog);
+        let work = accounts.add("Work").expect("add");
+        accounts
+            .store_login(
+                &work,
+                0,
+                catalog::Credential::oauth("work-token", "refresh", i64::MAX),
+            )
+            .expect("store");
+        crate::grok_accounts::choose_for_session("grok-wire-chooser", &work).expect("choose");
+        let model = catalog
+            .model(grok_cli::PROVIDER_ID, "grok-4.3")
+            .expect("model");
+        let responder = factory(0).catalog_assistant_responder(catalog.clone());
+        for session in ["grok-wire-chooser", "grok-wire-default"] {
+            let (request_options, _) = grok_options(session);
+            responder(&model, &text_context(), request_options).expect("response");
+        }
+        server.join().expect("server");
+        version_server.join().expect("version server");
+        let tokens = requests
+            .try_iter()
+            .map(|request| header(&request, "authorization").map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tokens,
+            [
+                Some("Bearer work-token".to_owned()),
+                Some("Bearer account-one-token".to_owned()),
+            ]
+        );
+        let _ = fs::remove_dir_all(agent_dir);
     }
 }
