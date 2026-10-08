@@ -60,8 +60,12 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use crate::catalog::{
-    Auth, AuthHeaders, CatalogError, Credential, CredentialKind, CredentialStore, EnvironmentLookup,
+use crate::{
+    catalog::{
+        Auth, AuthHeaders, CatalogError, Credential, CredentialKind, CredentialStore,
+        EnvironmentLookup,
+    },
+    meta_muse,
 };
 
 /// A token request is bounded independently from a model request.
@@ -158,13 +162,27 @@ pub enum OAuthError {
     DeviceTimedOut,
     Jwt(String),
     Storage(CatalogError),
+    /// A provider-specific failure whose wording is the provider's own (the
+    /// Meta Muse port keeps the extension's messages verbatim).
+    /// `unauthorized` marks one only a new login can fix.
+    Message {
+        message: String,
+        unauthorized: bool,
+    },
 }
 
 impl OAuthError {
     /// Whether retrying cannot repair this credential and a fresh login is
     /// required.
     pub fn is_unauthorized(&self) -> bool {
-        matches!(self, Self::Unauthorized { .. })
+        matches!(
+            self,
+            Self::Unauthorized { .. }
+                | Self::Message {
+                    unauthorized: true,
+                    ..
+                }
+        )
     }
 }
 
@@ -243,6 +261,7 @@ impl fmt::Display for OAuthError {
                 "failed to extract account ID from token: {message}"
             ),
             Self::Storage(error) => write!(formatter, "OAuth credential storage failed: {error}"),
+            Self::Message { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -406,6 +425,7 @@ pub enum OAuthProviderId {
     Anthropic,
     KimiCoding,
     Meta,
+    MetaMuse,
     OpenAiCodex,
     OpenRouter,
     Xai,
@@ -419,6 +439,7 @@ impl OAuthProviderId {
             Self::Anthropic => "anthropic",
             Self::KimiCoding => "kimi-coding",
             Self::Meta => "meta",
+            Self::MetaMuse => "meta-muse",
             Self::OpenAiCodex => "openai-codex",
             Self::OpenRouter => "openrouter",
             Self::Xai => "xai",
@@ -432,6 +453,7 @@ impl OAuthProviderId {
             "anthropic" => Some(Self::Anthropic),
             "kimi-coding" => Some(Self::KimiCoding),
             "meta" => Some(Self::Meta),
+            "meta-muse" => Some(Self::MetaMuse),
             "openai-codex" => Some(Self::OpenAiCodex),
             "openrouter" => Some(Self::OpenRouter),
             "xai" => Some(Self::Xai),
@@ -446,6 +468,7 @@ impl OAuthProviderId {
             Self::Anthropic => "Anthropic (Claude Pro/Max)",
             Self::KimiCoding => "Kimi Code (subscription)",
             Self::Meta => "Meta (Model API)",
+            Self::MetaMuse => "Meta Muse Code (subscription)",
             Self::OpenAiCodex => "OpenAI (ChatGPT Plus/Pro)",
             Self::OpenRouter => "OpenRouter",
             Self::Xai => "xAI (Grok subscription)",
@@ -501,6 +524,14 @@ const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         id: OAuthProviderId::Meta,
         display_name: "Meta (Model API)",
+        methods: DEVICE_METHOD,
+        flow_support: OAuthFlowSupport::Implemented,
+    },
+    // The pi-meta-muse-auth extension: the same auth.meta.com device flow,
+    // but the key is minted against the Muse Code subscription.
+    ProviderMetadata {
+        id: OAuthProviderId::MetaMuse,
+        display_name: "Meta Muse Code (subscription)",
         methods: DEVICE_METHOD,
         flow_support: OAuthFlowSupport::Implemented,
     },
@@ -571,6 +602,7 @@ pub struct OAuthAuth {
     api_key: Option<String>,
     headers: AuthHeaders,
     source: String,
+    base_url: Option<String>,
 }
 
 impl OAuthAuth {
@@ -584,6 +616,13 @@ impl OAuthAuth {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// The API base URL the credential itself names, which replaces the
+    /// provider default. Only Meta Muse sets one: Meta returns it with the
+    /// minted key.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
     }
 
     /// Moves the secret-bearing parts across the catalog integration seam.
@@ -618,6 +657,7 @@ pub fn auth_from_credential(
     }
 
     let mut headers = AuthHeaders::new();
+    let mut base_url = None;
     let api_key = match provider {
         OAuthProviderId::KimiCoding => {
             headers.insert("Authorization".to_owned(), Some(format!("Bearer {access}")));
@@ -626,6 +666,13 @@ pub fn auth_from_credential(
         OAuthProviderId::Meta => {
             headers.insert("Authorization".to_owned(), Some(format!("Bearer {access}")));
             None
+        }
+        // An openai-responses provider, so the key is an ordinary bearer API
+        // key; the stored base URL is re-validated on every use (`toAuth`).
+        OAuthProviderId::MetaMuse => {
+            let (api_key, sanctioned) = meta_muse::request_auth(credential)?;
+            base_url = Some(sanctioned);
+            Some(api_key)
         }
         OAuthProviderId::Anthropic
         | OAuthProviderId::OpenAiCodex
@@ -638,6 +685,7 @@ pub fn auth_from_credential(
         api_key,
         headers,
         source: "OAuth".to_owned(),
+        base_url,
     })
 }
 
@@ -875,7 +923,7 @@ impl OAuthEvent {
         }
     }
 
-    fn device_code(
+    pub(crate) fn device_code(
         user_code: impl Into<String>,
         verification_uri: impl Into<String>,
         interval: Duration,
@@ -893,7 +941,7 @@ impl OAuthEvent {
         }
     }
 
-    fn progress(message: impl Into<String>) -> Self {
+    pub(crate) fn progress(message: impl Into<String>) -> Self {
         Self {
             kind: OAuthEventKind::Progress,
             message: message.into(),
@@ -1510,6 +1558,23 @@ pub struct OAuthRequest {
 }
 
 impl OAuthRequest {
+    /// Builds a request for a flow implemented outside this module.
+    pub(crate) fn new(
+        method: Method,
+        url: Url,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body,
+            timeout,
+        }
+    }
+
     pub fn method(&self) -> &Method {
         &self.method
     }
@@ -1856,7 +1921,7 @@ fn append_query(url: &Url, fields: &[(&str, &str)]) -> Url {
     url
 }
 
-fn endpoint(base: &Url, path: &str) -> Result<Url> {
+pub(crate) fn endpoint(base: &Url, path: &str) -> Result<Url> {
     if !path.starts_with('/') {
         return Err(OAuthError::InvalidConfiguration(format!(
             "OAuth endpoint path {path:?} must start with '/'"
@@ -2024,6 +2089,9 @@ impl OAuthClient {
             }
             OAuthProviderId::KimiCoding => self.login_kimi(interaction, environment, cancellation),
             OAuthProviderId::Meta => self.login_meta(interaction, environment, cancellation),
+            OAuthProviderId::MetaMuse => self
+                .meta_muse_flow()
+                .login(interaction.as_ref(), cancellation),
             OAuthProviderId::OpenAiCodex => {
                 self.login_codex(interaction, environment, cancellation)
             }
@@ -2068,6 +2136,7 @@ impl OAuthClient {
             OAuthProviderId::Anthropic => self.refresh_anthropic(current, cancellation),
             OAuthProviderId::KimiCoding => self.refresh_kimi(current, environment, cancellation),
             OAuthProviderId::Meta => self.refresh_meta(current, environment, cancellation),
+            OAuthProviderId::MetaMuse => self.meta_muse_flow().refresh(current, cancellation),
             OAuthProviderId::OpenAiCodex => self.refresh_codex(current, cancellation),
             OAuthProviderId::Xai => self.refresh_xai(current, environment, cancellation),
             // The minted key does not expire; pi's refresh returns it as is.
@@ -3465,6 +3534,18 @@ fn is_loopback_hostname(host: &str) -> bool {
 }
 
 impl OAuthClient {
+    /// The Meta Muse flow lives in `meta_muse.rs`; it shares Meta's two
+    /// hosts, so a test pointing them at a fake server covers both flows.
+    fn meta_muse_flow(&self) -> meta_muse::Flow<'_> {
+        meta_muse::Flow {
+            transport: self.transport.as_ref(),
+            clock: self.clock.as_ref(),
+            auth_base_url: &self.endpoints.meta_auth_base_url,
+            api_base_url: &self.endpoints.meta_api_base_url,
+            timeout: self.token_request_timeout,
+        }
+    }
+
     fn meta_device_authorization_url(&self) -> Result<Url> {
         endpoint(
             &self.endpoints.meta_auth_base_url,
@@ -4007,6 +4088,7 @@ mod tests {
                 "anthropic",
                 "kimi-coding",
                 "meta",
+                "meta-muse",
                 "openai-codex",
                 "openrouter",
                 "xai"
@@ -5214,5 +5296,546 @@ mod tests {
             Err(OAuthError::TimedOut)
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    // --- Meta Muse Code (pi-meta-muse-auth) --------------------------------
+
+    fn muse_device_response(body: &str) -> OAuthResponse {
+        response(200, body.as_bytes().to_vec())
+    }
+
+    fn muse_standard_device() -> OAuthResponse {
+        muse_device_response(
+            r#"{
+                "device_code":"device-secret",
+                "user_code":"ABCD-EFGH",
+                "verification_uri":"https://auth.meta.com/oauth/device/",
+                "verification_uri_complete":"https://auth.meta.com/oauth/device/?code=ABCD-EFGH",
+                "expires_in":900,
+                "interval":1
+            }"#,
+        )
+    }
+
+    fn muse_identity() -> OAuthResponse {
+        response(
+            200,
+            br#"{"access_token":"identity-token","token_type":"Bearer","refresh_token":"unused"}"#
+                .to_vec(),
+        )
+    }
+
+    type MuseLogin = (
+        Result<Credential>,
+        Arc<FakeTransport>,
+        Arc<FakeClock>,
+        Arc<PromptInteraction>,
+    );
+
+    fn muse_login(responses: Vec<OAuthResponse>) -> MuseLogin {
+        let transport = Arc::new(FakeTransport::with_responses(responses));
+        let clock = Arc::new(FakeClock::new(1_000));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = Arc::new(PromptInteraction::answers([]));
+        let result = client.login(
+            OAuthProviderId::MetaMuse,
+            interaction.clone(),
+            &BTreeMap::new(),
+            &CancellationToken::new(),
+        );
+        (result, transport, clock, interaction)
+    }
+
+    fn device_events(interaction: &PromptInteraction) -> Vec<(String, String, u64, u64)> {
+        lock_unpoisoned(&interaction.events)
+            .iter()
+            .filter(|event| event.kind == OAuthEventKind::DeviceCode)
+            .map(|event| {
+                (
+                    event.user_code.clone(),
+                    event.verification_uri.clone(),
+                    event.interval_seconds,
+                    event.expires_in_seconds,
+                )
+            })
+            .collect()
+    }
+
+    fn header_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn meta_muse_device_login_mints_a_subscription_key_and_stores_pis_shape() {
+        let directory = env::temp_dir().join(format!(
+            "goshcoder-oauth-meta-muse-{}-{}",
+            std::process::id(),
+            Uuid::now_v7()
+        ));
+        let store = CredentialStore::file(directory.join("auth.json"));
+        let transport = Arc::new(FakeTransport::with_responses([
+            muse_standard_device(),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+            muse_identity(),
+            response(
+                200,
+                br#"{
+                    "api_key":"model-api-key",
+                    "base_url":"https://api.meta.ai/v1/",
+                    "is_subs_active":true,
+                    "subs_tier_name":"Everyday Usage"
+                }"#
+                .to_vec(),
+            ),
+        ]));
+        let clock = Arc::new(FakeClock::new(1_000));
+        let client = test_client(transport.clone(), clock.clone(), OAuthEndpoints::default());
+        let interaction = Arc::new(PromptInteraction::answers([]));
+        client
+            .login_and_persist(
+                OAuthProviderId::MetaMuse,
+                &store,
+                interaction.clone(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("Meta Muse login");
+
+        // One interval before the first poll and one after "pending", as the
+        // extension sleeps before every poll.
+        assert_eq!(
+            clock.sleeps(),
+            vec![Duration::from_secs(1), Duration::from_secs(1)]
+        );
+        assert_eq!(
+            device_events(&interaction),
+            vec![(
+                "ABCD-EFGH".to_owned(),
+                "https://auth.meta.com/oauth/device/?code=ABCD-EFGH".to_owned(),
+                1,
+                900
+            )]
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 4);
+        let launcher = header_map(&[
+            ("Accept", "application/json"),
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            ("User-Agent", "muse-code/launcher-2"),
+        ]);
+        assert_eq!(requests[0].method(), &Method::POST);
+        assert_eq!(
+            requests[0].url().as_str(),
+            "https://auth.meta.com/oidc/device/authorization/"
+        );
+        assert_eq!(requests[0].headers(), &launcher);
+        assert_eq!(
+            form(&requests[0]),
+            BTreeMap::from([("client_id".to_owned(), "1031625952748946".to_owned())])
+        );
+        for poll in &requests[1..3] {
+            assert_eq!(poll.method(), &Method::POST);
+            assert_eq!(
+                poll.url().as_str(),
+                "https://auth.meta.com/oidc/device/token/"
+            );
+            assert_eq!(poll.headers(), &launcher);
+            assert_eq!(
+                form(poll),
+                BTreeMap::from([
+                    (
+                        "grant_type".to_owned(),
+                        "urn:ietf:params:oauth:grant-type:device_code".to_owned()
+                    ),
+                    ("device_code".to_owned(), "device-secret".to_owned()),
+                    ("client_id".to_owned(), "1031625952748946".to_owned()),
+                ])
+            );
+        }
+        let mint = &requests[3];
+        assert_eq!(mint.method(), &Method::POST);
+        assert_eq!(mint.url().as_str(), "https://api.meta.ai/muse-code/key");
+        // No User-Agent of its own: only the launcher requests carry one.
+        assert_eq!(
+            mint.headers(),
+            &header_map(&[
+                ("Accept", "application/json"),
+                ("Authorization", "Bearer identity-token"),
+                ("Content-Type", "application/json"),
+                ("x-api-version", "1.0.0"),
+            ])
+        );
+        let body: Value = serde_json::from_slice(mint.body()).expect("mint JSON");
+        assert_eq!(body, json!({"show_subs_upsell": false}));
+
+        // auth.json holds exactly the extension's credential shape, with the
+        // trailing slash of Meta's base URL removed.
+        let stored: Value =
+            serde_json::from_slice(&std::fs::read(directory.join("auth.json")).expect("auth.json"))
+                .expect("auth.json JSON");
+        assert_eq!(
+            stored,
+            json!({"meta-muse": {
+                "type": "oauth",
+                "access": "model-api-key",
+                "refresh": "identity-token",
+                // Twelve hours from the mint, after the two one-second waits.
+                "expires": 3_000 + 12 * 60 * 60 * 1_000,
+                "baseUrl": "https://api.meta.ai/v1",
+                "subscriptionActive": true,
+                "subscriptionTier": "Everyday Usage"
+            }})
+        );
+        let credential = store
+            .read_raw("meta-muse")
+            .expect("read")
+            .expect("stored credential");
+        let auth = auth_from_credential(OAuthProviderId::MetaMuse, &credential).expect("auth");
+        assert_eq!(auth.api_key(), Some("model-api-key"));
+        assert_eq!(auth.base_url(), Some("https://api.meta.ai/v1"));
+        assert!(auth.headers().is_empty());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn meta_muse_refuses_a_key_without_a_confirmed_subscription() {
+        for mint in [
+            r#"{"api_key":"paygo-key","base_url":"https://api.meta.ai/v1","is_subs_active":false}"#,
+            r#"{"api_key":"paygo-key","is_subs_active":"true"}"#,
+            r#"{"api_key":"paygo-key"}"#,
+        ] {
+            let store = CredentialStore::in_memory();
+            let transport = Arc::new(FakeTransport::with_responses([
+                muse_standard_device(),
+                muse_identity(),
+                response(200, mint.as_bytes().to_vec()),
+            ]));
+            let client = test_client(
+                transport,
+                Arc::new(FakeClock::new(0)),
+                OAuthEndpoints::default(),
+            );
+            let error = client
+                .login_and_persist(
+                    OAuthProviderId::MetaMuse,
+                    &store,
+                    Arc::new(PromptInteraction::answers([])),
+                    &BTreeMap::new(),
+                    &CancellationToken::new(),
+                )
+                .err()
+                .expect("pay-as-you-go key refused");
+            assert_eq!(
+                error.to_string(),
+                "Meta did not confirm an active Muse Code subscription; refusing to use a potentially pay-as-you-go key",
+                "{mint}"
+            );
+            assert!(
+                store.read_raw("meta-muse").expect("read").is_none(),
+                "{mint}"
+            );
+        }
+
+        // Control: the same exchange with the subscription confirmed works.
+        let (result, ..) = muse_login(vec![
+            muse_standard_device(),
+            muse_identity(),
+            response(
+                200,
+                br#"{"api_key":"model-api-key","is_subs_active":true}"#.to_vec(),
+            ),
+        ]);
+        let credential = result.expect("subscription confirmed");
+        // Without base_url or tier: the default URL and no tier field.
+        assert_eq!(
+            credential.extra_string("baseUrl"),
+            Some("https://api.meta.ai/v1")
+        );
+        assert!(credential.extra("subscriptionTier").is_none());
+    }
+
+    #[test]
+    fn meta_muse_mint_failures_keep_the_extension_wording() {
+        let cases: [(OAuthResponse, &str, bool); 4] = [
+            (
+                response(200, br#"{"api_key":"","is_subs_active":true}"#.to_vec()),
+                "Meta Muse key exchange returned no API key",
+                false,
+            ),
+            (
+                response(403, b"{}".to_vec()),
+                "Meta Muse subscription key exchange failed with status 403",
+                true,
+            ),
+            (
+                response(503, b"busy".to_vec()),
+                "Meta Muse subscription key exchange failed with status 503",
+                false,
+            ),
+            (
+                response(
+                    200,
+                    br#"{"api_key":"k","is_subs_active":true,"base_url":"https://evil.example/v1"}"#
+                        .to_vec(),
+                ),
+                "Meta returned an untrusted Model API base URL",
+                false,
+            ),
+        ];
+        for (mint, message, unauthorized) in cases {
+            let (result, ..) = muse_login(vec![muse_standard_device(), muse_identity(), mint]);
+            let error = result.err().expect(message);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.is_unauthorized(), unauthorized, "{message}");
+        }
+    }
+
+    #[test]
+    fn meta_muse_device_responses_are_validated_and_clamped() {
+        // An untrusted complete URI falls back to a trusted plain one.
+        let (result, transport, _, interaction) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device",
+                    "verification_uri_complete":"http://auth.meta.com/device?code=U","expires_in":5}"#,
+            ),
+            response(400, br#"{"error":"access_denied"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("denied").to_string(),
+            "Meta Muse login was denied"
+        );
+        // expires_in is clamped to at least a minute; interval defaults to 5.
+        assert_eq!(
+            device_events(&interaction),
+            vec![(
+                "U".to_owned(),
+                "https://auth.meta.com/device".to_owned(),
+                5,
+                60
+            )]
+        );
+        assert_eq!(transport.requests().len(), 2);
+
+        let (result, _, _, interaction) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device","expires_in":99999,"interval":"7"}"#,
+            ),
+            response(400, br#"{"error":"expired_token"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("expired").to_string(),
+            "Meta Muse device authorization expired; run /login again"
+        );
+        assert_eq!(device_events(&interaction)[0].2, 5, "a string interval");
+        assert_eq!(
+            device_events(&interaction)[0].3,
+            1_800,
+            "clamped to 30 minutes"
+        );
+
+        // A page anywhere but https://auth.meta.com is refused before polling.
+        for device in [
+            r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com.example/device"}"#,
+            r#"{"device_code":"d","user_code":"U","verification_uri":"http://auth.meta.com/device"}"#,
+            r#"{"device_code":"","user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+            r#"{"user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+        ] {
+            let (result, transport, _, interaction) =
+                muse_login(vec![muse_device_response(device)]);
+            assert_eq!(
+                result.err().expect(device).to_string(),
+                "Meta Muse returned an invalid device authorization response",
+                "{device}"
+            );
+            assert_eq!(transport.requests().len(), 1, "{device}");
+            assert!(device_events(&interaction).is_empty(), "{device}");
+        }
+
+        let (result, ..) = muse_login(vec![response(500, b"down".to_vec())]);
+        assert_eq!(
+            result.err().expect("status").to_string(),
+            "Meta Muse device authorization failed with status 500"
+        );
+    }
+
+    #[test]
+    fn meta_muse_polling_backs_off_and_expires_with_the_extension_messages() {
+        // slow_down adds five seconds to every later wait.
+        let (result, _, clock, _) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device"}"#,
+            ),
+            response(400, br#"{"error":"slow_down"}"#.to_vec()),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+            response(400, br#"{"error":"server_error"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("unknown error").to_string(),
+            "Meta Muse device token request failed with status 400"
+        );
+        assert_eq!(
+            clock.sleeps(),
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(10)
+            ]
+        );
+
+        let (result, transport, ..) = muse_login(vec![
+            muse_device_response(
+                r#"{"device_code":"d","user_code":"U","verification_uri":"https://auth.meta.com/device","expires_in":60,"interval":30}"#,
+            ),
+            response(400, br#"{"error":"authorization_pending"}"#.to_vec()),
+        ]);
+        assert_eq!(
+            result.err().expect("deadline").to_string(),
+            "Meta Muse device authorization expired; run /login again"
+        );
+        assert_eq!(transport.requests().len(), 2);
+
+        for token in [
+            r#"{"access_token":"identity","token_type":"mac"}"#,
+            r#"{"access_token":"identity","token_type":null}"#,
+            r#"{"access_token":"","token_type":"Bearer"}"#,
+        ] {
+            let (result, ..) = muse_login(vec![
+                muse_standard_device(),
+                response(200, token.as_bytes().to_vec()),
+            ]);
+            assert_eq!(
+                result.err().expect(token).to_string(),
+                "Meta Muse returned an invalid device token response",
+                "{token}"
+            );
+        }
+        // Control: an absent token_type is accepted.
+        let (result, ..) = muse_login(vec![
+            muse_standard_device(),
+            response(200, br#"{"access_token":"identity"}"#.to_vec()),
+            response(
+                200,
+                br#"{"api_key":"model-api-key","is_subs_active":true}"#.to_vec(),
+            ),
+        ]);
+        assert_eq!(result.expect("logged in").refresh(), "identity");
+    }
+
+    fn complete_muse_credential() -> Credential {
+        let mut credential = Credential::oauth("old-model-key", "identity-token", 0);
+        credential
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        credential
+    }
+
+    #[test]
+    fn meta_muse_refresh_re_mints_from_the_stored_identity_token() {
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            200,
+            br#"{"api_key":"renewed-model-key","base_url":"https://api.meta.ai/v2","is_subs_active":true,"subs_tier_name":"Everyday Usage"}"#
+                .to_vec(),
+        )]));
+        let clock = Arc::new(FakeClock::new(50_000));
+        let client = test_client(transport.clone(), clock, OAuthEndpoints::default());
+        let refreshed = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &complete_muse_credential(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .expect("refresh");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].url().as_str(),
+            "https://api.meta.ai/muse-code/key"
+        );
+        assert_eq!(
+            requests[0]
+                .headers()
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer identity-token")
+        );
+        assert_eq!(refreshed.access(), "renewed-model-key");
+        assert_eq!(refreshed.refresh(), "identity-token");
+        assert_eq!(refreshed.expires_at_ms(), 50_000 + 12 * 60 * 60 * 1_000);
+        assert_eq!(
+            refreshed.extra_string("baseUrl"),
+            Some("https://api.meta.ai/v2")
+        );
+        assert_eq!(
+            refreshed.extra_string("subscriptionTier"),
+            Some("Everyday Usage")
+        );
+
+        // A rejected identity token needs a new login, not a retry.
+        let transport = Arc::new(FakeTransport::with_responses([response(
+            401,
+            b"{}".to_vec(),
+        )]));
+        let client = test_client(
+            transport,
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let error = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &complete_muse_credential(),
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("rejected");
+        assert!(error.is_unauthorized());
+    }
+
+    #[test]
+    fn an_incomplete_meta_muse_credential_is_refused_without_a_request() {
+        let transport = Arc::new(FakeTransport::with_responses([]));
+        let client = test_client(
+            transport.clone(),
+            Arc::new(FakeClock::new(0)),
+            OAuthEndpoints::default(),
+        );
+        let mut incomplete = Credential::oauth("model-key", "identity-token", 0);
+        incomplete
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        let error = client
+            .refresh(
+                OAuthProviderId::MetaMuse,
+                &incomplete,
+                &BTreeMap::new(),
+                &CancellationToken::new(),
+            )
+            .err()
+            .expect("incomplete");
+        assert_eq!(
+            error.to_string(),
+            "Stored Meta Muse credential is incomplete; run /login and configure Meta Muse Code again"
+        );
+        assert!(error.is_unauthorized());
+        assert!(transport.requests().is_empty());
+        let error = auth_from_credential(OAuthProviderId::MetaMuse, &incomplete)
+            .err()
+            .expect("unusable");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Stored Meta Muse credential is incomplete")
+        );
+        // The `meta` provider has no such requirement for the same entry.
+        assert!(auth_from_credential(OAuthProviderId::Meta, &incomplete).is_ok());
     }
 }

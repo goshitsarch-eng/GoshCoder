@@ -1005,11 +1005,21 @@ impl ProviderResponderFactory {
                 .resolve_model(&reference)
                 .map_err(|error| error.to_string())?;
             let credentials = ProviderCredentials::from_resolved_model(&resolved);
+            // A credential that names its own API base URL (Meta Muse) wins
+            // over the one the session's model copy was created with, so a
+            // re-minted key is always sent where Meta said to send it.
+            let model = match resolved.auth().base_url() {
+                Some(base_url) if base_url != model.base_url => Cow::Owned(llm::Model {
+                    base_url: base_url.to_owned(),
+                    ..model.clone()
+                }),
+                _ => Cow::Borrowed(model),
+            };
             // Native Aperture adaptation: a gateway-routed request carries the
             // provider-qualified model id and the provenance headers, and a
             // transient gateway restart is tagged so the retry classifier
             // recognizes it (cmd/goshcoder/aperture_session.go).
-            let routed = catalog.aperture_request_model(model, &options.session_id);
+            let routed = catalog.aperture_request_model(&model, &options.session_id);
             let gateway_routed = matches!(routed, Cow::Owned(_));
             let result = transport
                 .respond_with_credentials(&routed, context, options, credentials)
@@ -4215,7 +4225,9 @@ fn openai_responses_input(model: &llm::Model, context: &llm::Context) -> Result<
         context,
         ResponsesInputOptions {
             include_system_prompt: true,
-            supports_developer_role: true,
+            // pi's `openai-responses.ts` reads this from compat (default
+            // true); Meta Muse rejects the developer role.
+            supports_developer_role: compat_bool(model, "supportsDeveloperRole", true),
             allowed_tool_call_providers: OPENAI_TOOL_CALL_PROVIDERS,
             grammar_tool_input_properties: &grammar_tool_input_properties,
             deferred_tools: &deferred_tools,
@@ -9965,5 +9977,76 @@ mod tests {
         assert_eq!(response.usage.input, 6);
         assert_eq!(response.usage.output, 2);
         assert_eq!(response.usage.total_tokens, 12);
+    }
+
+    /// pi-meta-muse-auth: a `meta-muse` login reaches Meta's Responses API
+    /// with the minted key as a bearer token, the Muse client identity, and
+    /// the system prompt in the `system` role Muse requires.
+    #[test]
+    fn meta_muse_requests_use_responses_bearer_auth_and_the_system_role() {
+        let body = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":6,\"total_tokens\":26}}}\n\n"
+        );
+        let (base_url, requests, server) = test_server(vec![http_response(200, body)]);
+        let store = Arc::new(catalog::CredentialStore::in_memory());
+        let mut credential = catalog::Credential::oauth("muse-model-key", "identity", i64::MAX);
+        credential
+            .set_extra("baseUrl", json!("https://api.meta.ai/v1"))
+            .expect("extra");
+        credential
+            .set_extra("subscriptionActive", json!(true))
+            .expect("extra");
+        store.put("meta-muse", credential).expect("store");
+        let catalog = catalog::Catalog::with_environment(Some(store), Arc::new(|_| None))
+            .expect("catalog")
+            .with_dynamic_paths(catalog::DynamicPaths::disabled());
+        let resolved = catalog
+            .resolve_model("meta-muse/muse-spark-1.3")
+            .expect("meta-muse model resolves");
+        assert_eq!(resolved.model.base_url, "https://api.meta.ai/v1");
+        // A loopback stand-in for api.meta.ai that keeps the /v1 path.
+        let mut request_model = resolved.model.clone();
+        request_model.base_url = format!("{base_url}/v1");
+
+        let response =
+            factory_with_credentials(0, ProviderCredentials::from_resolved_model(&resolved))
+                .respond(
+                    &request_model,
+                    &text_context(),
+                    options(agent::CancellationToken::default()),
+                )
+                .expect("Muse response");
+        let request = requests.recv().expect("captured Muse request");
+        server.join().expect("Muse test server finishes");
+
+        assert_eq!(request.target, "/v1/responses");
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer muse-model-key")
+        );
+        assert_eq!(
+            request.headers.get("user-agent").map(String::as_str),
+            Some("muse-build/pi-meta-muse-auth")
+        );
+        assert!(!request.headers.contains_key("x-api-key"));
+        let sent: Value = serde_json::from_slice(&request.body).expect("request JSON");
+        assert_eq!(sent["model"], "muse-spark-1.3");
+        assert_eq!(
+            sent["input"][0],
+            json!({"role": "system", "content": "be concise"})
+        );
+        assert_eq!(sent["reasoning"]["effort"], "high");
+        assert_eq!(sent["tools"][0]["strict"], false);
+        assert_eq!(response.stop_reason, stream::STOP_TOOL_USE);
+
+        // Control: without the compat flag a reasoning model keeps pi's
+        // default developer role.
+        let mut default_compat = request_model.clone();
+        default_compat.compat = None;
+        let input = openai_responses_input(&default_compat, &text_context()).expect("input");
+        assert_eq!(input[0]["role"], "developer");
     }
 }

@@ -14,6 +14,7 @@ pub mod export_html;
 pub mod google_auth;
 pub mod llm;
 pub mod markdown;
+pub mod meta_muse;
 pub mod mistral;
 pub mod oauth;
 pub mod omni_cli;
@@ -332,10 +333,8 @@ fn run_command(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     // Notices were printed as they arrived (`live_notices`); only clear them.
     let _ = runtime::drain_session_notices(&prepared.runtime);
-    if !quiet {
-        if let Some(banner) = runtime::session_banner(&prepared.runtime) {
-            eprintln!("{}", dim(&banner, color_enabled()));
-        }
+    if !quiet && let Some(banner) = runtime::session_banner(&prepared.runtime) {
+        eprintln!("{}", dim(&banner, color_enabled()));
     }
 
     let render_lock = Arc::new(Mutex::new(()));
@@ -1968,11 +1967,12 @@ fn dispatch_login_command<'a>(
     }
     let provider_id = (*provider_id).to_owned();
     if use_key && !api_key_login_available(catalog, &provider_id) {
+        let (key_provider, key_api) = api_key_alternative(&provider_id);
         append_view_message(
             view,
             MessageRole::Error,
             format!(
-                "{provider_id} has no API key; use /login {provider_id}, or /login openai key for the OpenAI API"
+                "{provider_id} has no API key; use /login {provider_id}, or /login {key_provider} key for the {key_api}"
             ),
         );
         return CommandDispatch::Handled;
@@ -2048,6 +2048,7 @@ const FEATURED_PROVIDERS: &[&str] = &[
     "deepseek",
     "mistral",
     "meta",
+    "meta-muse",
     "kimi-coding",
     "moonshotai",
     "zai",
@@ -2102,6 +2103,7 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
                 "anthropic" => "sign in with Claude Pro/Max",
                 "xai" => "sign in with your Grok subscription",
                 "meta" => "sign in with your Meta account",
+                "meta-muse" => "sign in with your Muse Code subscription",
                 "kimi-coding" => "sign in with Kimi",
                 _ => "sign in through the browser",
             };
@@ -2126,11 +2128,21 @@ fn login_choices(catalog: &catalog::Catalog) -> Vec<state::Suggestion> {
 }
 
 /// Whether a provider with a login flow also takes an API key. Subscription
-/// providers such as a ChatGPT plan have none; `openai` is the API-key route.
+/// providers (a ChatGPT plan, Meta Muse Code, which refuses any key Meta does
+/// not confirm as subscription-backed) have none.
 fn api_key_login_available(catalog: &catalog::Catalog, provider_id: &str) -> bool {
     catalog
         .provider(provider_id)
         .is_some_and(|provider| provider.auth_kind != catalog::AuthKind::OAuthOnly)
+}
+
+/// The provider that takes an API key for the same models as a
+/// subscription-only one, and what that key is called.
+fn api_key_alternative(provider_id: &str) -> (&'static str, &'static str) {
+    match provider_id {
+        "meta-muse" => ("meta", "Meta Model API"),
+        _ => ("openai", "OpenAI API"),
+    }
 }
 
 fn login_flow_available(provider_id: &str) -> bool {
@@ -4003,6 +4015,39 @@ mod tests {
             unknown_command_message("bogus"),
             "unknown command \"bogus\"; run `goshcoder help` for usage"
         );
+    }
+
+    #[test]
+    fn the_login_picker_offers_muse_code_as_a_subscription_without_a_key_row() {
+        let catalog = catalog::Catalog::with_environment(
+            Some(std::sync::Arc::new(catalog::CredentialStore::in_memory())),
+            std::sync::Arc::new(|_| None),
+        )
+        .expect("catalog")
+        .with_dynamic_paths(catalog::DynamicPaths::disabled());
+        let choices = login_choices(&catalog);
+        let values = choices
+            .iter()
+            .map(|choice| choice.value.as_str())
+            .collect::<Vec<_>>();
+        let muse = choices
+            .iter()
+            .find(|choice| choice.value == "/login meta-muse")
+            .expect("Muse Code sign-in row");
+        assert_eq!(
+            muse.description,
+            "Meta Muse Code  ·  sign in with your Muse Code subscription"
+        );
+        assert!(!values.contains(&"/login meta-muse key"));
+        // The Meta Model API keeps both ways in, and Muse Code follows it.
+        let meta_key = values
+            .iter()
+            .position(|value| *value == "/login meta key")
+            .expect("Meta API-key row");
+        assert_eq!(values[meta_key + 1], "/login meta-muse");
+        assert!(!api_key_login_available(&catalog, "meta-muse"));
+        assert!(api_key_login_available(&catalog, "meta"));
+        assert_eq!(api_key_alternative("meta-muse"), ("meta", "Meta Model API"));
     }
 
     #[test]
